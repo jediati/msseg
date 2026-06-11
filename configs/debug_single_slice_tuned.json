@@ -1,16 +1,16 @@
 {
   "input": {
-    "folder": "data/input",
+    "folder": "C:/Users/jediati/Desktop/JEDIATI/data/spears",
     "extensions": [".tif", ".tiff"],
-    "match": "",
+    "match": "recon_",
     "use_regex": false,
     "natural_sort": true,
     "start": 0,
-    "count": null,
+    "count": 1,
     "stride": 1
   },
   "output": {
-    "folder": "data/output",
+    "folder": "C:/Users/jediati/Desktop/JEDIATI/data/spears/mscoupon_debug_out_tuned",
     "mask_template": "{stem}_mask.tiff",
     "table_template": "{stem}_segments.csv",
     "overwrite": true
@@ -20,10 +20,10 @@
     "params": {}
   },
   "msc": {
-    "persistence_absolute": null,
-    "persistence_percent": 10.0,
-    "accurate_ascending": true,
-    "accurate_descending": true,
+    "persistence_absolute": 0.0007,
+    "persistence_percent": null,
+    "accurate_ascending": false,
+    "accurate_descending": false,
     "manifold": "ascending"
   },
   "segments": {
@@ -37,18 +37,18 @@
     "deny_ids": []
   },
   "execution": {
-    "total_threads": 16,
-    "threads_per_slice": 4,
-    "concurrent_slices": 3,
+    "total_threads": 1,
+    "threads_per_slice": 1,
+    "concurrent_slices": 1,
     "read_threads": 1,
     "write_threads": 1,
-    "max_slices_at_a_time": 6,
-    "read_queue_capacity": 6,
-    "write_queue_capacity": 6
+    "max_slices_at_a_time": 1,
+    "read_queue_capacity": 1,
+    "write_queue_capacity": 1
   },
   "timing": {
     "write_json": true,
     "write_csv": true,
-    "output_path": "data/output/timing_report.json"
+    "output_path": "C:/Users/jediati/Desktop/JEDIATI/data/spears/mscoupon_debug_out_tuned/timing_report.json"
   }
 }

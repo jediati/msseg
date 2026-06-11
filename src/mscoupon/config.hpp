@@ -33,7 +33,8 @@ struct FilterConfig {
 };
 
 struct MscConfig {
-  float persistence = 0.0f;
+  std::optional<float> persistence_absolute;
+  std::optional<float> persistence_percent = 10.0f;
   bool accurate_ascending = true;
   bool accurate_descending = true;
   std::string manifold = "ascending";
@@ -67,6 +68,13 @@ struct TimingConfig {
   std::filesystem::path output_path = "timing_report.json";
 };
 
+struct DebugOutputConfig {
+  bool write_filter_tiff = false;
+  bool write_label_tiff = false;
+  std::string filter_template = "{stem}_filter.tiff";
+  std::string label_template = "{stem}_labels_i32.tiff";
+};
+
 struct AppConfig {
   InputConfig input;
   OutputConfig output;
@@ -75,6 +83,7 @@ struct AppConfig {
   SegmentKeepConfig segments;
   ExecutionConfig execution;
   TimingConfig timing;
+  DebugOutputConfig debug_output;
   bool dry_run = false;
 };
 
@@ -87,6 +96,8 @@ struct CliOptions {
   std::optional<std::size_t> count_override;
   std::optional<std::size_t> stride_override;
   std::optional<int> worker_override;
+  bool dump_filter_tiff = false;
+  bool dump_label_tiff = false;
   bool dry_run = false;
 };
 

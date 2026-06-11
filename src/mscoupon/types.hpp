@@ -45,6 +45,7 @@ struct StageTiming {
   double select_ms = 0.0;
   double write_ms = 0.0;
   double total_ms = 0.0;
+  double out_time_ms = 0.0;
 };
 
 struct SliceOutput {

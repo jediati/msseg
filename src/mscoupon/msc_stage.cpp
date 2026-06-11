@@ -1,5 +1,7 @@
 #include "mscoupon/msc_stage.hpp"
 
+#include <algorithm>
+#include <limits>
 #include <stdexcept>
 
 #include "msc_2d_lib.h"
@@ -14,7 +16,23 @@ std::vector<int> compute_msc_labels(const Image2D& filtered_image, const MscConf
   GInt::Msc2D::Msc2D msc;
   msc.compute(filtered_image.pixels.data(), filtered_image.height, filtered_image.width, cfg.accurate_ascending,
               cfg.accurate_descending);
-  msc.setPersistence(cfg.persistence);
+
+  float persistence_absolute = 0.0f;
+  if (cfg.persistence_absolute.has_value()) {
+    persistence_absolute = *cfg.persistence_absolute;
+  } else if (cfg.persistence_percent.has_value()) {
+    float min_v = std::numeric_limits<float>::max();
+    float max_v = std::numeric_limits<float>::lowest();
+    for (float v : filtered_image.pixels) {
+      min_v = std::min(min_v, v);
+      max_v = std::max(max_v, v);
+    }
+    const float range = max_v - min_v;
+    persistence_absolute = range * (*cfg.persistence_percent / 100.0f);
+  } else {
+    throw std::runtime_error("MSC persistence not configured.");
+  }
+  msc.setPersistence(persistence_absolute);
 
   if (cfg.manifold == "ascending") {
     return msc.ascending2Manifolds().labels;

@@ -118,6 +118,8 @@ std::vector<SliceJob> build_sequence(const AppConfig& cfg) {
     job.slice_index = slice_index;
     job.mask_output_path = cfg.output.folder / render_template(cfg.output.mask_template, input_path, slice_index);
     job.table_output_path = cfg.output.folder / render_template(cfg.output.table_template, input_path, slice_index);
+    job.filter_output_path = cfg.output.folder / render_template(cfg.debug_output.filter_template, input_path, slice_index);
+    job.label_output_path = cfg.output.folder / render_template(cfg.debug_output.label_template, input_path, slice_index);
     if (!cfg.output.overwrite && (std::filesystem::exists(job.mask_output_path) || std::filesystem::exists(job.table_output_path))) {
       throw std::runtime_error("Output exists while overwrite is false: " + job.input_path.string());
     }

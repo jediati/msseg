@@ -76,6 +76,10 @@ struct ProcessedSlice {
   SliceJob job;
   Mask2D mask;
   std::vector<SegmentStat> table;
+  std::optional<Image2D> filtered_image;
+  std::optional<std::vector<int>> labels;
+  int label_width = 0;
+  int label_height = 0;
   StageTiming timing;
 };
 
@@ -85,7 +89,8 @@ double elapsed_ms(const Clock::time_point& start) {
 
 }  // namespace
 
-std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<SliceJob>& jobs) {
+std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<SliceJob>& jobs,
+                                      const std::chrono::steady_clock::time_point& process_start) {
   std::filesystem::create_directories(cfg.output.folder);
 
   const int hw_threads = static_cast<int>(std::thread::hardware_concurrency());
@@ -198,6 +203,14 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
           processed.job = loaded.job;
           processed.mask = std::move(mask);
           processed.table = std::move(table.rows);
+          if (cfg.debug_output.write_filter_tiff) {
+            processed.filtered_image = filtered;
+          }
+          if (cfg.debug_output.write_label_tiff) {
+            processed.labels = labels;
+            processed.label_width = loaded.original.width;
+            processed.label_height = loaded.original.height;
+          }
           processed.timing = loaded.timing;
           write_queue.push(std::move(processed));
         }
@@ -220,6 +233,12 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
           const auto write_start = Clock::now();
           write_tiff_mask_u8(processed.job.mask_output_path, processed.mask);
           write_segment_table_csv(processed.job.table_output_path, processed.table);
+          if (cfg.debug_output.write_filter_tiff && processed.filtered_image.has_value()) {
+            write_tiff_float32(processed.job.filter_output_path, *processed.filtered_image);
+          }
+          if (cfg.debug_output.write_label_tiff && processed.labels.has_value()) {
+            write_tiff_int32(processed.job.label_output_path, processed.label_width, processed.label_height, *processed.labels);
+          }
           processed.timing.write_ms = elapsed_ms(write_start);
 
           SliceOutput out;
@@ -228,6 +247,7 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
           out.table_output_path = processed.job.table_output_path;
           out.slice_index = processed.job.slice_index;
           out.timing = processed.timing;
+          out.timing.out_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - process_start).count();
 
           {
             std::lock_guard lock(outputs_mu);
@@ -277,6 +297,7 @@ void write_timing_report(const AppConfig& cfg, const std::vector<SliceOutput>& o
           {"select_ms", out.timing.select_ms},
           {"write_ms", out.timing.write_ms},
           {"total_ms", out.timing.total_ms},
+          {"out_time_ms", out.timing.out_time_ms},
       });
     }
     root["items"] = std::move(items);
@@ -289,11 +310,11 @@ void write_timing_report(const AppConfig& cfg, const std::vector<SliceOutput>& o
     auto csv_path = cfg.timing.output_path;
     csv_path.replace_extension(".csv");
     std::ofstream out(csv_path);
-    out << "slice_index,input,read_ms,filter_ms,msc_ms,stats_ms,select_ms,write_ms,total_ms\n";
+    out << "slice_index,input,read_ms,filter_ms,msc_ms,stats_ms,select_ms,write_ms,total_ms,out_time_ms\n";
     for (const auto& item : outputs) {
       out << item.slice_index << "," << item.input_path.string() << "," << item.timing.read_ms << "," << item.timing.filter_ms << ","
           << item.timing.msc_ms << "," << item.timing.stats_ms << "," << item.timing.select_ms << "," << item.timing.write_ms << ","
-          << item.timing.total_ms << "\n";
+          << item.timing.total_ms << "," << item.timing.out_time_ms << "\n";
     }
   }
 }

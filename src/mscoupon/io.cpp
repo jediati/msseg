@@ -77,6 +77,36 @@ void write_tiff_mask_u8(const std::filesystem::path& path, const Mask2D& mask) {
   TinyTIFFWriter_close(writer);
 }
 
+void write_tiff_float32(const std::filesystem::path& path, const Image2D& image) {
+  TinyTIFFWriterFile* writer = TinyTIFFWriter_open(path.string().c_str(), 32, TinyTIFFWriter_Float, 1,
+                                                   static_cast<uint32_t>(image.width), static_cast<uint32_t>(image.height),
+                                                   TinyTIFFWriter_Greyscale);
+  if (writer == nullptr) {
+    throw std::runtime_error("Failed to open output float32 TIFF writer: " + path.string());
+  }
+  if (!TinyTIFFWriter_writeImage(writer, image.pixels.data())) {
+    const std::string err = TinyTIFFWriter_getLastError(writer);
+    TinyTIFFWriter_close(writer);
+    throw std::runtime_error("TinyTIFFWriter_writeImage float32 failed: " + err);
+  }
+  TinyTIFFWriter_close(writer);
+}
+
+void write_tiff_int32(const std::filesystem::path& path, int width, int height, const std::vector<int>& labels) {
+  TinyTIFFWriterFile* writer = TinyTIFFWriter_open(path.string().c_str(), 32, TinyTIFFWriter_Int, 1,
+                                                   static_cast<uint32_t>(width), static_cast<uint32_t>(height),
+                                                   TinyTIFFWriter_Greyscale);
+  if (writer == nullptr) {
+    throw std::runtime_error("Failed to open output int32 TIFF writer: " + path.string());
+  }
+  if (!TinyTIFFWriter_writeImage(writer, labels.data())) {
+    const std::string err = TinyTIFFWriter_getLastError(writer);
+    TinyTIFFWriter_close(writer);
+    throw std::runtime_error("TinyTIFFWriter_writeImage int32 failed: " + err);
+  }
+  TinyTIFFWriter_close(writer);
+}
+
 void write_segment_table_csv(const std::filesystem::path& path, const std::vector<SegmentStat>& stats) {
   std::ofstream out(path);
   if (!out.good()) {

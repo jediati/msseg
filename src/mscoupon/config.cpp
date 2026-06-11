@@ -56,7 +56,16 @@ void parse_filter(const nlohmann::json& root, FilterConfig& filter) {
 
 void parse_msc(const nlohmann::json& root, MscConfig& msc) {
   const auto& m = root.at("msc");
-  set_if_present(m, "persistence", msc.persistence);
+  if (m.contains("persistence_absolute") && !m.at("persistence_absolute").is_null()) {
+    msc.persistence_absolute = m.at("persistence_absolute").get<float>();
+  }
+  if (m.contains("persistence_percent") && !m.at("persistence_percent").is_null()) {
+    msc.persistence_percent = m.at("persistence_percent").get<float>();
+  }
+  // Backward compatibility for older configs.
+  if (m.contains("persistence") && !m.at("persistence").is_null()) {
+    msc.persistence_absolute = m.at("persistence").get<float>();
+  }
   set_if_present(m, "accurate_ascending", msc.accurate_ascending);
   set_if_present(m, "accurate_descending", msc.accurate_descending);
   set_if_present(m, "manifold", msc.manifold);
@@ -67,12 +76,12 @@ void parse_segments(const nlohmann::json& root, SegmentKeepConfig& seg) {
     return;
   }
   const auto& s = root.at("segments");
-  if (s.contains("min_area")) seg.min_area = s.at("min_area").get<std::size_t>();
-  if (s.contains("max_area")) seg.max_area = s.at("max_area").get<std::size_t>();
-  if (s.contains("min_value")) seg.min_value = s.at("min_value").get<float>();
-  if (s.contains("max_value")) seg.max_value = s.at("max_value").get<float>();
-  if (s.contains("min_mean")) seg.min_mean = s.at("min_mean").get<float>();
-  if (s.contains("max_mean")) seg.max_mean = s.at("max_mean").get<float>();
+  if (s.contains("min_area") && !s.at("min_area").is_null()) seg.min_area = s.at("min_area").get<std::size_t>();
+  if (s.contains("max_area") && !s.at("max_area").is_null()) seg.max_area = s.at("max_area").get<std::size_t>();
+  if (s.contains("min_value") && !s.at("min_value").is_null()) seg.min_value = s.at("min_value").get<float>();
+  if (s.contains("max_value") && !s.at("max_value").is_null()) seg.max_value = s.at("max_value").get<float>();
+  if (s.contains("min_mean") && !s.at("min_mean").is_null()) seg.min_mean = s.at("min_mean").get<float>();
+  if (s.contains("max_mean") && !s.at("max_mean").is_null()) seg.max_mean = s.at("max_mean").get<float>();
   set_if_present(s, "allow_ids", seg.allow_ids);
   set_if_present(s, "deny_ids", seg.deny_ids);
 }
@@ -104,6 +113,17 @@ void parse_timing(const nlohmann::json& root, TimingConfig& timing) {
   }
 }
 
+void parse_debug_output(const nlohmann::json& root, DebugOutputConfig& debug) {
+  if (!root.contains("debug_output")) {
+    return;
+  }
+  const auto& d = root.at("debug_output");
+  set_if_present(d, "write_filter_tiff", debug.write_filter_tiff);
+  set_if_present(d, "write_label_tiff", debug.write_label_tiff);
+  set_if_present(d, "filter_template", debug.filter_template);
+  set_if_present(d, "label_template", debug.label_template);
+}
+
 void apply_cli_overrides(const CliOptions& cli, AppConfig& cfg) {
   if (cli.input_folder_override.has_value()) cfg.input.folder = *cli.input_folder_override;
   if (cli.output_folder_override.has_value()) cfg.output.folder = *cli.output_folder_override;
@@ -112,6 +132,8 @@ void apply_cli_overrides(const CliOptions& cli, AppConfig& cfg) {
   if (cli.count_override.has_value()) cfg.input.count = *cli.count_override;
   if (cli.stride_override.has_value()) cfg.input.stride = *cli.stride_override;
   if (cli.worker_override.has_value()) cfg.execution.total_threads = *cli.worker_override;
+  if (cli.dump_filter_tiff) cfg.debug_output.write_filter_tiff = true;
+  if (cli.dump_label_tiff) cfg.debug_output.write_label_tiff = true;
   if (cli.dry_run) cfg.dry_run = true;
 }
 
@@ -155,12 +177,17 @@ CliOptions parse_cli(int argc, char** argv) {
     } else if (arg == "--workers") {
       if (!consume_arg_value(argc, argv, i, value)) throw std::runtime_error("Missing value for --workers");
       cli.worker_override = std::stoi(value);
+    } else if (arg == "--dump-filter-tiff") {
+      cli.dump_filter_tiff = true;
+    } else if (arg == "--dump-label-tiff") {
+      cli.dump_label_tiff = true;
     } else if (arg == "--dry-run") {
       cli.dry_run = true;
     } else if (arg == "--help" || arg == "-h") {
       throw std::runtime_error(
           "Usage: mscoupon --config <path> [--input-folder <path>] [--output-folder <path>] "
-          "[--match <string>] [--start <n>] [--count <n>] [--stride <n>] [--workers <n>] [--dry-run]");
+          "[--match <string>] [--start <n>] [--count <n>] [--stride <n>] [--workers <n>] "
+          "[--dump-filter-tiff] [--dump-label-tiff] [--dry-run]");
     } else {
       throw std::runtime_error(std::string("Unknown argument: ") + std::string(arg));
     }
@@ -189,6 +216,7 @@ AppConfig load_config(const CliOptions& cli) {
   parse_segments(root, cfg.segments);
   parse_execution(root, cfg.execution);
   parse_timing(root, cfg.timing);
+  parse_debug_output(root, cfg.debug_output);
 
   apply_cli_overrides(cli, cfg);
   validate_config(cfg);
@@ -205,6 +233,13 @@ void validate_config(const AppConfig& cfg) {
   if (cfg.execution.max_slices_at_a_time == 0) throw std::runtime_error("execution.max_slices_at_a_time must be > 0");
   if (cfg.execution.read_queue_capacity == 0) throw std::runtime_error("execution.read_queue_capacity must be > 0");
   if (cfg.execution.write_queue_capacity == 0) throw std::runtime_error("execution.write_queue_capacity must be > 0");
+  if (!cfg.msc.persistence_absolute.has_value() && !cfg.msc.persistence_percent.has_value()) {
+    throw std::runtime_error("msc requires persistence_absolute or persistence_percent.");
+  }
+  if (cfg.msc.persistence_percent.has_value()) {
+    const float p = *cfg.msc.persistence_percent;
+    if (p < 0.0f || p > 100.0f) throw std::runtime_error("msc.persistence_percent must be in [0, 100].");
+  }
 }
 
 }  // namespace mscoupon
