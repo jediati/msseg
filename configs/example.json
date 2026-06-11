@@ -1,0 +1,53 @@
+{
+  "input": {
+    "folder": "data/input",
+    "extensions": [".tif", ".tiff"],
+    "match": "",
+    "use_regex": false,
+    "natural_sort": true,
+    "start": 0,
+    "count": null,
+    "stride": 1
+  },
+  "output": {
+    "folder": "data/output",
+    "mask_template": "{stem}_mask.tiff",
+    "table_template": "{stem}_segments.csv",
+    "overwrite": true
+  },
+  "filter": {
+    "operation": "none",
+    "params": {}
+  },
+  "msc": {
+    "persistence": 0.0,
+    "accurate_ascending": true,
+    "accurate_descending": true,
+    "manifold": "ascending"
+  },
+  "segments": {
+    "min_area": 4,
+    "max_area": null,
+    "min_value": null,
+    "max_value": null,
+    "min_mean": null,
+    "max_mean": null,
+    "allow_ids": [],
+    "deny_ids": []
+  },
+  "execution": {
+    "total_threads": 16,
+    "threads_per_slice": 4,
+    "concurrent_slices": 3,
+    "read_threads": 1,
+    "write_threads": 1,
+    "max_slices_at_a_time": 6,
+    "read_queue_capacity": 6,
+    "write_queue_capacity": 6
+  },
+  "timing": {
+    "write_json": true,
+    "write_csv": true,
+    "output_path": "data/output/timing_report.json"
+  }
+}

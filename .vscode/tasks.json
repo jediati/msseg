@@ -1,0 +1,18 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Configure mscoupon compile_commands",
+      "type": "shell",
+      "command": "call \"C:\\Program Files\\Microsoft Visual Studio\\2022\\Professional\\Common7\\Tools\\VsDevCmd.bat\" -arch=x64 && cmake -G Ninja -S . -B C:/Users/jediati/Desktop/JEDIATI/build/mscoupon-ninja -DCMAKE_MAKE_PROGRAM=C:/Users/jediati/bin/ninja.exe",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "C:\\Windows\\System32\\cmd.exe",
+          "args": ["/d", "/c"]
+        }
+      },
+      "problemMatcher": []
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "cmake.generator": "Ninja",
+  "cmake.buildDirectory": "C:/Users/jediati/Desktop/JEDIATI/build/mscoupon-ninja",
+  "cmake.configureSettings": {
+    "MSC_PY": "ON",
+    "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+  },
+  "clangd.arguments": [
+    "--compile-commands-dir=C:/Users/jediati/Desktop/JEDIATI/build/mscoupon-ninja",
+    ],
+  "C_Cpp.default.compileCommands": "C:/Users/jediati/Desktop/JEDIATI/build/mscoupon-ninja/compile_commands.json",
+  "cmake.buildTarget": "all",
+  "cmake.configureOnOpen": true,
+  "cmake.skipConfigureIfCachePresent": false
+}

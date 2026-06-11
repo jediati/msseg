@@ -1,0 +1,112 @@
+Import instructions for using diffg from an external CMake project
+==================================================================
+
+Git ground truth
+----------------
+
+Repository: https://github.com/jediati/diffg.git
+Branch: main
+Commit: e06a0eaf8e5cd3ff15fec518af8dd7dc1eaefaaf
+
+This project builds a pure C++ static library target named diffg and an alias
+target named diffg::diffg. It requires CMake 3.20 or newer and C++17.
+
+For an external C++ project, disable diffg's optional Python module, examples,
+and tests before importing it:
+
+    set(DIFFG_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
+    set(DIFFG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(DIFFG_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+
+
+Recommended: import from GitHub with FetchContent
+-------------------------------------------------
+
+Use the exact commit above for reproducible builds.
+
+    cmake_minimum_required(VERSION 3.20)
+    project(MyImageProject LANGUAGES CXX)
+
+    include(FetchContent)
+
+    set(DIFFG_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
+    set(DIFFG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(DIFFG_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+
+    FetchContent_Declare(
+        diffg
+        GIT_REPOSITORY https://github.com/jediati/diffg.git
+        GIT_TAG        e06a0eaf8e5cd3ff15fec518af8dd7dc1eaefaaf
+    )
+
+    FetchContent_MakeAvailable(diffg)
+
+    add_executable(my_image_app
+        src/main.cpp
+    )
+
+    target_link_libraries(my_image_app
+        PRIVATE
+            diffg::diffg
+    )
+
+
+Alternative: import as a submodule or vendored directory
+--------------------------------------------------------
+
+If diffg is checked out inside the external project, for example at
+external/diffg, use add_subdirectory:
+
+    cmake_minimum_required(VERSION 3.20)
+    project(MyImageProject LANGUAGES CXX)
+
+    set(DIFFG_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
+    set(DIFFG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(DIFFG_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+
+    add_subdirectory(external/diffg)
+
+    add_executable(my_image_app
+        src/main.cpp
+    )
+
+    target_link_libraries(my_image_app
+        PRIVATE
+            diffg::diffg
+    )
+
+
+Using diffg from another pybind module
+--------------------------------------
+
+If the external project has its own pybind interface, keep DIFFG_BUILD_PYTHON
+OFF and link the C++ diffg library into the external pybind module:
+
+    pybind11_add_module(my_py_module
+        src/bindings.cpp
+    )
+
+    target_link_libraries(my_py_module
+        PRIVATE
+            diffg::diffg
+    )
+
+This avoids building diffg's own pybind module while still exposing the C++
+image computation code through the external project's bindings.
+
+
+Usage notes
+-----------
+
+- Prefer GIT_TAG set to the commit above for reproducibility. Use the branch
+  name main only for active development tracking.
+- The current project does not install a CMake package config, so use
+  FetchContent or add_subdirectory rather than find_package(diffg).
+- Include public headers from the diffg namespace, for example:
+
+      #include "diffg/image.hpp"
+      #include "diffg/blur.hpp"
+      #include "diffg/differentiator.hpp"
+
+- Link only to diffg::diffg from the consuming target. The include directory
+  and C++17 requirement are propagated by the CMake target.

@@ -1,0 +1,210 @@
+#include "mscoupon/config.hpp"
+
+#include <fstream>
+#include <stdexcept>
+#include <string_view>
+
+namespace mscoupon {
+namespace {
+
+template <typename T>
+void set_if_present(const nlohmann::json& object, const char* key, T& out) {
+  if (object.contains(key) && !object.at(key).is_null()) {
+    out = object.at(key).get<T>();
+  }
+}
+
+std::filesystem::path require_path(const nlohmann::json& object, const char* key) {
+  if (!object.contains(key)) {
+    throw std::runtime_error(std::string("Missing required key: ") + key);
+  }
+  return object.at(key).get<std::string>();
+}
+
+void parse_input(const nlohmann::json& root, InputConfig& input) {
+  const auto& in = root.at("input");
+  input.folder = require_path(in, "folder");
+  set_if_present(in, "extensions", input.extensions);
+  set_if_present(in, "match", input.match);
+  set_if_present(in, "use_regex", input.use_regex);
+  set_if_present(in, "natural_sort", input.natural_sort);
+  set_if_present(in, "start", input.start);
+  if (in.contains("count") && !in.at("count").is_null()) {
+    input.count = in.at("count").get<std::size_t>();
+  }
+  set_if_present(in, "stride", input.stride);
+}
+
+void parse_output(const nlohmann::json& root, OutputConfig& output) {
+  const auto& out = root.at("output");
+  output.folder = require_path(out, "folder");
+  set_if_present(out, "mask_template", output.mask_template);
+  set_if_present(out, "table_template", output.table_template);
+  set_if_present(out, "overwrite", output.overwrite);
+}
+
+void parse_filter(const nlohmann::json& root, FilterConfig& filter) {
+  if (!root.contains("filter")) {
+    return;
+  }
+  const auto& f = root.at("filter");
+  set_if_present(f, "operation", filter.operation);
+  if (f.contains("params")) {
+    filter.params = f.at("params");
+  }
+}
+
+void parse_msc(const nlohmann::json& root, MscConfig& msc) {
+  const auto& m = root.at("msc");
+  set_if_present(m, "persistence", msc.persistence);
+  set_if_present(m, "accurate_ascending", msc.accurate_ascending);
+  set_if_present(m, "accurate_descending", msc.accurate_descending);
+  set_if_present(m, "manifold", msc.manifold);
+}
+
+void parse_segments(const nlohmann::json& root, SegmentKeepConfig& seg) {
+  if (!root.contains("segments")) {
+    return;
+  }
+  const auto& s = root.at("segments");
+  if (s.contains("min_area")) seg.min_area = s.at("min_area").get<std::size_t>();
+  if (s.contains("max_area")) seg.max_area = s.at("max_area").get<std::size_t>();
+  if (s.contains("min_value")) seg.min_value = s.at("min_value").get<float>();
+  if (s.contains("max_value")) seg.max_value = s.at("max_value").get<float>();
+  if (s.contains("min_mean")) seg.min_mean = s.at("min_mean").get<float>();
+  if (s.contains("max_mean")) seg.max_mean = s.at("max_mean").get<float>();
+  set_if_present(s, "allow_ids", seg.allow_ids);
+  set_if_present(s, "deny_ids", seg.deny_ids);
+}
+
+void parse_execution(const nlohmann::json& root, ExecutionConfig& exec) {
+  if (!root.contains("execution")) {
+    return;
+  }
+  const auto& e = root.at("execution");
+  set_if_present(e, "total_threads", exec.total_threads);
+  set_if_present(e, "threads_per_slice", exec.threads_per_slice);
+  set_if_present(e, "concurrent_slices", exec.concurrent_slices);
+  set_if_present(e, "read_threads", exec.read_threads);
+  set_if_present(e, "write_threads", exec.write_threads);
+  set_if_present(e, "max_slices_at_a_time", exec.max_slices_at_a_time);
+  set_if_present(e, "read_queue_capacity", exec.read_queue_capacity);
+  set_if_present(e, "write_queue_capacity", exec.write_queue_capacity);
+}
+
+void parse_timing(const nlohmann::json& root, TimingConfig& timing) {
+  if (!root.contains("timing")) {
+    return;
+  }
+  const auto& t = root.at("timing");
+  set_if_present(t, "write_json", timing.write_json);
+  set_if_present(t, "write_csv", timing.write_csv);
+  if (t.contains("output_path")) {
+    timing.output_path = t.at("output_path").get<std::string>();
+  }
+}
+
+void apply_cli_overrides(const CliOptions& cli, AppConfig& cfg) {
+  if (cli.input_folder_override.has_value()) cfg.input.folder = *cli.input_folder_override;
+  if (cli.output_folder_override.has_value()) cfg.output.folder = *cli.output_folder_override;
+  if (cli.match_override.has_value()) cfg.input.match = *cli.match_override;
+  if (cli.start_override.has_value()) cfg.input.start = *cli.start_override;
+  if (cli.count_override.has_value()) cfg.input.count = *cli.count_override;
+  if (cli.stride_override.has_value()) cfg.input.stride = *cli.stride_override;
+  if (cli.worker_override.has_value()) cfg.execution.total_threads = *cli.worker_override;
+  if (cli.dry_run) cfg.dry_run = true;
+}
+
+bool consume_arg_value(int argc, char** argv, int& i, std::string& out) {
+  if (i + 1 >= argc) return false;
+  ++i;
+  out = argv[i];
+  return true;
+}
+
+}  // namespace
+
+CliOptions parse_cli(int argc, char** argv) {
+  CliOptions cli;
+
+  for (int i = 1; i < argc; ++i) {
+    const std::string_view arg = argv[i];
+    std::string value;
+
+    if (arg == "--config") {
+      if (!consume_arg_value(argc, argv, i, value)) throw std::runtime_error("Missing value for --config");
+      cli.config_path = value;
+    } else if (arg == "--input-folder") {
+      if (!consume_arg_value(argc, argv, i, value)) throw std::runtime_error("Missing value for --input-folder");
+      cli.input_folder_override = value;
+    } else if (arg == "--output-folder") {
+      if (!consume_arg_value(argc, argv, i, value)) throw std::runtime_error("Missing value for --output-folder");
+      cli.output_folder_override = value;
+    } else if (arg == "--match") {
+      if (!consume_arg_value(argc, argv, i, value)) throw std::runtime_error("Missing value for --match");
+      cli.match_override = value;
+    } else if (arg == "--start") {
+      if (!consume_arg_value(argc, argv, i, value)) throw std::runtime_error("Missing value for --start");
+      cli.start_override = static_cast<std::size_t>(std::stoull(value));
+    } else if (arg == "--count") {
+      if (!consume_arg_value(argc, argv, i, value)) throw std::runtime_error("Missing value for --count");
+      cli.count_override = static_cast<std::size_t>(std::stoull(value));
+    } else if (arg == "--stride") {
+      if (!consume_arg_value(argc, argv, i, value)) throw std::runtime_error("Missing value for --stride");
+      cli.stride_override = static_cast<std::size_t>(std::stoull(value));
+    } else if (arg == "--workers") {
+      if (!consume_arg_value(argc, argv, i, value)) throw std::runtime_error("Missing value for --workers");
+      cli.worker_override = std::stoi(value);
+    } else if (arg == "--dry-run") {
+      cli.dry_run = true;
+    } else if (arg == "--help" || arg == "-h") {
+      throw std::runtime_error(
+          "Usage: mscoupon --config <path> [--input-folder <path>] [--output-folder <path>] "
+          "[--match <string>] [--start <n>] [--count <n>] [--stride <n>] [--workers <n>] [--dry-run]");
+    } else {
+      throw std::runtime_error(std::string("Unknown argument: ") + std::string(arg));
+    }
+  }
+
+  if (cli.config_path.empty()) {
+    throw std::runtime_error("Missing required --config");
+  }
+  return cli;
+}
+
+AppConfig load_config(const CliOptions& cli) {
+  std::ifstream input(cli.config_path);
+  if (!input.good()) {
+    throw std::runtime_error("Could not open config file: " + cli.config_path.string());
+  }
+
+  nlohmann::json root;
+  input >> root;
+
+  AppConfig cfg;
+  parse_input(root, cfg.input);
+  parse_output(root, cfg.output);
+  parse_filter(root, cfg.filter);
+  parse_msc(root, cfg.msc);
+  parse_segments(root, cfg.segments);
+  parse_execution(root, cfg.execution);
+  parse_timing(root, cfg.timing);
+
+  apply_cli_overrides(cli, cfg);
+  validate_config(cfg);
+  return cfg;
+}
+
+void validate_config(const AppConfig& cfg) {
+  if (cfg.input.folder.empty()) throw std::runtime_error("input.folder must not be empty");
+  if (cfg.output.folder.empty()) throw std::runtime_error("output.folder must not be empty");
+  if (cfg.input.stride == 0) throw std::runtime_error("input.stride must be >= 1");
+  if (cfg.execution.threads_per_slice <= 0) throw std::runtime_error("execution.threads_per_slice must be > 0");
+  if (cfg.execution.read_threads <= 0) throw std::runtime_error("execution.read_threads must be > 0");
+  if (cfg.execution.write_threads <= 0) throw std::runtime_error("execution.write_threads must be > 0");
+  if (cfg.execution.max_slices_at_a_time == 0) throw std::runtime_error("execution.max_slices_at_a_time must be > 0");
+  if (cfg.execution.read_queue_capacity == 0) throw std::runtime_error("execution.read_queue_capacity must be > 0");
+  if (cfg.execution.write_queue_capacity == 0) throw std::runtime_error("execution.write_queue_capacity must be > 0");
+}
+
+}  // namespace mscoupon
