@@ -14,6 +14,9 @@ dependencies = ["numpy"]
 # installed into it by the CMake install() rules (see cmake/AddInstance.cmake).
 wheel.packages = ["python/msseg"]
 cmake.version = ">=3.21"
+# Only install our pybind modules into the wheel -- keeps FetchContent
+# dependencies' own install() output (TinyTIFF headers/libs, etc.) out.
+install.components = ["msseg_python"]
 
 [tool.scikit-build.cmake.define]
 MSSEG_BUILD_PYTHON = "ON"

@@ -27,6 +27,8 @@ function(add_msseg_instance NAME)
   if(ARG_PYTHON AND MSSEG_BUILD_PYTHON)
     pybind11_add_module(${NAME}_py ${CMAKE_CURRENT_SOURCE_DIR}/python/${NAME}_py.cpp)
     target_link_libraries(${NAME}_py PRIVATE ${NAME}_lib)
-    install(TARGETS ${NAME}_py LIBRARY DESTINATION msseg/${NAME})
+    # COMPONENT scopes the wheel to just our modules (scikit-build-core installs
+    # only this component), keeping FetchContent deps' own install() rules out.
+    install(TARGETS ${NAME}_py LIBRARY DESTINATION msseg/${NAME} COMPONENT msseg_python)
   endif()
 endfunction()
