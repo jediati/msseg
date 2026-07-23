@@ -2,7 +2,7 @@
   "cmake.generator": "Ninja",
   "cmake.buildDirectory": "C:/Users/jediati/Desktop/JEDIATI/build/msseg-ninja",
   "cmake.configureSettings": {
-    "MSC_PY": "ON",
+    "MSSEG_BUILD_PYTHON": "ON",
     "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
   },
   "clangd.arguments": [
