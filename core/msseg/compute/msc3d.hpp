@@ -41,8 +41,18 @@ class Msc3D {
   void select_persistence(float persistence);
   // Plain-data snapshot of the currently-selected complex.
   MscGraph snapshot() const;
-  // Fill the ascending/descending manifold cell set of a node.
+  // Number of living critical points of a given Morse index at the current
+  // persistence (-1 for all dimensions). Convenience for tests/diagnostics.
+  int living_node_count(int index_dim = -1) const;
+  // Fill the ascending/descending manifold cell set of a snapshot node.
   void fill_manifold(NodeId node_id, bool ascending, std::set<CellIndex>& out) const;
+
+  // Per-voxel basin labeling: for each vertex, the id of the extremum whose
+  // ascending (minima) / descending (maxima) manifold contains it, remapped
+  // through the simplification hierarchy at the current persistence. Voxels
+  // left unassigned get kBackgroundLabel; real basins are >= 1. Mirrors the
+  // recipe msc_2d_lib uses for ascending2Manifolds/descending2Manifolds.
+  LabelVolume basin_labels(bool ascending);
 
   // Lightweight self-test that constructs the core GInt grid types. Used by
   // the build to validate that GInt compiles/links under our C++20 toolchain.

@@ -53,5 +53,8 @@ if(MSSEG_BUILD_TESTS)
     target_link_libraries(mscoupon_tests PRIVATE mscoupon_lib)
     add_test(NAME mscoupon_tests COMMAND mscoupon_tests)
   endif()
-  # core_smoke (3D MSC end-to-end) is added in M3.
+
+  add_executable(core_smoke tests/core_smoke.cpp)
+  target_link_libraries(core_smoke PRIVATE msseg_core)
+  add_test(NAME core_smoke COMMAND core_smoke)
 endif()
