@@ -1,0 +1,34 @@
+# --- Build output --------------------------------------------------------
+# The primary build tree is out-of-source (outside the repo); these cover the
+# in-source preset dirs (linux-gcc/hpc) and any stray in-source configure.
+/build/
+build-*/
+_skbuild/
+_deps/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# --- Python --------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+wheelhouse/
+*.whl
+*.pyd
+.venv/
+venv/
+
+# --- Vendored Windows GL binaries ----------------------------------------
+# The freeglut/glew headers and the viewer sources stay tracked; the .dll/.lib
+# binaries are large and reproducible from the known-good local sources (see
+# docs/ / the M6 copy inventory). VendoredGL.cmake only defines its imported
+# targets when these files are present, so their absence degrades gracefully.
+ext/win64/**/*.dll
+ext/win64/**/*.lib
+
+# --- Editor / OS ---------------------------------------------------------
+.DS_Store
+Thumbs.db

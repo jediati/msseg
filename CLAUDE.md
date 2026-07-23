@@ -4,8 +4,7 @@ MSSeg is a Morse-Smale segmentation platform: a **portable core** library plus
 thin **frontends**. It takes a floating-point volume, transforms it (FeatureJ /
 diffg filters), computes a discrete gradient + Morse-Smale complex (MSCEER /
 GInt), simplifies by persistence, and segments via graph-walking into a label
-volume. (The repo directory is still named `MSCoupon/`; the project renamed to
-`MSSeg` and the old 2D pipeline became the `mscoupon` instance.)
+volume. (The old 2D pipeline became the `mscoupon` instance.)
 
 ## Layout
 
@@ -55,7 +54,6 @@ macros, volume layout).
 
 ## Status
 
-Done: M1 (restructure + parity), M3 (3D MSC core + `core_smoke`), M5 (generic
-runner), M4 (python + wheel). Pending: M6 (viewer), M2 (Linux/HPC parity), and
-the physical `MSCoupon/`→`MSSeg/` directory rename. Work happens on branch
-`refactor/msseg-scaffold`.
+Done: M1 (restructure + parity), M3 (3D MSC core + `core_smoke`), M4 (python +
+wheel), M5 (generic runner), M6 (Windows viewer). Pending: M2 (Linux/HPC
+parity). Work happens on branch `refactor/msseg-scaffold`.
