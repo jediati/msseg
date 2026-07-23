@@ -22,6 +22,7 @@
   "msc": {
     "persistence_absolute": 0.0007,
     "persistence_percent": null,
+    "compute_algorithm": "serial",
     "accurate_ascending": false,
     "accurate_descending": false,
     "manifold": "ascending"

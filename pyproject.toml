@@ -1,0 +1,21 @@
+[build-system]
+requires = ["scikit-build-core>=0.9", "pybind11>=2.13"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "msseg"
+version = "0.1.0"
+description = "Morse-Smale segmentation toolkit: portable core, verified instances, and a generic workflow runner."
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+
+[tool.scikit-build]
+# The python package tree lives under python/; compiled extension modules are
+# installed into it by the CMake install() rules (see cmake/AddInstance.cmake).
+wheel.packages = ["python/msseg"]
+cmake.version = ">=3.21"
+
+[tool.scikit-build.cmake.define]
+MSSEG_BUILD_PYTHON = "ON"
+MSSEG_BUILD_VIEWER = "OFF"
+MSSEG_BUILD_TESTS = "OFF"

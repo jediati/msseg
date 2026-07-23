@@ -66,6 +66,7 @@ void parse_msc(const nlohmann::json& root, MscConfig& msc) {
   if (m.contains("persistence") && !m.at("persistence").is_null()) {
     msc.persistence_absolute = m.at("persistence").get<float>();
   }
+  set_if_present(m, "compute_algorithm", msc.compute_algorithm);
   set_if_present(m, "accurate_ascending", msc.accurate_ascending);
   set_if_present(m, "accurate_descending", msc.accurate_descending);
   set_if_present(m, "manifold", msc.manifold);
@@ -239,6 +240,9 @@ void validate_config(const AppConfig& cfg) {
   if (cfg.msc.persistence_percent.has_value()) {
     const float p = *cfg.msc.persistence_percent;
     if (p < 0.0f || p > 100.0f) throw std::runtime_error("msc.persistence_percent must be in [0, 100].");
+  }
+  if (cfg.msc.compute_algorithm != "serial" && cfg.msc.compute_algorithm != "partitioned") {
+    throw std::runtime_error("msc.compute_algorithm must be 'serial' or 'partitioned'.");
   }
 }
 

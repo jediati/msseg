@@ -1,0 +1,60 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "windows-msvc",
+      "displayName": "Windows (MSVC x64, Ninja)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/../../build/msseg-ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "MSSEG_BUILD_VIEWER": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "linux-gcc",
+      "displayName": "Linux (GCC, Ninja)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-gcc",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_CXX_COMPILER": "g++",
+        "MSSEG_BUILD_VIEWER": "OFF"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "hpc",
+      "displayName": "HPC (offline, module-provided compilers)",
+      "inherits": "linux-gcc",
+      "binaryDir": "${sourceDir}/build/hpc",
+      "cacheVariables": {
+        "FETCHCONTENT_FULLY_DISCONNECTED": "ON",
+        "MSSEG_DEPS_DIR": "$env{MSSEG_DEPS_DIR}",
+        "CMAKE_C_COMPILER": "$env{CC}",
+        "CMAKE_CXX_COMPILER": "$env{CXX}",
+        "MSSEG_BUILD_VIEWER": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "windows-msvc", "configurePreset": "windows-msvc" },
+    { "name": "linux-gcc", "configurePreset": "linux-gcc" },
+    { "name": "hpc", "configurePreset": "hpc" }
+  ],
+  "testPresets": [
+    { "name": "windows-msvc", "configurePreset": "windows-msvc", "output": { "outputOnFailure": true } },
+    { "name": "linux-gcc", "configurePreset": "linux-gcc", "output": { "outputOnFailure": true } }
+  ]
+}

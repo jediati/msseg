@@ -6,11 +6,11 @@
     "use_regex": false,
     "natural_sort": true,
     "start": 0,
-    "count": 6,
+    "count": 7,
     "stride": 1
   },
   "output": {
-    "folder": "C:/Users/jediati/Desktop/JEDIATI/data/spears/mscoupon_debug_out_fast",
+    "folder": "C:/Users/jediati/Desktop/JEDIATI/data/spears/mscoupon_debug_out_fast_fixed",
     "mask_template": "{stem}_mask.tiff",
     "table_template": "{stem}_segments.csv",
     "overwrite": true
@@ -18,13 +18,14 @@
   "filter": {
     "operation": "edges",
     "params": {
-      "sigma": 2.0,
+      "sigma": 1.3,
       "output": "magnitude"
     }
   },
   "msc": {
     "persistence_absolute": null,
-    "persistence_percent": 20.0,
+    "persistence_percent": 10.0,
+    "compute_algorithm": "partitioned",
     "accurate_ascending": false,
     "accurate_descending": false,
     "manifold": "ascending"
@@ -45,13 +46,13 @@
     "concurrent_slices": 4,
     "read_threads": 1,
     "write_threads": 1,
-    "max_slices_at_a_time": 3,
+    "max_slices_at_a_time": 12,
     "read_queue_capacity": 1,
     "write_queue_capacity": 1
   },
   "timing": {
     "write_json": true,
     "write_csv": true,
-    "output_path": "C:/Users/jediati/Desktop/JEDIATI/data/spears/mscoupon_debug_out_fast/timing_report.json"
+    "output_path": "C:/Users/jediati/Desktop/JEDIATI/data/spears/mscoupon_debug_out_fast_p/timing_report_partitioned_fixed.json"
   }
 }

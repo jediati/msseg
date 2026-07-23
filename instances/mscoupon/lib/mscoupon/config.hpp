@@ -35,6 +35,7 @@ struct FilterConfig {
 struct MscConfig {
   std::optional<float> persistence_absolute;
   std::optional<float> persistence_percent = 10.0f;
+  std::string compute_algorithm = "serial";
   bool accurate_ascending = true;
   bool accurate_descending = true;
   std::string manifold = "ascending";
