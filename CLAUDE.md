@@ -12,6 +12,8 @@ volume. (The old 2D pipeline became the `mscoupon` instance.)
 core/msseg/         portable core (namespace msseg): msseg_core + msseg_io
                     filter · compute (msc2d/msc3d) · graph · segment · workflow · io
 instances/mscoupon/ verified 2D TIFF-slice pipeline (lib + cli + python)
+instances/cellseg/  3D fluorescent-membrane cell segmentation (lib + cli + python):
+                    two-phase heavy-lift + threshold-tuning (merge tree / masks)
 generic/msworkflow/ JSON-driven workflow runner (cli + python) over the core
 apps/msviewer/      Windows-only OpenGL debug viewer (optional; M6, in progress)
 python/msseg/       pip package; per-frontend pybind modules install as submodules
@@ -35,7 +37,9 @@ ctest --preset windows-msvc            # mscoupon_tests + core_smoke
 ```
 
 Add `-DMSSEG_BUILD_PYTHON=ON` for the pybind modules. Presets `linux-gcc` /
-`hpc` build the portable parts off Windows (viewer excluded).
+`hpc` build the portable parts off Windows (viewer excluded). For a
+step-by-step Linux/HPC recipe (modules, venv, `pip install`, cellseg smoke
+test), see **[docs/dane_hpc_build.md](docs/dane_hpc_build.md)**.
 
 ## The one hard rule: the GInt firewall
 

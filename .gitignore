@@ -29,6 +29,12 @@ venv/
 ext/win64/**/*.dll
 ext/win64/**/*.lib
 
+# --- Generated demo / segmentation outputs -------------------------------
+# The cellseg example scripts save these into the working dir; they are
+# reproducible artifacts, not source.
+cellseg_merge_tree.png
+cellseg_slice.png
+
 # --- Editor / OS ---------------------------------------------------------
 .DS_Store
 Thumbs.db

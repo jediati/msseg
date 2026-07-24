@@ -103,6 +103,40 @@ int main() {
   check(labels.size() == vol.size(), "label volume matches input dimensions");
   check(frac >= 0.95, "basin labeling covers >= 95%% of voxels");
 
+  // 4b. Two-phase decomposition: cached base pass + cheap NodeId-keyed living
+  //     labels, with per-node voxel counts and a working descending side.
+  {
+    msc.select_persistence(0.1f);
+    const msseg::MscGraph g2 = msc.snapshot();
+    msc.compute_base_decomposition(true);
+    msc.compute_base_decomposition(false);
+
+    std::vector<std::int64_t> asc_counts;
+    const msseg::LabelVolume asc = msc.living_labels(/*ascending=*/true, &asc_counts);
+    check(asc_counts.size() == g2.nodes.size(), "living voxel counts are keyed by snapshot NodeId");
+
+    std::int64_t count_sum = 0;
+    for (const std::int64_t c : asc_counts) count_sum += c;
+    std::size_t asc_labeled = 0;
+    bool labels_in_range = true;
+    for (std::size_t i = 0; i < asc.size(); ++i) {
+      const std::int32_t l = asc.data()[i];
+      if (l != msseg::kBackgroundLabel) ++asc_labeled;
+      if (l < 0 || l > static_cast<std::int32_t>(g2.nodes.size())) labels_in_range = false;
+    }
+    check(labels_in_range, "living ascending labels are within [0, node_count]");
+    check(count_sum == static_cast<std::int64_t>(asc_labeled),
+          "sum of living voxel counts equals labeled voxel total");
+
+    const msseg::LabelVolume dsc = msc.living_labels(/*ascending=*/false);
+    std::size_t dsc_labeled = 0;
+    for (std::size_t i = 0; i < dsc.size(); ++i)
+      if (dsc.data()[i] != msseg::kBackgroundLabel) ++dsc_labeled;
+    std::printf("  descending coverage: %zu / %zu\n", dsc_labeled, dsc.size());
+    check(dsc_labeled > 0, "descending manifold labeling is non-empty (top-cell mapping)");
+    check(msc.value_range() > 0.0f, "value_range() is positive");
+  }
+
   // 5. The "basin" strategy is registered and runs through the seam.
   auto strategy = msseg::make_strategy("basin");
   const msseg::LabelVolume via_strategy = strategy->segment(g, msc, vol, msseg::SegmentationParams{});

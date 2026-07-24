@@ -52,6 +52,17 @@ struct Msc3D::Impl {
   // Maps a compact snapshot NodeId back to the GInt node id (populated by
   // snapshot(), used by fill_manifold()).
   std::vector<INT_TYPE> snapshot_gids;
+  // Inverse of snapshot_gids: GInt node id -> compact snapshot NodeId (also
+  // populated by snapshot(), used by living_labels()).
+  std::unordered_map<INT_TYPE, NodeId> gid_to_compact;
+
+  // Cached base per-vertex extremum labeling (all critical points alive): the
+  // base minimum / maximum GInt node id covering each vertex, or -1. Filled by
+  // compute_base_decomposition(); shared by basin_labels()/living_labels().
+  std::vector<int> base_asc;  // ascending (minima) decomposition
+  std::vector<int> base_dsc;  // descending (maxima) decomposition
+  bool base_asc_done = false;
+  bool base_dsc_done = false;
 
   MscType* mscOrThrow() const {
     if (!msc) throw std::runtime_error("Msc3D: complex not computed. Call build()+compute() first.");
@@ -95,8 +106,25 @@ void Msc3D::build(const Volume& volume, const Msc3DParams& params) {
   if (params.gradient_mode == Msc3DParams::GradientMode::GradFile) {
     impl_->grad->load_from_file(params.grad_file_path.c_str());
   } else {
+    // Both RobinsNoalloc and OnDemandAccurate start from the in-process Robins
+    // steepest-descent pairing. With both OnDemandAccurate accuracy flags off,
+    // that IS the requested gradient (the "ondemandaccurate all-false" case).
     RobinsType robins(impl_->topofunc.get(), impl_->mesh.get(), impl_->grad.get());
     robins.compute_output();
+
+    if (params.gradient_mode == Msc3DParams::GradientMode::OnDemandAccurate &&
+        (params.accurate_ascending_3m || params.accurate_descending_3m)) {
+      // The accurate-3-manifold refinement (numeric integration + local
+      // gradient recompute) needs MSCEER's alternate gradient stack
+      // (MyRobinsNoalloc / RegularGridMaxMinVertexLabeling3D / path-compressing
+      // integrators), which is not yet mirrored here. Fail loudly rather than
+      // silently returning the plain steepest-descent gradient.
+      throw std::runtime_error(
+          "Msc3D: OnDemandAccurate accurate-3-manifold refinement "
+          "(accurate_ascending_3m / accurate_descending_3m) is not yet "
+          "implemented; use the default (both flags false) for steepest "
+          "descent.");
+    }
   }
 
   TopoAlgsType topo_algs(impl_->topofunc.get(), impl_->mesh.get(), impl_->grad.get());
@@ -135,8 +163,9 @@ MscGraph Msc3D::snapshot() const {
   MscType* msc = impl_->mscOrThrow();
   MscGraph graph;
   impl_->snapshot_gids.clear();
+  impl_->gid_to_compact.clear();
 
-  std::unordered_map<INT_TYPE, NodeId> gid_to_compact;
+  std::unordered_map<INT_TYPE, NodeId>& gid_to_compact = impl_->gid_to_compact;
 
   MscType::LivingNodesIterator nit(msc);
   for (nit.begin(); nit.valid(); nit.advance()) {
@@ -193,28 +222,52 @@ void Msc3D::fill_manifold(NodeId node_id, bool ascending, std::set<CellIndex>& o
   for (const INDEX_TYPE cid : cells) out.insert(static_cast<CellIndex>(cid));
 }
 
-LabelVolume Msc3D::basin_labels(bool ascending) {
+float Msc3D::value_range() const { return impl_->value_range; }
+
+void Msc3D::compute_base_decomposition(bool ascending) {
   MscType* msc = impl_->mscOrThrow();
+  std::vector<int>& base = ascending ? impl_->base_asc : impl_->base_dsc;
+  bool& done = ascending ? impl_->base_asc_done : impl_->base_dsc_done;
+  if (done) return;
+
   const int target_dim = ascending ? 0 : 3;
+  // Cell dimension to keep when mapping manifold cells to voxels: ascending
+  // (minima) 3-manifolds are enumerated via their 0-cells (vertices);
+  // descending (maxima) 3-manifolds contain no 0-cells, so we take their
+  // top-dimensional (3-)cells and map each to a vertex via
+  // VertexNumberFromCellID -- mirroring msc_2d_lib's ascending/descending
+  // 2-manifold recipe (which keeps dim 0 vs dim D=2).
+  const int keep_dim = ascending ? 0 : 3;
   const INDEX_TYPE nvert = impl_->grid->NumElements();
+  const float saved_pers = impl_->selected_persistence;
 
   // Base labeling at full resolution (all critical points alive): each vertex
   // gets the base-node id of the extremum whose manifold covers it.
-  std::vector<int> base(static_cast<std::size_t>(nvert), -1);
+  base.assign(static_cast<std::size_t>(nvert), -1);
   msc->SetSelectPersAbs(-1.0f);
-  {
-    MscType::LivingNodesIterator nit(msc);
-    for (nit.begin(); nit.valid(); nit.advance()) {
-      const INT_TYPE nid = nit.value();
-      if (msc->getNode(nid).dim != target_dim) continue;
-      std::set<INDEX_TYPE> manifold;
-      msc->fillGeometry(nid, manifold, ascending);
-      for (const INDEX_TYPE cid : manifold) {
-        if (impl_->mesh->dimension(cid) != 0) continue;
-        base[static_cast<std::size_t>(impl_->mesh->VertexNumberFromCellID(cid))] = static_cast<int>(nid);
-      }
+  MscType::LivingNodesIterator nit(msc);
+  for (nit.begin(); nit.valid(); nit.advance()) {
+    const INT_TYPE nid = nit.value();
+    if (msc->getNode(nid).dim != target_dim) continue;
+    std::set<INDEX_TYPE> manifold;
+    msc->fillGeometry(nid, manifold, ascending);
+    for (const INDEX_TYPE cid : manifold) {
+      if (impl_->mesh->dimension(cid) != keep_dim) continue;
+      base[static_cast<std::size_t>(impl_->mesh->VertexNumberFromCellID(cid))] = static_cast<int>(nid);
     }
   }
+
+  // Restore the caller's persistence selection (the base pass perturbed it).
+  msc->SetSelectPersAbs(saved_pers);
+  done = true;
+}
+
+LabelVolume Msc3D::basin_labels(bool ascending) {
+  compute_base_decomposition(ascending);
+  MscType* msc = impl_->mscOrThrow();
+  const int target_dim = ascending ? 0 : 3;
+  const std::vector<int>& base = ascending ? impl_->base_asc : impl_->base_dsc;
+  const INDEX_TYPE nvert = impl_->grid->NumElements();
 
   // Remap base-node ids to the living extremum they merged into at the current
   // persistence.
@@ -238,6 +291,51 @@ LabelVolume Msc3D::basin_labels(bool ascending) {
     const auto it = (b >= 0) ? remap.find(b) : remap.end();
     // Offset by +1 so background (unlabeled) is kBackgroundLabel (0).
     out.data()[i] = (it != remap.end()) ? static_cast<std::int32_t>(it->second) + 1 : kBackgroundLabel;
+  }
+  return out;
+}
+
+LabelVolume Msc3D::living_labels(bool ascending, std::vector<std::int64_t>* voxel_counts) {
+  compute_base_decomposition(ascending);
+  MscType* msc = impl_->mscOrThrow();
+  const int target_dim = ascending ? 0 : 3;
+  const std::vector<int>& base = ascending ? impl_->base_asc : impl_->base_dsc;
+  const INDEX_TYPE nvert = impl_->grid->NumElements();
+
+  // Remap each base extremum's GInt id to the living extremum (GInt id) it
+  // merged into at the current persistence.
+  msc->SetSelectPersAbs(impl_->selected_persistence);
+  std::unordered_map<int, INT_TYPE> remap;  // base gid -> living gid
+  {
+    MscType::LivingNodesIterator nit(msc);
+    for (nit.begin(); nit.valid(); nit.advance()) {
+      const INT_TYPE nid = nit.value();
+      if (msc->getNode(nid).dim != target_dim) continue;
+      std::set<INT_TYPE> constituents;
+      msc->GatherNodes(nid, constituents, ascending);
+      for (const INT_TYPE c : constituents) remap[static_cast<int>(c)] = nid;
+    }
+  }
+
+  if (voxel_counts) voxel_counts->assign(impl_->snapshot_gids.size(), 0);
+
+  LabelVolume out(diffg::Dimensions{static_cast<std::size_t>(impl_->dim_x), static_cast<std::size_t>(impl_->dim_y),
+                                    static_cast<std::size_t>(impl_->dim_z)});
+  for (INDEX_TYPE i = 0; i < nvert; ++i) {
+    const int b = base[static_cast<std::size_t>(i)];
+    std::int32_t label = kBackgroundLabel;
+    if (b >= 0) {
+      const auto rit = remap.find(b);
+      if (rit != remap.end()) {
+        const auto cit = impl_->gid_to_compact.find(rit->second);
+        if (cit != impl_->gid_to_compact.end()) {
+          const NodeId compact = cit->second;
+          label = static_cast<std::int32_t>(compact) + 1;  // +1 so background stays 0
+          if (voxel_counts) ++(*voxel_counts)[static_cast<std::size_t>(compact)];
+        }
+      }
+    }
+    out.data()[i] = label;
   }
   return out;
 }

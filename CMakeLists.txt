@@ -32,6 +32,7 @@ add_subdirectory(core)
 
 if(MSSEG_BUILD_INSTANCES)
   add_subdirectory(instances/mscoupon)
+  add_subdirectory(instances/cellseg)
 endif()
 
 add_subdirectory(generic/msworkflow)
@@ -52,6 +53,10 @@ if(MSSEG_BUILD_TESTS)
     add_executable(mscoupon_tests tests/mscoupon_tests.cpp)
     target_link_libraries(mscoupon_tests PRIVATE mscoupon_lib)
     add_test(NAME mscoupon_tests COMMAND mscoupon_tests)
+
+    add_executable(cellseg_tests tests/cellseg_tests.cpp)
+    target_link_libraries(cellseg_tests PRIVATE cellseg_lib)
+    add_test(NAME cellseg_tests COMMAND cellseg_tests)
   endif()
 
   add_executable(core_smoke tests/core_smoke.cpp)
