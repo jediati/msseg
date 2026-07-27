@@ -96,3 +96,25 @@ if(MSSEG_BUILD_PYTHON)
     FetchContent_MakeAvailable(pybind11)
   endif()
 endif()
+
+# ---------------------------------------------------------------------------
+# GCC/Clang parity (M2). MSCEER's cmake/Common.cmake pins CMAKE_CXX_STANDARD=11,
+# but GInt's headers need C++14+: gi_vectors.h has constexpr operator[] overloads
+# that collide under C++11's implicit-const rule, and
+# gi_regular_grid_trilinear_function.h / gi_discrete_gradient_labeling.h call
+# memcpy/memset without <cstring> (GCC 12's libstdc++ no longer pulls it in
+# transitively). Fix per-target so the MSVC build is untouched. The -include is
+# PUBLIC so it also reaches msseg_core's msc3d.cpp / msc2d.cpp, which include the
+# MSCEER header stack directly.
+# ---------------------------------------------------------------------------
+foreach(_msceer_tgt GInt msc_2d_lib)
+  if(TARGET ${_msceer_tgt})
+    set_target_properties(${_msceer_tgt} PROPERTIES
+      CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF)
+    if(NOT MSVC)
+      target_compile_options(${_msceer_tgt} PUBLIC -include cstring)
+    endif()
+  endif()
+endforeach()
