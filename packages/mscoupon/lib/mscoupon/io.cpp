@@ -45,4 +45,29 @@ void write_segment_table_csv(const std::filesystem::path& path, const std::vecto
   }
 }
 
+void write_feature_map_csv(const std::filesystem::path& path, const std::vector<FeatureMapRow>& rows) {
+  std::ofstream out(path);
+  if (!out.good()) {
+    throw std::runtime_error("Failed to write feature map: " + path.string());
+  }
+  out << "slice_index,segment_id,global_id\n";
+  for (const auto& row : rows) {
+    out << row.slice_index << "," << row.segment_id << "," << row.global_id << "\n";
+  }
+}
+
+void write_global_table_csv(const std::filesystem::path& path, const std::vector<GlobalFeatureStat>& stats) {
+  std::ofstream out(path);
+  if (!out.good()) {
+    throw std::runtime_error("Failed to write global table: " + path.string());
+  }
+  out << "global_id,voxel_count,num_slices,first_slice,last_slice,"
+         "min_x,min_y,min_z,max_x,max_y,max_z,min_value,max_value,mean_value\n";
+  for (const auto& row : stats) {
+    out << row.global_id << "," << row.voxel_count << "," << row.num_slices << "," << row.first_slice << ","
+        << row.last_slice << "," << row.min_x << "," << row.min_y << "," << row.min_z << "," << row.max_x << ","
+        << row.max_y << "," << row.max_z << "," << row.min_value << "," << row.max_value << "," << row.mean_value << "\n";
+  }
+}
+
 }  // namespace mscoupon

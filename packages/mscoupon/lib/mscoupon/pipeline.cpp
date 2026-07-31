@@ -4,11 +4,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <queue>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 
 #include <nlohmann/json.hpp>
 
@@ -18,6 +20,7 @@
 
 #include "mscoupon/filter.hpp"
 #include "mscoupon/io.hpp"
+#include "mscoupon/matcher.hpp"
 #include "mscoupon/msc_stage.hpp"
 #include "mscoupon/stats.hpp"
 
@@ -80,6 +83,12 @@ struct ProcessedSlice {
   std::optional<std::vector<int>> labels;
   int label_width = 0;
   int label_height = 0;
+  // Retained only when cross-slice matching is enabled: the full local-label
+  // image + kept-id set the matcher needs (labels above is optional/debug-only).
+  std::vector<int> match_labels;
+  std::unordered_set<int> keep_ids;
+  int width = 0;
+  int height = 0;
   StageTiming timing;
 };
 
@@ -103,6 +112,12 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
   BlockingQueue<SliceJob> read_queue(std::max<std::size_t>(cfg.execution.read_queue_capacity, cfg.execution.max_slices_at_a_time));
   BlockingQueue<LoadedSlice> compute_queue(std::max<std::size_t>(1, cfg.execution.max_slices_at_a_time));
   BlockingQueue<ProcessedSlice> write_queue(std::max<std::size_t>(cfg.execution.write_queue_capacity, cfg.execution.max_slices_at_a_time));
+
+  // With matching enabled, compute lanes feed a single in-order matcher thread
+  // (which forwards each slice unchanged to the writers); otherwise they feed the
+  // writers directly, exactly as before.
+  BlockingQueue<ProcessedSlice> match_queue(std::max<std::size_t>(cfg.execution.write_queue_capacity, cfg.execution.max_slices_at_a_time));
+  BlockingQueue<ProcessedSlice>& compute_out = cfg.matching.enabled ? match_queue : write_queue;
 
   std::mutex inflight_mu;
   std::condition_variable inflight_cv;
@@ -211,8 +226,14 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
             processed.label_width = loaded.original.width;
             processed.label_height = loaded.original.height;
           }
+          if (cfg.matching.enabled) {
+            processed.width = loaded.original.width;
+            processed.height = loaded.original.height;
+            processed.keep_ids = keep_ids;             // keep_ids also used by build_mask above
+            processed.match_labels = std::move(labels);
+          }
           processed.timing = loaded.timing;
-          write_queue.push(std::move(processed));
+          compute_out.push(std::move(processed));
         }
       } catch (...) {
         capture_error(std::current_exception());
@@ -261,11 +282,61 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
     });
   }
 
+  // The matcher runs only when enabled: it consumes compute output in arbitrary
+  // order, reorders by slice_index, links each slice to the prior one, forwards it
+  // unchanged to the writers, and finally emits the derived cross-slice CSVs.
+  std::thread matcher_thread;
+  if (cfg.matching.enabled) {
+    matcher_thread = std::thread([&]() {
+      try {
+        SliceMatcher matcher;
+        std::map<int, ProcessedSlice> pending;
+        int expected = 0;
+
+        auto consume = [&](ProcessedSlice&& ps) {
+          matcher.add_slice(ps.match_labels, ps.width, ps.height, ps.keep_ids, ps.table, ps.job.slice_index);
+          write_queue.push(std::move(ps));
+        };
+
+        while (true) {
+          auto maybe = match_queue.pop();
+          if (!maybe.has_value()) break;
+          const int idx = maybe->job.slice_index;
+          pending.emplace(idx, std::move(*maybe));
+          while (!pending.empty() && pending.begin()->first == expected) {
+            auto it = pending.begin();
+            consume(std::move(it->second));
+            pending.erase(it);
+            ++expected;
+          }
+        }
+        // Flush any stragglers in ascending order. Under normal operation pending
+        // is already empty; a gap only remains if an upstream error dropped a
+        // slice, in which case the error is rethrown after the joins below.
+        for (auto& kv : pending) consume(std::move(kv.second));
+
+        std::vector<FeatureMapRow> map_rows;
+        std::vector<GlobalFeatureStat> global_rows;
+        matcher.finalize(map_rows, global_rows);
+        write_feature_map_csv(cfg.output.folder / cfg.matching.map_template, map_rows);
+        write_global_table_csv(cfg.output.folder / cfg.matching.global_table_template, global_rows);
+      } catch (...) {
+        capture_error(std::current_exception());
+      }
+      write_queue.close();
+    });
+  }
+
   producer.join();
   for (auto& t : readers) t.join();
   compute_queue.close();
   for (auto& t : compute_lanes) t.join();
-  write_queue.close();
+  if (cfg.matching.enabled) {
+    match_queue.close();
+    matcher_thread.join();  // finalizes derived CSVs and closes write_queue
+  } else {
+    write_queue.close();
+  }
   for (auto& t : writers) t.join();
 
   if (first_error) std::rethrow_exception(first_error);

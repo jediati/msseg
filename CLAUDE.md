@@ -103,3 +103,13 @@ wheel into per-package distributions: `libs/{core,render}`,
 Pending: M2 (Linux/HPC parity). Note: the `cellseg` Python smoke test has a
 pre-existing drift from the current cellseg output (the C++ `cellseg_tests` is
 authoritative and passes).
+
+**mscoupon cross-slice matching** (on by default, `--no-matching` /
+`matching.enabled=false` to disable): after per-slice segmentation, a serial
+in-order stage links kept 2D features into 3D features by 26-neighbor
+connectivity between consecutive slices (union-find over `(slice, id)` nodes,
+`libs`→`packages/mscoupon/lib/mscoupon/matcher.cpp`). Per-slice masks/CSVs are
+unchanged; two derived files are written at the end — `feature_map.csv`
+(`slice_index, segment_id → global_id`) and `global_segments.csv` (aggregated
+master table, sorted by voxel count descending). The per-slice size threshold
+still gates which features participate.

@@ -66,6 +66,16 @@ struct ExecutionConfig {
   std::size_t write_queue_capacity = 4;
 };
 
+struct MatchingConfig {
+  // Cross-slice feature matching: link kept 2D features into 3D features by
+  // 26-neighbor connectivity between consecutive slices. Per-slice masks/CSVs are
+  // unchanged; the cross-slice identity is emitted as two derived files at the end
+  // of the run (a per-slice->global map and an aggregated master table).
+  bool enabled = true;
+  std::string map_template = "feature_map.csv";
+  std::string global_table_template = "global_segments.csv";
+};
+
 struct TimingConfig {
   bool write_json = true;
   bool write_csv = false;
@@ -86,6 +96,7 @@ struct AppConfig {
   MscConfig msc;
   SegmentKeepConfig segments;
   ExecutionConfig execution;
+  MatchingConfig matching;
   TimingConfig timing;
   DebugOutputConfig debug_output;
   bool dry_run = false;
@@ -103,6 +114,7 @@ struct CliOptions {
   std::optional<int> parallelism_override;
   bool dump_filter_tiff = false;
   bool dump_label_tiff = false;
+  bool disable_matching = false;
   bool dry_run = false;
 };
 

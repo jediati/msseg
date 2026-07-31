@@ -48,6 +48,11 @@
     "read_queue_capacity": 6,
     "write_queue_capacity": 6
   },
+  "matching": {
+    "enabled": true,
+    "map_template": "feature_map.csv",
+    "global_table_template": "global_segments.csv"
+  },
   "timing": {
     "write_json": true,
     "write_csv": true,

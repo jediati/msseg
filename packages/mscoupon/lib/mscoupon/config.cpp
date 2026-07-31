@@ -103,6 +103,16 @@ void parse_execution(const nlohmann::json& root, ExecutionConfig& exec) {
   set_if_present(e, "write_queue_capacity", exec.write_queue_capacity);
 }
 
+void parse_matching(const nlohmann::json& root, MatchingConfig& matching) {
+  if (!root.contains("matching")) {
+    return;
+  }
+  const auto& m = root.at("matching");
+  set_if_present(m, "enabled", matching.enabled);
+  set_if_present(m, "map_template", matching.map_template);
+  set_if_present(m, "global_table_template", matching.global_table_template);
+}
+
 void parse_timing(const nlohmann::json& root, TimingConfig& timing) {
   if (!root.contains("timing")) {
     return;
@@ -137,6 +147,7 @@ void apply_cli_overrides(const CliOptions& cli, AppConfig& cfg) {
   if (cli.parallelism_override.has_value()) cfg.msc.requested_parallelism = *cli.parallelism_override;
   if (cli.dump_filter_tiff) cfg.debug_output.write_filter_tiff = true;
   if (cli.dump_label_tiff) cfg.debug_output.write_label_tiff = true;
+  if (cli.disable_matching) cfg.matching.enabled = false;
   if (cli.dry_run) cfg.dry_run = true;
 }
 
@@ -187,13 +198,15 @@ CliOptions parse_cli(int argc, char** argv) {
       cli.dump_filter_tiff = true;
     } else if (arg == "--dump-label-tiff") {
       cli.dump_label_tiff = true;
+    } else if (arg == "--no-matching") {
+      cli.disable_matching = true;
     } else if (arg == "--dry-run") {
       cli.dry_run = true;
     } else if (arg == "--help" || arg == "-h") {
       throw std::runtime_error(
           "Usage: mscoupon --config <path> [--input-folder <path>] [--output-folder <path>] "
           "[--match <string>] [--start <n>] [--count <n>] [--stride <n>] [--workers <n>] "
-          "[--parallelism <n>] [--dump-filter-tiff] [--dump-label-tiff] [--dry-run]");
+          "[--parallelism <n>] [--dump-filter-tiff] [--dump-label-tiff] [--no-matching] [--dry-run]");
     } else {
       throw std::runtime_error(std::string("Unknown argument: ") + std::string(arg));
     }
@@ -221,6 +234,7 @@ AppConfig load_config(const CliOptions& cli) {
   parse_msc(root, cfg.msc);
   parse_segments(root, cfg.segments);
   parse_execution(root, cfg.execution);
+  parse_matching(root, cfg.matching);
   parse_timing(root, cfg.timing);
   parse_debug_output(root, cfg.debug_output);
 
@@ -251,6 +265,12 @@ void validate_config(const AppConfig& cfg) {
   }
   if (cfg.msc.requested_parallelism < 0) {
     throw std::runtime_error("msc.requested_parallelism must be >= 0 (0 = library default).");
+  }
+  if (cfg.matching.enabled) {
+    if (cfg.matching.map_template.empty()) throw std::runtime_error("matching.map_template must not be empty when matching is enabled.");
+    if (cfg.matching.global_table_template.empty()) {
+      throw std::runtime_error("matching.global_table_template must not be empty when matching is enabled.");
+    }
   }
 }
 
