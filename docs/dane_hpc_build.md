@@ -86,14 +86,17 @@ python -m pip install --upgrade pip
 From the repository root (with the venv active):
 
 ```bash
-pip install numpy            # runtime dependency (also declared in pyproject.toml)
-pip install -v .             # builds the C++ core + pybind modules, installs the msseg wheel
+pip install numpy            # runtime dependency (also declared per package)
+# Each frontend is its own distribution; install the one(s) you need. cellseg's
+# viewer dep msseg-viz is pure-Python -- install it alongside from the local tree.
+pip install -v ./packages/msseg-viz ./packages/cellseg   # builds core + cellseg pybind
 ```
 
 The `-v` flag streams the CMake/compile output so you can watch `FetchContent`
-clone the dependencies and the `cellseg_py`, `mscoupon_py`, and `msworkflow_py`
-extensions build. The build uses `scikit-build-core`, which already forces
-`MSSEG_BUILD_PYTHON=ON` and disables the (Windows-only) viewer and the C++ tests.
+clone the dependencies and the `cellseg_py` extension build. Each package's
+`pyproject.toml` forces `MSSEG_BUILD_PYTHON=ON` and disables the (Windows-only)
+viewer and the C++ tests. (Substitute `./packages/mscoupon` or
+`./packages/msworkflow` for those frontends.)
 
 Verify the extension loaded:
 
@@ -109,7 +112,7 @@ The smoke test needs no external data — it synthesizes a small fluorescent-she
 volume in memory and drives the full two-phase pipeline:
 
 ```bash
-python python/tests/smoke_cellseg.py
+python packages/cellseg/tests/smoke_cellseg.py
 ```
 
 Expected output (values approximate):
@@ -122,7 +125,7 @@ cellseg smoke test OK
 ```
 
 Exit code `0` means success. The same file is collectable by pytest
-(`pytest python/tests/smoke_cellseg.py`) if you prefer.
+(`pytest packages/cellseg/tests/smoke_cellseg.py`) if you prefer.
 
 ## Troubleshooting
 
@@ -175,7 +178,7 @@ Then install without build isolation so the build sees `MSSEG_DEPS_DIR` and the
 ```bash
 pip install scikit-build-core pybind11 numpy      # build deps into the venv
 CC=gcc CXX=g++ MSSEG_DEPS_DIR=~/msseg-deps \
-  pip install -v --no-build-isolation .
+  pip install -v --no-build-isolation ./packages/msseg-viz ./packages/cellseg
 ```
 
 The `hpc` configure preset (`CMakePresets.json`) exists for the same purpose when
