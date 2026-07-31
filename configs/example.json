@@ -25,7 +25,8 @@
     "compute_algorithm": "serial",
     "accurate_ascending": true,
     "accurate_descending": true,
-    "manifold": "ascending"
+    "manifold": "ascending",
+    "requested_parallelism": 0
   },
   "segments": {
     "min_area": 4,

@@ -27,6 +27,9 @@ void compute_with_algorithm(MscType& msc, const float* pixels, int rows, int col
     typename MscType::ComputeOptions options;
     options.accurateAsc = cfg.accurate_ascending;
     options.accurateDsc = cfg.accurate_descending;
+    if (cfg.requested_parallelism > 0) {
+      options.requestedParallelism = cfg.requested_parallelism;
+    }
     if (cfg.compute_algorithm == "partitioned") {
       options.builderMode = MscType::BuilderMode::Partitioned;
     } else {

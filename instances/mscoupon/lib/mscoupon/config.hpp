@@ -39,6 +39,9 @@ struct MscConfig {
   bool accurate_ascending = true;
   bool accurate_descending = true;
   std::string manifold = "ascending";
+  // Discrete-gradient thread count and (in "partitioned" mode) MSC/hierarchy
+  // partition count. 0 => leave the msc_2d_lib default (8).
+  int requested_parallelism = 0;
 };
 
 struct SegmentKeepConfig {
@@ -97,6 +100,7 @@ struct CliOptions {
   std::optional<std::size_t> count_override;
   std::optional<std::size_t> stride_override;
   std::optional<int> worker_override;
+  std::optional<int> parallelism_override;
   bool dump_filter_tiff = false;
   bool dump_label_tiff = false;
   bool dry_run = false;

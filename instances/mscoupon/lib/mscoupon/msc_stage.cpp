@@ -22,6 +22,7 @@ std::vector<int> compute_msc_labels(const Image2D& filtered_image, const MscConf
   params.accurate_ascending = cfg.accurate_ascending;
   params.accurate_descending = cfg.accurate_descending;
   params.manifold = cfg.manifold;
+  params.requested_parallelism = cfg.requested_parallelism;
 
   return msseg::compute_msc2d_labels(filtered, params);
 }

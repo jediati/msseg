@@ -70,6 +70,7 @@ void parse_msc(const nlohmann::json& root, MscConfig& msc) {
   set_if_present(m, "accurate_ascending", msc.accurate_ascending);
   set_if_present(m, "accurate_descending", msc.accurate_descending);
   set_if_present(m, "manifold", msc.manifold);
+  set_if_present(m, "requested_parallelism", msc.requested_parallelism);
 }
 
 void parse_segments(const nlohmann::json& root, SegmentKeepConfig& seg) {
@@ -133,6 +134,7 @@ void apply_cli_overrides(const CliOptions& cli, AppConfig& cfg) {
   if (cli.count_override.has_value()) cfg.input.count = *cli.count_override;
   if (cli.stride_override.has_value()) cfg.input.stride = *cli.stride_override;
   if (cli.worker_override.has_value()) cfg.execution.total_threads = *cli.worker_override;
+  if (cli.parallelism_override.has_value()) cfg.msc.requested_parallelism = *cli.parallelism_override;
   if (cli.dump_filter_tiff) cfg.debug_output.write_filter_tiff = true;
   if (cli.dump_label_tiff) cfg.debug_output.write_label_tiff = true;
   if (cli.dry_run) cfg.dry_run = true;
@@ -178,6 +180,9 @@ CliOptions parse_cli(int argc, char** argv) {
     } else if (arg == "--workers") {
       if (!consume_arg_value(argc, argv, i, value)) throw std::runtime_error("Missing value for --workers");
       cli.worker_override = std::stoi(value);
+    } else if (arg == "--parallelism") {
+      if (!consume_arg_value(argc, argv, i, value)) throw std::runtime_error("Missing value for --parallelism");
+      cli.parallelism_override = std::stoi(value);
     } else if (arg == "--dump-filter-tiff") {
       cli.dump_filter_tiff = true;
     } else if (arg == "--dump-label-tiff") {
@@ -188,7 +193,7 @@ CliOptions parse_cli(int argc, char** argv) {
       throw std::runtime_error(
           "Usage: mscoupon --config <path> [--input-folder <path>] [--output-folder <path>] "
           "[--match <string>] [--start <n>] [--count <n>] [--stride <n>] [--workers <n>] "
-          "[--dump-filter-tiff] [--dump-label-tiff] [--dry-run]");
+          "[--parallelism <n>] [--dump-filter-tiff] [--dump-label-tiff] [--dry-run]");
     } else {
       throw std::runtime_error(std::string("Unknown argument: ") + std::string(arg));
     }
@@ -243,6 +248,9 @@ void validate_config(const AppConfig& cfg) {
   }
   if (cfg.msc.compute_algorithm != "serial" && cfg.msc.compute_algorithm != "partitioned") {
     throw std::runtime_error("msc.compute_algorithm must be 'serial' or 'partitioned'.");
+  }
+  if (cfg.msc.requested_parallelism < 0) {
+    throw std::runtime_error("msc.requested_parallelism must be >= 0 (0 = library default).");
   }
 }
 

@@ -23,6 +23,9 @@ struct Msc2DParams {
   bool accurate_ascending = true;
   bool accurate_descending = true;
   std::string manifold = "ascending";  // "ascending" | "descending"
+  // Partition/thread count for the discrete gradient and (in "partitioned"
+  // mode) the parallel MSC/hierarchy build. 0 => leave the msc_2d_lib default.
+  int requested_parallelism = 0;
 };
 
 }  // namespace msseg
