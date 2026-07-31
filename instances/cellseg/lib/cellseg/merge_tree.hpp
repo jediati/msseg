@@ -60,4 +60,20 @@ std::unordered_map<msseg::NodeId, int> cut_regions(
     const MergeTree& tree, float cut_threshold, float select_persistence,
     std::vector<std::int64_t>* region_voxels = nullptr);
 
+// Post-cut absorption: every minimum whose VALUE is above the cut is merged into
+// an adjacent CELL -- a non-background cut region (branch_survivors + heaviest =
+// background) whose deepest minimum lies below the cut. Adjacency is the LIVING
+// min->1-saddle network (`graph`), NOT the merge-tree branch structure, so a
+// min's cell can differ from the branch it merges into. Implemented as a
+// marker-based watershed flood: seed from the below-cut minima of cell regions
+// and grow across 1-saddles in increasing saddle value, so each above-cut min
+// joins the cell reached via the lowest connecting saddle (nesting handled by
+// the priority queue). Background is not a marker: an above-cut min joins the
+// lowest reachable NON-background cell, and only keeps its cut region when no
+// cell path exists. Returns min NodeId -> the deepest-min NodeId of its final
+// cell (so the per-minimum palette colors it like the tree).
+std::unordered_map<msseg::NodeId, msseg::NodeId> absorb_above_cut_minima(
+    const msseg::MscGraph& graph, const MergeTree& tree, float cut_threshold,
+    float select_persistence);
+
 }  // namespace cellseg

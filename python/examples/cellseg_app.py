@@ -361,6 +361,9 @@ class CellsegApp:
         # per-persistence caches (ascending labels, cancellation persistence, tree)
         self.asc = None
         self.asc_tree = None        # branch-decomposition ("asc tree") labels
+        self.cells = None           # post-cut cell-interior labels (cut-scoped)
+        self._cells_bg = 0          # background cell label (heaviest) in `cells`
+        self._ids_bg = 0            # background cell label (heaviest) in `ids` (extended)
         self._min_pers = None
         self._tree = None
         self._labels_persistence = None
@@ -507,7 +510,8 @@ class CellsegApp:
         ttk.Label(r, text="Seg:").pack(side=tk.LEFT)
         self.seg_mode_var = tk.StringVar(value="none")
         for m, txt in (("none", "none"), ("bitfield", "bitfield"),
-                       ("labels", "labels"), ("ascman", "asc man"), ("asctree", "asc tree")):
+                       ("ascman", "asc man"), ("asctree", "asc tree"),
+                       ("cells", "cell-interior"), ("labels", "labels")):
             ttk.Radiobutton(r, text=txt, variable=self.seg_mode_var, value=m,
                             command=self._on_seg_mode).pack(side=tk.LEFT, padx=(4, 0))
 
@@ -652,7 +656,7 @@ class CellsegApp:
         self.d, self.h, self.w = self.volume.shape
         self.cz, self.cy, self.cx = self.d // 2, self.h // 2, self.w // 2
         self.pipe = self.transformed = self.seg8 = self.ids = None
-        self.asc = self.asc_tree = self._tree = self._min_pers = self._region_rgb = None
+        self.asc = self.asc_tree = self.cells = self._tree = self._min_pers = self._region_rgb = None
         self._labels_persistence = None
         self.tree_btn.configure(state=tk.DISABLED)
         self.save_lbl_btn.configure(state=tk.DISABLED)
@@ -784,8 +788,12 @@ class CellsegApp:
             self.set_status("Segmentation failed")
             return
         self.seg8 = np.asarray(seg8)
-        self.ids = np.asarray(ids)
+        self.ids = np.asarray(ids)                            # cell interiors extended thru membrane
         self._seg8_present = np.unique(self.seg8)
+        self._ids_bg = self._heaviest_label(self.ids)         # background cell in the extended ids
+        _stage("fetch cell_labels")
+        self.cells = np.asarray(self.pipe.cell_labels(cut))   # cell interiors only (cut-scoped)
+        self._cells_bg = self._heaviest_label(self.cells)
         _stage("rebuild labels (re-derive cut)")
         self._rebuild_labels(cut)     # per-cut region colors / deaths / background
         _stage("phase-B done, rendering")
@@ -926,6 +934,13 @@ class CellsegApp:
                 for c in reversed(kids):
                     stack.append(c)
         return region_of_min, region_death, region_rep, region_vox, counter
+
+    @staticmethod
+    def _heaviest_label(vol):
+        """The most common non-zero label in a volume (the background cell)."""
+        flat = vol.ravel()
+        nz = flat[flat > 0]
+        return int(np.bincount(nz).argmax()) if nz.size else 0
 
     def _rebuild_labels(self, cut):
         if self._tree is None:
@@ -1109,9 +1124,11 @@ class CellsegApp:
             v = int(self.seg8[z, y, x])
             lines.append(f"bits={v} ({self._bit_label(v)})")
         elif mode == "labels" and self.ids is not None:
-            r = int(self.ids[z, y, x])
-            d = self._region_death.get(r)
-            lines.append(f"region={r}" + (f"  merge@={d:.4g}" if d is not None else "  (root)"))
+            lab = int(self.ids[z, y, x])
+            if lab <= 0:
+                lines.append("cell=—")
+            else:
+                lines.append(f"cell={lab - 1}" + ("  (bg)" if lab == self._ids_bg else ""))
         elif mode == "ascman" and self.asc is not None:
             lab = int(self.asc[z, y, x])
             if lab <= 0:
@@ -1133,6 +1150,9 @@ class CellsegApp:
         elif mode == "asctree" and self.asc_tree is not None:
             lab = int(self.asc_tree[z, y, x])
             lines.append("branch=—" if lab <= 0 else f"branch={lab - 1}")
+        elif mode == "cells" and self.cells is not None:
+            lab = int(self.cells[z, y, x])
+            lines.append("cell=—" if lab <= 0 else f"cell={lab - 1}")
         return "\n".join(lines)
 
     def _update_contour(self, pane, base2d, level):
@@ -1229,13 +1249,13 @@ class CellsegApp:
             rgb = _BIT_LUT[np.clip(s2d.astype(int), 0, 15)]
             a = np.where(s2d > 0, alpha, 0.0)
 
-        elif mode == "labels":                       # region ids -> deepest-min color
-            if self.ids is None or self._region_rgb is None:
+        elif mode == "labels":                       # cell interiors EXTENDED thru membranes
+            if self.ids is None:
                 return None
-            s2d = self._base_slice(plane, self.ids)
-            idx = np.clip(s2d.astype(int), 0, self._region_rgb.shape[0] - 1)
-            rgb = self._region_rgb[idx]
-            a = np.where(s2d != self._region_bg, alpha, 0.0)   # background transparent
+            s2d = self._base_slice(plane, self.ids)            # extended cell rep NodeId + 1
+            nid = np.maximum(s2d.astype(int) - 1, 0)           # shared per-minimum palette
+            rgb = _MIN_LUT[nid % _MIN_K]
+            a = np.where((s2d > 0) & (s2d != self._ids_bg), alpha, 0.0)  # background transparent
 
         elif mode == "ascman":                       # per-minimum color (full decomposition)
             if self.asc is None:
@@ -1250,6 +1270,14 @@ class CellsegApp:
                 return None
             s2d = self._base_slice(plane, self.asc_tree)       # surviving-branch min NodeId + 1
             nid = np.maximum(s2d.astype(int) - 1, 0)           # same palette as the tree / asc man
+            rgb = _MIN_LUT[nid % _MIN_K]
+            a = np.where(s2d > 0, alpha, 0.0)
+
+        elif mode == "cells":                        # post-cut cell absorption (shared palette)
+            if self.cells is None:
+                return None
+            s2d = self._base_slice(plane, self.cells)          # final cell's deepest-min NodeId + 1
+            nid = np.maximum(s2d.astype(int) - 1, 0)
             rgb = _MIN_LUT[nid % _MIN_K]
             a = np.where(s2d > 0, alpha, 0.0)
 
@@ -1356,13 +1384,19 @@ def _selftest():
     tip = app._tip_text(app.cx, app.cy, app.cz)
     assert "orig=" in tip and "xform=" in tip and "min=" in tip
     app.seg_mode_var.set("labels")
-    assert "region=" in app._tip_text(app.cx, app.cy, app.cz)
+    assert "cell=" in app._tip_text(app.cx, app.cy, app.cz)   # labels now uses the cells labeling
 
     # branch-decomposition "asc tree" overlay + tip
     assert app.asc_tree is not None
     app.seg_mode_var.set("asctree"); app._on_seg_mode()
     assert app._overlay_rgba("xy") is not None
     assert "branch=" in app._tip_text(app.cx, app.cy, app.cz)
+
+    # post-cut "cells" absorption overlay + tip
+    assert app.cells is not None
+    app.seg_mode_var.set("cells"); app._on_seg_mode()
+    assert app._overlay_rgba("xy") is not None
+    assert "cell=" in app._tip_text(app.cx, app.cy, app.cz)
 
     # exercise the new layout controls
     app.sx_var.set("1"); app.sy_var.set("1"); app.sz_var.set("3"); app._on_spacing_change()

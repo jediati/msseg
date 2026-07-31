@@ -39,6 +39,13 @@ class CellPipeline {
   // parent. Each voxel carries its surviving branch's deepest-minimum NodeId + 1
   // (0 = background), so the per-minimum palette colors it like the tree.
   msseg::LabelVolume ascending_tree_labels();
+
+  // "cells" segmentation (post-cut absorption): the relabel-then-cut regions
+  // (at cut_threshold) with every above-cut minimum region-grown into the lowest
+  // adjacent non-background cell over the living min->1-saddle network. Each
+  // voxel carries its final cell's deepest-minimum NodeId + 1 (shared palette).
+  // Cut-dependent -- refetch when the cut changes.
+  msseg::LabelVolume cell_labels(float cut_threshold);
   // Absolute cancellation persistence per living node (aligned to view().graph
   // NodeIds); NaN where a node is never cancelled.
   std::vector<float> node_cancellation_persistence();

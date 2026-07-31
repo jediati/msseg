@@ -20,10 +20,11 @@ The computation is deliberately TWO-PHASE:
 
   Phase B -- threshold tuning (re-runnable CHEAPLY):
       select a living persistence -> merge tree -> branch decomposition ->
-      relabel-then-cut -> separating saddles -> touched/appendage maxima ->
-      membrane reconstruction -> seg8 bit-flag volume + int32 cell-id volume.
-      Driven by three knobs; safe to sweep interactively without repeating
-      Phase A.
+      relabel-then-cut -> cell interiors (above-cut absorption) -> separating
+      saddles -> touched/appendage maxima -> membrane reconstruction -> seg8
+      bit-flag volume + int32 cell-id volume (cell interiors extended through
+      the membranes). Driven by three knobs; safe to sweep interactively without
+      repeating Phase A.
 
 The one hard architectural rule (the "GInt firewall"): only
 core/msseg/compute/msc3d.cpp includes MSCEER's gi_*.h. Everything cellseg does
@@ -103,8 +104,10 @@ heavy_lift() takes the "heavy_lift" block either wrapped or flat.
       The merge-tree cut level, and more generally the value-barrier for every
       upward hop ("never cross the cut"). Comes into play at STAGE 8 (relabel-
       then-cut: a branch survives as its own region only when its death merger
-      value > cut_threshold, combined with the persistence test above) and again
-      at STAGES 11 / 13 / 16 as the >= cut_threshold gate on 2-saddles.
+      value > cut_threshold, combined with the persistence test above), at STAGE
+      8.5 (a minimum whose VALUE is above the cut is absorbed into an adjacent
+      cell), and again at STAGES 11 / 13 / 16 as the >= cut_threshold gate on
+      2-saddles.
 
   background_threshold   (float, default 0.0)
       Fixed intensity threshold on the filtered volume for the fluorescent /
@@ -431,6 +434,52 @@ Tests:
       partition; the asc-tree volume matches the Python survivor remap exactly.
 
 --------------------------------------------------------------------------------
+ STAGE 8.5 -- Cell interiors (above-cut absorption)  ["cell-interior" overlay]
+--------------------------------------------------------------------------------
+Objective:
+    Turn the cut regions into cell INTERIORS: every minimum whose VALUE is above
+    the cut is merged into an adjacent CELL. A cell = a non-background cut region
+    (STAGE 8) whose deepest minimum is below the cut. Crucially the adjacency is
+    the LIVING min->1-saddle network, NOT the merge-tree branch structure, so a
+    min's cell can differ from the branch it merges into (its branch may descend
+    to background, while a cell is reachable across the network).
+
+    Structured as a marker-based watershed region-growing from the boundary of
+    the cells: seed from each cell's below-cut minima and flood across 1-saddles
+    in increasing saddle value, so each above-cut minimum joins the cell reached
+    via the LOWEST connecting saddle. Nesting (above-cut min adjacent only to
+    other above-cut minima) is handled by the priority queue. Background is not a
+    marker: a min joins the lowest reachable NON-background cell, and only keeps
+    its cut region when no cell path exists. Below-cut minima are never moved.
+
+Inputs:
+    view.graph (living min->1-saddle network); view.tree; cut_threshold;
+    select_persistence (= view.persistence).
+
+Outputs:
+    min NodeId -> its final cell's deepest-min NodeId (the "cell interior" map);
+    a per-voxel label volume (cell rep NodeId + 1), shown by the "cell-interior"
+    overlay and used as the seed for STAGE 16.
+
+Code hooks:
+    - branch_survivors for the STAGE-8 partition + heaviest-region background;
+      then a std::priority_queue watershed over min-adjacency built from the
+      living 1-saddles. Iterative, no recursion.  [merge_tree.cpp,
+      absorb_above_cut_minima]
+    - CellPipeline::cell_labels(cut_threshold) remaps the ascending labels
+      through it.  [cell_pipeline.cpp]
+    - Python: CellPipeline.cell_labels(cut) -> the app's "cell-interior" overlay
+      (shared per-minimum palette; cut-scoped, refetched when the cut changes).
+
+Tests:
+    - offline: on an engineered two-well + shallow-bridge volume, the bridge
+      minimum (above the cut, its own STAGE-8 region) is reassigned into the
+      adjacent well reached via the lowest saddle -- confirming absorption is
+      network-based, not branch-based. On isolated shells nothing moves (their
+      above-cut minima are adjacent only to background), correctly.
+    - App --selftest exercises the "cell-interior" overlay + hover tip.
+
+--------------------------------------------------------------------------------
  STAGE 9 -- Background region
 --------------------------------------------------------------------------------
 Objective:
@@ -591,33 +640,44 @@ Tests:
  STAGE 16 -- Cell-id volume
 --------------------------------------------------------------------------------
 Objective:
-    Produce an int32 per-voxel cell-id volume. Start from the ascending cut
-    region id, then attribute each cleaned-membrane region to a cell: by maximum
-    overlap with a non-background ascending region if it overlaps one, else by
-    shortest path over the ridge graph to the nearest already-labeled maximum.
+    Produce the int32 cell-id volume = the STAGE-8.5 cell INTERIORS EXTENDED
+    through the membranes ("labels" overlay). Start from the cell-interior label
+    of each voxel (NOT the raw ascending cut region), then attribute each
+    cleaned-membrane region to a cell: by maximum overlap with a non-background
+    cell interior if it overlaps one, else by shortest path over the ridge graph
+    to the nearest already-labeled maximum.
 
 Inputs:
-    asc_region, background_region, descending labels, fluor, view.graph,
-    cut_threshold.
+    the STAGE-8.5 cell-interior map (absorb_above_cut_minima), asc_labels,
+    descending labels, fluor, view.graph, cut_threshold.
 
 Outputs:
-    result.ids (LabelVolume; int32 to Python).
+    result.ids (LabelVolume; int32 to Python). Each voxel = its cell's rep
+    (deepest-min NodeId) + 1, so "labels" shares the "cell-interior" palette:
+    off-membrane it equals cell-interior exactly; membrane voxels are the
+    extension.
 
 Code hooks:
     - run_segmentation:
-        * ids[voxel] = asc_region (or background).
-        * mem_overlap histogram -> cell_of_max seed (max overlap).
+        * cell_of_min = absorb_above_cut_minima(...); cell_interior[voxel] = the
+          voxel's cell rep; background = the heaviest cell.
+        * ids[voxel] = cell_interior rep + 1 (background included).
+        * mem_overlap histogram (over cell interiors) -> cell_of_max seed (max
+          overlap with a non-background cell).
         * multi-source Dijkstra (std::priority_queue, greater<>) over
           max -> 2-saddle(>= cut) -> max, edge weight = value[next_max] -
           value[2saddle]; non-overlapping membrane regions inherit the nearest
-          seed's id.
+          seed's cell.
         * paint foreground voxels of each labeled max's descending manifold with
-          its cell id.
+          its cell rep + 1.
       [segment.cpp, "Step 15"]
-    - Python: second element of CellPipeline.segment(...) -> int32 (d,h,w).
+    - Python: second element of CellPipeline.segment(...) -> int32 (d,h,w); the
+      app's "labels" overlay (background hidden) and "Save labels".
 
 Tests:
     - cellseg_tests.cpp: id volume has >= 2 distinct labels.
+    - offline: on touching shells, labels == cell-interior on every off-membrane
+      voxel, and fills strictly more membrane voxels (the descending extension).
 
 
 ================================================================================
@@ -640,8 +700,9 @@ Tests:
 
   python/examples/cellseg_app.py  (--selftest)
       Builds the app layout headless, exercises the overlay modes (none /
-      bitfield / labels / asc man / asc tree), the flat-tree icicle, and the
-      Python relabel-then-cut re-derivation (must match the C++ ids volume).
+      bitfield / asc man / asc tree / cell-interior / labels) and their hover
+      tips, and the flat-tree icicle. "cell-interior" shows the STAGE-8.5 cell
+      interiors; "labels" shows them extended through the membranes (STAGE 16).
 
 Run all: ctest --preset windows-msvc  (build the wheel with
 -DMSSEG_BUILD_PYTHON=ON for the Python paths).

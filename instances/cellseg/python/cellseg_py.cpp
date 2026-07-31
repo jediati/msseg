@@ -143,6 +143,22 @@ PYBIND11_MODULE(cellseg_py, m) {
            },
            "Branch-decomposition ascending labels: sub-persistence branches folded into "
            "their parent; each voxel = surviving branch's deepest-min NodeId + 1, int32 (d,h,w).")
+      .def("cell_labels",
+           [](CellPipeline& self, float cut_threshold) {
+             msseg::LabelVolume lab = [&] {
+               py::gil_scoped_release rel;
+               return self.cell_labels(cut_threshold);
+             }();
+             const auto d = lab.dims();
+             py::array_t<std::int32_t> out({static_cast<py::ssize_t>(d.depth),
+                                            static_cast<py::ssize_t>(d.height),
+                                            static_cast<py::ssize_t>(d.width)});
+             std::memcpy(out.request().ptr, lab.data(), lab.size() * sizeof(std::int32_t));
+             return out;
+           },
+           py::arg("cut_threshold"),
+           "Post-cut 'cells' labels: above-cut minima region-grown into the lowest adjacent "
+           "non-background cell; each voxel = final cell's deepest-min NodeId + 1, int32 (d,h,w).")
       .def("node_cancellation_persistence",
            [](CellPipeline& self) {
              std::vector<float> pers = [&] {

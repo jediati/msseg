@@ -1,9 +1,13 @@
 #include "cellseg/merge_tree.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <functional>
+#include <queue>
 #include <set>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -237,6 +241,89 @@ std::unordered_map<msseg::NodeId, int> cut_regions(const MergeTree& tree, float 
   }
   if (region_voxels) *region_voxels = std::move(rvox);
   return region_of_min;
+}
+
+std::unordered_map<msseg::NodeId, msseg::NodeId> absorb_above_cut_minima(
+    const msseg::MscGraph& graph, const MergeTree& tree, float cut_threshold,
+    float select_persistence) {
+  // Stage-8 partition: each min -> its region's deepest minimum (the survivor).
+  std::unordered_map<msseg::NodeId, msseg::NodeId> survivor =
+      branch_survivors(tree, cut_threshold, select_persistence);
+
+  // Per-region voxel sums (keyed by survivor) + per-min value, from the leaves.
+  std::unordered_map<msseg::NodeId, std::int64_t> region_vox;
+  std::unordered_map<msseg::NodeId, float> min_value;
+  for (const MergeNode& n : tree.nodes) {
+    if (!n.is_leaf) continue;
+    const auto it = survivor.find(n.msc_node);
+    const msseg::NodeId sv = (it != survivor.end()) ? it->second : n.msc_node;
+    region_vox[sv] += n.voxel_count;
+    min_value[n.msc_node] = n.value;
+  }
+  // Background = the heaviest region.
+  msseg::NodeId background = -1;
+  std::int64_t best = -1;
+  for (const auto& [sv, v] : region_vox)
+    if (v > best) { best = v; background = sv; }
+
+  const auto below_cut = [&](msseg::NodeId m) {
+    const auto it = min_value.find(m);
+    return it != min_value.end() && it->second < cut_threshold;
+  };
+  // A cell = a non-background region whose deepest minimum (survivor) is below
+  // the cut, i.e. contains a genuine below-cut minimum.
+  const auto is_cell = [&](msseg::NodeId sv) { return sv != background && below_cut(sv); };
+
+  // Min adjacency from living 1-saddles: distinct downward minima are pairwise
+  // adjacent with weight = the saddle value.
+  std::unordered_map<msseg::NodeId, std::vector<std::pair<msseg::NodeId, float>>> adj;
+  for (const auto& node : graph.nodes) {
+    if (node.index_dim != 1) continue;
+    std::vector<msseg::NodeId> mins;
+    for (const msseg::NodeId aid : graph.adjacency[static_cast<std::size_t>(node.id)]) {
+      const auto& a = graph.arcs[static_cast<std::size_t>(aid)];
+      if (a.upper == node.id && graph.nodes[static_cast<std::size_t>(a.lower)].index_dim == 0) {
+        if (std::find(mins.begin(), mins.end(), a.lower) == mins.end()) mins.push_back(a.lower);
+      }
+    }
+    for (std::size_t i = 0; i < mins.size(); ++i)
+      for (std::size_t j = i + 1; j < mins.size(); ++j) {
+        adj[mins[i]].push_back({mins[j], node.value});
+        adj[mins[j]].push_back({mins[i], node.value});
+      }
+  }
+
+  // Marker-based watershed flood: markers are cell cores (below-cut minima of
+  // cell regions); grow only into above-cut minima, lowest connecting saddle
+  // first, so each joins the lowest reachable non-background cell.
+  struct Front { float w; msseg::NodeId to; msseg::NodeId rep; };
+  const auto greater = [](const Front& a, const Front& b) { return a.w > b.w; };
+  std::priority_queue<Front, std::vector<Front>, decltype(greater)> pq(greater);
+
+  std::unordered_map<msseg::NodeId, msseg::NodeId> assigned;
+  const auto push_neighbors = [&](msseg::NodeId m, msseg::NodeId rep) {
+    const auto it = adj.find(m);
+    if (it == adj.end()) return;
+    for (const auto& [nb, w] : it->second)
+      if (!below_cut(nb) && !assigned.count(nb)) pq.push({w, nb, rep});
+  };
+  for (const auto& [m, sv] : survivor)
+    if (below_cut(m) && is_cell(sv)) {  // fixed cell core; seed its above-cut boundary
+      assigned[m] = sv;
+      push_neighbors(m, sv);
+    }
+  while (!pq.empty()) {
+    const Front f = pq.top();
+    pq.pop();
+    if (assigned.count(f.to)) continue;  // claimed by a lower saddle already
+    assigned[f.to] = f.rep;
+    push_neighbors(f.to, f.rep);
+  }
+
+  // Reassigned above-cut minima override; every other min keeps its cut region.
+  std::unordered_map<msseg::NodeId, msseg::NodeId> result = std::move(survivor);
+  for (const auto& [m, rep] : assigned) result[m] = rep;
+  return result;
 }
 
 }  // namespace cellseg

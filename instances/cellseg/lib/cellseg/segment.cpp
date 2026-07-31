@@ -202,41 +202,64 @@ SegmentResult run_segmentation(msseg::Msc3D& msc, const msseg::Volume& filtered,
     seg8[i] = bits;
   }
 
-  // --- Step 15: cell-id volume (grow ascending regions through membrane) ----
-  // FIRST label every voxel by its ascending cut region.
-  std::int32_t* ids = result.ids.data();
-  for (std::size_t i = 0; i < n; ++i)
-    ids[i] = static_cast<std::int32_t>(asc_region[i] >= 0 ? asc_region[i] : background_region);
+  // --- Step 15: cell-id volume = cell interiors extended through membranes ----
+  // Cell interiors come from the post-cut absorption (every above-cut minimum
+  // merged into its adjacent cell over the living min->1-saddle network). Each
+  // ascending voxel takes its cell's representative (deepest-min NodeId); the
+  // heaviest cell is background. The descending-manifold overlap strategy below
+  // then extends those interiors across the membranes.
+  const std::unordered_map<msseg::NodeId, msseg::NodeId> cell_of_min =
+      absorb_above_cut_minima(g, view.tree, cut_threshold, view.persistence);
 
-  // A "cleaned membrane region" is one maximum's descending manifold restricted
-  // to foreground (fluorescent) voxels. Overlap each with the non-background
-  // ascending regions.
-  std::unordered_map<msseg::NodeId, std::unordered_map<int, std::int64_t>> mem_overlap;
+  std::vector<msseg::NodeId> cell_interior(n, -1);  // cell rep NodeId per voxel
+  std::unordered_map<msseg::NodeId, std::int64_t> cell_vox;
+  for (std::size_t i = 0; i < n; ++i) {
+    const std::int32_t lab = asc[i];
+    if (lab <= 0) continue;
+    const msseg::NodeId m = static_cast<msseg::NodeId>(lab - 1);
+    const auto it = cell_of_min.find(m);
+    const msseg::NodeId rep = (it != cell_of_min.end()) ? it->second : m;
+    cell_interior[i] = rep;
+    ++cell_vox[rep];
+  }
+  msseg::NodeId bg_cell = -1;
+  std::int64_t bgbest = -1;
+  for (const auto& [r, v] : cell_vox)
+    if (v > bgbest) { bgbest = v; bg_cell = r; }
+
+  // Base: every voxel = its cell interior rep + 1 (background included), so the
+  // per-minimum palette colors it like the cell-interior view.
+  std::int32_t* ids = result.ids.data();
+  for (std::size_t i = 0; i < n; ++i) {
+    const msseg::NodeId rep = cell_interior[i] >= 0 ? cell_interior[i] : bg_cell;
+    ids[i] = rep >= 0 ? static_cast<std::int32_t>(rep) + 1 : 0;
+  }
+
+  // Each membrane region (a maximum's descending manifold restricted to
+  // foreground) takes the non-background cell interior it overlaps most.
+  std::unordered_map<msseg::NodeId, std::unordered_map<msseg::NodeId, std::int64_t>> mem_overlap;
   for (std::size_t i = 0; i < n; ++i) {
     if (!fluor[i]) continue;
     const std::int32_t dl = dsc[i];
     if (dl <= 0) continue;
     const msseg::NodeId M = static_cast<msseg::NodeId>(dl - 1);
-    mem_overlap[M];  // register this membrane region (even if no non-bg overlap)
-    const int r = asc_region[i];
-    if (r >= 0 && r != background_region) ++mem_overlap[M][r];
+    mem_overlap[M];  // register even if no non-bg overlap
+    const msseg::NodeId rep = cell_interior[i];
+    if (rep >= 0 && rep != bg_cell) ++mem_overlap[M][rep];
   }
-
-  // Seed: each membrane region that overlaps a non-background ascending region
-  // takes the id of the maximum overlap.
-  std::unordered_map<msseg::NodeId, int> cell_of_max;
+  std::unordered_map<msseg::NodeId, msseg::NodeId> cell_of_max;  // max -> cell rep
   for (const auto& [M, hist] : mem_overlap) {
-    int arg = -1;
+    msseg::NodeId arg = -1;
     std::int64_t bestc = -1;
-    for (const auto& [r, c] : hist)
-      if (c > bestc) { bestc = c; arg = r; }
+    for (const auto& [rep, c] : hist)
+      if (c > bestc) { bestc = c; arg = rep; }
     if (arg >= 0) cell_of_max[M] = arg;
   }
 
   // Non-overlapping membrane regions: shortest path over max -> 2-saddle -> max
-  // (skipping cut arcs, i.e. 2-saddles below the cut) to the nearest already-
-  // labeled maximum, whose id they inherit (multi-source Dijkstra, edge weight =
-  // value drop from the next max down to the connecting 2-saddle).
+  // (2-saddles >= cut) to the nearest labeled maximum, whose cell they inherit
+  // (multi-source Dijkstra, edge weight = value drop from the next max to the
+  // connecting 2-saddle).
   {
     std::unordered_map<msseg::NodeId, float> dist;
     using DN = std::pair<float, msseg::NodeId>;
@@ -250,7 +273,7 @@ SegmentResult run_segmentation(msseg::Msc3D& msc, const msseg::Volume& filtered,
       pq.pop();
       const auto di = dist.find(M);
       if (di == dist.end() || d > di->second) continue;
-      const int cell = cell_of_max[M];
+      const msseg::NodeId cell = cell_of_max[M];
       std::vector<msseg::NodeId> tsads;
       downward_of_dim(g, M, 2, tsads);
       for (const msseg::NodeId t : tsads) {
@@ -263,7 +286,7 @@ SegmentResult run_segmentation(msseg::Msc3D& msc, const msseg::Volume& filtered,
           const auto it2 = dist.find(M2);
           if (it2 == dist.end() || nd < it2->second) {
             dist[M2] = nd;
-            cell_of_max[M2] = cell;  // inherit the source region's id
+            cell_of_max[M2] = cell;  // inherit the source cell
             pq.push({nd, M2});
           }
         }
@@ -271,13 +294,13 @@ SegmentResult run_segmentation(msseg::Msc3D& msc, const msseg::Volume& filtered,
     }
   }
 
-  // Grow each cell across its cleaned membrane region.
+  // Extend each cell across its membrane (foreground descending-manifold voxels).
   for (std::size_t i = 0; i < n; ++i) {
     if (!fluor[i]) continue;
     const std::int32_t dl = dsc[i];
     if (dl <= 0) continue;
     const auto it = cell_of_max.find(static_cast<msseg::NodeId>(dl - 1));
-    if (it != cell_of_max.end()) ids[i] = static_cast<std::int32_t>(it->second);
+    if (it != cell_of_max.end()) ids[i] = static_cast<std::int32_t>(it->second) + 1;
   }
 
   return result;

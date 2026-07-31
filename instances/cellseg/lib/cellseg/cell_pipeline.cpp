@@ -77,4 +77,27 @@ std::vector<float> CellPipeline::node_cancellation_persistence() {
   return state_.msc.node_cancellation_persistence();
 }
 
+msseg::LabelVolume CellPipeline::cell_labels(float cut_threshold) {
+  ensure_view();
+  const std::unordered_map<msseg::NodeId, msseg::NodeId> rep =
+      absorb_above_cut_minima(view_.graph, view_.tree, cut_threshold, current_persistence_);
+
+  const msseg::LabelVolume& asc = view_.asc_labels;
+  msseg::LabelVolume out(asc.dims());
+  const std::int32_t* src = asc.data();
+  std::int32_t* dst = out.data();
+  for (std::size_t i = 0; i < asc.size(); ++i) {
+    const std::int32_t lab = src[i];
+    if (lab <= 0) {
+      dst[i] = 0;
+      continue;
+    }
+    const msseg::NodeId mn = static_cast<msseg::NodeId>(lab - 1);
+    const auto it = rep.find(mn);
+    const msseg::NodeId sv = (it != rep.end()) ? it->second : mn;
+    dst[i] = static_cast<std::int32_t>(sv) + 1;
+  }
+  return out;
+}
+
 }  // namespace cellseg
