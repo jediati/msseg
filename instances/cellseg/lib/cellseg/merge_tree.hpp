@@ -38,12 +38,26 @@ MergeTree build_merge_tree(const msseg::MscGraph& graph,
 // node_id,children:[...]}, ... ]}. Easy to load in matplotlib / the viewer.
 std::string merge_tree_to_json(const MergeTree& tree);
 
-// Apply a cut: every merger whose saddle value exceeds `cut_threshold` is cut,
-// splitting its children into separate regions. Returns min NodeId -> region id
-// (contiguous 0..K-1). Also fills `region_voxels` (summed voxel count per
-// region) when non-null.
+// Branch decomposition + persistence/cut relabel. Each living minimum-leaf owns
+// a branch that dies at the merger where a deeper sibling first appears (its
+// leaf-to-merge persistence = that merger's value minus the leaf value). A
+// branch stays separate from the branch it dies into only when its death is a
+// *barrier*: death value > `cut_threshold` AND persistence >=
+// `select_persistence`. Otherwise it is relabeled into (merged with) the deeper
+// branch. Returns, per living minimum NodeId, the NodeId of the surviving
+// branch's leaf minimum (the deepest minimum of the feature it belongs to).
+// Pass cut = -inf to relabel by persistence only (the "asc tree" simplification
+// that finishes the persistence cancellation the GInt arc-count cap skips).
+std::unordered_map<msseg::NodeId, msseg::NodeId> branch_survivors(
+    const MergeTree& tree, float cut_threshold, float select_persistence);
+
+// Relabel-then-cut: collapse every branch below `select_persistence` into its
+// parent (branch_survivors), then number the surviving branches into regions.
+// Returns min NodeId -> region id (contiguous 0..K-1, pre-order first-reference
+// order). Also fills `region_voxels` (summed voxel count per region) when
+// non-null. With select = -inf this reduces to the plain merge-tree cut.
 std::unordered_map<msseg::NodeId, int> cut_regions(
-    const MergeTree& tree, float cut_threshold,
+    const MergeTree& tree, float cut_threshold, float select_persistence,
     std::vector<std::int64_t>* region_voxels = nullptr);
 
 }  // namespace cellseg

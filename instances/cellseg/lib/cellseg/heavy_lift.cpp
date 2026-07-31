@@ -1,5 +1,6 @@
 #include "cellseg/heavy_lift.hpp"
 
+#include <cstdio>
 #include <stdexcept>
 #include <utility>
 
@@ -10,6 +11,8 @@
 namespace cellseg {
 namespace {
 
+inline void stage(const char* msg) { std::fprintf(stderr, "[cellseg] %s\n", msg); std::fflush(stderr); }
+
 msseg::Msc3DParams make_msc_params(const HeavyLiftConfig& cfg) {
   msseg::Msc3DParams p;
   p.gradient_mode = msseg::Msc3DParams::GradientMode::OnDemandAccurate;
@@ -19,6 +22,7 @@ msseg::Msc3DParams make_msc_params(const HeavyLiftConfig& cfg) {
   p.integration_error = cfg.integration_error;
   p.gradient_threshold = cfg.gradient_threshold;
   p.integration_max_iter = cfg.integration_max_iter;
+  p.minima_ignore_boundary = cfg.minima_ignore_boundary;
   p.build_arcs = true;
   p.build_arc_geometry = false;
   return p;
@@ -34,22 +38,32 @@ CellState build_from_volume(msseg::Volume input, const HeavyLiftConfig& cfg) {
   CellState state;
 
   // Filter: Gaussian blur (sigma).
+  stage("filter: gaussian blur");
   msseg::FilterParams filter;
   filter.operation = "blur";
   filter.params = {{"sigma", cfg.blur_sigma}};
   state.filtered = msseg::apply_filter(input, filter);
 
-  const msseg::Msc3DParams params = make_msc_params(cfg);
+  stage("build: discrete gradient");
+  msseg::Msc3DParams params = make_msc_params(cfg);
   state.msc.build(state.filtered, params);
-  state.msc.compute(params);
 
+  // Resolve the persistence now (value range is known after build) and use it
+  // as the hierarchy cap: ComputeHierarchy only cancels up to this persistence.
   state.value_range = state.msc.value_range();
   state.heavy_persistence = resolve_persistence(cfg, state.value_range);
+  params.hierarchy_persistence_cap = state.heavy_persistence;
+  stage("compute: MS complex + hierarchy");
+  state.msc.compute(params);
+  stage("select persistence");
   state.msc.select_persistence(state.heavy_persistence);
 
   // Cache both base 3-manifold decompositions once (the expensive pass).
+  stage("base decomposition: ascending");
   state.msc.compute_base_decomposition(/*ascending=*/true);
+  stage("base decomposition: descending");
   state.msc.compute_base_decomposition(/*ascending=*/false);
+  stage("heavy lift done");
   return state;
 }
 

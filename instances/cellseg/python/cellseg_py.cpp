@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -112,7 +113,47 @@ PYBIND11_MODULE(cellseg_py, m) {
              return segment_result_to_numpy(res);
            },
            py::arg("cut_threshold"), py::arg("background_threshold"),
-           "Run Phase-B segmentation; returns (seg8 uint8 (d,h,w), ids int32 (d,h,w)).");
+           "Run Phase-B segmentation; returns (seg8 uint8 (d,h,w), ids int32 (d,h,w)).")
+      .def("ascending_labels",
+           [](CellPipeline& self) {
+             const msseg::LabelVolume& lab = [&]() -> const msseg::LabelVolume& {
+               py::gil_scoped_release rel;
+               return self.ascending_labels();
+             }();
+             const auto d = lab.dims();
+             py::array_t<std::int32_t> out({static_cast<py::ssize_t>(d.depth),
+                                            static_cast<py::ssize_t>(d.height),
+                                            static_cast<py::ssize_t>(d.width)});
+             std::memcpy(out.request().ptr, lab.data(), lab.size() * sizeof(std::int32_t));
+             return out;
+           },
+           "Living ascending-manifold labels (minimum NodeId + 1 per voxel), int32 (d,h,w).")
+      .def("ascending_tree_labels",
+           [](CellPipeline& self) {
+             msseg::LabelVolume lab = [&] {
+               py::gil_scoped_release rel;
+               return self.ascending_tree_labels();
+             }();
+             const auto d = lab.dims();
+             py::array_t<std::int32_t> out({static_cast<py::ssize_t>(d.depth),
+                                            static_cast<py::ssize_t>(d.height),
+                                            static_cast<py::ssize_t>(d.width)});
+             std::memcpy(out.request().ptr, lab.data(), lab.size() * sizeof(std::int32_t));
+             return out;
+           },
+           "Branch-decomposition ascending labels: sub-persistence branches folded into "
+           "their parent; each voxel = surviving branch's deepest-min NodeId + 1, int32 (d,h,w).")
+      .def("node_cancellation_persistence",
+           [](CellPipeline& self) {
+             std::vector<float> pers = [&] {
+               py::gil_scoped_release rel;
+               return self.node_cancellation_persistence();
+             }();
+             py::array_t<float> out(static_cast<py::ssize_t>(pers.size()));
+             std::memcpy(out.request().ptr, pers.data(), pers.size() * sizeof(float));
+             return out;
+           },
+           "Absolute cancellation persistence per living node (NodeId-indexed); NaN = never cancelled.");
 
   m.def("heavy_lift",
         [](const py::array_t<float, py::array::c_style | py::array::forcecast>& volume,

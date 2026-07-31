@@ -34,6 +34,24 @@ struct Msc3DParams {
 
   bool build_arcs = true;
   bool build_arc_geometry = false;
+
+  // Cap for the cancellation-hierarchy build (passed to ComputeHierarchy):
+  // arcs above this persistence are never cancelled, so persistence selection
+  // is limited to <= this value but the build is much cheaper. <= 0 builds the
+  // full value range (any persistence browsable).
+  float hierarchy_persistence_cap = 0.0f;
+
+  // Ignore the boundary gate for min->1-saddle (dim-0) arcs when building the
+  // cancellation hierarchy. The hierarchy normally refuses to cancel an arc
+  // whose endpoints have different boundary values, which preserves
+  // boundary-only minima (domain corners/edges) and fragments the "background"
+  // into many ascending regions. With this on, minima cancel purely by
+  // persistence (including boundary-min <-> boundary-min through a boundary
+  // saddle) while the 1-2 and 2-3 boundary rules are left intact -- so 1-2
+  // boundary cancellations stay feasible and a boundary 2-saddle still cannot
+  // cancel with an interior maximum. Boundary marks are NOT mutated. Enable when
+  // only true (interior) minima matter.
+  bool minima_ignore_boundary = false;
 };
 
 // PIMPL facade over the MSCEER GInt 3D typedef stack
@@ -66,6 +84,13 @@ class Msc3D {
   // Value range (max - min) of the loaded volume. Handy for percent-of-range
   // persistence thresholds (e.g. "5% of the input range").
   float value_range() const;
+
+  // Absolute persistence at which each node of the most recent snapshot() is
+  // cancelled in the simplification hierarchy (aligned to the snapshot's compact
+  // NodeIds). Derived from GInt's per-node `destroyed` cancellation index and the
+  // running-max of the cancellation records. Nodes that are never cancelled (the
+  // surviving extremum of a component) get NaN. Requires a prior snapshot().
+  std::vector<float> node_cancellation_persistence() const;
 
   // Per-voxel basin labeling: for each vertex, the id of the extremum whose
   // ascending (minima) / descending (maxima) manifold contains it, remapped

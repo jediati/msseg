@@ -1,6 +1,8 @@
 #include "msseg/compute/msc3d.hpp"
 
+#include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -34,6 +36,29 @@ using TopoFuncType = GInt::TopologicalMaxVertexMeshFunction<MeshType, MaxVLType,
 using MscType = GInt::MorseSmaleComplexBasic<float, MeshType, TopoFuncType, GradType>;
 using RobinsType = GInt::RobinsLabelingAlgorithm<MeshType, TopoFuncType>;
 using TopoAlgsType = GInt::TopologicalGradientUsingAlgorithms<MeshType, TopoFuncType, GradType>;
+
+// Option 3 "minima ignore boundary": a MorseSmaleComplexBasic whose cancellation
+// validity test skips the boundary-equality gate for min->1-saddle (dim-0) arcs
+// only. Boundary minima then cancel purely by persistence -- fixing background
+// fragmentation, including boundary-min <-> boundary-min through a boundary
+// saddle -- while the 1-2 and 2-3 boundary rules are left intact: 1-2 boundary
+// cancellations stay feasible and a boundary 2-saddle still cannot cancel with
+// an interior maximum. isValid is a protected virtual dispatched from
+// ComputeHierarchy, so overriding it here keeps the change behind the GInt
+// firewall (no MSCEER source edit). arc.dim is the lower endpoint's dimension.
+class CellsegMsc : public MscType {
+ public:
+  using MscType::MscType;
+  bool ignore_boundary_min_saddle = false;
+
+  bool isValid(INT_TYPE /*a*/, GInt::arc<float>& ap) const override {
+    if (!(ignore_boundary_min_saddle && ap.dim == 0) &&
+        this->nodes[ap.lower].boundary != this->nodes[ap.upper].boundary)
+      return false;
+    // Endpoints must be connected by exactly one (living) arc.
+    return this->countMultiplicity(ap, this->num_cancelled) == 1;
+  }
+};
 
 struct Msc3D::Impl {
   std::vector<float> raw;  // referenced by gridfunc, kept alive here
@@ -134,12 +159,23 @@ void Msc3D::build(const Volume& volume, const Msc3DParams& params) {
 void Msc3D::compute(const Msc3DParams& params) {
   if (!impl_->grad) throw std::runtime_error("Msc3D::compute called before build().");
 
-  impl_->msc = std::make_unique<MscType>(impl_->grad.get(), impl_->mesh.get(), impl_->topofunc.get());
-  impl_->msc->SetBuildArcGeometry(GInt::Vec3b(params.build_arc_geometry, params.build_arc_geometry,
-                                              params.build_arc_geometry));
-  impl_->msc->ComputeFromGrad();
-  // Build the full cancellation hierarchy so any persistence can be browsed.
-  impl_->msc->ComputeHierarchy(impl_->value_range);
+  // Construct the cellseg MSC subclass so the cancellation hierarchy can, when
+  // requested, ignore the boundary gate for min->1-saddle arcs only (Option 3).
+  // The flag must be set before ComputeHierarchy; isValid reads it via virtual
+  // dispatch. We keep boundary marks untouched so the 1-2 / 2-3 rules survive.
+  auto msc = std::make_unique<CellsegMsc>(impl_->grad.get(), impl_->mesh.get(), impl_->topofunc.get());
+  msc->ignore_boundary_min_saddle = params.minima_ignore_boundary;
+  msc->SetBuildArcGeometry(GInt::Vec3b(params.build_arc_geometry, params.build_arc_geometry,
+                                       params.build_arc_geometry));
+  msc->ComputeFromGrad();
+  impl_->msc = std::move(msc);
+
+  // Build the cancellation hierarchy. A positive cap stops cancelling past that
+  // persistence (cheaper; selection then limited to <= cap); otherwise build the
+  // full value range so any persistence can be browsed.
+  const float hier_cap = params.hierarchy_persistence_cap > 0.0f ? params.hierarchy_persistence_cap
+                                                                 : impl_->value_range;
+  impl_->msc->ComputeHierarchy(hier_cap);
   impl_->msc->SetSelectPersAbs(0.0f);
   impl_->selected_persistence = 0.0f;
 }
@@ -223,6 +259,31 @@ void Msc3D::fill_manifold(NodeId node_id, bool ascending, std::set<CellIndex>& o
 }
 
 float Msc3D::value_range() const { return impl_->value_range; }
+
+std::vector<float> Msc3D::node_cancellation_persistence() const {
+  MscType* msc = impl_->mscOrThrow();
+  // Reconstruct cancel_num_to_pers as the running max of the cancellation-record
+  // persistences (mirrors how GInt builds it), then index by each node's
+  // `destroyed` cancellation time.
+  const auto& recs = msc->GetCancellationRecords();
+  std::vector<float> cum(recs.size());
+  float running = -std::numeric_limits<float>::infinity();
+  for (std::size_t i = 0; i < recs.size(); ++i) {
+    running = std::max(running, static_cast<float>(recs[i].persistence));
+    cum[i] = running;
+  }
+
+  const std::size_t nnodes = impl_->snapshot_gids.size();
+  std::vector<float> out(nnodes, std::numeric_limits<float>::quiet_NaN());
+  for (std::size_t i = 0; i < nnodes; ++i) {
+    const INT_TYPE dt = msc->getNode(impl_->snapshot_gids[i]).destroyed;
+    if (dt >= 1 && static_cast<std::size_t>(dt) <= cum.size()) {
+      out[i] = cum[static_cast<std::size_t>(dt) - 1];  // absolute cancellation persistence
+    }
+    // else NaN: never cancelled (the component's surviving extremum)
+  }
+  return out;
+}
 
 void Msc3D::compute_base_decomposition(bool ascending) {
   MscType* msc = impl_->mscOrThrow();

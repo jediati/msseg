@@ -17,6 +17,7 @@ struct LivingView {
   msseg::LabelVolume asc_labels;         // ascending living labels (min NodeId + 1)
   std::vector<std::int64_t> min_counts;  // ascending voxel count per snapshot NodeId
   MergeTree tree;
+  float persistence = 0.0f;              // the persistence this view was taken at
 };
 
 struct SegmentResult {

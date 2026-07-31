@@ -96,17 +96,14 @@ print("merge-tree roots    :", len(tree["roots"]))
 
 # %%
 # --- Lay out the merge tree as a voxel-count icicle -------------------------
-# Each node is a box. Its x-extent comes from the feature's voxel count: the
-# root spans the whole width, and every split divides the parent's span
-# proportionally. Children are ordered left-to-right by their subtree's lowest
-# minima value (deepest feature first). Boxes use their full size width and are
-# separated only by a 1px white border. y is the function value: a box spans
-# [node value, parent value], so its height is the feature's persistence.
-#
-# Colour is inherited by size (independent of the ordering): the root gets a
-# random colour, its largest sub-feature keeps that colour, and every other
-# child starts a new random lineage colour.
+# Flat {nodes, roots} format (node id == index; children are id references), so
+# the traversals below are fully iterative (explicit stacks) and safe for a
+# million-deep tree. Each node is a box: x-extent = voxel count, children ordered
+# left-to-right by their subtree's lowest minima value, y spans [node value,
+# parent value]. Colour is inherited by size: the root gets a random colour, its
+# largest sub-feature keeps it, other children start new random lineages.
 import colorsys
+from matplotlib.patches import Rectangle
 
 _rng = np.random.default_rng(0)
 
@@ -116,74 +113,57 @@ def _rand_color():
     v = 0.75 + 0.20 * float(_rng.random())
     return colorsys.hsv_to_rgb(h, s, v)
 
-_all_vals = []
-def _collect_vals(node):
-    _all_vals.append(node["value"])
-    for c in node.get("children", []):
-        _collect_vals(c)
-for root in tree["roots"]:
-    _collect_vals(root)
-_vmin, _vmax = min(_all_vals), max(_all_vals)
+_nodes = tree["nodes"]
+_N = len(_nodes)
+_vmin = min(nd["value"] for nd in _nodes)
+_vmax = max(nd["value"] for nd in _nodes)
 _vspan = (_vmax - _vmin) or 1.0
 _root_top = _vmax + 0.05 * _vspan   # short cap above the final merge
 
-# O(n) post-order pass: each node's lowest-leaf value (min minima value in its
-# subtree). Used to order children left-to-right (deepest minimum first).
-def _set_lowest_leaf(node):
-    kids = node.get("children", [])
-    node["_lowest_leaf"] = node["value"] if not kids else min(_set_lowest_leaf(c) for c in kids)
-    return node["_lowest_leaf"]
-for root in tree["roots"]:
-    _set_lowest_leaf(root)
+# Post-order (iterative): lowest-leaf value per node subtree.
+_lo = [0.0] * _N
+_st = [(r, False) for r in tree["roots"]]
+while _st:
+    _idx, _done = _st.pop()
+    _kids = _nodes[_idx]["children"]
+    if _done:
+        _lo[_idx] = _nodes[_idx]["value"] if not _kids else min(_lo[c] for c in _kids)
+    else:
+        _st.append((_idx, True))
+        _st.extend((c, False) for c in _kids)
 
-def _layout(node, x0, color, parent_value):
-    node["_x0"] = x0
-    node["_w"] = float(node["voxel_count"])   # full width; separation is the white border
-    node["_color"] = color
-    node["_y0"] = node["value"]
-    node["_y1"] = parent_value
-    kids = node.get("children", [])
-    largest = max(kids, key=lambda c: c["voxel_count"], default=None)  # colour heir (by size)
-    cursor = x0                                # place children left-to-right by lowest leaf
-    for c in sorted(kids, key=lambda c: c["_lowest_leaf"]):
-        _layout(c, cursor, color if c is largest else _rand_color(), node["value"])
-        cursor += float(c["voxel_count"])
-
-# Roots laid left-to-right by lowest leaf (usually a single root).
-roots = sorted(tree["roots"], key=lambda r: r["_lowest_leaf"])
-_cursor = 0.0
-for r in roots:
-    _layout(r, _cursor, _rand_color(), _root_top)
-    _cursor += float(r["voxel_count"])
-_total_size = _cursor
-
+# Pre-order (iterative) layout + size-based colour inheritance.
+boxes = []          # (x0, y0, w, h, color)
 _n_leaf = 0
-def _count_leaves(node):
-    global _n_leaf
-    if node.get("type") == "leaf":
+_cursor = 0.0
+_root_items = []
+for r in sorted(tree["roots"], key=lambda k: _lo[k]):
+    _root_items.append((r, _cursor, _root_top, _rand_color()))
+    _cursor += float(_nodes[r]["voxel_count"])
+_total_size = _cursor
+_st = list(reversed(_root_items))    # (idx, x0, parent_value, color)
+while _st:
+    _idx, _x0, _pv, _color = _st.pop()
+    _nd = _nodes[_idx]
+    boxes.append((_x0, _nd["value"], float(_nd["voxel_count"]), _pv - _nd["value"], _color))
+    _kids = _nd["children"]
+    if not _kids:
         _n_leaf += 1
-    for c in node.get("children", []):
-        _count_leaves(c)
-for root in roots:
-    _count_leaves(root)
+        continue
+    _largest = max(_kids, key=lambda c: _nodes[c]["voxel_count"])   # colour heir (by size)
+    _cc = _x0
+    _child_items = []
+    for c in sorted(_kids, key=lambda k: _lo[k]):                   # left-to-right by lowest leaf
+        _child_items.append((c, _cc, _nd["value"], _color if c == _largest else _rand_color()))
+        _cc += float(_nodes[c]["voxel_count"])
+    _st.extend(reversed(_child_items))
 print("leaves (minima):", _n_leaf, "| total feature size:", int(_total_size))
 
 # %%
 # --- Plot the voxel-count icicle --------------------------------------------
-from matplotlib.patches import Rectangle
-
 fig, ax = plt.subplots(figsize=(13, 7))
-
-def _draw(node):
-    ax.add_patch(Rectangle((node["_x0"], node["_y0"]), node["_w"],
-                           node["_y1"] - node["_y0"],
-                           facecolor=node["_color"], edgecolor="white", linewidth=1.0))
-    for c in node.get("children", []):
-        _draw(c)
-
-for root in roots:
-    _draw(root)
-
+for _x0, _y0, _w, _h, _color in boxes:
+    ax.add_patch(Rectangle((_x0, _y0), _w, _h, facecolor=_color, edgecolor="none"))
 ax.set_xlim(0, _total_size)
 ax.set_ylim(_vmin - 0.02 * _vspan, _root_top)
 ax.set_xlabel("voxel count (feature size)")

@@ -29,6 +29,9 @@ struct HeavyLiftConfig {
   float integration_error = 0.01f;
   float gradient_threshold = 0.0f;
   int integration_max_iter = 1000;
+  // Treat minima as interior before simplification so boundary-only minima
+  // cancel and the background stays one region (cellseg wants true minima).
+  bool minima_ignore_boundary = true;
 
   // Simplification persistence: absolute wins; else percent-of-range (5% def).
   std::optional<float> persistence_absolute;

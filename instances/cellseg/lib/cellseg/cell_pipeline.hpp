@@ -31,6 +31,18 @@ class CellPipeline {
   std::string merge_tree_json();          // nested JSON of the merge tree
   SegmentResult segment(float cut_threshold, float background_threshold);
 
+  // Living ascending-manifold labels (minimum NodeId + 1 per voxel) at the
+  // current persistence.
+  const msseg::LabelVolume& ascending_labels();
+  // Branch-decomposition ("asc tree") segmentation: ascending labels relabeled
+  // by branch, collapsing every branch below the current persistence into its
+  // parent. Each voxel carries its surviving branch's deepest-minimum NodeId + 1
+  // (0 = background), so the per-minimum palette colors it like the tree.
+  msseg::LabelVolume ascending_tree_labels();
+  // Absolute cancellation persistence per living node (aligned to view().graph
+  // NodeIds); NaN where a node is never cancelled.
+  std::vector<float> node_cancellation_persistence();
+
  private:
   void ensure_view();
 

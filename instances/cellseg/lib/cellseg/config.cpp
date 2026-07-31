@@ -51,6 +51,7 @@ AppConfig config_from_json(const nlohmann::json& root) {
     set_if_present(h, "integration_error", cfg.heavy.integration_error);
     set_if_present(h, "gradient_threshold", cfg.heavy.gradient_threshold);
     set_if_present(h, "integration_max_iter", cfg.heavy.integration_max_iter);
+    set_if_present(h, "minima_ignore_boundary", cfg.heavy.minima_ignore_boundary);
     set_opt_if_present(h, "persistence_absolute", cfg.heavy.persistence_absolute);
     set_opt_if_present(h, "persistence_percent", cfg.heavy.persistence_percent);
   }

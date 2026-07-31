@@ -94,51 +94,147 @@ MergeTree build_merge_tree(const msseg::MscGraph& graph,
 }
 
 std::string merge_tree_to_json(const MergeTree& tree) {
-  std::function<nlohmann::json(int)> emit = [&](int idx) -> nlohmann::json {
-    const MergeNode& n = tree.nodes[static_cast<std::size_t>(idx)];
+  // Flat format: a node list (id == index) with children stored as id
+  // references, plus a roots id list. Avoids deeply-nested JSON (the tree can be
+  // a million-deep caterpillar), so serialization/parsing stay O(1)-shallow.
+  nlohmann::json nodes = nlohmann::json::array();
+  for (const MergeNode& n : tree.nodes) {
     nlohmann::json j;
     j["id"] = n.id;
     j["type"] = n.is_leaf ? "leaf" : "merger";
     j["value"] = n.value;
     j["voxel_count"] = n.voxel_count;
     j["node_id"] = n.msc_node;
-    if (!n.is_leaf) {
-      nlohmann::json kids = nlohmann::json::array();
-      for (int c : n.children) kids.push_back(emit(c));
-      j["children"] = std::move(kids);
-    }
-    return j;
-  };
-
-  nlohmann::json roots = nlohmann::json::array();
-  for (int r : tree.roots) roots.push_back(emit(r));
+    j["children"] = n.children;  // flat list of child node ids
+    nodes.push_back(std::move(j));
+  }
   nlohmann::json out;
-  out["roots"] = std::move(roots);
-  return out.dump(2);
+  out["nodes"] = std::move(nodes);
+  out["roots"] = tree.roots;
+  return out.dump();
+}
+
+std::unordered_map<msseg::NodeId, msseg::NodeId> branch_survivors(
+    const MergeTree& tree, float cut_threshold, float select_persistence) {
+  std::unordered_map<msseg::NodeId, msseg::NodeId> result;
+  const int n = static_cast<int>(tree.nodes.size());
+  if (n == 0) return result;
+
+  // Pass 1 (post-order, iterative): lo = deepest leaf value in subtree, rep =
+  // that leaf's node index. This is the same low-to-high pass the tree coloring
+  // uses; the deepest leaf is each subtree's branch representative.
+  std::vector<float> lo(static_cast<std::size_t>(n), 0.0f);
+  std::vector<int> rep(static_cast<std::size_t>(n), -1);
+  {
+    std::vector<std::pair<int, bool>> st;
+    for (const int r : tree.roots) st.emplace_back(r, false);
+    while (!st.empty()) {
+      const auto [idx, done] = st.back();
+      st.pop_back();
+      const auto& kids = tree.nodes[static_cast<std::size_t>(idx)].children;
+      if (kids.empty()) {  // leaf
+        lo[static_cast<std::size_t>(idx)] = tree.nodes[static_cast<std::size_t>(idx)].value;
+        rep[static_cast<std::size_t>(idx)] = idx;
+      } else if (done) {
+        int best = kids[0];
+        for (const int c : kids)
+          if (lo[static_cast<std::size_t>(c)] < lo[static_cast<std::size_t>(best)]) best = c;
+        lo[static_cast<std::size_t>(idx)] = lo[static_cast<std::size_t>(best)];
+        rep[static_cast<std::size_t>(idx)] = rep[static_cast<std::size_t>(best)];
+      } else {
+        st.emplace_back(idx, true);
+        for (const int c : kids) st.emplace_back(c, false);
+      }
+    }
+  }
+
+  // Pass 2 (pre-order, iterative): for each merger, every child whose branch rep
+  // differs from the merger's rep is a *side* branch that dies here. It merges
+  // into the deeper (main) branch unless its death is a barrier.
+  std::vector<int> parent_leaf(static_cast<std::size_t>(n), -1);  // leaf idx -> leaf it dies into
+  std::vector<char> surviving(static_cast<std::size_t>(n), 0);    // leaf idx survives?
+  for (const int r : tree.roots) surviving[static_cast<std::size_t>(rep[static_cast<std::size_t>(r)])] = 1;
+  {
+    std::vector<int> st(tree.roots.rbegin(), tree.roots.rend());
+    while (!st.empty()) {
+      const int idx = st.back();
+      st.pop_back();
+      const MergeNode& nd = tree.nodes[static_cast<std::size_t>(idx)];
+      if (nd.children.empty()) continue;
+      const int mainrep = rep[static_cast<std::size_t>(idx)];
+      for (const int c : nd.children) {
+        const int leafL = rep[static_cast<std::size_t>(c)];
+        if (leafL != mainrep) {  // side branch: dies at this merger
+          const float pers = nd.value - lo[static_cast<std::size_t>(c)];  // leaf-to-merge
+          parent_leaf[static_cast<std::size_t>(leafL)] = mainrep;
+          if (nd.value > cut_threshold && pers >= select_persistence)
+            surviving[static_cast<std::size_t>(leafL)] = 1;  // barrier -> its own feature
+        }
+        st.push_back(c);
+      }
+    }
+  }
+
+  // Resolve each leaf to its surviving ancestor branch (iterative pointer-jump
+  // with memoization; no recursion).
+  std::vector<int> memo(static_cast<std::size_t>(n), -1);
+  for (int i = 0; i < n; ++i) {
+    if (!tree.nodes[static_cast<std::size_t>(i)].children.empty()) continue;  // leaves only
+    std::vector<int> path;
+    int x = i;
+    while (!surviving[static_cast<std::size_t>(x)]) {
+      if (memo[static_cast<std::size_t>(x)] != -1) { x = memo[static_cast<std::size_t>(x)]; break; }
+      const int p = parent_leaf[static_cast<std::size_t>(x)];
+      if (p < 0) break;  // safety: a non-root branch always has a parent
+      path.push_back(x);
+      x = p;
+    }
+    for (const int p : path) memo[static_cast<std::size_t>(p)] = x;
+    result[tree.nodes[static_cast<std::size_t>(i)].msc_node] =
+        tree.nodes[static_cast<std::size_t>(x)].msc_node;
+  }
+  return result;
 }
 
 std::unordered_map<msseg::NodeId, int> cut_regions(const MergeTree& tree, float cut_threshold,
+                                                   float select_persistence,
                                                    std::vector<std::int64_t>* region_voxels) {
+  const std::unordered_map<msseg::NodeId, msseg::NodeId> survivors =
+      branch_survivors(tree, cut_threshold, select_persistence);
+
+  // Number surviving branches into regions. Iterative pre-order DFS (the tree
+  // may be far too deep to recurse); a region id is allocated the first time a
+  // leaf's surviving branch is referenced -- deterministic and mirrored in the
+  // Python app so the ids volume and the tree coloring agree.
+  std::unordered_map<msseg::NodeId, int> region_of_survivor;
   std::unordered_map<msseg::NodeId, int> region_of_min;
   std::vector<std::int64_t> rvox;
   int next_region = 0;
 
-  std::function<void(int, int)> assign = [&](int idx, int rid) {
-    const MergeNode& n = tree.nodes[static_cast<std::size_t>(idx)];
-    if (n.is_leaf) {
-      region_of_min[n.msc_node] = rid;
-      if (static_cast<int>(rvox.size()) <= rid) rvox.resize(static_cast<std::size_t>(rid) + 1, 0);
-      rvox[static_cast<std::size_t>(rid)] += n.voxel_count;
-      return;
+  std::vector<int> stack(tree.roots.rbegin(), tree.roots.rend());
+  while (!stack.empty()) {
+    const int idx = stack.back();
+    stack.pop_back();
+    const MergeNode& nd = tree.nodes[static_cast<std::size_t>(idx)];
+    if (nd.children.empty()) {
+      const msseg::NodeId mn = nd.msc_node;
+      const auto sit = survivors.find(mn);
+      const msseg::NodeId sv = (sit != survivors.end()) ? sit->second : mn;
+      int rid;
+      const auto rit = region_of_survivor.find(sv);
+      if (rit == region_of_survivor.end()) {
+        rid = next_region++;
+        region_of_survivor[sv] = rid;
+        rvox.push_back(0);
+      } else {
+        rid = rit->second;
+      }
+      region_of_min[mn] = rid;
+      rvox[static_cast<std::size_t>(rid)] += nd.voxel_count;
+    } else {
+      for (auto c = nd.children.rbegin(); c != nd.children.rend(); ++c) stack.push_back(*c);
     }
-    if (n.value > cut_threshold) {          // cut here: children become new regions
-      for (int c : n.children) assign(c, next_region++);
-    } else {                                // keep: children stay in this region
-      for (int c : n.children) assign(c, rid);
-    }
-  };
-
-  for (int root : tree.roots) assign(root, next_region++);
+  }
   if (region_voxels) *region_voxels = std::move(rvox);
   return region_of_min;
 }
