@@ -12,54 +12,49 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 # --- Options ---------------------------------------------------------------
-option(MSSEG_BUILD_INSTANCES "Build verified segmentation instances" ON)
+# This root CMakeLists is the developer "build & test everything" entry point.
+# Each package under packages/<name> is ALSO independently pip-installable via
+# its own pyproject.toml + CMakeLists.txt (which bootstrap the deps + libs/core
+# themselves). Adding them here reuses the single dependency set below.
 option(MSSEG_BUILD_TESTS "Build tests" ON)
 option(MSSEG_BUILD_PYTHON "Build python bindings" OFF)
 if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
-  option(MSSEG_BUILD_VIEWER "Build the Windows OpenGL debug viewer" ON)
+  option(MSSEG_BUILD_VIEWER "Build the OpenGL debug viewer (needs ext/win64 GL binaries)" ON)
 else()
-  option(MSSEG_BUILD_VIEWER "Build the Windows OpenGL debug viewer" OFF)
+  option(MSSEG_BUILD_VIEWER "Build the OpenGL debug viewer" OFF)
 endif()
 set(MSSEG_DEPS_DIR "" CACHE PATH "Local dependency checkouts for offline/HPC builds")
 
-# --- Dependencies ----------------------------------------------------------
+# --- Dependencies (provisioned once, shared by libs/core + every package) ---
 find_package(OpenMP QUIET)
 include(Dependencies)   # diffg, MSCEER (GInt/msc_2d_lib), TinyTIFF, nlohmann_json [, pybind11]
-include(AddInstance)    # add_msseg_instance()
 
-# --- Targets ---------------------------------------------------------------
-add_subdirectory(core)
+# --- Shared library ---------------------------------------------------------
+add_subdirectory(libs/core)
 
-if(MSSEG_BUILD_INSTANCES)
-  add_subdirectory(instances/mscoupon)
-  add_subdirectory(instances/cellseg)
-endif()
+# --- Packages (each: instance lib + CLI + pybind module) --------------------
+# Their CMakeLists skip their standalone-bootstrap block because msseg_core is
+# already defined here (if(NOT TARGET msseg_core)).
+add_subdirectory(packages/mscoupon)
+add_subdirectory(packages/cellseg)
+add_subdirectory(packages/msworkflow)
 
-add_subdirectory(generic/msworkflow)
-
+# --- Optional native 3D viewer (desktop/Windows; never in a wheel) ----------
 if(MSSEG_BUILD_VIEWER)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/apps/msviewer/CMakeLists.txt")
-    include(VendoredGL)
+    add_subdirectory(libs/render)
     add_subdirectory(apps/msviewer)
   else()
-    message(STATUS "MSSeg: viewer enabled but apps/msviewer is not present yet (lands in M6); skipping.")
+    message(STATUS "MSSeg: viewer enabled but apps/msviewer is absent; skipping.")
   endif()
 endif()
 
 # --- Tests -----------------------------------------------------------------
+# Per-package tests (mscoupon_tests, cellseg_tests) are wired by each package's
+# CMakeLists under MSSEG_BUILD_TESTS. The portable core smoke test lives here.
 if(MSSEG_BUILD_TESTS)
   enable_testing()
-  if(MSSEG_BUILD_INSTANCES)
-    add_executable(mscoupon_tests tests/mscoupon_tests.cpp)
-    target_link_libraries(mscoupon_tests PRIVATE mscoupon_lib)
-    add_test(NAME mscoupon_tests COMMAND mscoupon_tests)
-
-    add_executable(cellseg_tests tests/cellseg_tests.cpp)
-    target_link_libraries(cellseg_tests PRIVATE cellseg_lib)
-    add_test(NAME cellseg_tests COMMAND cellseg_tests)
-  endif()
-
-  add_executable(core_smoke tests/core_smoke.cpp)
+  add_executable(core_smoke libs/core/tests/core_smoke.cpp)
   target_link_libraries(core_smoke PRIVATE msseg_core)
   add_test(NAME core_smoke COMMAND core_smoke)
 endif()

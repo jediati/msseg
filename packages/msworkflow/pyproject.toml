@@ -1,0 +1,23 @@
+[build-system]
+requires = ["scikit-build-core>=0.9", "pybind11>=2.13"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "msseg-workflow"
+version = "0.1.0"
+description = "MSSeg generic JSON-described workflow runner over the portable core."
+requires-python = ">=3.9"
+dependencies = ["numpy", "tifffile"]
+
+[project.scripts]
+msworkflow = "msseg.workflow.cli:main"
+
+[tool.scikit-build]
+wheel.packages = ["src/msseg"]
+cmake.version = ">=3.21"
+install.components = ["msseg_python"]
+
+[tool.scikit-build.cmake.define]
+MSSEG_BUILD_PYTHON = "ON"
+MSSEG_BUILD_VIEWER = "OFF"
+MSSEG_BUILD_TESTS = "OFF"

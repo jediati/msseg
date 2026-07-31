@@ -18,7 +18,7 @@
 #include "msseg/volume/types.hpp"
 #include "msseg/workflow/pipeline.hpp"
 
-#include "third_party/mscapps/glut_crystal_ball_viewer.h"
+#include "glut_crystal_ball_viewer.h"   // from libs/render (msrender)
 
 #include "renderables.hpp"
 

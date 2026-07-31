@@ -3,7 +3,7 @@
 #include "msseg/graph/msc_graph.hpp"
 #include "msseg/workflow/pipeline.hpp"
 
-#include "third_party/mscapps/glut_crystal_ball_viewer.h"
+#include "glut_crystal_ball_viewer.h"   // from libs/render (msrender)
 
 namespace msviewer {
 

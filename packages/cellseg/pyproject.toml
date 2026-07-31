@@ -1,0 +1,26 @@
+[build-system]
+requires = ["scikit-build-core>=0.9", "pybind11>=2.13"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "msseg-cellseg"
+version = "0.1.0"
+description = "MSSeg cellseg: 3D fluorescent-membrane cell segmentation + tri-planar viewer."
+requires-python = ">=3.9"
+# numpy powers the pybind API; matplotlib/tifffile + msseg-viz power the viewer app.
+dependencies = ["numpy", "matplotlib", "tifffile", "msseg-viz"]
+
+[project.scripts]
+# Launches the Tk tri-planar viewer (desktop). The headless pipeline is the
+# pybind API (from msseg import cellseg) or the native cellseg CLI.
+cellseg = "msseg.cellseg.app:main"
+
+[tool.scikit-build]
+wheel.packages = ["src/msseg"]
+cmake.version = ">=3.21"
+install.components = ["msseg_python"]
+
+[tool.scikit-build.cmake.define]
+MSSEG_BUILD_PYTHON = "ON"
+MSSEG_BUILD_VIEWER = "OFF"
+MSSEG_BUILD_TESTS = "OFF"

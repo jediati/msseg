@@ -1,0 +1,14 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "msseg-viz"
+version = "0.1.0"
+description = "MSSeg shared visualization utilities (per-minimum palette, merge-tree icicle)."
+requires-python = ">=3.9"
+dependencies = ["numpy", "matplotlib"]
+
+[tool.hatch.build.targets.wheel]
+# PEP 420 namespace: ship msseg/viz/ with no top-level msseg/__init__.py.
+packages = ["src/msseg"]

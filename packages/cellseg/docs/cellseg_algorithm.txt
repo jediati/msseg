@@ -1,0 +1,708 @@
+================================================================================
+ cellseg — 3D fluorescent-membrane cell segmentation: algorithm reference
+================================================================================
+
+The cellseg instance segments cell-like blobs in a 3D volume where a
+fluorescent dye marks the membrane (and some cell internals). Thresholding
+fails because the membrane shell has gaps and the interior is not a clean void.
+cellseg instead works topologically: it builds a Morse-Smale complex on the
+(blurred) intensity field, uses the minima -> 1-saddle merge tree to separate
+cell interiors, and uses descending manifolds of maxima (the ridges of the dye
+signal) to reconstruct membranes.
+
+The computation is deliberately TWO-PHASE:
+
+  Phase A -- heavy lift (run ONCE per input):
+      read -> gaussian blur -> discrete gradient -> MS complex ->
+      cancellation hierarchy -> pick heavy persistence -> cache the
+      ascending/descending 3-manifold base decompositions.
+      Expensive. Produces a primed CellPipeline.
+
+  Phase B -- threshold tuning (re-runnable CHEAPLY):
+      select a living persistence -> merge tree -> branch decomposition ->
+      relabel-then-cut -> cell interiors (above-cut absorption) -> separating
+      saddles -> touched/appendage maxima -> membrane reconstruction -> seg8
+      bit-flag volume + int32 cell-id volume (cell interiors extended through
+      the membranes). Driven by three knobs; safe to sweep interactively without
+      repeating Phase A.
+
+The one hard architectural rule (the "GInt firewall"): only
+core/msseg/compute/msc3d.cpp includes MSCEER's gi_*.h. Everything cellseg does
+crosses the boundary through the plain-data MscGraph + the Msc3D API. Union-find,
+the merge tree, all masks, and both output volumes are plain MscGraph/LabelVolume
+logic with no GInt.
+
+
+================================================================================
+ 1. HIGH-LEVEL PARAMETERS
+================================================================================
+
+Parameters split into Phase-A (baked into the heavy lift) and Phase-B (the three
+cheap knobs you sweep). Config keys are the JSON names accepted by
+config_from_json (instances/cellseg/lib/cellseg/config.cpp); the Python
+heavy_lift() takes the "heavy_lift" block either wrapped or flat.
+
+--- Phase A (HeavyLiftConfig) --------------------------------------------------
+
+  input_path / dim_x,dim_y,dim_z
+      Source volume. Dims are parsed from a "<name>_XxYxZ.raw" filename (X
+      fastest) or an explicit override; a "<path>.dat" sidecar is the fallback.
+      Comes into play at STAGE 0 (load). Not used by the in-memory Python
+      heavy_lift(volume, ...) entry point, which is handed an ndarray directly.
+
+  blur_sigma            (float, default 2.0)
+      Gaussian blur sigma applied before any topology. Comes into play at
+      STAGE 1 (filter). A median pre-pass is intentionally out of scope (done
+      upstream in Python for now).
+
+  accurate_ascending_3m / accurate_descending_3m   (bool, default false)
+  presimp_threshold     (float, default 0.0)
+  integration_error     (float, default 0.01)
+  gradient_threshold    (float, default 0.0)
+  integration_max_iter  (int,   default 1000)
+      Gradient-accuracy demands + their numeric-integration knobs. Both flags
+      false == plain steepest-descent (Robins) pairing, the common path.
+      Enabling a flag runs MSCEER's ondemandaccurate refinement for that side.
+      All come into play at STAGE 2 (discrete gradient).
+      NOTE: the accurate-3m flags are currently plumbed but Msc3D::build throws
+      if either is set (the alternate MSCEER gradient stack is not yet wired);
+      leave them false.
+
+  minima_ignore_boundary   (bool, default true)
+      Ignore the boundary gate for min->1-saddle (dim-0) arcs when building the
+      cancellation hierarchy. The hierarchy normally refuses to cancel an arc
+      whose endpoints have different boundary values, which preserves
+      boundary-only minima (domain corners/edges) and fragments the background
+      into many ascending regions. With this ON (the default), minima cancel
+      purely by persistence -- including boundary-min <-> boundary-min through a
+      boundary saddle -- while the 1-2 and 2-3 boundary rules are left intact, so
+      1-2 boundary cancellations stay feasible and a boundary 2-saddle still
+      cannot cancel with an interior maximum. Boundary marks are NOT mutated;
+      the effect is a subclass (CellsegMsc) override of the validity predicate.
+      cellseg only cares about true (interior) minima, so this defaults ON.
+      Comes into play at STAGE 3 (hierarchy).
+
+  persistence_absolute  (optional float)   -- wins if present
+  persistence_percent   (optional float, default 5.0)
+      The heavy persistence. Absolute is an absolute function-value; percent is
+      that fraction of the volume value-range. This value is used TWICE: as the
+      CAP on the cancellation hierarchy at STAGE 3 (arcs above it are never
+      cancelled -- much cheaper build, but persistence browsing is then limited
+      to <= cap), and as the initial selected persistence at STAGE 4.
+
+--- Phase B (PhaseBConfig) -----------------------------------------------------
+
+  persistence_selection  (optional float)
+      The persistence at which to view the living complex. Unset == reuse the
+      heavy persistence. Must be <= the heavy hierarchy cap. Comes into play at
+      STAGE 6 (living view) AND doubles as the branch-relabel threshold at STAGES
+      7.5 / 8 (branches with leaf-to-merge persistence below it fold into their
+      parent, finishing the cancellation GInt's arc-count cap skipped).
+      Interactively this is CellPipeline.set_persistence.
+
+  cut_threshold          (float, default 0.0)
+      The merge-tree cut level, and more generally the value-barrier for every
+      upward hop ("never cross the cut"). Comes into play at STAGE 8 (relabel-
+      then-cut: a branch survives as its own region only when its death merger
+      value > cut_threshold, combined with the persistence test above), at STAGE
+      8.5 (a minimum whose VALUE is above the cut is absorbed into an adjacent
+      cell), and again at STAGES 11 / 13 / 16 as the >= cut_threshold gate on
+      2-saddles.
+
+  background_threshold   (float, default 0.0)
+      Fixed intensity threshold on the filtered volume for the fluorescent /
+      foreground mask. Comes into play at STAGE 10 (mask), and thereby every
+      downstream stage that intersects with foreground.
+
+--- Outputs (OutputConfig, CLI only) -------------------------------------------
+
+  seg8_path / ids_path / merge_tree_path
+      Where the CLI writes the uint8 bit-flag volume, the int32 cell-id volume,
+      and the merge-tree JSON. The Python/viewer paths return these in memory.
+
+
+================================================================================
+ 2. STAGES
+================================================================================
+
+Stage numbering follows execution order. Stages 0-5 are Phase A (run once by
+run_heavy_lift); stages 6+ are Phase B (run by CellPipeline::segment, and cheap
+to repeat). Within run_segmentation the sub-steps are interleaved for a single
+pass over the voxels, but they are described here in dependency order.
+
+--------------------------------------------------------------------------------
+ STAGE 0 -- Load volume
+--------------------------------------------------------------------------------
+Objective:
+    Get a contiguous C-order float32 (depth, height, width) volume. Layout is
+    x-fastest (X=width, Y=height, Z=depth), no transpose.
+
+Inputs:
+    A "<name>_XxYxZ.raw" file (CLI), or an in-memory numpy float32 array (Python).
+
+Outputs:
+    msseg::Volume passed into Phase A.
+
+Code hooks:
+    - CLI/file: cellseg::run_heavy_lift(cfg) -> parse_dims_from_filename ->
+      msseg::read_raw_volume (core/msseg/io/raw_io).  [heavy_lift.cpp]
+    - Python in-memory: cellseg_py.array_to_volume (memcpy ndarray -> Volume);
+      cellseg.heavy_lift / heavy_lift_file.  [python/cellseg_py.cpp]
+    - Demo/app do the TIFF -> float32 (d,h,w) coercion in Python
+      (channel-reduce, squeeze, promote 2D) before calling heavy_lift.
+      [python/examples/cellseg_pipeline_demo.py, cellseg_app.py]
+
+Tests:
+    - core_smoke.cpp: raw_io write/read round-trips a volume exactly.
+    - cellseg_tests.cpp: builds an in-memory shell volume (make_shells) -> no
+      file I/O, exercises the Volume path directly.
+
+--------------------------------------------------------------------------------
+ STAGE 1 -- Filter (Gaussian blur)
+--------------------------------------------------------------------------------
+Objective:
+    Smooth the intensity field so the discrete gradient is well-behaved. The
+    blurred volume is ALSO the field the foreground mask (Stage 10) thresholds.
+
+Inputs:
+    Raw Volume; blur_sigma.
+
+Outputs:
+    state.filtered (Volume) -- retained for the whole pipeline.
+
+Code hooks:
+    - make from FilterParams{operation="blur", params={sigma}} ->
+      msseg::apply_filter (diffg gaussian).  [heavy_lift.cpp build_from_volume,
+      stage("filter: gaussian blur")]
+    - Exposed to Python as CellPipeline.filtered() (the field the app/demo shows
+      as "transformed").
+
+Tests:
+    - Indirectly by cellseg_tests.cpp (heavy lift runs with blur_sigma=1.5).
+    - No standalone filter assertion in cellseg; diffg blur is covered upstream.
+
+--------------------------------------------------------------------------------
+ STAGE 2 -- Discrete gradient
+--------------------------------------------------------------------------------
+Objective:
+    Compute the discrete (combinatorial) gradient vector field on the filtered
+    volume -- the pairing that defines the Morse-Smale structure.
+
+Inputs:
+    state.filtered; gradient_mode + accuracy flags/knobs.
+
+Outputs:
+    Internal GInt gradient inside the Msc3D PIMPL (no plain-data output yet).
+
+Code hooks:
+    - make_msc_params sets GradientMode::OnDemandAccurate + flags/knobs.
+      [heavy_lift.cpp make_msc_params]
+    - msseg::Msc3D::build(filtered, params).  [core/msseg/compute/msc3d.cpp,
+      the only TU that includes gi_*.h]  stage("build: discrete gradient").
+    - Default (both flags false) == steepest-descent Robins pairing.
+      build() THROWS if an accurate-3m flag is set (deferred capability).
+
+Tests:
+    - core_smoke.cpp: Msc3D::build + compute on a synthetic blob volume; asserts
+      a non-empty complex and valid arc endpoints.
+    - Msc3D::probe() is the build-time GInt compile/link self-test.
+
+--------------------------------------------------------------------------------
+ STAGE 3 -- MS complex + cancellation hierarchy
+--------------------------------------------------------------------------------
+Objective:
+    Build the Morse-Smale arcs and the persistence cancellation hierarchy so any
+    persistence <= the cap can be browsed in O(1)-ish time. Optionally neutralize
+    boundary minima first so the background stays one region.
+
+Inputs:
+    Built gradient; hierarchy_persistence_cap (= heavy persistence, resolved
+    here); minima_ignore_boundary.
+
+Outputs:
+    Internal hierarchy; state.value_range and state.heavy_persistence cached.
+
+Code hooks:
+    - resolve_persistence(cfg, value_range) -> params.hierarchy_persistence_cap.
+      [heavy_lift.cpp]  (value_range from Msc3D::value_range()).
+    - msseg::Msc3D::compute(params) -> ComputeHierarchy(cap). When
+      minima_ignore_boundary is set, the complex is built as the CellsegMsc
+      subclass whose isValid() override skips the boundary-equality gate for
+      min->1-saddle (dim-0) arcs only, so boundary minima cancel by persistence
+      (incl. boundary-min <-> boundary-min) while the 1-2 and 2-3 boundary rules
+      stay intact (a boundary 2-saddle still cannot cancel an interior maximum).
+      Boundary marks are NOT mutated. [msc3d.cpp CellsegMsc]
+      stage("compute: MS complex + hierarchy").
+
+Tests:
+    - core_smoke.cpp: living critical-point count is monotone non-increasing as
+      persistence rises; at least one CP survives.
+    - cellseg_tests.cpp: heavy_persistence is reported and used downstream.
+
+--------------------------------------------------------------------------------
+ STAGE 4 -- Select heavy persistence
+--------------------------------------------------------------------------------
+Objective:
+    Pick the initial living complex at the heavy persistence.
+
+Inputs:
+    state.heavy_persistence.
+
+Outputs:
+    The selected (living) complex inside Msc3D.
+
+Code hooks:
+    - msseg::Msc3D::select_persistence(heavy_persistence).  [heavy_lift.cpp]
+      stage("select persistence").
+    - Cancellation persistence per node is separately available as
+      Msc3D::node_cancellation_persistence() (NaN = never cancelled), surfaced to
+      Python as CellPipeline.node_cancellation_persistence() for the app's tips.
+
+Tests:
+    - core_smoke.cpp: select_persistence at several levels drives the monotonic
+      CP-count check.
+
+--------------------------------------------------------------------------------
+ STAGE 5 -- Base 3-manifold decompositions (cached)
+--------------------------------------------------------------------------------
+Objective:
+    Run the expensive per-voxel base extremum labeling ONCE for both the
+    ascending (minima) and descending (maxima) 3-manifolds, with all critical
+    points alive. Phase B remaps these cheaply per persistence.
+
+Inputs:
+    Built complex.
+
+Outputs:
+    Two cached per-voxel base-extremum id arrays inside Msc3D.
+
+Code hooks:
+    - msseg::Msc3D::compute_base_decomposition(true)  (ascending / minima)
+      msseg::Msc3D::compute_base_decomposition(false) (descending / maxima).
+      [heavy_lift.cpp]  stage("base decomposition: ascending" / "... descending").
+      Descending manifolds map top-dim (D=3) cells to voxels.
+
+Tests:
+    - core_smoke.cpp (section 4b): compute_base_decomposition(true/false) then
+      living_labels(&counts); asserts counts keyed by snapshot NodeId, count sum
+      == labeled voxel total, descending labeling non-empty.
+
+    ---- end of Phase A: run_heavy_lift returns a primed CellPipeline ----
+
+--------------------------------------------------------------------------------
+ STAGE 6 -- Living view (select persistence -> snapshot + ascending labels)
+--------------------------------------------------------------------------------
+Objective:
+    Materialize the living complex at the Phase-B persistence as plain data, plus
+    per-voxel ascending labels and per-minimum voxel counts in one shared NodeId
+    space.
+
+Inputs:
+    persistence_selection (or heavy persistence); cached base decomposition.
+
+Outputs:
+    LivingView{ graph (MscGraph snapshot), asc_labels (min NodeId+1 per voxel),
+    min_counts (per snapshot NodeId), tree (built in Stage 7) }.
+
+Code hooks:
+    - CellPipeline::select_persistence -> Msc3D::select_persistence,
+      Msc3D::snapshot(), Msc3D::living_labels(true, &min_counts).
+      [cell_pipeline.cpp]
+    - Python: CellPipeline.set_persistence(p); .ascending_labels() returns the
+      int32 (d,h,w) ascending label volume (used by the app's "Asc Man" overlay).
+
+Tests:
+    - cellseg_tests.cpp: pipe.select_persistence(heavy) then pipe.view().
+    - core_smoke.cpp (4b): living_labels range + count-sum invariants.
+
+--------------------------------------------------------------------------------
+ STAGE 7 -- Merge tree
+--------------------------------------------------------------------------------
+Objective:
+    Build the minima -> 1-saddle merge (join) tree over the LIVING complex:
+    leaves are minima (value + voxel count), internal nodes are 1-saddles that
+    merge two basins (saddle value + summed voxel count).
+
+Inputs:
+    view.graph (living nodes/arcs); view.min_counts.
+
+Outputs:
+    view.tree (MergeTree: flat node list + roots); serialized to JSON on demand.
+
+Code hooks:
+    - build_merge_tree(graph, min_counts): DSU over minima (UnionFind,
+      union_find.hpp); 1-saddles processed in ascending value order; each
+      saddle's distinct downward minima fold their sets into a merger node.
+      [merge_tree.cpp]
+    - merge_tree_to_json emits the FLAT format {"nodes":[{id,type,value,
+      voxel_count,node_id,children:[ids]}], "roots":[ids]} -- children are id
+      references, so serialization/parsing stay shallow even for a
+      million-deep caterpillar tree (no recursion).  [merge_tree.cpp]
+    - Python: CellPipeline.merge_tree_json(); the app/demo draw a voxel-count
+      icicle with fully iterative (explicit-stack) traversals.
+
+Tests:
+    - cellseg_tests.cpp: merge tree has >= one leaf per shell and >= one root.
+    - The app's --selftest draws the icicle from the flat tree (deep-tree safe).
+
+--------------------------------------------------------------------------------
+ STAGE 7.5 -- Branch decomposition + "asc tree" segmentation
+--------------------------------------------------------------------------------
+Objective:
+    Decompose the merge tree into BRANCHES and use them to finish the persistence
+    simplification the GInt cancellation hierarchy skips. GInt defers (and, past
+    the cap, drops) any cancellation whose edgeCountWeight exceeds 1500 -- e.g. a
+    background minimum incident to thousands of 1-saddles -- so low-persistence
+    minima can stay alive that a clean join-tree simplification would remove. The
+    branch relabel does that removal directly on the tree.
+
+    Each minimum-leaf owns a branch that continues up through every merger where
+    it is the deepest leaf (the "lowest subtree" continuation) and DIES at the
+    first merger where a deeper sibling appears; its leaf-to-merge persistence is
+    that merger's value minus the leaf value. A branch folds into the deeper
+    branch it dies into unless its death is a BARRIER:
+        death value > cut_threshold  AND  persistence >= select_persistence.
+    With cut = -inf the barrier reduces to persistence >= select_persistence:
+    a pure persistence simplification (this is the "asc tree" view). The
+    surviving branch of a leaf is the deepest minimum of the feature it belongs
+    to; that shared NodeId is what colors the tree and both overlays.
+
+Inputs:
+    view.tree; select_persistence (= the current view persistence, STAGE 6);
+    view.asc_labels; cut_threshold (only for the relabel-then-cut at STAGE 8).
+
+Outputs:
+    survivor map (min NodeId -> surviving branch's deepest-min NodeId); the
+    "asc tree" label volume (each voxel = its surviving branch NodeId + 1).
+
+Code hooks:
+    - branch_survivors(tree, cut, select): two iterative passes -- post-order for
+      the deepest-leaf rep (the same low-to-high pass the tree coloring uses),
+      pre-order to find each side branch's death + barrier, then pointer-jump
+      resolve to the surviving ancestor. No recursion.  [merge_tree.cpp]
+    - CellPipeline::ascending_tree_labels(): branch_survivors(tree, -inf,
+      current_persistence) remapped over the ascending labels.  [cell_pipeline.cpp]
+    - Python: CellPipeline.ascending_tree_labels() feeds the app's "asc tree"
+      overlay (a 5th seg-mode radio, colored by the shared per-minimum palette,
+      so it agrees with "asc man" and the tree). The branch logic is mirrored in
+      the app's _branch_survivors for tree/region coloring.  [cellseg_app.py]
+
+Tests:
+    - core/offline: the Python _branch_survivors mirror matches the C++
+      ascending_tree_labels volume 100% voxel-for-voxel across persistences; the
+      fold/barrier predicate is unit-checked on a hand-built tree.
+    - App --selftest exercises the "asc tree" overlay + hover tip.
+
+--------------------------------------------------------------------------------
+ STAGE 8 -- Relabel-then-cut -> region ids
+--------------------------------------------------------------------------------
+Objective:
+    Partition minima into regions. FIRST relabel (STAGE 7.5): fold every branch
+    whose leaf-to-merge persistence is below select_persistence into its parent
+    branch -- finishing the cancellation GInt's arc-count cap skipped. THEN cut:
+    a surviving branch stays its own region only when its death merger is a
+    barrier (value > cut_threshold AND persistence >= select_persistence);
+    otherwise it joins the deeper branch. Equivalently, two minima share a region
+    unless separated by a barrier merger.
+
+Inputs:
+    view.tree; cut_threshold; select_persistence (= view.persistence).
+
+Outputs:
+    region_of_min (min NodeId -> region id); region_voxels (voxels per region).
+    Per-voxel ascending region id derived by remapping asc_labels through it.
+
+Code hooks:
+    - cut_regions(tree, cut_threshold, select_persistence, &region_voxels): calls
+      branch_survivors then numbers surviving branches into regions via an
+      ITERATIVE pre-order DFS (a region id allocated the first time a survivor is
+      referenced -- deterministic and mirrored in Python _rederive_cut so the
+      app coloring and the C++ ids volume agree).  [merge_tree.cpp]
+    - run_segmentation passes view.persistence as select and builds asc_region
+      [voxel] from region_of_min.  [segment.cpp, "Step 9"]
+    - NOTE: because the relabel feeds the cut, seg8/ids reflect the branch
+      simplification, not the raw cut. With select = -inf this reduces to the
+      plain per-merger cut.
+
+Tests:
+    - cellseg_tests.cpp: segment(cut=0) at the heavy persistence; the classic
+      complex (11 living minima) relabels to 4 survivors == the ignore-boundary
+      result, confirming the fold. Uses two OVERLAPPING shells so a real
+      cell-cell membrane survives simplification (isolated shells fold to no
+      membrane -- see STAGE 14).
+    - App --selftest / offline diag: Python _rederive_cut mirrors the C++
+      partition; the asc-tree volume matches the Python survivor remap exactly.
+
+--------------------------------------------------------------------------------
+ STAGE 8.5 -- Cell interiors (above-cut absorption)  ["cell-interior" overlay]
+--------------------------------------------------------------------------------
+Objective:
+    Turn the cut regions into cell INTERIORS: every minimum whose VALUE is above
+    the cut is merged into an adjacent CELL. A cell = a non-background cut region
+    (STAGE 8) whose deepest minimum is below the cut. Crucially the adjacency is
+    the LIVING min->1-saddle network, NOT the merge-tree branch structure, so a
+    min's cell can differ from the branch it merges into (its branch may descend
+    to background, while a cell is reachable across the network).
+
+    Structured as a marker-based watershed region-growing from the boundary of
+    the cells: seed from each cell's below-cut minima and flood across 1-saddles
+    in increasing saddle value, so each above-cut minimum joins the cell reached
+    via the LOWEST connecting saddle. Nesting (above-cut min adjacent only to
+    other above-cut minima) is handled by the priority queue. Background is not a
+    marker: a min joins the lowest reachable NON-background cell, and only keeps
+    its cut region when no cell path exists. Below-cut minima are never moved.
+
+Inputs:
+    view.graph (living min->1-saddle network); view.tree; cut_threshold;
+    select_persistence (= view.persistence).
+
+Outputs:
+    min NodeId -> its final cell's deepest-min NodeId (the "cell interior" map);
+    a per-voxel label volume (cell rep NodeId + 1), shown by the "cell-interior"
+    overlay and used as the seed for STAGE 16.
+
+Code hooks:
+    - branch_survivors for the STAGE-8 partition + heaviest-region background;
+      then a std::priority_queue watershed over min-adjacency built from the
+      living 1-saddles. Iterative, no recursion.  [merge_tree.cpp,
+      absorb_above_cut_minima]
+    - CellPipeline::cell_labels(cut_threshold) remaps the ascending labels
+      through it.  [cell_pipeline.cpp]
+    - Python: CellPipeline.cell_labels(cut) -> the app's "cell-interior" overlay
+      (shared per-minimum palette; cut-scoped, refetched when the cut changes).
+
+Tests:
+    - offline: on an engineered two-well + shallow-bridge volume, the bridge
+      minimum (above the cut, its own STAGE-8 region) is reassigned into the
+      adjacent well reached via the lowest saddle -- confirming absorption is
+      network-based, not branch-based. On isolated shells nothing moves (their
+      above-cut minima are adjacent only to background), correctly.
+    - App --selftest exercises the "cell-interior" overlay + hover tip.
+
+--------------------------------------------------------------------------------
+ STAGE 9 -- Background region
+--------------------------------------------------------------------------------
+Objective:
+    Identify the background as the cut region with the largest summed voxel count.
+
+Inputs:
+    region_voxels.
+
+Outputs:
+    background_region (int).
+
+Code hooks:
+    - run_segmentation: argmax over region_voxels.  [segment.cpp, "Step 10"]
+
+Tests:
+    - cellseg_tests.cpp: background is implicitly the largest region; id volume
+      has >= 2 distinct labels (background + cells).
+
+--------------------------------------------------------------------------------
+ STAGE 10 -- Fluorescent / foreground mask
+--------------------------------------------------------------------------------
+Objective:
+    Mark foreground (dye) voxels: filtered >= background_threshold. A fixed
+    intensity threshold. Computed early because Stage 12's seed overlap needs it.
+
+Inputs:
+    state.filtered; background_threshold.
+
+Outputs:
+    fluor[voxel] (0/1).
+
+Code hooks:
+    - run_segmentation: fluor[i] = filtered[i] >= background_threshold.
+      [segment.cpp, "Step 12 (moved up)"]
+
+Tests:
+    - cellseg_tests.cpp: seg8 bit 8 (foreground) is non-empty at bg=0.4.
+
+--------------------------------------------------------------------------------
+ STAGE 11 -- Touched boundary maxima (barrier-respecting walk-up)
+--------------------------------------------------------------------------------
+Objective:
+    Find maxima on cell-separating ridges: from each SEPARATING 1-saddle (whose
+    downward minima fall in >= 2 different cut regions), walk up 1->2->3 through
+    only the 2-saddles that do not cross the cut (value >= cut_threshold),
+    collecting the reached maxima.
+
+Inputs:
+    view.graph; region_of_min; descending labels (living_labels(false));
+    cut_threshold.
+
+Outputs:
+    touched_maxima (set of maximum NodeIds).
+
+Code hooks:
+    - run_segmentation with helpers downward_minima, upward_of_dim; the
+      >= cut_threshold gate on 2-saddles.  [segment.cpp, "Step 11"]
+
+Tests:
+    - Covered end-to-end by cellseg_tests.cpp (membrane bit-2 non-empty implies
+      labeled maxima were found); no isolated unit assertion.
+
+--------------------------------------------------------------------------------
+ STAGE 12 -- Seed-label touched maxima
+--------------------------------------------------------------------------------
+Objective:
+    Give each touched maximum a cell id: the non-background ascending cut-region
+    with the largest FOREGROUND overlap inside that max's descending manifold.
+
+Inputs:
+    touched_maxima; descending labels; asc_region; fluor; background_region.
+
+Outputs:
+    labeled (max NodeId -> cell id) for the seed maxima.
+
+Code hooks:
+    - run_segmentation: seed_overlap histogram per max -> argmax region.
+      [segment.cpp, "Seed-label each touched max"]
+
+Tests:
+    - cellseg_tests.cpp (indirect): produces the labeled-max set feeding bits
+      2/4 and the id volume.
+
+--------------------------------------------------------------------------------
+ STAGE 13 -- Extend labels along ridge appendages (Prim growth)
+--------------------------------------------------------------------------------
+Objective:
+    Grow cell labels from seed maxima along max -> 2-saddle -> other-max ridge
+    hops, so a cell's label follows thin protrusions. Strongest connection first.
+
+Inputs:
+    labeled (seeds); view.graph; cut_threshold.
+
+Outputs:
+    labeled extended to appendage maxima (max NodeId -> cell id).
+
+Code hooks:
+    - run_segmentation: min-priority queue keyed by weight = value[next_max] -
+      value[2saddle]; only 2-saddles with value >= cut_threshold; never reassign
+      a labeled max. Helpers downward_of_dim / upward_of_dim.
+      [segment.cpp, "Step 11.5", struct Hop / HopGreater]
+
+Tests:
+    - Plan's verification note: bit-4 coverage grows as appendages join and
+      shrinks as the cut rises. Exercised end-to-end by cellseg_tests.cpp.
+
+--------------------------------------------------------------------------------
+ STAGE 14 -- Membrane regions + cleaned membrane
+--------------------------------------------------------------------------------
+Objective:
+    membrane_region = voxels whose descending manifold belongs to a labeled max
+    (touched + appendage). cleaned = membrane_region intersect fluorescent.
+
+Inputs:
+    descending labels; labeled; fluor.
+
+Outputs:
+    membrane_region[voxel], cleaned[voxel].
+
+Code hooks:
+    - run_segmentation per-voxel loop.  [segment.cpp, "Steps 11/13"]
+
+Note:
+    Membrane exists only where labeled maxima exist -- i.e. where separating
+    saddles bridge two different regions (cell-cell or inside-outside contact).
+    After the STAGE 8 relabel folds boundary/low-persistence fragments, ISOLATED
+    features have no cell-cell contact and produce no cleaned membrane; that is
+    correct, not a miss. The smoke test therefore uses two OVERLAPPING shells.
+
+Tests:
+    - cellseg_tests.cpp: cleaned-membrane (bit 2) is non-empty (touching shells).
+
+--------------------------------------------------------------------------------
+ STAGE 15 -- seg8 bit-flag volume
+--------------------------------------------------------------------------------
+Objective:
+    Pack the four masks into an 8-bit-per-voxel diagnostic volume.
+      bit 1 = non-background ascending 3-manifold
+      bit 2 = cleaned membrane (membrane_region & fluorescent)
+      bit 4 = membrane region (descending 3-manifold of a labeled max)
+      bit 8 = foreground (filtered >= background_threshold)
+
+Inputs:
+    asc_region, background_region, cleaned, membrane_region, fluor.
+
+Outputs:
+    result.seg8 (LabelVolume; uint8 to Python).
+
+Code hooks:
+    - run_segmentation packs bits.  [segment.cpp, "Step 14"]
+    - Python: first element of CellPipeline.segment(...) -> uint8 (d,h,w);
+      segment_result_to_numpy masks to 0xFF.  [cellseg_py.cpp]
+
+Tests:
+    - cellseg_tests.cpp: seg8 size matches input; bits 1/2/8 non-empty.
+
+--------------------------------------------------------------------------------
+ STAGE 16 -- Cell-id volume
+--------------------------------------------------------------------------------
+Objective:
+    Produce the int32 cell-id volume = the STAGE-8.5 cell INTERIORS EXTENDED
+    through the membranes ("labels" overlay). Start from the cell-interior label
+    of each voxel (NOT the raw ascending cut region), then attribute each
+    cleaned-membrane region to a cell: by maximum overlap with a non-background
+    cell interior if it overlaps one, else by shortest path over the ridge graph
+    to the nearest already-labeled maximum.
+
+Inputs:
+    the STAGE-8.5 cell-interior map (absorb_above_cut_minima), asc_labels,
+    descending labels, fluor, view.graph, cut_threshold.
+
+Outputs:
+    result.ids (LabelVolume; int32 to Python). Each voxel = its cell's rep
+    (deepest-min NodeId) + 1, so "labels" shares the "cell-interior" palette:
+    off-membrane it equals cell-interior exactly; membrane voxels are the
+    extension.
+
+Code hooks:
+    - run_segmentation:
+        * cell_of_min = absorb_above_cut_minima(...); cell_interior[voxel] = the
+          voxel's cell rep; background = the heaviest cell.
+        * ids[voxel] = cell_interior rep + 1 (background included).
+        * mem_overlap histogram (over cell interiors) -> cell_of_max seed (max
+          overlap with a non-background cell).
+        * multi-source Dijkstra (std::priority_queue, greater<>) over
+          max -> 2-saddle(>= cut) -> max, edge weight = value[next_max] -
+          value[2saddle]; non-overlapping membrane regions inherit the nearest
+          seed's cell.
+        * paint foreground voxels of each labeled max's descending manifold with
+          its cell rep + 1.
+      [segment.cpp, "Step 15"]
+    - Python: second element of CellPipeline.segment(...) -> int32 (d,h,w); the
+      app's "labels" overlay (background hidden) and "Save labels".
+
+Tests:
+    - cellseg_tests.cpp: id volume has >= 2 distinct labels.
+    - offline: on touching shells, labels == cell-interior on every off-membrane
+      voxel, and fills strictly more membrane voxels (the descending extension).
+
+
+================================================================================
+ 3. WHERE THE TESTS LIVE
+================================================================================
+
+  tests/core_smoke.cpp      (ctest: core_smoke)
+      Covers the Msc3D core path used by Phase A: build -> compute ->
+      select_persistence -> snapshot -> basin_labels, plus the two-phase
+      compute_base_decomposition / living_labels(&counts) invariants and
+      value_range(). No external data.
+
+  tests/cellseg_tests.cpp   (ctest: cellseg_tests)
+      End-to-end instance smoke: synthesizes hollow fluorescent shells (two
+      overlapping + one isolated), runs run_heavy_lift + a Phase-B segment(cut,
+      bg) in memory, and checks merge tree structure, seg8 bits 1/2/8, and
+      distinct cell ids. Path A uses the classic boundary rule and Path B the
+      ignore-boundary rule; the branch relabel makes the classic complex's living
+      minima fold to the ignore-boundary count.
+
+  python/examples/cellseg_app.py  (--selftest)
+      Builds the app layout headless, exercises the overlay modes (none /
+      bitfield / asc man / asc tree / cell-interior / labels) and their hover
+      tips, and the flat-tree icicle. "cell-interior" shows the STAGE-8.5 cell
+      interiors; "labels" shows them extended through the membranes (STAGE 16).
+
+Run all: ctest --preset windows-msvc  (build the wheel with
+-DMSSEG_BUILD_PYTHON=ON for the Python paths).

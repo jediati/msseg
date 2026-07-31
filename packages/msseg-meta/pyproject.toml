@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "msseg"
+version = "0.1.0"
+description = "MSSeg meta-distribution: installs the full Morse-Smale segmentation toolkit."
+requires-python = ">=3.9"
+# Umbrella: `pip install msseg` pulls every frontend. Each is independently
+# installable on its own; this is only for users who want everything.
+dependencies = [
+    "msseg-viz",
+    "msseg-mscoupon",
+    "msseg-cellseg",
+    "msseg-workflow",
+]
+
+[tool.hatch.build.targets.wheel]
+# Metadata-only distribution: no importable modules of its own.
+bypass-selection = true
