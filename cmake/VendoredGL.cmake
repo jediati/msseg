@@ -10,7 +10,9 @@
 set(_gl_root ${CMAKE_SOURCE_DIR}/ext/win64)
 
 if(EXISTS ${_gl_root}/freeglut/lib/freeglut.lib AND NOT TARGET freeglut::freeglut)
-  add_library(freeglut::freeglut SHARED IMPORTED)
+  # GLOBAL so the imported target is visible in apps/msviewer (a subdirectory)
+  # and to its POST_BUILD $<TARGET_FILE:...> generator expression.
+  add_library(freeglut::freeglut SHARED IMPORTED GLOBAL)
   set_target_properties(freeglut::freeglut PROPERTIES
     IMPORTED_IMPLIB   ${_gl_root}/freeglut/lib/freeglut.lib
     IMPORTED_LOCATION ${_gl_root}/freeglut/bin/freeglut.dll
@@ -18,7 +20,7 @@ if(EXISTS ${_gl_root}/freeglut/lib/freeglut.lib AND NOT TARGET freeglut::freeglu
 endif()
 
 if(EXISTS ${_gl_root}/glew/lib/glew32.lib AND NOT TARGET glew::glew)
-  add_library(glew::glew SHARED IMPORTED)
+  add_library(glew::glew SHARED IMPORTED GLOBAL)
   set_target_properties(glew::glew PROPERTIES
     IMPORTED_IMPLIB   ${_gl_root}/glew/lib/glew32.lib
     IMPORTED_LOCATION ${_gl_root}/glew/bin/glew32.dll

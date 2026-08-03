@@ -47,7 +47,7 @@ FetchContent_Declare(diffg
 )
 FetchContent_Declare(msceer
   GIT_REPOSITORY https://github.com/sci-visus/MSCEER.git
-  GIT_TAG a77e8642ccdf2de3c83fc0c19834cc1842b5777a   # portable GCC build: <cstring> + C++17 usage requirement
+  GIT_TAG 1b35c04210bafb53834c59f6481b4dc3a2dd47ee   # sci-visus/MSCEER master
 )
 FetchContent_Declare(tinytiff
   GIT_REPOSITORY https://github.com/jkriege2/TinyTIFF.git
