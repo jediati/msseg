@@ -34,6 +34,9 @@ ext/win64/**/*.lib
 # reproducible artifacts, not source.
 cellseg_merge_tree.png
 cellseg_slice.png
+# mscoupon run outputs (CLI timing report + the analysis Bokeh viewer).
+timing_report.json
+coupon_viewer.html
 
 # --- Editor / OS ---------------------------------------------------------
 .DS_Store
