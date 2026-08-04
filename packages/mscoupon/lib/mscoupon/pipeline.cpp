@@ -4,10 +4,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <fstream>
+#include <iostream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
@@ -22,6 +25,7 @@
 #include "mscoupon/io.hpp"
 #include "mscoupon/matcher.hpp"
 #include "mscoupon/msc_stage.hpp"
+#include "mscoupon/query.hpp"
 #include "mscoupon/stats.hpp"
 
 namespace mscoupon {
@@ -101,6 +105,23 @@ double elapsed_ms(const Clock::time_point& start) {
 std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<SliceJob>& jobs,
                                       const std::chrono::steady_clock::time_point& process_start) {
   std::filesystem::create_directories(cfg.output.folder);
+
+  // Startup summary: the workflow parameters, so the log records how the run was
+  // configured relative to the data.
+  {
+    std::ostringstream oss;
+    oss << "[mscoupon] run: " << jobs.size() << " slices, filters=[";
+    for (std::size_t i = 0; i < cfg.filters.size(); ++i) {
+      oss << (i ? "," : "") << cfg.filters[i].operation;
+    }
+    oss << "] manifold=" << cfg.msc.manifold << " persistence=";
+    if (cfg.msc.persistence_absolute.has_value()) oss << *cfg.msc.persistence_absolute << "abs";
+    else if (cfg.msc.persistence_percent.has_value()) oss << *cfg.msc.persistence_percent << "%";
+    oss << " feature_filters=" << cfg.feature_filters.size()
+        << " assembly.connectivity=" << cfg.assembly.connectivity
+        << " matching=" << (cfg.matching.enabled ? "on" : "off") << "\n";
+    std::cerr << oss.str();
+  }
 
   const int hw_threads = static_cast<int>(std::thread::hardware_concurrency());
   const int total_threads = cfg.execution.total_threads > 0 ? cfg.execution.total_threads : std::max(2, hw_threads);
@@ -196,11 +217,14 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
 #endif
 
           const auto filter_start = Clock::now();
-          Image2D filtered = apply_filter(loaded.original, cfg.filter);
+          Image2D filtered = apply_filter_chain(loaded.original, cfg.filters);
           loaded.timing.filter_ms = elapsed_ms(filter_start);
 
+          // Merge-tree authoritative segmentation (same engine the GUI drives),
+          // so an exported config reproduces the viewer's per-slice output.
           const auto msc_start = Clock::now();
-          std::vector<int> labels = compute_msc_labels(filtered, cfg.msc);
+          SliceSegmentation seg = segment_slice_pipeline(loaded.original, filtered, cfg.msc);
+          std::vector<int>& labels = seg.labels;
           loaded.timing.msc_ms = elapsed_ms(msc_start);
 
           const auto stats_start = Clock::now();
@@ -208,9 +232,41 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
           loaded.timing.stats_ms = elapsed_ms(stats_start);
 
           const auto select_start = Clock::now();
-          const auto keep_ids = select_segment_ids(table, cfg.segments);
+          std::unordered_set<int> keep_ids = select_segment_ids(table, cfg.segments);
+          // Intersect with the feature-query chain (evaluated on the per-feature
+          // base+filtered statistics), the single-source evaluator shared with
+          // the GUI.
+          if (!cfg.feature_filters.empty()) {
+            std::unordered_set<int> pass;
+            for (const auto& f : seg.features) {
+              if (row_passes(feature_row(f), cfg.feature_filters)) {
+                pass.insert(static_cast<int>(f.feature_id));
+              }
+            }
+            std::unordered_set<int> both;
+            for (const int id : keep_ids) {
+              if (pass.count(id)) both.insert(id);
+            }
+            keep_ids.swap(both);
+          }
           Mask2D mask = build_mask(labels, loaded.original.width, loaded.original.height, keep_ids);
           loaded.timing.select_ms = elapsed_ms(select_start);
+
+          // Per-slice stage log (MSCEER's own stdout above reports the MSC
+          // structure; this adds the pipeline-level summary). Built as one line
+          // so parallel compute lanes don't interleave mid-line.
+          {
+            float imin = std::numeric_limits<float>::max(), imax = std::numeric_limits<float>::lowest();
+            for (float v : loaded.original.pixels) { imin = std::min(imin, v); imax = std::max(imax, v); }
+            float fmin = std::numeric_limits<float>::max(), fmax = std::numeric_limits<float>::lowest();
+            for (float v : filtered.pixels) { fmin = std::min(fmin, v); fmax = std::max(fmax, v); }
+            std::ostringstream oss;
+            oss << "[mscoupon] slice " << loaded.job.slice_index << " ("
+                << loaded.job.input_path.filename().string() << "): image[" << imin << "," << imax
+                << "] filtered[" << fmin << "," << fmax << "] regions=" << seg.features.size()
+                << " kept=" << keep_ids.size() << "\n";
+            std::cerr << oss.str();
+          }
 
           loaded.timing.total_ms = elapsed_ms(loaded.total_start);
 

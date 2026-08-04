@@ -35,4 +35,16 @@ Image2D apply_filter(const Image2D& image, const FilterConfig& filter) {
   return from_diffg(msseg::apply_filter(to_diffg(image), params));
 }
 
+Image2D apply_filter_chain(const Image2D& image, const std::vector<FilterConfig>& filters) {
+  std::vector<msseg::FilterParams> chain;
+  chain.reserve(filters.size());
+  for (const auto& f : filters) {
+    msseg::FilterParams params;
+    params.operation = f.operation;
+    params.params = f.params;
+    chain.push_back(std::move(params));
+  }
+  return from_diffg(msseg::apply_filter_chain(to_diffg(image), chain));
+}
+
 }  // namespace mscoupon

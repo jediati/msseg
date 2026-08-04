@@ -4,13 +4,16 @@
 #include <cstddef>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "diffg/blur.hpp"
 #include "diffg/differentiator.hpp"
 #include "diffg/edges.hpp"
 #include "diffg/hessian.hpp"
 #include "diffg/image.hpp"
+#include "diffg/labeling.hpp"
 #include "diffg/laplacian.hpp"
+#include "diffg/morphology.hpp"
 #include "diffg/options.hpp"
 #include "diffg/structure.hpp"
 
@@ -115,7 +118,52 @@ diffg::Image<float> apply_filter(const diffg::Image<float>& input, const FilterP
     throw std::runtime_error("Invalid edges output mode: " + output);
   }
 
+  // Grayscale morphology (square structuring element of the given radius).
+  if (filter.operation == "erode") {
+    return diffg::erode(view, std::max(0, get_int(filter.params, "radius", 1)), exec);
+  }
+  if (filter.operation == "dilate") {
+    return diffg::dilate(view, std::max(0, get_int(filter.params, "radius", 1)), exec);
+  }
+  if (filter.operation == "open") {
+    return diffg::open(view, std::max(0, get_int(filter.params, "radius", 1)), exec);
+  }
+  if (filter.operation == "close") {
+    return diffg::close(view, std::max(0, get_int(filter.params, "radius", 1)), exec);
+  }
+
+  // Connected-component labeling: threshold the input into a foreground mask
+  // (value > `threshold`, default 0), label it (4-connected), and return the
+  // integer component ids widened to float (0 = background).
+  if (filter.operation == "label_components") {
+    const float threshold = static_cast<float>(get_double(filter.params, "threshold", 0.0));
+    diffg::Image<unsigned char> mask(input.dims());
+    for (std::size_t i = 0; i < input.size(); ++i) {
+      mask.data()[i] = input.data()[i] > threshold ? 1 : 0;
+    }
+    const auto labels = diffg::label_mask(mask.view(), exec);
+    diffg::Image<float> out(input.dims());
+    for (std::size_t i = 0; i < out.size(); ++i) {
+      out.data()[i] = static_cast<float>(labels.data()[i]);
+    }
+    return out;
+  }
+
   throw std::runtime_error("Unknown filter operation: " + filter.operation);
+}
+
+diffg::Image<float> apply_filter_chain(const diffg::Image<float>& input,
+                                       const std::vector<FilterParams>& filters) {
+  if (filters.empty()) {
+    return input;
+  }
+  // Apply the first stage against the caller's input, then thread each output
+  // into the next stage so we only keep one intermediate alive at a time.
+  diffg::Image<float> current = apply_filter(input, filters.front());
+  for (std::size_t i = 1; i < filters.size(); ++i) {
+    current = apply_filter(current, filters[i]);
+  }
+  return current;
 }
 
 }  // namespace msseg

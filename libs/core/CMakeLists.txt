@@ -14,6 +14,7 @@ add_library(msseg_core STATIC
   msseg/compute/msc2d.cpp
   msseg/compute/msc3d.cpp
   msseg/graph/graph_ops.cpp
+  msseg/graph/merge_tree.cpp
   msseg/segment/registry.cpp
   msseg/io/raw_io.cpp
   msseg/workflow/pipeline.cpp

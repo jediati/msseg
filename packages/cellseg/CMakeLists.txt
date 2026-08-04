@@ -32,7 +32,6 @@ add_msseg_instance(cellseg
   LIB_SOURCES
     lib/cellseg/config.cpp
     lib/cellseg/heavy_lift.cpp
-    lib/cellseg/merge_tree.cpp
     lib/cellseg/segment.cpp
     lib/cellseg/cell_pipeline.cpp
     lib/cellseg/cellseg_cli.cpp

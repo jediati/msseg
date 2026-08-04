@@ -7,11 +7,20 @@ name = "msseg-mscoupon"
 version = "0.1.0"
 description = "MSSeg mscoupon: 2D TIFF-slice Morse-Smale segmentation + coupon analysis CLI."
 requires-python = ">=3.9"
-# numpy is needed by the pybind API; the rest power the `mscoupon` analysis CLI.
-dependencies = ["numpy", "scipy", "pandas", "tifffile", "pillow", "bokeh"]
+# numpy is needed by the pybind API; the rest power the `mscoupon` analysis CLI
+# and the `mscoupon-gui` Tkinter viewer (matplotlib for the merge-tree icicle,
+# msseg-viz for the shared palette/icicle, large-image for pyramidal TIFF display).
+dependencies = [
+  "numpy", "scipy", "pandas", "tifffile", "pillow", "bokeh",
+  # large-image[tiff] gives the libtiff tiled/pyramidal source; [tifffile] adds a
+  # source that also reads plain (non-tiled) TIFF slices, so a typical sequence
+  # opens pyramidally too (otherwise the canvas falls back to in-memory display).
+  "matplotlib", "msseg-viz", "large-image[tiff,tifffile]",
+]
 
 [project.scripts]
 mscoupon = "msseg.mscoupon.analysis:main"
+mscoupon-gui = "msseg.mscoupon.app:main"
 
 [tool.scikit-build]
 # src-layout: ship msseg/mscoupon/ (namespace package, no msseg/__init__.py).

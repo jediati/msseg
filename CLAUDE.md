@@ -113,3 +113,21 @@ unchanged; two derived files are written at the end — `feature_map.csv`
 (`slice_index, segment_id → global_id`) and `global_segments.csv` (aggregated
 master table, sorted by voxel count descending). The per-slice size threshold
 still gates which features participate.
+
+**mscoupon interactive viewer** (`mscoupon-gui`, Tkinter — see
+[docs/mscoupon_gui.md](docs/mscoupon_gui.md)): browse TIFF sequences into
+subsequences, chain filters, set persistence + manifold, prime each subsequence,
+then live-drag a persistence slider and filter 3D features by statistics, and
+export a `config.json` the CLI reproduces. Backed by a **merge/statistics tree**
+in the portable core: `msseg::Msc2DPipeline` (`libs/core/msseg/compute/msc2d.cpp`)
+runs the MSC once and caches the base 2-manifold decomposition + a merge tree
+(`libs/core/msseg/graph/merge_tree.{hpp,cpp}`, promoted from cellseg, generalized
+asc/desc) + per-manifold statistics, so `select_persistence` re-thresholds cheaply.
+The merge tree is the **authoritative** segmentation for BOTH the GUI and the CLI
+(the batch pipeline uses `Msc2DPipeline` too), so an exported config reproduces
+the viewer output; it intentionally diverges from GInt's native cancellation above
+persistence 0 (branch decomposition vs pairwise cancel). Filter chain
+(`filters[]`, incl. diffg morphology `erode/dilate/open/close`) and the
+feature-query chain (`feature_filters[]`, evaluated by the single-source
+`mscoupon::row_passes`) are honored by the CLI; the GUI's on-the-fly 3D assembly
+(`src/msseg/mscoupon/assembly.py`) mirrors the matcher's connectivity.

@@ -33,6 +33,7 @@ void parse_input(const nlohmann::json& root, InputConfig& input) {
     input.count = in.at("count").get<std::size_t>();
   }
   set_if_present(in, "stride", input.stride);
+  set_if_present(in, "files", input.files);
 }
 
 void parse_output(const nlohmann::json& root, OutputConfig& output) {
@@ -43,15 +44,50 @@ void parse_output(const nlohmann::json& root, OutputConfig& output) {
   set_if_present(out, "overwrite", output.overwrite);
 }
 
-void parse_filter(const nlohmann::json& root, FilterConfig& filter) {
-  if (!root.contains("filter")) {
-    return;
-  }
-  const auto& f = root.at("filter");
+FilterConfig parse_one_filter(const nlohmann::json& f) {
+  FilterConfig filter;
   set_if_present(f, "operation", filter.operation);
   if (f.contains("params")) {
     filter.params = f.at("params");
   }
+  return filter;
+}
+
+// Populate the filter chain from a `filters` array when present, otherwise from
+// a singular legacy `filter` object. `cfg.filter` mirrors the first stage so the
+// pybind/legacy single-filter path keeps working.
+void parse_filters(const nlohmann::json& root, AppConfig& cfg) {
+  if (root.contains("filters") && root.at("filters").is_array()) {
+    for (const auto& f : root.at("filters")) {
+      cfg.filters.push_back(parse_one_filter(f));
+    }
+  } else if (root.contains("filter")) {
+    cfg.filters.push_back(parse_one_filter(root.at("filter")));
+  }
+  if (!cfg.filters.empty()) {
+    cfg.filter = cfg.filters.front();
+  }
+}
+
+void parse_feature_filters(const nlohmann::json& root, std::vector<FeatureQuery>& queries) {
+  if (!root.contains("feature_filters") || !root.at("feature_filters").is_array()) {
+    return;
+  }
+  for (const auto& q : root.at("feature_filters")) {
+    FeatureQuery fq;
+    set_if_present(q, "field", fq.field);
+    set_if_present(q, "op", fq.op);
+    set_if_present(q, "value", fq.value);
+    set_if_present(q, "value2", fq.value2);
+    queries.push_back(fq);
+  }
+}
+
+void parse_assembly(const nlohmann::json& root, AssemblyConfig& assembly) {
+  if (!root.contains("assembly")) {
+    return;
+  }
+  set_if_present(root.at("assembly"), "connectivity", assembly.connectivity);
 }
 
 void parse_msc(const nlohmann::json& root, MscConfig& msc) {
@@ -230,11 +266,13 @@ AppConfig load_config(const CliOptions& cli) {
   AppConfig cfg;
   parse_input(root, cfg.input);
   parse_output(root, cfg.output);
-  parse_filter(root, cfg.filter);
+  parse_filters(root, cfg);
   parse_msc(root, cfg.msc);
   parse_segments(root, cfg.segments);
+  parse_feature_filters(root, cfg.feature_filters);
   parse_execution(root, cfg.execution);
   parse_matching(root, cfg.matching);
+  parse_assembly(root, cfg.assembly);
   parse_timing(root, cfg.timing);
   parse_debug_output(root, cfg.debug_output);
 
@@ -270,6 +308,17 @@ void validate_config(const AppConfig& cfg) {
     if (cfg.matching.map_template.empty()) throw std::runtime_error("matching.map_template must not be empty when matching is enabled.");
     if (cfg.matching.global_table_template.empty()) {
       throw std::runtime_error("matching.global_table_template must not be empty when matching is enabled.");
+    }
+  }
+  if (cfg.assembly.connectivity != 6 && cfg.assembly.connectivity != 18 &&
+      cfg.assembly.connectivity != 26) {
+    throw std::runtime_error("assembly.connectivity must be 6, 18, or 26.");
+  }
+  for (const auto& q : cfg.feature_filters) {
+    if (q.field.empty()) throw std::runtime_error("feature_filters[].field must not be empty.");
+    if (q.op != "lt" && q.op != "le" && q.op != "gt" && q.op != "ge" &&
+        q.op != "eq" && q.op != "between") {
+      throw std::runtime_error("feature_filters[].op must be lt/le/gt/ge/eq/between (got '" + q.op + "').");
     }
   }
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <optional>
 #include <string>
 
@@ -26,6 +27,11 @@ struct Msc2DParams {
   // Partition/thread count for the discrete gradient and (in "partitioned"
   // mode) the parallel MSC/hierarchy build. 0 => leave the msc_2d_lib default.
   int requested_parallelism = 0;
+  // Per-arc-dimension geometry construction, passed through to the MSC compute.
+  // The core does not impose a policy here -- each instance decides (building arc
+  // geometry is costly, so it defaults off; turn on the dims a downstream
+  // approach actually consumes).
+  std::array<bool, 3> build_arc_geometry = {{false, false, false}};
 };
 
 }  // namespace msseg

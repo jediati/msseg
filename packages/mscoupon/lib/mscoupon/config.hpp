@@ -18,6 +18,10 @@ struct InputConfig {
   std::size_t start = 0;
   std::optional<std::size_t> count;
   std::size_t stride = 1;
+  // Optional explicit, ordered file list. When non-empty it takes precedence
+  // over folder scanning + match/start/stride (a GUI-exported subsequence is a
+  // concrete list). Paths may be absolute or relative to `folder`.
+  std::vector<std::string> files;
 };
 
 struct OutputConfig {
@@ -30,6 +34,18 @@ struct OutputConfig {
 struct FilterConfig {
   std::string operation = "none";
   nlohmann::json params = nlohmann::json::object();
+};
+
+// One predicate in the feature-selection query chain. Predicates are ANDed:
+// a feature is kept only if it satisfies every query. `field` names a per-feature
+// statistic (area, mean_base, mean_filtered, min_base, max_base, std_base,
+// bbox_w, bbox_h, ...); `op` is one of lt/le/gt/ge/eq/between. `value2` is only
+// used by `between` (kept iff value <= stat <= value2).
+struct FeatureQuery {
+  std::string field;
+  std::string op = "gt";
+  double value = 0.0;
+  double value2 = 0.0;
 };
 
 struct MscConfig {
@@ -76,6 +92,13 @@ struct MatchingConfig {
   std::string global_table_template = "global_segments.csv";
 };
 
+// 3D assembly of kept per-slice features into 3D features. `connectivity` is the
+// voxel neighborhood (6/18/26); the CLI matcher and the GUI's scipy labeling
+// share this value so they produce the same grouping.
+struct AssemblyConfig {
+  int connectivity = 26;
+};
+
 struct TimingConfig {
   bool write_json = true;
   bool write_csv = false;
@@ -92,11 +115,18 @@ struct DebugOutputConfig {
 struct AppConfig {
   InputConfig input;
   OutputConfig output;
-  FilterConfig filter;
+  // Ordered filter chain (applied output->input). Populated from a `filters`
+  // array, or from a singular legacy `filter` object as a one-element chain.
+  std::vector<FilterConfig> filters;
+  FilterConfig filter;  // legacy single-filter mirror (== filters.front()).
   MscConfig msc;
   SegmentKeepConfig segments;
+  // Feature-selection query chain (ANDed). Generalizes `segments`; empty means
+  // no query filtering beyond the legacy `segments` keep config.
+  std::vector<FeatureQuery> feature_filters;
   ExecutionConfig execution;
   MatchingConfig matching;
+  AssemblyConfig assembly;
   TimingConfig timing;
   DebugOutputConfig debug_output;
   bool dry_run = false;

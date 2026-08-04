@@ -43,11 +43,11 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(diffg
   GIT_REPOSITORY https://github.com/jediati/diffg.git
-  GIT_TAG e06a0eaf8e5cd3ff15fec518af8dd7dc1eaefaaf   # bump to a9503a0 for morphology/labeling
+  GIT_TAG a9503a0a204e6c7dd898469506ad4cab7c328242   # morphology + label_mask (4nn CC)
 )
 FetchContent_Declare(msceer
   GIT_REPOSITORY https://github.com/sci-visus/MSCEER.git
-  GIT_TAG 1b35c04210bafb53834c59f6481b4dc3a2dd47ee   # sci-visus/MSCEER master
+  GIT_TAG 0c1b90b5708988da56cc560f14edfd2bf3be6cc6   # msc_2d_lib respects buildArcGeometry flags
 )
 FetchContent_Declare(tinytiff
   GIT_REPOSITORY https://github.com/jkriege2/TinyTIFF.git

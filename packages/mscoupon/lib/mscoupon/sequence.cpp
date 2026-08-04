@@ -86,29 +86,47 @@ std::string render_template(const std::string& template_value, const std::filesy
 }  // namespace
 
 std::vector<SliceJob> build_sequence(const AppConfig& cfg) {
-  if (!std::filesystem::exists(cfg.input.folder)) {
-    throw std::runtime_error("Input folder does not exist: " + cfg.input.folder.string());
-  }
-
   std::vector<std::filesystem::path> candidates;
-  for (const auto& entry : std::filesystem::directory_iterator(cfg.input.folder)) {
-    if (!entry.is_regular_file()) continue;
-    const auto path = entry.path();
-    if (!extension_matches(path, cfg.input.extensions)) continue;
-    if (!name_matches(path.filename().string(), cfg.input)) continue;
-    candidates.push_back(path);
-  }
 
-  if (cfg.input.natural_sort) {
-    std::sort(candidates.begin(), candidates.end(), natural_less);
+  // An explicit `files` list is the authoritative, ordered selection (e.g. a
+  // GUI-exported subsequence): use it verbatim, skipping folder scan + match +
+  // natural sort + start/stride/count. Relative entries resolve against folder.
+  const bool explicit_files = !cfg.input.files.empty();
+  if (explicit_files) {
+    for (const auto& f : cfg.input.files) {
+      std::filesystem::path p(f);
+      if (p.is_relative()) p = cfg.input.folder / p;
+      if (!std::filesystem::exists(p)) {
+        throw std::runtime_error("Listed input file does not exist: " + p.string());
+      }
+      candidates.push_back(p);
+    }
   } else {
-    std::sort(candidates.begin(), candidates.end());
+    if (!std::filesystem::exists(cfg.input.folder)) {
+      throw std::runtime_error("Input folder does not exist: " + cfg.input.folder.string());
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(cfg.input.folder)) {
+      if (!entry.is_regular_file()) continue;
+      const auto path = entry.path();
+      if (!extension_matches(path, cfg.input.extensions)) continue;
+      if (!name_matches(path.filename().string(), cfg.input)) continue;
+      candidates.push_back(path);
+    }
+
+    if (cfg.input.natural_sort) {
+      std::sort(candidates.begin(), candidates.end(), natural_less);
+    } else {
+      std::sort(candidates.begin(), candidates.end());
+    }
   }
 
   std::vector<SliceJob> jobs;
-  const std::size_t stride = cfg.input.stride;
-  for (std::size_t i = cfg.input.start; i < candidates.size(); i += stride) {
-    if (cfg.input.count.has_value() && jobs.size() >= *cfg.input.count) break;
+  // Explicit lists consume every entry in order; scanned candidates honor
+  // start/stride/count.
+  const std::size_t start = explicit_files ? 0 : cfg.input.start;
+  const std::size_t stride = explicit_files ? 1 : cfg.input.stride;
+  for (std::size_t i = start; i < candidates.size(); i += stride) {
+    if (!explicit_files && cfg.input.count.has_value() && jobs.size() >= *cfg.input.count) break;
 
     const auto& input_path = candidates[i];
     const int slice_index = static_cast<int>(jobs.size());
