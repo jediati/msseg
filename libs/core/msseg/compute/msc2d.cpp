@@ -1,8 +1,11 @@
 #include "msseg/compute/msc2d.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
@@ -10,7 +13,6 @@
 
 #include "msc_2d_lib.h"
 
-#include "msseg/graph/merge_tree.hpp"
 #include "msseg/graph/msc_graph.hpp"
 
 namespace msseg {
@@ -45,6 +47,27 @@ void compute_with_algorithm(MscType& msc, const float* pixels, int rows, int col
     } else {
       options.builderMode = MscType::BuilderMode::Serial;
     }
+    // Cap the cancellation hierarchy so native re-thresholding (setPersistence +
+    // ascending/descending2Manifolds) spans the selectable persistence range. We
+    // EXTEND the cap to the configured max persistence but never below MSCEER's
+    // default 10%-of-range floor -- the floor keeps the base complex at its default
+    // (basePersistence = min(1%, cancel) stays 1%), so a Msc2DPipeline built to a
+    // high cap and a one-shot compute_msc2d_labels agree at every persistence.
+    float lo = std::numeric_limits<float>::max();
+    float hi = std::numeric_limits<float>::lowest();
+    const std::size_t n = static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
+    for (std::size_t i = 0; i < n; ++i) {
+      lo = std::min(lo, pixels[i]);
+      hi = std::max(hi, pixels[i]);
+    }
+    const float range = hi - lo;
+    float cap = 0.1f * range;  // MSCEER default floor
+    if (cfg.persistence_absolute.has_value()) {
+      cap = std::max(cap, *cfg.persistence_absolute);
+    } else if (cfg.persistence_percent.has_value()) {
+      cap = std::max(cap, range * (*cfg.persistence_percent / 100.0f));
+    }
+    options.cancelPersistenceAbs = cap;
     msc.compute(pixels, rows, cols, options);
   } else {
     if (cfg.compute_algorithm == "partitioned") {
@@ -103,6 +126,9 @@ std::vector<int> compute_msc2d_labels(const diffg::Image<float>& filtered, const
 // --------------------------------------------------------------------------- //
 namespace {
 
+// Merge two manifold statistics. The extremum fields (ext_*) are deliberately
+// NOT merged here: a living feature inherits the surviving critical point, which
+// select_persistence() stamps from the surviving base manifold afterwards.
 void accumulate(Msc2DFeatureStat& dst, const Msc2DFeatureStat& src) {
   if (src.area == 0) return;
   if (dst.area == 0) {
@@ -126,6 +152,28 @@ void accumulate(Msc2DFeatureStat& dst, const Msc2DFeatureStat& src) {
   dst.max_y = std::max(dst.max_y, src.max_y);
 }
 
+// Sample the base channel around (px, py). `radius <= 0` reads the single pixel;
+// otherwise the mean over the (2*radius+1)^2 window, clamped at the border.
+float sample_base(const diffg::Image<float>& base, int width, int height, int px, int py,
+                  int radius) {
+  px = std::clamp(px, 0, width - 1);
+  py = std::clamp(py, 0, height - 1);
+  const auto at = [&](int x, int y) {
+    return base.data()[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+                       static_cast<std::size_t>(x)];
+  };
+  if (radius <= 0) return at(px, py);
+  double sum = 0.0;
+  int n = 0;
+  for (int y = std::max(0, py - radius); y <= std::min(height - 1, py + radius); ++y) {
+    for (int x = std::max(0, px - radius); x <= std::min(width - 1, px + radius); ++x) {
+      sum += at(x, y);
+      ++n;
+    }
+  }
+  return n > 0 ? static_cast<float>(sum / n) : at(px, py);
+}
+
 }  // namespace
 
 struct Msc2DPipeline::Impl {
@@ -134,13 +182,20 @@ struct Msc2DPipeline::Impl {
   float value_range = 0.0f;
   bool ascending = true;
   float current_persistence = 0.0f;
+  // Which statistics build() was asked for -- consumers need it to know which
+  // fields in leaf_stats/features are meaningful.
+  StatsSpec stats;
 
-  MscGraph graph;
-  MergeTree tree;
-  // Per-base-extremum leaf statistics, indexed by compact NodeId (entries at
-  // non-extremum node ids stay area==0 and are ignored).
+  // The MSC engine is kept alive so persistence re-thresholding uses MSCEER's
+  // NATIVE cancellation hierarchy (setPersistence + ascending/descending2Manifolds),
+  // not an external merge tree. Adjacent-basin cancellation keeps every living
+  // feature spatially connected.
+  GInt::Msc2D::Msc2D msc;
+  // Native base-extremum node id -> dense 0..M-1 compact id.
+  std::unordered_map<int, int> nid_to_compact;
+  // Per-base-manifold leaf statistics, indexed by compact base id.
   std::vector<Msc2DFeatureStat> leaf_stats;
-  // Compact extremum NodeId per pixel (row-major), -1 where unlabeled.
+  // Compact base-extremum id per pixel (row-major), -1 where unlabeled.
   std::vector<int> base_labels;
 
   // Derived at the current persistence:
@@ -163,7 +218,6 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
     throw std::runtime_error("Msc2DPipeline: base and filtered images must share dimensions.");
   }
   const bool ascending = (cfg.manifold != "descending");
-  const int extremum_dim = ascending ? 0 : 2;
 
   impl_->width = width;
   impl_->height = height;
@@ -178,105 +232,129 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
   }
   impl_->value_range = max_v - min_v;
 
-  // Heavy: compute the MSC once, then view it at persistence -1 (all living) so
-  // criticalPoints/arcGeometry/2-manifolds give the finest base complex.
-  GInt::Msc2D::Msc2D msc;
-  compute_with_algorithm(msc, filtered.data(), height, width, cfg);
-  msc.setPersistence(-1.0f);
+  // Heavy: compute the MSC hierarchy once and keep the engine (impl_->msc) alive
+  // for cheap native re-thresholding. compute_with_algorithm caps the cancellation
+  // hierarchy at the configured max persistence so setPersistence() spans the range.
+  compute_with_algorithm(impl_->msc, filtered.data(), height, width, cfg);
 
-  const std::vector<GInt::Msc2D::CriticalPoint> cps = msc.criticalPoints();
-  const std::vector<GInt::Msc2D::ArcGeometry> arcs = msc.arcGeometry();
+  // Base (finest) manifold labeling: at persistence -1 the native base->living
+  // remap is the identity, so each labeled pixel carries its BASE extremum node id.
+  impl_->msc.setPersistence(-1.0f);
   const GInt::Msc2D::LabelImage base_img =
-      ascending ? msc.ascending2Manifolds() : msc.descending2Manifolds();
+      ascending ? impl_->msc.ascending2Manifolds() : impl_->msc.descending2Manifolds();
 
-  // Compact NodeId space over all critical points, in criticalPoints() order.
-  std::unordered_map<int, NodeId> raw_to_compact;
-  raw_to_compact.reserve(cps.size() * 2);
-  MscGraph& graph = impl_->graph;
-  graph.nodes.clear();
-  graph.arcs.clear();
-  graph.adjacency.clear();
-  graph.nodes.reserve(cps.size());
-  for (const auto& cp : cps) {
-    const NodeId cid = static_cast<NodeId>(graph.nodes.size());
-    raw_to_compact[cp.id] = cid;
-    MscNode n;
-    n.id = cid;
-    n.cell_index = cp.id;   // stash the raw msc_2d_lib node id
-    n.index_dim = cp.dim;
-    n.value = cp.value;
-    n.pos = {cp.x, cp.y, 0.0f};
-    graph.nodes.push_back(n);
-  }
-  graph.adjacency.assign(graph.nodes.size(), {});
-  graph.arcs.reserve(arcs.size());
-  for (const auto& ag : arcs) {
-    const auto lo = raw_to_compact.find(ag.lowerNodeId);
-    const auto hi = raw_to_compact.find(ag.upperNodeId);
-    if (lo == raw_to_compact.end() || hi == raw_to_compact.end()) continue;
-    MscArc a;
-    a.id = static_cast<NodeId>(graph.arcs.size());
-    a.lower = lo->second;
-    a.upper = hi->second;
-    a.index_dim = ag.dim;
-    graph.adjacency[static_cast<std::size_t>(a.lower)].push_back(a.id);
-    graph.adjacency[static_cast<std::size_t>(a.upper)].push_back(a.id);
-    graph.arcs.push_back(std::move(a));
-  }
-
-  // Base labels: remap raw extremum node ids -> compact ids.
+  // Compact the sparse base extremum node ids to a dense 0..M-1 id space, and
+  // stamp the compact base id per pixel.
+  impl_->nid_to_compact.clear();
   impl_->base_labels.assign(static_cast<std::size_t>(width) * static_cast<std::size_t>(height), -1);
   const std::size_t npix = impl_->base_labels.size();
   for (std::size_t i = 0; i < npix && i < base_img.labels.size(); ++i) {
-    const int raw = base_img.labels[i];
-    if (raw < 0) continue;
-    const auto it = raw_to_compact.find(raw);
-    if (it != raw_to_compact.end()) impl_->base_labels[i] = static_cast<int>(it->second);
+    const int nid = base_img.labels[i];
+    if (nid < 0) continue;
+    auto it = impl_->nid_to_compact.find(nid);
+    int compact;
+    if (it == impl_->nid_to_compact.end()) {
+      compact = static_cast<int>(impl_->nid_to_compact.size());
+      impl_->nid_to_compact.emplace(nid, compact);
+    } else {
+      compact = it->second;
+    }
+    impl_->base_labels[i] = compact;
   }
+  const std::size_t num_base = impl_->nid_to_compact.size();
 
-  // Per-base-extremum leaf statistics (one pass over pixels, both images).
+  // Per-base-manifold leaf statistics (one pass over pixels, both images),
+  // indexed by compact base id. These are aggregated up to living features on
+  // each select_persistence() -- the base constituents are what we precompute.
+  const StatsSpec& spec = cfg.stats;
+  impl_->stats = spec;
+  const bool want_base_sums = spec.base_channel && (spec.mean || spec.std);
+  const bool want_filt_sums = spec.filtered_channel && (spec.mean || spec.std);
+  const bool want_filt_extent = spec.needs_filtered_extent();
+
   std::vector<Msc2DFeatureStat>& leaf = impl_->leaf_stats;
-  leaf.assign(graph.nodes.size(), Msc2DFeatureStat{});
-  for (std::size_t c = 0; c < leaf.size(); ++c) {
+  leaf.assign(num_base, Msc2DFeatureStat{});
+  for (std::size_t c = 0; c < num_base; ++c) {
     leaf[c].feature_id = static_cast<NodeId>(c);
     leaf[c].base_min = std::numeric_limits<float>::max();
     leaf[c].base_max = std::numeric_limits<float>::lowest();
-    leaf[c].filt_min = std::numeric_limits<float>::max();
-    leaf[c].filt_max = std::numeric_limits<float>::lowest();
+    // Only sentinel the filtered extent when it is actually going to be filled;
+    // otherwise a min/max sentinel would survive into merges and CSVs as a
+    // 3.4e38 rather than an obvious zero.
+    if (want_filt_extent) {
+      leaf[c].filt_min = std::numeric_limits<float>::max();
+      leaf[c].filt_max = std::numeric_limits<float>::lowest();
+    }
     leaf[c].min_x = width;
     leaf[c].min_y = height;
     leaf[c].max_x = -1;
     leaf[c].max_y = -1;
   }
+  // Pixel attaining the seeding extremum per base manifold. Only the side the
+  // manifold direction actually seeds from is tracked -- the other was always
+  // allocated and never read.
+  std::vector<std::size_t> arg_ext(num_base, 0);
   for (std::size_t i = 0; i < npix; ++i) {
     const int c = impl_->base_labels[i];
     if (c < 0) continue;
     Msc2DFeatureStat& s = leaf[static_cast<std::size_t>(c)];
     const float b = base.data()[i];
-    const float f = filtered.data()[i];
     const int x = static_cast<int>(i % static_cast<std::size_t>(width));
     const int y = static_cast<int>(i / static_cast<std::size_t>(width));
     s.area += 1;
-    s.base_sum += b;
-    s.base_sumsq += static_cast<double>(b) * b;
+    if (want_base_sums) {
+      s.base_sum += b;
+      s.base_sumsq += static_cast<double>(b) * b;
+    }
     s.base_min = std::min(s.base_min, b);
     s.base_max = std::max(s.base_max, b);
-    s.filt_sum += f;
-    s.filt_sumsq += static_cast<double>(f) * f;
-    s.filt_min = std::min(s.filt_min, f);
-    s.filt_max = std::max(s.filt_max, f);
+    if (want_filt_sums || want_filt_extent) {
+      const float f = filtered.data()[i];
+      if (want_filt_sums) {
+        s.filt_sum += f;
+        s.filt_sumsq += static_cast<double>(f) * f;
+      }
+      if (want_filt_extent) {
+        if (ascending) {
+          if (f < s.filt_min) { s.filt_min = f; arg_ext[static_cast<std::size_t>(c)] = i; }
+          s.filt_max = std::max(s.filt_max, f);
+        } else {
+          if (f > s.filt_max) { s.filt_max = f; arg_ext[static_cast<std::size_t>(c)] = i; }
+          s.filt_min = std::min(s.filt_min, f);
+        }
+      }
+    }
     s.min_x = std::min(s.min_x, x);
     s.min_y = std::min(s.min_y, y);
     s.max_x = std::max(s.max_x, x);
     s.max_y = std::max(s.max_y, y);
   }
 
-  // Merge tree over the base complex, with per-extremum voxel counts.
-  std::vector<std::int64_t> counts(graph.nodes.size(), 0);
-  for (std::size_t c = 0; c < leaf.size(); ++c) counts[c] = leaf[c].area;
-  impl_->tree = build_merge_tree(graph, counts, ascending, extremum_dim, /*saddle_dim=*/1);
+  // Seeding extremum per base manifold. A base ascending 2-manifold is the basin
+  // of exactly one minimum, and every other vertex in the basin flows down to it,
+  // so the pixel attaining filt_min IS that minimum -- and symmetrically filt_max
+  // for a descending manifold's maximum. Deriving it from the labeling rather
+  // than from MSCEER's criticalPoints() keeps this independent of node-id
+  // semantics (which differ between the serial and partitioned builders) and
+  // always yields a real pixel of the manifold: a maximum is a 2-cell, so its
+  // native position is a half-pixel whose value need not even be attained inside
+  // the manifold.
+  const int ext_radius = spec.extremum_sample_radius > 0 ? spec.extremum_sample_radius
+                                                         : cfg.extremum_sample_radius;
+  if (spec.extremum) {
+    for (std::size_t c = 0; c < num_base; ++c) {
+      if (leaf[c].area == 0) continue;
+      const std::size_t i = arg_ext[c];
+      const int x = static_cast<int>(i % static_cast<std::size_t>(width));
+      const int y = static_cast<int>(i / static_cast<std::size_t>(width));
+      leaf[c].ext_x = static_cast<float>(x);
+      leaf[c].ext_y = static_cast<float>(y);
+      leaf[c].ext_filtered = ascending ? leaf[c].filt_min : leaf[c].filt_max;
+      leaf[c].ext_base = sample_base(base, width, height, x, y, ext_radius);
+    }
+  }
 
-  // Initial persistence from cfg.
+  // Initial persistence from cfg (native cancellation).
   float persistence = 0.0f;
   if (cfg.persistence_absolute.has_value()) {
     persistence = *cfg.persistence_absolute;
@@ -293,39 +371,79 @@ float Msc2DPipeline::current_persistence() const { return impl_->current_persist
 
 void Msc2DPipeline::select_persistence(float persistence_absolute) {
   impl_->current_persistence = persistence_absolute;
-  const float inf = std::numeric_limits<float>::infinity();
-  // Persistence-only cut: no value barrier (ascending -> -inf, descending -> +inf).
-  const float cut = impl_->ascending ? -inf : inf;
-  const std::unordered_map<NodeId, NodeId> survivors =
-      branch_survivors(impl_->tree, cut, persistence_absolute);
+  // Phase timing, opt-in via MSSEG_TIME_MSC=1. Re-thresholding is the
+  // interactive path's dominant cost, so it needs to be attributable.
+  const bool time_phases = std::getenv("MSSEG_TIME_MSC") != nullptr;
+  const auto t_start = std::chrono::steady_clock::now();
+  auto lap = [&](const char* what, std::chrono::steady_clock::time_point& from) {
+    if (!time_phases) return;
+    const auto now = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "  [msc2d] %-10s %6.1f ms\n", what,
+                 std::chrono::duration<double, std::milli>(now - from).count());
+    from = now;
+  };
+  auto mark = t_start;
 
-  // Remap base labels (compact extremum id) -> surviving feature id.
-  impl_->labels.assign(impl_->base_labels.size(), -1);
-  std::unordered_map<NodeId, Msc2DFeatureStat> agg;
-  for (std::size_t i = 0; i < impl_->base_labels.size(); ++i) {
-    const int c = impl_->base_labels[i];
-    if (c < 0) continue;
-    const auto it = survivors.find(static_cast<NodeId>(c));
-    const NodeId sv = (it != survivors.end()) ? it->second : static_cast<NodeId>(c);
-    impl_->labels[i] = static_cast<int>(sv);
+  // Native cancellation: set the living value, then read the surviving-extremum
+  // labels. ascending/descending2Manifolds() remaps each base minimum to its
+  // living representative via the cancellation hierarchy (cheap -- no gradient or
+  // base-manifold recompute). Adjacent-basin merges keep features CONNECTED.
+  impl_->msc.setPersistence(persistence_absolute);
+  const GInt::Msc2D::LabelImage living_img =
+      impl_->ascending ? impl_->msc.ascending2Manifolds() : impl_->msc.descending2Manifolds();
+  lap("msceer", mark);
+
+  const std::size_t npix = impl_->base_labels.size();
+  impl_->labels.assign(npix, -1);
+  for (std::size_t i = 0; i < npix && i < living_img.labels.size(); ++i) {
+    const int nid = living_img.labels[i];
+    if (nid < 0) continue;
+    const auto it = impl_->nid_to_compact.find(nid);
+    if (it != impl_->nid_to_compact.end()) impl_->labels[i] = it->second;
   }
-  // Aggregate leaf statistics up to the surviving features.
-  for (const auto& node : impl_->tree.nodes) {
-    if (!node.is_leaf) continue;
-    const NodeId ext = node.msc_node;
-    const auto it = survivors.find(ext);
-    const NodeId sv = (it != survivors.end()) ? it->second : ext;
-    Msc2DFeatureStat& dst = agg[sv];
-    dst.feature_id = sv;
-    accumulate(dst, impl_->leaf_stats[static_cast<std::size_t>(ext)]);
+  lap("relabel", mark);
+
+  // Aggregate the precomputed per-base leaf stats up to the living features. Every
+  // pixel of a base manifold maps to the same living representative, so a pixelwise
+  // base->living map is exact; roll up leaf_stats via accumulate().
+  std::unordered_map<int, int> base_to_living;
+  base_to_living.reserve(impl_->leaf_stats.size() * 2);
+  for (std::size_t i = 0; i < npix; ++i) {
+    const int b = impl_->base_labels[i];
+    const int L = impl_->labels[i];
+    if (b >= 0 && L >= 0) base_to_living.emplace(b, L);   // consistent per base manifold
+  }
+  lap("base_map", mark);
+  std::unordered_map<int, Msc2DFeatureStat> agg;
+  for (int b = 0; b < static_cast<int>(impl_->leaf_stats.size()); ++b) {
+    if (impl_->leaf_stats[static_cast<std::size_t>(b)].area == 0) continue;
+    const auto it = base_to_living.find(b);
+    if (it == base_to_living.end()) continue;
+    Msc2DFeatureStat& dst = agg[it->second];
+    dst.feature_id = static_cast<NodeId>(it->second);
+    accumulate(dst, impl_->leaf_stats[static_cast<std::size_t>(b)]);
   }
   impl_->features.clear();
   impl_->features.reserve(agg.size());
-  for (auto& [id, s] : agg) impl_->features.push_back(s);
+  for (auto& [id, s] : agg) {
+    // A merged feature keeps the SURVIVING extremum, and the living compact id
+    // is exactly that surviving extremum's own base-manifold id -- so the seed
+    // is a direct lookup, not an accumulation.
+    if (id >= 0 && id < static_cast<int>(impl_->leaf_stats.size())) {
+      const Msc2DFeatureStat& seed = impl_->leaf_stats[static_cast<std::size_t>(id)];
+      s.ext_x = seed.ext_x;
+      s.ext_y = seed.ext_y;
+      s.ext_base = seed.ext_base;
+      s.ext_filtered = seed.ext_filtered;
+    }
+    impl_->features.push_back(s);
+  }
+  lap("rollup", mark);
 }
 
 const std::vector<int>& Msc2DPipeline::labels() const { return impl_->labels; }
 std::vector<Msc2DFeatureStat> Msc2DPipeline::feature_stats() const { return impl_->features; }
-std::string Msc2DPipeline::merge_tree_json() const { return merge_tree_to_json(impl_->tree); }
+
+const StatsSpec& Msc2DPipeline::stats() const { return impl_->stats; }
 
 }  // namespace msseg

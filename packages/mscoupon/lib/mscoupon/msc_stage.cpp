@@ -15,8 +15,9 @@ namespace {
 // leave all arc-geometry dims OFF (it is the dominant per-slice cost). If a later
 // approach needs, e.g., the ascending 1-saddle arc geometry (should the filters
 // lack the needed sensitivity/specificity), enable that dim here.
-msseg::Msc2DParams to_msc_params(const MscConfig& cfg) {
+msseg::Msc2DParams to_msc_params(const MscConfig& cfg, const msseg::StatsSpec& stats) {
   msseg::Msc2DParams params;
+  params.stats = stats;
   params.persistence_absolute = cfg.persistence_absolute;
   params.persistence_percent = cfg.persistence_percent;
   params.compute_algorithm = cfg.compute_algorithm;
@@ -24,6 +25,7 @@ msseg::Msc2DParams to_msc_params(const MscConfig& cfg) {
   params.accurate_descending = cfg.accurate_descending;
   params.manifold = cfg.manifold;
   params.requested_parallelism = cfg.requested_parallelism;
+  params.extremum_sample_radius = cfg.extremum_sample_radius;
   params.build_arc_geometry = {{false, false, false}};
   return params;
 }
@@ -37,11 +39,13 @@ std::vector<int> compute_msc_labels(const Image2D& filtered_image, const MscConf
       static_cast<std::size_t>(filtered_image.width), static_cast<std::size_t>(filtered_image.height), 1});
   std::copy(filtered_image.pixels.begin(), filtered_image.pixels.end(), filtered.data());
 
-  return msseg::compute_msc2d_labels(filtered, to_msc_params(cfg));
+  // Labels only -- this one-shot path never builds per-feature statistics, so the
+  // spec is irrelevant here.
+  return msseg::compute_msc2d_labels(filtered, to_msc_params(cfg, msseg::StatsSpec{}));
 }
 
 SliceSegmentation segment_slice_pipeline(const Image2D& original, const Image2D& filtered,
-                                         const MscConfig& cfg) {
+                                         const MscConfig& cfg, const msseg::StatsSpec& stats) {
   const auto to_diffg = [](const Image2D& img) {
     diffg::Image<float> out(diffg::Dimensions{
         static_cast<std::size_t>(img.width), static_cast<std::size_t>(img.height), 1});
@@ -50,7 +54,7 @@ SliceSegmentation segment_slice_pipeline(const Image2D& original, const Image2D&
   };
 
   msseg::Msc2DPipeline pipe;
-  pipe.build(to_diffg(original), to_diffg(filtered), to_msc_params(cfg));
+  pipe.build(to_diffg(original), to_diffg(filtered), to_msc_params(cfg, stats));
 
   SliceSegmentation seg;
   seg.labels = pipe.labels();

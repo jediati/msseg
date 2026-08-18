@@ -114,20 +114,113 @@ unchanged; two derived files are written at the end — `feature_map.csv`
 master table, sorted by voxel count descending). The per-slice size threshold
 still gates which features participate.
 
+**mscoupon 2-point normalization** (`base_filters[]`, off by default): a coupon
+stack's absolute intensity drifts slice to slice, so a raw threshold that is
+right at the start of a scan is wrong by the end. Two landmarks per slice — low
+(air/void) and high (metal/solid) — let a threshold be written once as a
+normalized number: **`0.7` means `0.3*low + 0.7*high`**, resolved per slice.
+Three measures produce the landmarks, all in portable C++ with pybind wrappers
+(`fit_gmm` / `measure_histogram` / `measure_regions`): a 2-component Gaussian
+mixture (`lib/mscoupon/gmm.cpp`), histogram peak finding (`histogram_peaks.cpp`),
+and two hand-picked rectangles (`region_measure.cpp`). **`omit_value`** governs
+the no-data mask everywhere: the sentinel to drop, defaulting to **0** (and to
+**none** for regions, whose rectangles are chosen physical areas), with `null`
+meaning "keep every pixel". It is a *value* rather than a flag because a stack
+may pad with any constant -- one set pads with 43 -- and dropping the wrong value
+leaves that plateau in the fit as a spurious population. The older boolean
+`omit_zeros` is still honoured (true -> 0, false -> none); an explicit
+`omit_value` wins. Comparison happens in the raster's own dtype, so a float32
+image is matched against the sentinel rounded the way it was stored.
+
+Normalization is modelled as a **filter stage on a channel**, not as a transform
+on each threshold: `base_filters` preprocesses the base channel (the raster
+statistics and pixel filters are read from) while `filters` builds the topology
+field, both derived from the raw slice. Rewriting the channel once means every
+downstream statistic is already normalized — so `std` scales correctly without a
+per-field location/spread table, and per-slice sums merge correctly into 3D
+features with no change to `matcher.cpp`. The map is affine and order-preserving,
+so the MSC is provably unchanged (`test_normalize_preserves_msc_labels`), and no
+pixel *value* is a sentinel anywhere (background is label `-1`), so shifting
+zeros off zero is safe. `persistence_percent` is invariant under the map and
+keeps its meaning. An empty `base_filters` reproduces the previous output
+byte-for-byte. Python-side library: `src/msseg/mscoupon/normalize/` (the single
+home for the mask/subsample/trim/percentile/peak helpers the ~13 one-off
+`measure_*`/`calculate_*`/`plot_*` scripts used to each carry a copy of);
+scikit-learn is now only a **test** dependency (`tests/gmm_parity.py`).
+
 **mscoupon interactive viewer** (`mscoupon-gui`, Tkinter — see
 [docs/mscoupon_gui.md](docs/mscoupon_gui.md)): browse TIFF sequences into
 subsequences, chain filters, set persistence + manifold, prime each subsequence,
 then live-drag a persistence slider and filter 3D features by statistics, and
-export a `config.json` the CLI reproduces. Backed by a **merge/statistics tree**
-in the portable core: `msseg::Msc2DPipeline` (`libs/core/msseg/compute/msc2d.cpp`)
-runs the MSC once and caches the base 2-manifold decomposition + a merge tree
-(`libs/core/msseg/graph/merge_tree.{hpp,cpp}`, promoted from cellseg, generalized
-asc/desc) + per-manifold statistics, so `select_persistence` re-thresholds cheaply.
-The merge tree is the **authoritative** segmentation for BOTH the GUI and the CLI
-(the batch pipeline uses `Msc2DPipeline` too), so an exported config reproduces
-the viewer output; it intentionally diverges from GInt's native cancellation above
-persistence 0 (branch decomposition vs pairwise cancel). Filter chain
-(`filters[]`, incl. diffg morphology `erode/dilate/open/close`) and the
-feature-query chain (`feature_filters[]`, evaluated by the single-source
-`mscoupon::row_passes`) are honored by the CLI; the GUI's on-the-fly 3D assembly
+export a `config.json` the CLI reproduces. Backed by a **two-phase statistics
+pipeline** in the portable core: `msseg::Msc2DPipeline`
+(`libs/core/msseg/compute/msc2d.cpp`) runs the MSC once, keeps the MSCEER engine
+alive, and caches the base 2-manifold decomposition + per-manifold statistics, so
+`select_persistence` re-thresholds cheaply via MSCEER's **native** cancellation
+hierarchy (`setPersistence` + `ascending/descending2Manifolds` remap each base
+extremum to its living representative — adjacent-basin merges, so every living
+feature stays connected). It is the **authoritative** segmentation for BOTH the
+GUI and the CLI (the batch pipeline uses `Msc2DPipeline` too), so an exported
+config reproduces the viewer output. Filter chain (`filters[]`, incl. diffg
+morphology `erode/dilate/open/close`) and the feature-query chain
+(`feature_filters[]`, evaluated by the single-source `mscoupon::row_passes`) are
+honored by the CLI; the GUI's on-the-fly 3D assembly
 (`src/msseg/mscoupon/assembly.py`) mirrors the matcher's connectivity.
+
+**mscoupon extremum statistics** (`ext_x`, `ext_y`, `ext_base`, `ext_filtered`):
+the per-slice selection chain can also ask about a region's **seeding critical
+point** — the minimum for ascending manifolds, the maximum for descending — not
+just aggregates over its basin. This separates a real void (whose well bottom is
+genuinely dark) from a shallow dip inside metal with a similar `mean_base`. A base
+manifold is one extremum's basin and every other pixel flows to it, so the seed is
+just the pixel attaining `filt_min` (asc) / `filt_max` (dsc) — derived from the
+labeling rather than `criticalPoints()`, which keeps it free of MSCEER node-id
+semantics (serial vs partitioned) and always lands on a real pixel (a maximum is a
+2-cell, so its native position is a half-pixel). A merged feature inherits the
+**surviving** extremum, a direct `leaf_stats[living_id]` lookup rather than an
+accumulation — which is why `ext_filtered` can sit above the merged region's
+`min_filtered`: persistence, not depth, decides which minimum survives. `ext_base`
+samples the BASE channel (i.e. post-`base_filters`, so it reads in normalized
+units) at that pixel; `msc.extremum_sample_radius` (default 0) switches it to the
+mean over the `(2r+1)²` window. The fields are queryable, offered in the GUI
+dropdown, and appended to `{stem}_segments.csv`. `feature_filters[].field` is now
+validated against the `feature_row` schema (`mscoupon::is_feature_field`) —
+previously a typo silently excluded every feature.
+
+**mscoupon statistics are a spec, not a fixed list** (`statistics` config block,
+`msseg::StatsSpec`). The per-feature row is rebuilt on every persistence change
+and marshalled across pybind, so field count drives GUI slider latency — what a
+workflow does not ask for is not accumulated and does not become a field:
+
+```jsonc
+"statistics": {
+  "channels": ["base"],                     // "filtered" opts its aggregates back in
+  "reductions": ["mean", "min", "max", "std"],
+  "extremum": true, "extremum_sample_radius": 0,
+  "per_slice": { "quantities": ["area", "bbox_w", "bbox_h"],
+                 "reductions": ["mean", "min", "max", "std"] }
+}
+```
+
+Omitting it gives base-only aggregates plus the extremum. The **filtered
+aggregates now default OFF** — `mean/min/max/std_filtered` had no reader anywhere
+in the tree, and a config still naming one fails validation with the available
+names listed (leaf `filt_min`/`filt_max` are still computed regardless: they
+*define* the seeding extremum). `mscoupon.feature_fields(params_json)` returns the
+schema, and the GUI dropdown is generated from it, so there is no hand-kept mirror
+to drift — the previous `QUERY_FIELDS` literal survives only as a headless
+fallback.
+
+**3D features now carry a seeding extremum** (`ext_x/y/z`, `ext_base`,
+`ext_filtered` on `GlobalFeatureStat`). Each per-slice CC node derives its own
+from its pixels — argmin (asc) / argmax (dsc) of the filtered field, the same rule
+as 2D — rather than inheriting the MSC feature's: a CC node has no MSC identity
+left (the mask is a union of kept features) and the pixel trim runs first, so an
+inherited extremum could name a trimmed-away pixel. The cross-slice merge
+**carries the whole tuple** from the most extreme constituent slice rather than
+reducing each field independently, which would pair a position from one slice with
+a value from another. Reductions over `field` stay voxel-pooled in 3D (a mean of
+per-slice means weights by slice count, not area); `per_slice` reductions instead
+run *across* slices, which is the only way `area`/`bbox_w/h` mean anything under
+mean/min/max/std. `assembly.py` mirrors all of it so the GUI's 3D assembly agrees
+with the CLI.

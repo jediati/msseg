@@ -18,3 +18,9 @@ _MIN_LUT = np.array(
 def min_color(node_id):
     """Deterministic RGB for a minimum NodeId (shared tree/slice palette)."""
     return tuple(_MIN_LUT[int(node_id) % _MIN_K])
+
+
+def min_colors(ids):
+    """Vectorized ``min_color``: (N,3) float RGB rows for an int array of NodeIds
+    (same golden-ratio palette, so a minimum keeps its color everywhere)."""
+    return _MIN_LUT[np.asarray(ids, dtype=np.int64) % _MIN_K]

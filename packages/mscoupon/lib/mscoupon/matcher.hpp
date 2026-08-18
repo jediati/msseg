@@ -1,71 +1,85 @@
 #pragma once
 
 #include <cstdint>
-#include <unordered_map>
-#include <unordered_set>
+#include <functional>
 #include <vector>
 
+#include "mscoupon/cc_stage.hpp"
+#include "mscoupon/config.hpp"   // StatisticsConfig
 #include "mscoupon/types.hpp"
 
 namespace mscoupon {
 
-// Accumulates cross-slice feature identity as a union-find over
-// (slice_index, segment_id) nodes. Slices are added strictly in ascending slice
-// order; a kept feature in slice N is linked to a kept feature in the previously
-// added slice when they are 26-neighbor connected (a 3x3 stencil into the prior
-// slice — in-plane connectivity is already handled by the 2D MSC component).
-//
-// Per-slice output (masks / per-slice CSVs) is never modified. finalize()
-// resolves the union-find into deterministic global ids and produces the
-// per-slice->global map plus an aggregated master table.
+// A per-slice raster of GLOBAL feature ids (-1 background), produced by the relabel
+// pass at finalize().
+struct GlobalLabelRaster {
+  int slice_index = 0;
+  int width = 0;
+  int height = 0;
+  std::vector<int> data;
+};
+
+// Streaming cross-slice connected-components over per-slice CC nodes. Slices are
+// added in ascending order; a node in slice N links to a node in the previously
+// added slice when they overlap under the `connectivity` stencil. The union-find
+// keeps the FIRST-SEEN (lowest global node index = earliest slice / lowest local
+// id) node as the representative, so nothing already emitted needs renumbering.
+// finalize() numbers global ids in appearance order and produces the per-slice ->
+// global map, the aggregated master table, and per-slice global-id rasters.
 class SliceMatcher {
  public:
-  // Add one slice's kept features and link them to the previously added slice.
-  //   labels    per-pixel local-id image, row-major, size width*height
-  //   keep_ids  local ids that passed the per-slice size threshold
-  //   rows      per-segment statistics (only kept ids are consumed)
-  void add_slice(const std::vector<int>& labels, int width, int height,
-                 const std::unordered_set<int>& keep_ids, const std::vector<SegmentStat>& rows,
-                 int slice_index);
-
-  // Resolve the union-find, assign global ids in (slice_index, segment_id)
-  // appearance order, and fill the per-slice->global map plus the aggregated
-  // master table (sorted by voxel_count descending, tie -> global_id ascending).
-  void finalize(std::vector<FeatureMapRow>& map_out, std::vector<GlobalFeatureStat>& table_out);
-
- private:
-  struct NodePayload {
-    int slice_index = 0;
-    int segment_id = 0;
-    std::size_t area = 0;
-    double sum_value = 0.0;
-    float min_value = 0.0f;
-    float max_value = 0.0f;
-    int min_x = 0;
-    int min_y = 0;
-    int max_x = 0;
-    int max_y = 0;
-  };
-
-  static std::int64_t key_of(int slice_index, int segment_id) {
-    return (static_cast<std::int64_t>(slice_index) << 32) |
-           static_cast<std::int64_t>(static_cast<std::uint32_t>(segment_id));
+  // Which statistics to aggregate, and the manifold direction that decides which
+  // constituent slice's extremum a merged feature inherits. Must be set before
+  // finalize(); the defaults reproduce base-only aggregates with an extremum.
+  void configure(const StatisticsConfig& stats, bool ascending) {
+    stats_ = stats;
+    ascending_ = ascending;
   }
 
+  // Add one slice's CC labeling (cc_labels: -1 bg, 0..n-1) + per-component stats,
+  // linking it to the previously added slice by the `connectivity` stencil.
+  void add_slice(const std::vector<int>& cc_labels, int width, int height,
+                 const std::vector<CcNodeStat>& node_stats, int slice_index,
+                 int connectivity);
+
+  // Called once per slice with that slice's relabeled raster. The raster is
+  // MOVED in, and the matcher releases its own copy immediately after, so a sink
+  // that writes and drops it keeps peak memory flat instead of proportional to
+  // the stack depth.
+  using GlobalRasterSink = std::function<void(GlobalLabelRaster&&)>;
+
+  // Streaming form: emits per-slice rasters one at a time (ascending slice
+  // order) and frees each slice as it goes. Prefer this -- a 2500-slice stack of
+  // 3232^2 int32 rasters is ~100 GB, so collecting them all is not an option.
+  void finalize(std::vector<FeatureMapRow>& map_out,
+                std::vector<GlobalFeatureStat>& table_out,
+                const GlobalRasterSink& emit);
+
+  // Collecting form, for small stacks and tests. Holds every raster at once.
+  void finalize(std::vector<FeatureMapRow>& map_out,
+                std::vector<GlobalFeatureStat>& table_out,
+                std::vector<GlobalLabelRaster>& rasters_out);
+
+ private:
   int find(int x);
-  void unite(int a, int b);
-  int node_for(int slice_index, int segment_id) const;  // -1 if absent
+  void unite_first_seen(int a, int b);   // lower index (first-seen) wins
 
-  std::unordered_map<std::int64_t, int> index_;  // key(slice,id) -> node index
-  std::vector<int> parent_;
-  std::vector<int> rank_;
-  std::vector<NodePayload> payload_;
+  std::vector<int> parent_;              // per global node index
+  std::vector<CcNodeStat> node_stat_;    // per global node index
+  std::vector<int> node_slice_;          // slice index of each node
 
-  std::vector<int> prev_labels_;
-  int prev_width_ = 0;
-  int prev_height_ = 0;
-  int prev_slice_index_ = -1;
-  std::unordered_set<int> prev_keep_;
+  StatisticsConfig stats_;
+  bool ascending_ = true;
+
+  struct SliceRaster {
+    int slice_index = 0, width = 0, height = 0, node_base = 0, n = 0;
+    std::vector<int> cc;                 // per-pixel CC id (-1 bg)
+  };
+  std::vector<SliceRaster> slices_;
+
+  // Previous added slice, for cross-slice linking. The labels themselves live in
+  // slices_.back() -- keeping a second copy here would cost another full raster.
+  int prev_width_ = 0, prev_height_ = 0, prev_node_base_ = -1;
 };
 
 }  // namespace mscoupon

@@ -5,6 +5,7 @@
 
 #include "diffg/image.hpp"
 #include "msseg/filter/filter_stage.hpp"
+#include "mscoupon/normalize.hpp"
 
 namespace mscoupon {
 namespace {
@@ -27,24 +28,44 @@ Image2D from_diffg(const diffg::Image<float>& input) {
 }  // namespace
 
 // Thin adapter: this instance keeps its Image2D batch currency and delegates
-// the actual transform to the (dimension-general) core filter stage.
+// the actual transform to the (dimension-general) core filter stage. Routed
+// through the chain so a lone `normalize` stage is handled here rather than
+// being passed to core, which does not know the operation.
 Image2D apply_filter(const Image2D& image, const FilterConfig& filter) {
-  msseg::FilterParams params;
-  params.operation = filter.operation;
-  params.params = filter.params;
-  return from_diffg(msseg::apply_filter(to_diffg(image), params));
+  return apply_filter_chain(image, {filter});
 }
 
-Image2D apply_filter_chain(const Image2D& image, const std::vector<FilterConfig>& filters) {
-  std::vector<msseg::FilterParams> chain;
-  chain.reserve(filters.size());
+Image2D apply_filter_chain(const Image2D& image, const std::vector<FilterConfig>& filters,
+                           std::vector<TwoPoint>* normalizers_out) {
+  // `normalize` is an mscoupon op: it needs this package's intensity measures,
+  // which the (instance-agnostic) core filter stage knows nothing about. Run of
+  // consecutive core ops are batched and delegated as before; a normalize stage
+  // is applied here, in place, between them.
+  Image2D current = image;
+  std::vector<msseg::FilterParams> pending;
+
+  const auto flush = [&]() {
+    if (pending.empty()) return;
+    current = from_diffg(msseg::apply_filter_chain(to_diffg(current), pending));
+    pending.clear();
+  };
+
   for (const auto& f : filters) {
+    if (f.operation == kNormalizeOperation) {
+      flush();
+      const NormalizeConfig cfg = parse_normalize_config(f.params);
+      const TwoPoint tp = measure_two_point(current, cfg);
+      apply_two_point(current, tp, cfg.clamp);
+      if (normalizers_out != nullptr) normalizers_out->push_back(tp);
+      continue;
+    }
     msseg::FilterParams params;
     params.operation = f.operation;
     params.params = f.params;
-    chain.push_back(std::move(params));
+    pending.push_back(std::move(params));
   }
-  return from_diffg(msseg::apply_filter_chain(to_diffg(image), chain));
+  flush();
+  return current;
 }
 
 }  // namespace mscoupon

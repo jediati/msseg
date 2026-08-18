@@ -40,10 +40,22 @@ rendering; optional — the canvas falls back to in-memory display without it).
   slider; zoom (wheel) and pan (drag).
 - **Slice slider (top)** — a single slider linearized over *all* subsequences'
   slices (shown when > 1 TIFF); crossing a boundary switches the active stack.
-- **Persistence %** — live merge-tree re-threshold (cheap; no MSC recompute).
-- **Feature queries** — an extendable `field / op / value` chain (`area`,
-  `mean_base`, `mean_filtered`, `std_base`, `bbox_w/h`, …; ops `lt le gt ge eq
-  between`) applied to the assembled 3D features.
+- **Persistence %** — live re-threshold via native cancellation (cheap; no MSC
+  recompute).
+- **Per-slice selection** — an extendable `field / op / value` chain (`area`,
+  `mean_base`, `min_base`, `max_base`, `std_base`, `bbox_w/h`,
+  `min_x/max_x/min_y/max_y`, `ext_x`, `ext_y`, `ext_base`, `ext_filtered`;
+  ops `lt le gt ge eq between`). The dropdown is generated from the C++ schema
+  (`mscoupon.feature_fields()`), so it always offers exactly the fields the
+  `statistics` block computes — including the filtered-channel aggregates when
+  they are switched on, and nothing when a reduction is switched off)
+  gating the 2D MSC regions before the 3D assembly. The `ext_*` fields describe
+  the region's **seeding critical point** — the minimum for ascending manifolds,
+  the maximum for descending — so `ext_base < 0.3` rejects a basin whose well
+  bottom is not actually dark, which `mean_base` alone cannot distinguish.
+- **ext sample radius** (`msc.extremum_sample_radius`) — `0` reads `ext_base` at
+  the single critical pixel; `r > 0` averages the `(2r+1)²` window around it,
+  trading exactness for noise robustness.
 - **3D connectivity** (6/18/26) — cross-slice linking for the on-the-fly 3D
   assembly.
 - **Show merge tree** — the voxel-count icicle for the current slice.
@@ -54,17 +66,18 @@ The interactivity comes from a two-phase C++ core facade,
 `msseg::Msc2DPipeline` (`libs/core/msseg/compute/msc2d.cpp`), mirroring cellseg's
 `Msc3D`/`CellPipeline`:
 
-- **Prime** (`prime_slice`) runs the MSC once and caches the finest 2-manifold
-  labels, a **merge tree** that mirrors the manifold merger
-  (`libs/core/msseg/graph/merge_tree.{hpp,cpp}`) and per-manifold statistics on
-  both the base image and the filtered field.
-- **Re-threshold** (`select_persistence`) is a merge-tree branch cut + mergeable
-  statistics aggregation — O(tree), so dragging the slider is cheap.
+- **Prime** (`prime_slice`) runs the MSC once, keeps the MSCEER engine alive, and
+  caches the finest 2-manifold labels plus per-manifold statistics on both the
+  base image and the filtered field — including each manifold's **seeding
+  extremum** (the pixel attaining its filtered min/max) and the base channel
+  sampled there.
+- **Re-threshold** (`select_persistence`) uses MSCEER's **native cancellation**
+  hierarchy (`setPersistence` + `ascending/descending2Manifolds` remap each base
+  extremum to its living representative) and rolls the cached statistics up — no
+  gradient or base-manifold recompute, so dragging the slider is cheap.
 
-The merge tree is **authoritative** for segmentation, used by both the GUI and the
+`Msc2DPipeline` is **authoritative** for segmentation, used by both the GUI and the
 CLI batch pipeline, so an exported config reproduces the viewer's per-slice output.
-(It intentionally differs from GInt's native persistence cancellation above
-persistence 0: branch decomposition vs pairwise cancellation.)
 
 3D features are assembled in Python on-the-fly
 (`src/msseg/mscoupon/assembly.py`, union-find over `(slice, feature)` linked by an
@@ -81,9 +94,11 @@ single-source C++ evaluator (`mscoupon::row_passes`, exposed as
   "output": { "folder": "..." },
   "filters": [ { "operation": "blur", "params": { "sigma": 1.0 } }, ... ],
   "msc":    { "persistence_percent": 10.0, "manifold": "ascending",
-              "accurate_ascending": false, "accurate_descending": false },
+              "accurate_ascending": false, "accurate_descending": false,
+              "extremum_sample_radius": 0 },
   "segments": { "min_area": 25 },
-  "feature_filters": [ { "field": "area", "op": "ge", "value": 50 } ],
+  "feature_filters": [ { "field": "area", "op": "ge", "value": 50 },
+                       { "field": "ext_base", "op": "lt", "value": 0.3 } ],
   "assembly": { "connectivity": 26 },
   "matching": { "enabled": true }
 }

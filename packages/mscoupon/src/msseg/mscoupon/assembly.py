@@ -1,21 +1,30 @@
-"""On-the-fly 3D assembly of per-slice 2D features into 3D features.
+"""Per-slice trim + connected-components 3D assembly for the mscoupon viewer.
 
-Mirrors the C++ ``SliceMatcher`` (union-find over ``(slice, feature_id)`` nodes,
-linked by an N-neighbor stencil between consecutive slices) so the viewer and the
-CLI produce the same 3D grouping. Per-2D-feature statistics are mergeable, so 3D
-feature stats are combined cheaply as features are unioned -- no re-scan of voxels
-as the persistence/query controls change.
+Pipeline (mirrors the C++ CLI so the GUI and an exported config agree):
+  MSC per slice -> PER-SLICE SELECTION (kept 2D merged regions) -> PIXEL TRIM
+  (keep/omit pixels by base/filtered value) -> PER-SLICE connected components
+  (in-plane) -> STREAMING 6-neighbor GLOBAL connected components.
 
-Pure Python + numpy (scipy optional); importable and testable headlessly.
+Nodes are the per-slice connected components of the selected+trimmed raster (NOT
+raw MSC ids -- trimming can split a region). Cross-slice identity is resolved with
+``scipy.sparse.csgraph.connected_components`` over the accumulated edge graph, then
+global ids are renumbered in FIRST-SEEN (appearance) order so the numbering matches
+the streaming C++ ``SliceMatcher``. Statistics are a node-level reduction over the
+final components (no pixel revisit), computed from the actual (trimmed) pixel sets.
+
+Pure Python + numpy + scipy (all mscoupon deps); importable/testable headlessly.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Sequence, Set, Tuple
+import math
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 import numpy as np
 
 
 # Cross-slice in-plane offsets for each 3D connectivity (the z+1 neighborhood).
+# 6 = face only (same x,y); 18 = + edges; 26 = + corners. This ALSO selects the
+# in-plane 2D structuring element for the per-slice CC (see `cc_structure`).
 _OFFSETS = {
     6: [(0, 0)],
     18: [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)],
@@ -24,8 +33,7 @@ _OFFSETS = {
 
 
 def _shift(b: np.ndarray, dy: int, dx: int) -> np.ndarray:
-    """Return an array `bs` with bs[y,x] = b[y+dy, x+dx], out-of-range -> 0
-    (non-wrapping, unlike np.roll, so features can't link across image edges)."""
+    """Return `bs` with bs[y,x] = b[y+dy, x+dx], out-of-range -> 0 (non-wrapping)."""
     out = np.zeros_like(b)
     h, w = b.shape
     y_dst = slice(max(0, -dy), h - max(0, dy))
@@ -36,154 +44,420 @@ def _shift(b: np.ndarray, dy: int, dx: int) -> np.ndarray:
     return out
 
 
-class _UnionFind:
-    def __init__(self):
-        self.parent: Dict[Tuple[int, int], Tuple[int, int]] = {}
-
-    def add(self, x):
-        self.parent.setdefault(x, x)
-
-    def find(self, x):
-        root = x
-        while self.parent[root] != root:
-            root = self.parent[root]
-        while self.parent[x] != root:
-            self.parent[x], x = root, self.parent[x]
-        return root
-
-    def union(self, a, b):
-        ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self.parent[rb] = ra
+# --------------------------------------------------------------------------- #
+# Stage helpers (each operates on one slice's rasters)
+# --------------------------------------------------------------------------- #
+def selection_mask(labels: np.ndarray, kept: Optional[Set[int]]) -> np.ndarray:
+    """Boolean mask of pixels whose MSC region id is in `kept` (all if None)."""
+    fg = labels >= 0
+    if kept is None:
+        return fg
+    K = int(labels.max()) + 1 if labels.size else 1
+    lut = np.zeros(K, dtype=bool)
+    if kept:
+        ids = np.fromiter((int(i) for i in kept), dtype=np.int64)
+        ids = ids[(ids >= 0) & (ids < K)]
+        lut[ids] = True
+    return fg & lut[np.where(fg, labels, 0)]
 
 
-def _combine(dst: dict, src: dict, slice_index: int):
-    """Merge one 2D feature stat (`src`) into a 3D accumulator (`dst`)."""
-    area = float(src.get("area", 0.0))
-    base_sum = float(src.get("mean_base", 0.0)) * area
-    if dst.get("area", 0.0) == 0.0:
-        dst.update(
-            area=area, base_sum=base_sum,
-            min_base=float(src.get("min_base", 0.0)), max_base=float(src.get("max_base", 0.0)),
-            min_x=int(src.get("min_x", 0)), max_x=int(src.get("max_x", 0)),
-            min_y=int(src.get("min_y", 0)), max_y=int(src.get("max_y", 0)),
-            min_z=slice_index, max_z=slice_index, slices={slice_index},
-        )
-        return
-    dst["area"] += area
-    dst["base_sum"] += base_sum
-    dst["min_base"] = min(dst["min_base"], float(src.get("min_base", 0.0)))
-    dst["max_base"] = max(dst["max_base"], float(src.get("max_base", 0.0)))
-    dst["min_x"] = min(dst["min_x"], int(src.get("_min_x", 0)))
-    dst["max_x"] = max(dst["max_x"], int(src.get("_max_x", 0)))
-    dst["min_y"] = min(dst["min_y"], int(src.get("_min_y", 0)))
-    dst["max_y"] = max(dst["max_y"], int(src.get("_max_y", 0)))
-    dst["min_z"] = min(dst["min_z"], slice_index)
-    dst["max_z"] = max(dst["max_z"], slice_index)
-    dst["slices"].add(slice_index)
+def apply_pixel_filters(mask: np.ndarray, base: np.ndarray, filt: np.ndarray,
+                        rules: Sequence[Dict[str, Any]]) -> np.ndarray:
+    """Refine `mask` by the pixel intensity trim chain. Each rule:
+    {channel: base|filtered, mode: keep|omit, op: lt|le|gt|ge, value: float}.
+    keep -> drop pixels that FAIL the predicate; omit -> drop pixels that PASS."""
+    out = mask.copy()
+    for r in rules:
+        chan = base if r.get("channel") == "base" else filt
+        op, val = r.get("op", "gt"), float(r.get("value", 0.0))
+        if op == "lt":
+            passed = chan < val
+        elif op == "le":
+            passed = chan <= val
+        elif op == "gt":
+            passed = chan > val
+        elif op == "ge":
+            passed = chan >= val
+        else:
+            continue
+        out &= passed if r.get("mode", "keep") == "keep" else ~passed
+    return out
 
 
-def assemble(
-    labels_per_slice: Sequence[np.ndarray],
-    kept_per_slice: Sequence[Set[int]],
-    stats_per_slice: Sequence[Dict[int, dict]],
-    connectivity: int = 26,
-) -> Tuple[Dict[Tuple[int, int], int], List[dict]]:
-    """Link kept per-slice features into 3D features.
+def cc_structure(connectivity: int):
+    """In-plane structuring element: 6 -> 4-connectivity, 18/26 -> 8-connectivity."""
+    from scipy import ndimage
+    return ndimage.generate_binary_structure(2, 1 if connectivity == 6 else 2)
+
+
+def per_slice_cc(mask: np.ndarray, connectivity: int = 6):
+    """In-plane connected components of `mask`. Returns (lbl, n) where lbl is the
+    scipy labeling (0 = background, 1..n = components)."""
+    from scipy import ndimage
+    lbl, n = ndimage.label(mask, structure=cc_structure(connectivity))
+    return lbl.astype(np.int64), int(n)
+
+
+def node_stats(lbl: np.ndarray, n: int, base: np.ndarray, filt: np.ndarray,
+               ascending: bool = True) -> Dict[str, np.ndarray]:
+    """Per-component (1..n) statistics from the actual pixel sets. Structure-of-
+    arrays indexed 0..n-1. Sums use bincount; min/max/bbox use ndimage (C-fast).
+
+    `ascending` picks the side the seeding extremum comes from, mirroring
+    ``mscoupon::label_selected_components``: the pixel attaining the component's
+    filtered minimum (ascending) or maximum (descending). It is taken from the
+    component's own pixels rather than inherited from the MSC feature, because
+    the pixel trim runs first and can remove the feature's true extremum."""
+    from scipy import ndimage
+    h, w = lbl.shape
+    out: Dict[str, np.ndarray] = {}
+    if n == 0:
+        for k in ("area", "base_sum", "base_sumsq", "filt_sum", "filt_sumsq",
+                  "base_min", "base_max", "filt_min", "filt_max",
+                  "min_x", "max_x", "min_y", "max_y",
+                  "ext_x", "ext_y", "ext_base", "ext_filtered"):
+            out[k] = np.zeros(0, dtype=np.float64)
+        return out
+    # Everything below works on the compressed foreground vectors, not the full
+    # raster. `ndimage.minimum`/`maximum`/`minimum_position` with an index array
+    # are ~900-1000 ms per call on a 3232^2 slice -- five calls made this function
+    # ~95% of a Rerun-selection. The ufunc.at equivalents are ~5 ms, so the same
+    # numbers come out ~175x faster.
+    flat = lbl.ravel()
+    fg = flat > 0
+    idx = flat[fg] - 1                                   # 0..n-1
+    b = base.ravel()[fg].astype(np.float64)
+    f = filt.ravel()[fg].astype(np.float64)
+    out["area"] = np.bincount(idx, minlength=n).astype(np.float64)
+    out["base_sum"] = np.bincount(idx, weights=b, minlength=n)
+    out["base_sumsq"] = np.bincount(idx, weights=b * b, minlength=n)
+    out["filt_sum"] = np.bincount(idx, weights=f, minlength=n)
+    out["filt_sumsq"] = np.bincount(idx, weights=f * f, minlength=n)
+
+    def _reduce(op, values, init):
+        acc = np.full(n, init, dtype=np.float64)
+        op.at(acc, idx, values)
+        # A component with no pixels keeps the sentinel; report 0 rather than inf.
+        return np.where(np.isfinite(acc), acc, 0.0)
+
+    out["base_min"] = _reduce(np.minimum, b, np.inf)
+    out["base_max"] = _reduce(np.maximum, b, -np.inf)
+    out["filt_min"] = _reduce(np.minimum, f, np.inf)
+    out["filt_max"] = _reduce(np.maximum, f, -np.inf)
+
+    # Bounding box, same treatment (find_objects also walks per component).
+    flat_pos = np.nonzero(fg)[0]
+    py = (flat_pos // w).astype(np.float64)
+    px = (flat_pos % w).astype(np.float64)
+    out["min_x"], out["max_x"] = _reduce(np.minimum, px, np.inf), _reduce(np.maximum, px, -np.inf)
+    out["min_y"], out["max_y"] = _reduce(np.minimum, py, np.inf), _reduce(np.maximum, py, -np.inf)
+
+    # Seeding extremum per component: the pixel attaining the component's filtered
+    # min (ascending) or max (descending). Found by locating the pixels that equal
+    # their own component's extreme value, then keeping the first of them per
+    # component -- assigning in reverse so the earliest index wins, matching the
+    # C++, which keeps the first strictly-better pixel in scan order.
+    ext_val = out["filt_min"] if ascending else out["filt_max"]
+    ext_x = np.full(n, -1.0); ext_y = np.full(n, -1.0)
+    ext_base = np.zeros(n); ext_filt = np.zeros(n)
+    hit = np.nonzero(f == ext_val[idx])[0]
+    if hit.size:
+        pos = np.full(n, -1, dtype=np.int64)
+        pos[idx[hit[::-1]]] = hit[::-1]
+        have = pos >= 0
+        sel = pos[have]
+        ext_x[have] = px[sel]
+        ext_y[have] = py[sel]
+        ext_base[have] = b[sel]
+        ext_filt[have] = f[sel]
+    out["ext_x"], out["ext_y"] = ext_x, ext_y
+    out["ext_base"], out["ext_filtered"] = ext_base, ext_filt
+    return out
+
+
+def _std(sum_: np.ndarray, sumsq: np.ndarray, area: np.ndarray) -> np.ndarray:
+    """Vectorized population std from sum / sum-of-squares (0 where area==0)."""
+    area = np.where(area > 0, area, 1.0)
+    mean = sum_ / area
+    var = sumsq / area - mean * mean
+    return np.sqrt(np.clip(var, 0.0, None))
+
+
+# --------------------------------------------------------------------------- #
+# Streaming assembly
+# --------------------------------------------------------------------------- #
+def assemble_cc(
+    labels_list: Sequence[np.ndarray],
+    kept_list: Sequence[Optional[Set[int]]],
+    base_list: Sequence[np.ndarray],
+    filt_list: Sequence[np.ndarray],
+    pixel_rules: Sequence[Dict[str, Any]] = (),
+    connectivity: int = 6,
+    ascending: bool = True,
+    timing: Optional[Dict[str, float]] = None,
+):
+    """Assemble a stack into 3D connected components.
 
     Args:
-        labels_per_slice: [Z] int arrays (H,W) of feature id per pixel.
-        kept_per_slice:   [Z] sets of feature ids that participate (size-gated).
-        stats_per_slice:  [Z] dict feature_id -> stat dict (needs area, mean_base,
-                          min_base, max_base, and bbox fields _min_x/_max_x/_min_y/_max_y).
-        connectivity:     6 / 18 / 26 (cross-slice in-plane stencil).
+        labels_list: [Z] MSC merged feature-id rasters (-1 background).
+        kept_list:   [Z] sets of selected MSC feature ids (None = keep all).
+        base_list, filt_list: [Z] the base (original) and filtered rasters.
+        pixel_rules: pixel intensity trim chain (see apply_pixel_filters).
+        connectivity: 6/18/26 (drives in-plane CC + cross-slice stencil).
 
-    Returns:
-        (global_of, features_3d) where global_of maps (slice, feature_id) -> global
-        3D id (0..K-1), and features_3d[i] is a stat dict for global id i.
+    Returns dict:
+        cc_labels:     [Z] per-slice CC id raster (-1 bg, 0..n_z-1).
+        global_labels: [Z] per-slice GLOBAL id raster (-1 bg, 0..G-1).
+        global_table:  [G] stat dicts (global_id, voxel_count, mean/min/max/std for
+                       base & filtered, bbox_w/h/d, num_slices).
+        n_global:      G.
     """
-    offsets = _OFFSETS.get(connectivity, _OFFSETS[26])
-    uf = _UnionFind()
-    for z, kept in enumerate(kept_per_slice):
-        for fid in kept:
-            uf.add((z, int(fid)))
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
 
-    # Cross-slice linking between consecutive slices.
-    for z in range(len(labels_per_slice) - 1):
-        a, b = labels_per_slice[z], labels_per_slice[z + 1]
-        keep_a, keep_b = kept_per_slice[z], kept_per_slice[z + 1]
-        if not keep_a or not keep_b:
+    if timing is None:
+        timing = {}
+    Z = len(labels_list)
+    offsets = _OFFSETS.get(connectivity, _OFFSETS[6])
+
+    # --- per-slice: select -> trim -> CC -> node stats (streaming) --------- #
+    lbls: List[np.ndarray] = []               # scipy labelings (0 bg, 1..n)
+    slice_offset = [0]
+    node_cols: Dict[str, List[np.ndarray]] = {}
+    node_z: List[np.ndarray] = []
+    import time as _time
+    _t = _time.perf_counter
+    for k in ("mask", "cc", "node_stats"):
+        timing.setdefault(k, 0.0)
+    for z in range(Z):
+        t = _t()
+        mask = selection_mask(labels_list[z], kept_list[z] if z < len(kept_list) else None)
+        mask = apply_pixel_filters(mask, base_list[z], filt_list[z], pixel_rules)
+        timing["mask"] += _t() - t
+
+        t = _t()
+        lbl, n = per_slice_cc(mask, connectivity)
+        timing["cc"] += _t() - t
+        lbls.append(lbl)
+
+        t = _t()
+        st = node_stats(lbl, n, base_list[z], filt_list[z], ascending)
+        timing["node_stats"] += _t() - t
+        for k, v in st.items():
+            node_cols.setdefault(k, []).append(v)
+        node_z.append(np.full(n, z, dtype=np.int64))
+        slice_offset.append(slice_offset[-1] + n)
+
+    N = slice_offset[-1]
+    cols = {k: (np.concatenate(v) if v else np.zeros(0)) for k, v in node_cols.items()}
+    z_of = np.concatenate(node_z) if node_z else np.zeros(0, dtype=np.int64)
+
+    # --- cross-slice edges (vectorized 6/18/26 stencil, +z only) ----------- #
+    _t_edges = _t()
+    pa_parts: List[np.ndarray] = []
+    pb_parts: List[np.ndarray] = []
+    for z in range(Z - 1):
+        a, b = lbls[z], lbls[z + 1]
+        if a.max(initial=0) == 0 or b.max(initial=0) == 0:
             continue
-        amask = np.isin(a, list(keep_a))
+        off_a, off_b = slice_offset[z], slice_offset[z + 1]
         for dy, dx in offsets:
-            bs = _shift(b, dy, dx)
-            both = amask & np.isin(bs, list(keep_b))
-            if not both.any():
+            bs = b if (dy == 0 and dx == 0) else _shift(b, dy, dx)
+            m = (a > 0) & (bs > 0)
+            if not m.any():
                 continue
-            fa = a[both].astype(np.int64)
-            fb = bs[both].astype(np.int64)
-            pairs = np.unique(np.stack([fa, fb], axis=1), axis=0)
-            for pa, pb in pairs:
-                uf.union((z, int(pa)), (z + 1, int(pb)))
+            ga = off_a + (a[m] - 1).astype(np.int64)
+            gb = off_b + (bs[m] - 1).astype(np.int64)
+            key = np.unique(ga * np.int64(N) + gb)
+            pa_parts.append(key // N)
+            pb_parts.append(key % N)
 
-    # Number the roots into contiguous global ids (deterministic: sorted).
-    roots = sorted({uf.find(n) for n in uf.parent})
-    root_to_gid = {r: i for i, r in enumerate(roots)}
-    global_of: Dict[Tuple[int, int], int] = {}
-    accum: List[dict] = [dict() for _ in roots]
-    for (z, fid) in uf.parent:
-        gid = root_to_gid[uf.find((z, fid))]
-        global_of[(z, fid)] = gid
-        st = stats_per_slice[z].get(fid)
-        if st is not None:
-            _combine(accum[gid], st, z)
+    timing["edges"] = _t() - _t_edges
 
-    features_3d: List[dict] = []
-    for gid, a in enumerate(accum):
-        area = a.get("area", 0.0)
-        features_3d.append({
+    # --- resolve identity + first-seen (appearance-order) global ids ------- #
+    _t_cc3d = _t()
+    if N == 0:
+        comp = np.zeros(0, dtype=np.int64)
+        n_global = 0
+    else:
+        if pa_parts:
+            pa = np.concatenate(pa_parts); pb = np.concatenate(pb_parts)
+            g = coo_matrix((np.ones(len(pa), dtype=np.int8), (pa, pb)), shape=(N, N))
+        else:
+            g = coo_matrix((N, N), dtype=np.int8)
+        n_comp, raw = connected_components(g, directed=False, connection="weak")
+        # Renumber components by the smallest node id they contain (= earliest
+        # slice / lowest local id) so global ids come out in first-seen order.
+        min_node = np.full(n_comp, N, dtype=np.int64)
+        np.minimum.at(min_node, raw, np.arange(N, dtype=np.int64))
+        order = np.argsort(np.argsort(min_node, kind="stable"), kind="stable")
+        comp = order[raw].astype(np.int64)
+        n_global = int(n_comp)
+
+    timing["cc3d"] = _t() - _t_cc3d
+
+    # --- node-level stats reduction by global id --------------------------- #
+    _t_reduce = _t()
+
+    def reduce_sum(col):
+        return np.bincount(comp, weights=cols[col], minlength=n_global) if N else np.zeros(n_global)
+
+    def reduce_min(col):
+        acc = np.full(n_global, np.inf)
+        if N:
+            np.minimum.at(acc, comp, cols[col])
+        return acc
+
+    def reduce_max(col):
+        acc = np.full(n_global, -np.inf)
+        if N:
+            np.maximum.at(acc, comp, cols[col])
+        return acc
+
+    area_g = reduce_sum("area")
+    base_sum_g, base_sq_g = reduce_sum("base_sum"), reduce_sum("base_sumsq")
+    filt_sum_g, filt_sq_g = reduce_sum("filt_sum"), reduce_sum("filt_sumsq")
+    base_min_g, base_max_g = reduce_min("base_min"), reduce_max("base_max")
+    filt_min_g, filt_max_g = reduce_min("filt_min"), reduce_max("filt_max")
+    min_x_g, max_x_g = reduce_min("min_x"), reduce_max("max_x")
+    min_y_g, max_y_g = reduce_min("min_y"), reduce_max("max_y")
+    min_z_g = np.full(n_global, np.inf); max_z_g = np.full(n_global, -np.inf)
+    if N:
+        np.minimum.at(min_z_g, comp, z_of.astype(np.float64))
+        np.maximum.at(max_z_g, comp, z_of.astype(np.float64))
+    # distinct slices per global id
+    num_slices_g = np.zeros(n_global, dtype=np.int64)
+    if N:
+        gz = np.unique(comp * np.int64(Z) + z_of)
+        num_slices_g = np.bincount((gz // Z).astype(np.int64), minlength=n_global)
+
+    std_base_g = _std(base_sum_g, base_sq_g, area_g)
+    std_filt_g = _std(filt_sum_g, filt_sq_g, area_g)
+    area_safe = np.where(area_g > 0, area_g, 1.0)
+
+    # Seeding extremum: pick the constituent NODE whose ext_filtered is most
+    # extreme, then take its whole tuple. Reducing each ext_* column separately
+    # would pair a position from one slice with a value from another.
+    ext_x_g = np.full(n_global, -1.0); ext_y_g = np.full(n_global, -1.0)
+    ext_z_g = np.full(n_global, -1, dtype=np.int64)
+    ext_base_g = np.zeros(n_global); ext_filt_g = np.zeros(n_global)
+    if N and "ext_filtered" in cols:
+        key = cols["ext_filtered"] if ascending else -cols["ext_filtered"]
+        best = np.full(n_global, np.inf)
+        np.minimum.at(best, comp, key)
+        # First node attaining its component's best key wins ties, matching the
+        # C++ (which keeps the first strictly-better node in slice-major order).
+        winner = np.full(n_global, -1, dtype=np.int64)
+        is_best = key <= best[comp]
+        for node in np.nonzero(is_best)[0][::-1]:
+            winner[comp[node]] = node
+        take = winner >= 0
+        w = winner[take]
+        ext_x_g[take] = cols["ext_x"][w]
+        ext_y_g[take] = cols["ext_y"][w]
+        ext_z_g[take] = z_of[w]
+        ext_base_g[take] = cols["ext_base"][w]
+        ext_filt_g[take] = cols["ext_filtered"][w]
+
+    # Per-slice reductions: how the footprint varies across the slices a feature
+    # spans. Unlike the field statistics, which pool voxels.
+    per_slice_cols = {"area": cols["area"] if N else np.zeros(0),
+                      "bbox_w": (cols["max_x"] - cols["min_x"] + 1) if N else np.zeros(0),
+                      "bbox_h": (cols["max_y"] - cols["min_y"] + 1) if N else np.zeros(0)}
+    ps: Dict[str, np.ndarray] = {}
+    node_count = np.bincount(comp, minlength=n_global) if N else np.zeros(n_global)
+    count_safe = np.where(node_count > 0, node_count, 1.0)
+    for name, vals in per_slice_cols.items():
+        if not N:
+            for r in ("mean", "min", "max", "std"):
+                ps[f"{name}_{r}"] = np.zeros(n_global)
+            continue
+        s1 = np.bincount(comp, weights=vals, minlength=n_global)
+        s2 = np.bincount(comp, weights=vals * vals, minlength=n_global)
+        lo = np.full(n_global, np.inf); np.minimum.at(lo, comp, vals)
+        hi = np.full(n_global, -np.inf); np.maximum.at(hi, comp, vals)
+        mean = s1 / count_safe
+        ps[f"{name}_mean"] = mean
+        ps[f"{name}_min"] = np.where(np.isfinite(lo), lo, 0.0)
+        ps[f"{name}_max"] = np.where(np.isfinite(hi), hi, 0.0)
+        ps[f"{name}_std"] = np.sqrt(np.clip(s2 / count_safe - mean * mean, 0.0, None))
+    global_table: List[dict] = []
+    for gid in range(n_global):
+        a = float(area_g[gid])
+        global_table.append({
             "global_id": gid,
-            "area": area,
-            "voxel_count": area,
-            "mean_base": (a.get("base_sum", 0.0) / area) if area else 0.0,
-            "min_base": a.get("min_base", 0.0),
-            "max_base": a.get("max_base", 0.0),
-            "num_slices": len(a.get("slices", ())),
-            "bbox_w": (a.get("max_x", 0) - a.get("min_x", 0) + 1) if area else 0,
-            "bbox_h": (a.get("max_y", 0) - a.get("min_y", 0) + 1) if area else 0,
-            "bbox_d": (a.get("max_z", 0) - a.get("min_z", 0) + 1) if area else 0,
+            "area": a, "voxel_count": a,
+            "mean_base": float(base_sum_g[gid] / area_safe[gid]),
+            "min_base": float(base_min_g[gid]), "max_base": float(base_max_g[gid]),
+            "std_base": float(std_base_g[gid]),
+            "mean_filtered": float(filt_sum_g[gid] / area_safe[gid]),
+            "min_filtered": float(filt_min_g[gid]), "max_filtered": float(filt_max_g[gid]),
+            "std_filtered": float(std_filt_g[gid]),
+            "num_slices": int(num_slices_g[gid]),
+            "bbox_w": int(max_x_g[gid] - min_x_g[gid] + 1) if a else 0,
+            "bbox_h": int(max_y_g[gid] - min_y_g[gid] + 1) if a else 0,
+            "bbox_d": int(max_z_g[gid] - min_z_g[gid] + 1) if a else 0,
+            "ext_x": float(ext_x_g[gid]), "ext_y": float(ext_y_g[gid]),
+            "ext_z": int(ext_z_g[gid]),
+            "ext_base": float(ext_base_g[gid]),
+            "ext_filtered": float(ext_filt_g[gid]),
+            **{k: float(v[gid]) for k, v in ps.items()},
         })
-    return global_of, features_3d
+
+    timing["reduce"] = _t() - _t_reduce
+
+    # --- output rasters: per-slice CC (-1 bg) and global id (-1 bg) --------- #
+    _t_out = _t()
+    cc_labels: List[np.ndarray] = []
+    global_labels: List[np.ndarray] = []
+    for z in range(Z):
+        lbl = lbls[z]
+        cc_labels.append(np.where(lbl > 0, lbl - 1, -1))
+        if lbl.max(initial=0) == 0:
+            global_labels.append(np.full(lbl.shape, -1, dtype=np.int64))
+            continue
+        node_gid = comp[slice_offset[z]:slice_offset[z + 1]]   # local cc id -> gid
+        gmap = np.concatenate([node_gid, np.array([-1])])       # -1 sentinel at index n
+        global_labels.append(gmap[np.where(lbl > 0, lbl - 1, len(node_gid))])
+
+    timing["rasters"] = _t() - _t_out
+
+    return {"cc_labels": cc_labels, "global_labels": global_labels,
+            "global_table": global_table, "n_global": n_global}
 
 
 def _selftest():
-    # Two features per slice across 3 slices; feature 1 overlaps across all
-    # slices (one 3D feature), feature 2 only in slice 0 (its own 3D feature).
-    z0 = np.array([[1, 1, 2], [1, 1, 2]], dtype=np.int32)
-    z1 = np.array([[1, 1, 0], [1, 1, 0]], dtype=np.int32)
-    z2 = np.array([[1, 1, 0], [1, 1, 0]], dtype=np.int32)
+    # Feature 1 (value 1, cols 0-1) spans all 3 slices; feature 2 (value 2, col 3)
+    # only slice 0. A background gap (col 2) keeps them as DISTINCT in-plane CCs
+    # (binary-foreground CC merges only touching pixels). base == filt here.
+    z0 = np.array([[1, 1, -1, 2], [1, 1, -1, 2]], dtype=np.int32)
+    z1 = np.array([[1, 1, -1, -1], [1, 1, -1, -1]], dtype=np.int32)
+    z2 = np.array([[1, 1, -1, -1], [1, 1, -1, -1]], dtype=np.int32)
     labels = [z0, z1, z2]
-    kept = [{1, 2}, {1}, {1}]
-    stat = lambda a, mb: {"area": a, "mean_base": mb, "min_base": 0.0, "max_base": 1.0,
-                          "min_x": 0, "max_x": 1, "min_y": 0, "max_y": 1}
-    stats = [{1: stat(4, 2.0), 2: stat(2, 5.0)}, {1: stat(4, 2.0)}, {1: stat(4, 2.0)}]
-    # 6-connectivity: feature 2 (only in slice 0, no direct z-overlap) stays
-    # distinct; feature 1 unifies across the 3 slices by direct overlap.
-    global_of, feats = assemble(labels, kept, stats, connectivity=6)
-    assert global_of[(0, 1)] == global_of[(1, 1)] == global_of[(2, 1)]
-    assert global_of[(0, 2)] != global_of[(0, 1)]
-    assert len(feats) == 2
-    big = feats[global_of[(0, 1)]]
-    assert big["voxel_count"] == 12 and big["num_slices"] == 3 and big["bbox_d"] == 3
-    # 26-connectivity: feature 2's corner voxel is diagonally adjacent to feature
-    # 1 in slice 1, so they unify (matches the C++ matcher's 26-neighbor rule).
-    g26, f26 = assemble(labels, kept, stats, connectivity=26)
-    assert g26[(0, 2)] == g26[(0, 1)] and len(f26) == 1
-    # non-wrapping shift: an edge-only feature must NOT link across the image edge.
-    edge = [np.array([[3, 0, 0]], dtype=np.int32), np.array([[0, 0, 4]], dtype=np.int32)]
-    ge, _ = assemble(edge, [{3}, {4}], [{3: stat(1, 1.0)}, {4: stat(1, 1.0)}], connectivity=26)
-    assert ge[(0, 3)] != ge[(1, 4)], "features must not wrap across image edges"
-    print("assembly selftest OK:", len(feats), "(6-conn) /", len(f26), "(26-conn) 3D features")
+    base = [z.astype(np.float32) for z in labels]
+    kept = [None, None, None]
+    out = assemble_cc(labels, kept, base, base, pixel_rules=(), connectivity=6)
+    g0 = out["global_labels"][0]
+    assert g0[0, 0] == g0[0, 1] and g0[0, 0] != g0[0, 3], "distinct components on slice 0"
+    assert out["global_labels"][1][0, 0] == g0[0, 0], "feature 1 links across slices"
+    assert out["n_global"] == 2, out["n_global"]
+    big = out["global_table"][int(g0[0, 0])]
+    assert big["voxel_count"] == 12 and big["num_slices"] == 3 and big["bbox_d"] == 3, big
+    assert big["mean_base"] == 1.0 and big["bbox_w"] == 2, big
+    # First-seen numbering: feature 1 (min node id 0) is global id 0.
+    assert g0[0, 0] == 0, "first-seen component is global id 0"
+
+    # Pixel trim: keep base >= 2 drops feature-1 pixels (value 1) -> only feature 2.
+    rules = [{"channel": "base", "mode": "keep", "op": "ge", "value": 2.0}]
+    out2 = assemble_cc(labels, kept, base, base, pixel_rules=rules, connectivity=6)
+    assert out2["n_global"] == 1, out2["n_global"]      # only feature-2 blob survives
+    assert (out2["global_labels"][0] >= 0).sum() == 2, "trim kept only value>=2 pixels"
+
+    # Per-slice selection: keep only feature 2 (id 2) on slice 0.
+    out3 = assemble_cc(labels, [{2}, set(), set()], base, base, connectivity=6)
+    assert out3["n_global"] == 1 and (out3["global_labels"][0] >= 0).sum() == 2
+
+    print("assembly selftest OK:", out["n_global"], "components; trim + selection verified")
 
 
 if __name__ == "__main__":

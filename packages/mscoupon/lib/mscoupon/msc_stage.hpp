@@ -21,6 +21,6 @@ struct SliceSegmentation {
 };
 
 SliceSegmentation segment_slice_pipeline(const Image2D& original, const Image2D& filtered,
-                                         const MscConfig& cfg);
+                                         const MscConfig& cfg, const msseg::StatsSpec& stats);
 
 }  // namespace mscoupon

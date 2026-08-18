@@ -47,7 +47,7 @@ FetchContent_Declare(diffg
 )
 FetchContent_Declare(msceer
   GIT_REPOSITORY https://github.com/sci-visus/MSCEER.git
-  GIT_TAG 0c1b90b5708988da56cc560f14edfd2bf3be6cc6   # msc_2d_lib respects buildArcGeometry flags
+  GIT_TAG c04aab11cb4fd3b46450f1b70650437a8752858f   # + cheap re-thresholding (compact base ids, no per-pixel hash)
 )
 FetchContent_Declare(tinytiff
   GIT_REPOSITORY https://github.com/jkriege2/TinyTIFF.git

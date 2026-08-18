@@ -4,8 +4,21 @@
 #include <stdexcept>
 #include <string_view>
 
+#include "mscoupon/query.hpp"   // is_feature_field / feature_fields (the schema)
+
 namespace mscoupon {
 namespace {
+
+// Render the available field names for an error message, so a rejected config
+// says what it could have used instead.
+std::string join_fields(const std::vector<std::string>& names) {
+  std::string out;
+  for (const auto& n : names) {
+    if (!out.empty()) out += ", ";
+    out += n;
+  }
+  return out;
+}
 
 template <typename T>
 void set_if_present(const nlohmann::json& object, const char* key, T& out) {
@@ -67,6 +80,11 @@ void parse_filters(const nlohmann::json& root, AppConfig& cfg) {
   if (!cfg.filters.empty()) {
     cfg.filter = cfg.filters.front();
   }
+  if (root.contains("base_filters") && root.at("base_filters").is_array()) {
+    for (const auto& f : root.at("base_filters")) {
+      cfg.base_filters.push_back(parse_one_filter(f));
+    }
+  }
 }
 
 void parse_feature_filters(const nlohmann::json& root, std::vector<FeatureQuery>& queries) {
@@ -83,12 +101,93 @@ void parse_feature_filters(const nlohmann::json& root, std::vector<FeatureQuery>
   }
 }
 
+void parse_pixel_filters(const nlohmann::json& root, std::vector<PixelFilter>& rules) {
+  if (!root.contains("pixel_filters") || !root.at("pixel_filters").is_array()) {
+    return;
+  }
+  for (const auto& r : root.at("pixel_filters")) {
+    PixelFilter pf;
+    set_if_present(r, "channel", pf.channel);
+    set_if_present(r, "mode", pf.mode);
+    set_if_present(r, "op", pf.op);
+    set_if_present(r, "value", pf.value);
+    rules.push_back(pf);
+  }
+}
+
 void parse_assembly(const nlohmann::json& root, AssemblyConfig& assembly) {
   if (!root.contains("assembly")) {
     return;
   }
   set_if_present(root.at("assembly"), "connectivity", assembly.connectivity);
 }
+
+// Read a reduction list ("mean"/"min"/"max"/"std") into four flags. Absent =>
+// leave the defaults (all on); present but empty => all off, which is how a
+// workflow asks for a channel's extent without paying for the sums.
+void parse_reductions(const nlohmann::json& block, const char* key, bool& mean, bool& min,
+                      bool& max, bool& std_flag) {
+  if (!block.contains(key) || block.at(key).is_null()) return;
+  const auto& arr = block.at(key);
+  if (!arr.is_array()) throw std::runtime_error(std::string("statistics.") + key + " must be an array.");
+  mean = min = max = std_flag = false;
+  for (const auto& item : arr) {
+    const auto name = item.get<std::string>();
+    if (name == "mean" || name == "average") {
+      mean = true;
+    } else if (name == "min") {
+      min = true;
+    } else if (name == "max") {
+      max = true;
+    } else if (name == "std") {
+      std_flag = true;
+    } else {
+      throw std::runtime_error("statistics." + std::string(key) +
+                               "[] must be mean/min/max/std (got '" + name + "').");
+    }
+  }
+}
+
+}  // namespace
+
+void parse_statistics_json(const nlohmann::json& root, StatisticsConfig& stats) {
+  // Default per-slice quantities: the ones whose per-slice spread actually says
+  // something about a 3D feature's shape.
+  stats.per_slice_quantities = {"area", "bbox_w", "bbox_h"};
+  if (!root.contains("statistics") || root.at("statistics").is_null()) return;
+  const auto& s = root.at("statistics");
+
+  if (s.contains("channels") && !s.at("channels").is_null()) {
+    const auto& arr = s.at("channels");
+    if (!arr.is_array()) throw std::runtime_error("statistics.channels must be an array.");
+    stats.spec.base_channel = false;
+    stats.spec.filtered_channel = false;
+    for (const auto& item : arr) {
+      const auto name = item.get<std::string>();
+      if (name == "base") {
+        stats.spec.base_channel = true;
+      } else if (name == "filtered") {
+        stats.spec.filtered_channel = true;
+      } else {
+        throw std::runtime_error("statistics.channels[] must be base/filtered (got '" + name + "').");
+      }
+    }
+  }
+  parse_reductions(s, "reductions", stats.spec.mean, stats.spec.min, stats.spec.max,
+                   stats.spec.std);
+  set_if_present(s, "extremum", stats.spec.extremum);
+  set_if_present(s, "extremum_sample_radius", stats.spec.extremum_sample_radius);
+
+  if (s.contains("per_slice") && !s.at("per_slice").is_null()) {
+    const auto& p = s.at("per_slice");
+    if (p.contains("quantities") && !p.at("quantities").is_null()) {
+      stats.per_slice_quantities = p.at("quantities").get<std::vector<std::string>>();
+    }
+    parse_reductions(p, "reductions", stats.ps_mean, stats.ps_min, stats.ps_max, stats.ps_std);
+  }
+}
+
+namespace {
 
 void parse_msc(const nlohmann::json& root, MscConfig& msc) {
   const auto& m = root.at("msc");
@@ -107,6 +206,7 @@ void parse_msc(const nlohmann::json& root, MscConfig& msc) {
   set_if_present(m, "accurate_descending", msc.accurate_descending);
   set_if_present(m, "manifold", msc.manifold);
   set_if_present(m, "requested_parallelism", msc.requested_parallelism);
+  set_if_present(m, "extremum_sample_radius", msc.extremum_sample_radius);
 }
 
 void parse_segments(const nlohmann::json& root, SegmentKeepConfig& seg) {
@@ -147,6 +247,10 @@ void parse_matching(const nlohmann::json& root, MatchingConfig& matching) {
   set_if_present(m, "enabled", matching.enabled);
   set_if_present(m, "map_template", matching.map_template);
   set_if_present(m, "global_table_template", matching.global_table_template);
+  set_if_present(m, "write_cc_labels", matching.write_cc_labels);
+  set_if_present(m, "write_global_labels", matching.write_global_labels);
+  set_if_present(m, "cc_label_template", matching.cc_label_template);
+  set_if_present(m, "global_label_template", matching.global_label_template);
 }
 
 void parse_timing(const nlohmann::json& root, TimingConfig& timing) {
@@ -268,8 +372,15 @@ AppConfig load_config(const CliOptions& cli) {
   parse_output(root, cfg.output);
   parse_filters(root, cfg);
   parse_msc(root, cfg.msc);
+  parse_statistics_json(root, cfg.statistics);
+  // `msc.extremum_sample_radius` predates the statistics block; keep honouring it
+  // when the newer key was not set, so existing configs and the GUI's params JSON
+  // keep working. An explicit statistics.extremum_sample_radius wins.
+  if (cfg.statistics.spec.extremum_sample_radius == 0)
+    cfg.statistics.spec.extremum_sample_radius = cfg.msc.extremum_sample_radius;
   parse_segments(root, cfg.segments);
   parse_feature_filters(root, cfg.feature_filters);
+  parse_pixel_filters(root, cfg.pixel_filters);
   parse_execution(root, cfg.execution);
   parse_matching(root, cfg.matching);
   parse_assembly(root, cfg.assembly);
@@ -304,6 +415,9 @@ void validate_config(const AppConfig& cfg) {
   if (cfg.msc.requested_parallelism < 0) {
     throw std::runtime_error("msc.requested_parallelism must be >= 0 (0 = library default).");
   }
+  if (cfg.msc.extremum_sample_radius < 0) {
+    throw std::runtime_error("msc.extremum_sample_radius must be >= 0 (0 = the single critical pixel).");
+  }
   if (cfg.matching.enabled) {
     if (cfg.matching.map_template.empty()) throw std::runtime_error("matching.map_template must not be empty when matching is enabled.");
     if (cfg.matching.global_table_template.empty()) {
@@ -316,10 +430,34 @@ void validate_config(const AppConfig& cfg) {
   }
   for (const auto& q : cfg.feature_filters) {
     if (q.field.empty()) throw std::runtime_error("feature_filters[].field must not be empty.");
+    // row_passes fails closed on an unknown field, so an unvalidated typo would
+    // silently drop every feature. Reject it here instead. This also catches a
+    // field the `statistics` block switched off -- including the filtered
+    // aggregates, which are no longer computed by default.
+    if (!is_feature_field(q.field, cfg.statistics.spec)) {
+      throw std::runtime_error("feature_filters[].field is not an available statistic (got '" +
+                               q.field + "'). Available: " +
+                               join_fields(feature_fields(cfg.statistics.spec)));
+    }
     if (q.op != "lt" && q.op != "le" && q.op != "gt" && q.op != "ge" &&
         q.op != "eq" && q.op != "between") {
       throw std::runtime_error("feature_filters[].op must be lt/le/gt/ge/eq/between (got '" + q.op + "').");
     }
+  }
+  for (const auto& r : cfg.pixel_filters) {
+    if (r.channel != "base" && r.channel != "filtered") {
+      throw std::runtime_error("pixel_filters[].channel must be base/filtered (got '" + r.channel + "').");
+    }
+    if (r.mode != "keep" && r.mode != "omit") {
+      throw std::runtime_error("pixel_filters[].mode must be keep/omit (got '" + r.mode + "').");
+    }
+    if (r.op != "lt" && r.op != "le" && r.op != "gt" && r.op != "ge") {
+      throw std::runtime_error("pixel_filters[].op must be lt/le/gt/ge (got '" + r.op + "').");
+    }
+  }
+  if (cfg.assembly.connectivity != 6 && cfg.assembly.connectivity != 18 &&
+      cfg.assembly.connectivity != 26) {
+    throw std::runtime_error("assembly.connectivity must be 6/18/26.");
   }
 }
 

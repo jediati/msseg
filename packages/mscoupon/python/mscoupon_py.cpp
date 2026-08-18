@@ -22,7 +22,11 @@
 
 #include "diffg/image.hpp"
 #include "mscoupon/config.hpp"
+#include "mscoupon/gmm.hpp"
+#include "mscoupon/histogram_peaks.hpp"
+#include "mscoupon/measure_config.hpp"
 #include "mscoupon/query.hpp"
+#include "mscoupon/region_measure.hpp"
 #include "msseg/compute/msc2d.hpp"
 #include "msseg/filter/filter_stage.hpp"
 
@@ -53,6 +57,16 @@ msseg::FilterParams parse_filter(const nlohmann::json& cfg) {
   return filter;
 }
 
+// Parse the optional "statistics" block. Shares the CLI's parser so the GUI and
+// a batch run agree on which fields exist -- the schema is a wire format across
+// this boundary, so a divergence here shows up as a field the GUI offers and the
+// CLI rejects.
+msseg::StatsSpec parse_stats_spec(const nlohmann::json& cfg) {
+  mscoupon::StatisticsConfig stats;
+  mscoupon::parse_statistics_json(cfg, stats);
+  return stats.spec;
+}
+
 // Parse the optional "msc" block of a params-JSON string into Msc2DParams.
 msseg::Msc2DParams parse_msc(const nlohmann::json& cfg) {
   msseg::Msc2DParams msc;
@@ -65,7 +79,12 @@ msseg::Msc2DParams parse_msc(const nlohmann::json& cfg) {
     msc.accurate_descending = m.value("accurate_descending", msc.accurate_descending);
     msc.manifold = m.value("manifold", msc.manifold);
     msc.requested_parallelism = m.value("requested_parallelism", msc.requested_parallelism);
+    msc.extremum_sample_radius = m.value("extremum_sample_radius", msc.extremum_sample_radius);
   }
+  msc.stats = parse_stats_spec(cfg);
+  // Legacy alias: `msc.extremum_sample_radius` predates the statistics block.
+  if (msc.stats.extremum_sample_radius == 0)
+    msc.stats.extremum_sample_radius = msc.extremum_sample_radius;
   return msc;
 }
 
@@ -190,12 +209,20 @@ py::array_t<std::int32_t> pipeline_labels(const msseg::Msc2DPipeline& pipe) {
 // Per-surviving-feature statistics as a list of dicts (derived fields).
 py::list pipeline_feature_stats(const msseg::Msc2DPipeline& pipe) {
   py::list rows;
+  const msseg::StatsSpec& spec = pipe.stats();
   for (const auto& s : pipe.feature_stats()) {
     py::dict d;
-    for (const auto& [k, v] : mscoupon::feature_row(s)) d[py::str(k)] = v;
+    for (const auto& [k, v] : mscoupon::feature_row(s, spec)) d[py::str(k)] = v;
     rows.append(std::move(d));
   }
   return rows;
+}
+
+// The field names a given statistics spec produces. The GUI builds its field
+// dropdown from this instead of a hand-kept list, so the offered fields are
+// exactly the ones the CLI will accept.
+std::vector<std::string> feature_fields_py(const std::string& params_json) {
+  return mscoupon::feature_fields(parse_stats_spec(parse_params(params_json)));
 }
 
 // Evaluate the feature-query chain against a list of feature rows (dicts). Works
@@ -212,6 +239,177 @@ std::vector<bool> evaluate_queries(const py::list& rows, const std::string& quer
     keep.push_back(mscoupon::row_passes(row, queries));
   }
   return keep;
+}
+
+// --- 1-D Gaussian mixture -------------------------------------------------
+
+// The JSON -> options parsers live in the library (mscoupon/measure_config.hpp)
+// so the CLI's `normalize` filter op and these bindings accept exactly the same
+// keys; there is no second parser to drift.
+
+// Run `fn` if the array holds dtype T; false means "not this dtype, try the
+// next". The array is only copied when it is not already C-contiguous T, and
+// the GIL is released for the duration of the measure.
+template <typename T, typename Fn>
+bool run_if_dtype(const py::array& image, const char* what, Fn& fn) {
+  if (!image.dtype().equal(py::dtype::of<T>())) return false;
+  auto arr = py::array_t<T, py::array::c_style | py::array::forcecast>::ensure(image);
+  if (!arr)
+    throw std::runtime_error(std::string(what) + ": could not view the input as a contiguous array");
+  const T* data = arr.data();
+  const auto count = static_cast<std::size_t>(arr.size());
+  const auto ndim = arr.ndim();
+  const int height = ndim == 2 ? static_cast<int>(arr.shape(0)) : 0;
+  const int width = ndim == 2 ? static_cast<int>(arr.shape(1)) : 0;
+  {
+    py::gil_scoped_release release;
+    fn(data, count, width, height);
+  }
+  return true;
+}
+
+// Dispatch `fn(const T* data, size_t count, int width, int height)` over every
+// real numeric dtype a TIFF can arrive as. width/height are 0 unless the array
+// is 2-D. Shared by all three measures so the dtype list cannot drift.
+template <typename Fn>
+void dispatch_dtype(const py::array& image, const char* what, Fn fn) {
+  const bool handled =
+      run_if_dtype<float>(image, what, fn) || run_if_dtype<double>(image, what, fn) ||
+      run_if_dtype<std::int16_t>(image, what, fn) ||
+      run_if_dtype<std::uint16_t>(image, what, fn) ||
+      run_if_dtype<std::uint8_t>(image, what, fn) ||
+      run_if_dtype<std::int8_t>(image, what, fn) ||
+      run_if_dtype<std::int32_t>(image, what, fn) ||
+      run_if_dtype<std::uint32_t>(image, what, fn) ||
+      run_if_dtype<std::int64_t>(image, what, fn) ||
+      run_if_dtype<std::uint64_t>(image, what, fn);
+  if (!handled)
+    throw std::runtime_error(std::string(what) +
+                             ": unsupported dtype; expected a real numeric array "
+                             "(float32/64, int8/16/32/64 or uint8/16/32/64)");
+}
+
+py::dict gmm_result_dict(const mscoupon::GmmResult& r) {
+  py::list components;
+  for (const auto& c : r.components) {
+    py::dict d;
+    d["mean"] = c.mean;
+    d["sigma"] = c.sigma;
+    d["weight"] = c.weight;
+    d["n_hard"] = c.n_hard;
+    d["hard_mean"] = c.hard_mean;
+    d["median"] = c.median;
+    d["mode"] = c.mode;
+    components.append(std::move(d));
+  }
+
+  py::dict out;
+  out["components"] = std::move(components);
+  out["n_valid"] = r.n_valid;
+  out["n_sampled"] = r.n_sampled;
+  out["n_fit"] = r.n_fit;
+  out["trim_lo"] = r.trim_lo;
+  out["trim_hi"] = r.trim_hi;
+  out["log_likelihood"] = r.log_likelihood;
+  out["n_iter"] = r.n_iter;
+  out["converged"] = r.converged;
+  return out;
+}
+
+// Fit a 1-D Gaussian mixture to the pixels of any real numeric array. Shape is
+// irrelevant -- the pixels are treated as an unordered bag, as in the Python.
+py::dict fit_gmm(const py::array& image, const std::string& params_json) {
+  const mscoupon::GmmOptions opts = mscoupon::parse_gmm_options(parse_params(params_json));
+  mscoupon::GmmResult r;
+  dispatch_dtype(image, "gmm", [&](const auto* data, std::size_t count, int, int) {
+    r = mscoupon::fit_gmm(data, count, opts);
+  });
+  return gmm_result_dict(r);
+}
+
+// --- Histogram peaks ------------------------------------------------------
+
+py::dict histogram_result_dict(const mscoupon::HistogramResult& r) {
+  py::dict out;
+  out["peak_low"] = r.peak_low;
+  out["peak_high"] = r.peak_high;
+  out["peak_low_bin"] = r.peak_low_bin;
+  out["peak_high_bin"] = r.peak_high_bin;
+  out["peak_low_height"] = r.peak_low_height;
+  out["peak_high_height"] = r.peak_high_height;
+  out["hist_lo"] = r.hist_lo;
+  out["hist_hi"] = r.hist_hi;
+  out["n_total_pixels"] = r.n_total;
+  out["n_zero_pixels"] = r.n_zero;
+  out["n_valid_pixels"] = r.n_valid;
+  out["n_sampled_pixels"] = r.n_sampled;
+  out["min"] = r.min_value;
+  out["max"] = r.max_value;
+
+  const auto& names = mscoupon::default_percentile_names();
+  for (std::size_t i = 0; i < names.size() && i < r.percentiles.size(); ++i) {
+    out[py::str(names[i])] = r.percentiles[i];
+  }
+  return out;
+}
+
+py::dict measure_histogram(const py::array& image, const std::string& params_json) {
+  const mscoupon::HistogramOptions opts =
+      mscoupon::parse_histogram_options(parse_params(params_json));
+  mscoupon::HistogramResult r;
+  dispatch_dtype(image, "histogram", [&](const auto* data, std::size_t count, int, int) {
+    r = mscoupon::measure_histogram(data, count, opts);
+  });
+  return histogram_result_dict(r);
+}
+
+// --- Fixed rectangular regions --------------------------------------------
+
+py::dict region_stats_dict(const mscoupon::RegionStats& s) {
+  py::dict out;
+  out["n_pixels"] = s.n_pixels;
+  out["min"] = s.min_value;
+  out["max"] = s.max_value;
+  out["mean"] = s.mean;
+  out["std"] = s.std_dev;
+
+  const auto& names = mscoupon::default_percentile_names();
+  for (std::size_t i = 0; i < names.size() && i < s.percentiles.size(); ++i) {
+    out[py::str(names[i])] = s.percentiles[i];
+  }
+  return out;
+}
+
+// Measure every rectangle named in params_json["regions"], e.g.
+// {"regions": {"air": {"rows": "250:350", "cols": "740:840"}, "metal": {...}}}.
+py::dict measure_regions(const py::array& image, const std::string& params_json) {
+  const nlohmann::json cfg = parse_params(params_json);
+  const mscoupon::RegionOptions opts = mscoupon::parse_region_options(cfg);
+
+  const nlohmann::json& spec = cfg.contains("regions") ? cfg.at("regions") : cfg;
+  std::vector<std::pair<std::string, mscoupon::Rect>> rects;
+  for (auto it = spec.begin(); it != spec.end(); ++it) {
+    if (!it.value().is_object() || !it.value().contains("rows")) continue;
+    rects.emplace_back(it.key(), mscoupon::parse_rect_json(it.value()));
+  }
+  if (rects.empty())
+    throw std::runtime_error("region: no rectangles given; expected {\"name\": "
+                             "{\"rows\": \"a:b\", \"cols\": \"c:d\"}, ...}");
+
+  std::vector<mscoupon::RegionStats> stats(rects.size());
+  dispatch_dtype(image, "region", [&](const auto* data, std::size_t, int width, int height) {
+    if (width == 0 || height == 0)
+      throw std::runtime_error("region: expected a 2-D image");
+    for (std::size_t i = 0; i < rects.size(); ++i) {
+      stats[i] = mscoupon::measure_region(data, width, height, rects[i].second, opts);
+    }
+  });
+
+  py::dict out;
+  for (std::size_t i = 0; i < rects.size(); ++i) {
+    out[py::str(rects[i].first)] = region_stats_dict(stats[i]);
+  }
+  return out;
 }
 
 }  // namespace
@@ -241,9 +439,7 @@ PYBIND11_MODULE(mscoupon_py, m) {
       .def("height", &msseg::Msc2DPipeline::height)
       .def("labels", &pipeline_labels, "Feature id per pixel (int32 h,w) at the current persistence.")
       .def("feature_stats", &pipeline_feature_stats,
-           "Per-surviving-feature statistics (list of dicts) at the current persistence.")
-      .def("merge_tree_json", &msseg::Msc2DPipeline::merge_tree_json,
-           "The merge tree (flat JSON) mirroring the manifold merger.");
+           "Per-living-feature statistics (list of dicts) at the current persistence.");
 
   m.def("prime_slice", &prime_slice, py::arg("base"), py::arg("filtered"),
         py::arg("params_json") = std::string(),
@@ -252,4 +448,45 @@ PYBIND11_MODULE(mscoupon_py, m) {
   m.def("evaluate_queries", &evaluate_queries, py::arg("rows"), py::arg("queries_json"),
         "Evaluate a feature-query chain (JSON array of {field,op,value[,value2]}) against a "
         "list of feature-stat dicts; returns a list of bool keep flags. Shared 2D/3D evaluator.");
+
+  m.def("feature_fields", &feature_fields_py, py::arg("params_json") = std::string(),
+        "Sorted field names the given params JSON's statistics block produces, i.e. exactly "
+        "the fields feature_filters may name. Derived from the same schema the CLI validates "
+        "against, so the GUI dropdown cannot drift out of sync.");
+
+  m.def("fit_gmm", &fit_gmm, py::arg("image"), py::arg("params_json") = std::string(),
+        "Fit a 1-D Gaussian mixture to the pixels of a real numeric array of any shape "
+        "(they are treated as an unordered bag). This is the C++ port of "
+        "calculate_2_gaussian_mixture.py / measure_gmm.py.\n\n"
+        "params_json['gmm'] (or a bare options object) accepts: preset "
+        "('two_gaussian' | 'measure'), n_components, downsample_factor, omit_zeros, "
+        "omit_nonfinite, trim_percent, init ('kmeans' | 'quantile'), n_init, max_iter, "
+        "tol, reg_covar, seed, compute_hard_stats, mode_bins.\n\n"
+        "Returns a dict: components (list of {mean, sigma, weight, n_hard, hard_mean, "
+        "median, mode}, sorted by increasing mean), n_valid, n_sampled, n_fit, trim_lo, "
+        "trim_hi, log_likelihood, n_iter, converged.");
+
+  m.def("measure_histogram", &measure_histogram, py::arg("image"),
+        py::arg("params_json") = std::string(),
+        "Locate the two intensity populations by histogram peak finding. This is the C++ "
+        "port of measure_im.py: mask zeros/non-finite, random subsample, build a histogram "
+        "between two percentiles, smooth it, then take the two strongest separated local "
+        "maxima and refine each to sub-bin precision.\n\n"
+        "params_json['histogram'] (or a bare options object) accepts: downsample_factor, "
+        "omit_zeros, omit_nonfinite, bins, smooth_width, peak_window, min_peak_distance, "
+        "hist_lo_percentile, hist_hi_percentile, seed.\n\n"
+        "Returns a dict: peak_low, peak_high (ordered by intensity, not height), "
+        "peak_*_bin, peak_*_height, hist_lo, hist_hi, min, max, the p0_01..p99_99 "
+        "percentile ladder, and the n_*_pixels counts.");
+
+  m.def("measure_regions", &measure_regions, py::arg("image"),
+        py::arg("params_json") = std::string(),
+        "Measure intensity statistics inside named rectangles of a 2-D image. This is the "
+        "C++ port of measure_2_regions.py.\n\n"
+        "params_json['regions'] (or a bare object) maps each name to {'rows': 'START:END', "
+        "'cols': 'START:END'} -- rows are Y, cols are X, matching image[r0:r1, c0:c1]. "
+        "omit_zeros defaults to FALSE here (unlike the other measures): these are "
+        "explicitly chosen physical regions, so exact zeros are kept unless asked "
+        "otherwise.\n\n"
+        "Returns a dict of name -> {n_pixels, min, max, mean, std, p0_01..p99_99}.");
 }

@@ -13,6 +13,8 @@ struct SliceJob {
   std::filesystem::path table_output_path;
   std::filesystem::path filter_output_path;
   std::filesystem::path label_output_path;
+  std::filesystem::path cc_label_output_path;      // per-slice in-plane CC id raster
+  std::filesystem::path global_label_output_path;  // per-slice GLOBAL id raster
   int slice_index = 0;
 };
 

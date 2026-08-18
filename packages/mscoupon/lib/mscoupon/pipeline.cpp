@@ -13,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <nlohmann/json.hpp>
@@ -21,6 +22,7 @@
 #include <omp.h>
 #endif
 
+#include "mscoupon/cc_stage.hpp"
 #include "mscoupon/filter.hpp"
 #include "mscoupon/io.hpp"
 #include "mscoupon/matcher.hpp"
@@ -84,13 +86,13 @@ struct ProcessedSlice {
   Mask2D mask;
   std::vector<SegmentStat> table;
   std::optional<Image2D> filtered_image;
-  std::optional<std::vector<int>> labels;
+  std::optional<std::vector<int>> labels;   // debug MSC-merged label tiff
   int label_width = 0;
   int label_height = 0;
-  // Retained only when cross-slice matching is enabled: the full local-label
-  // image + kept-id set the matcher needs (labels above is optional/debug-only).
-  std::vector<int> match_labels;
-  std::unordered_set<int> keep_ids;
+  // Per-slice connected components of the selected+trimmed raster: the nodes the
+  // matcher links into 3D features, and the source for the CC / global label TIFFs.
+  std::vector<int> cc_labels;               // -1 bg, 0..n-1
+  std::vector<CcNodeStat> node_stats;       // per component
   int width = 0;
   int height = 0;
   StageTiming timing;
@@ -114,7 +116,15 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
     for (std::size_t i = 0; i < cfg.filters.size(); ++i) {
       oss << (i ? "," : "") << cfg.filters[i].operation;
     }
-    oss << "] manifold=" << cfg.msc.manifold << " persistence=";
+    oss << "]";
+    if (!cfg.base_filters.empty()) {
+      oss << " base_filters=[";
+      for (std::size_t i = 0; i < cfg.base_filters.size(); ++i) {
+        oss << (i ? "," : "") << cfg.base_filters[i].operation;
+      }
+      oss << "]";
+    }
+    oss << " manifold=" << cfg.msc.manifold << " persistence=";
     if (cfg.msc.persistence_absolute.has_value()) oss << *cfg.msc.persistence_absolute << "abs";
     else if (cfg.msc.persistence_percent.has_value()) oss << *cfg.msc.persistence_percent << "%";
     oss << " feature_filters=" << cfg.feature_filters.size()
@@ -217,29 +227,61 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
 #endif
 
           const auto filter_start = Clock::now();
+          // Two independent channels, both derived from the raw slice:
+          //   base     = base_filters(original)  -- what statistics and pixel
+          //              filters are measured against
+          //   filtered = filters(original)       -- the topology field the MSC runs on
+          // Deriving both from `original` (rather than chaining filters onto base)
+          // keeps `filters` meaning exactly what it always has, so a config with
+          // no base_filters is bit-for-bit identical to the previous behaviour.
+          // A `normalize` stage in either chain puts that channel on a two-point
+          // [0,1] scale; because the map is affine and order-preserving it cannot
+          // change the MSC, only the units the thresholds are read in.
+          std::vector<TwoPoint> base_normalizers;
+          Image2D base = cfg.base_filters.empty()
+                             ? loaded.original
+                             : apply_filter_chain(loaded.original, cfg.base_filters,
+                                                  &base_normalizers);
           Image2D filtered = apply_filter_chain(loaded.original, cfg.filters);
           loaded.timing.filter_ms = elapsed_ms(filter_start);
 
           // Merge-tree authoritative segmentation (same engine the GUI drives),
           // so an exported config reproduces the viewer's per-slice output.
           const auto msc_start = Clock::now();
-          SliceSegmentation seg = segment_slice_pipeline(loaded.original, filtered, cfg.msc);
+          SliceSegmentation seg =
+              segment_slice_pipeline(base, filtered, cfg.msc, cfg.statistics.spec);
           std::vector<int>& labels = seg.labels;
           loaded.timing.msc_ms = elapsed_ms(msc_start);
 
           const auto stats_start = Clock::now();
-          SegmentTable table = compute_segment_table(loaded.original, labels, loaded.job.slice_index);
+          SegmentTable table = compute_segment_table(base, labels, loaded.job.slice_index);
+          // The CSV rows are accumulated over the base channel only; carry the
+          // seeding critical point across from the MSC feature statistics so the
+          // table reports the same ext_* the selection queries see.
+          {
+            std::unordered_map<int, const msseg::Msc2DFeatureStat*> by_id;
+            by_id.reserve(seg.features.size() * 2);
+            for (const auto& f : seg.features) by_id.emplace(static_cast<int>(f.feature_id), &f);
+            for (auto& row : table.rows) {
+              const auto it = by_id.find(row.segment_id);
+              if (it == by_id.end()) continue;   // background row (-1) has no extremum
+              row.ext_x = it->second->ext_x;
+              row.ext_y = it->second->ext_y;
+              row.ext_base = it->second->ext_base;
+              row.ext_filtered = it->second->ext_filtered;
+            }
+          }
           loaded.timing.stats_ms = elapsed_ms(stats_start);
 
           const auto select_start = Clock::now();
+          // Per-slice selection: legacy size gate intersected with the query chain
+          // (evaluated on the 2D merged-region base+filtered stats -- single-source
+          // evaluator shared with the GUI).
           std::unordered_set<int> keep_ids = select_segment_ids(table, cfg.segments);
-          // Intersect with the feature-query chain (evaluated on the per-feature
-          // base+filtered statistics), the single-source evaluator shared with
-          // the GUI.
           if (!cfg.feature_filters.empty()) {
             std::unordered_set<int> pass;
             for (const auto& f : seg.features) {
-              if (row_passes(feature_row(f), cfg.feature_filters)) {
+              if (row_passes(feature_row(f, cfg.statistics.spec), cfg.feature_filters)) {
                 pass.insert(static_cast<int>(f.feature_id));
               }
             }
@@ -249,7 +291,22 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
             }
             keep_ids.swap(both);
           }
-          Mask2D mask = build_mask(labels, loaded.original.width, loaded.original.height, keep_ids);
+          // Pixel trim + per-slice connected components over the selected raster.
+          std::vector<int> cc_labels;
+          std::vector<CcNodeStat> node_stats;
+          const int n_cc = label_selected_components(
+              labels, base.width, base.height, base,
+              filtered, keep_ids, cfg.pixel_filters, cfg.assembly.connectivity,
+              cfg.msc.manifold != "descending", cfg.statistics.spec,
+              cc_labels, node_stats);
+          // Per-slice mask = the selected + trimmed CC foreground.
+          Mask2D mask;
+          mask.width = base.width;
+          mask.height = base.height;
+          mask.pixels.resize(cc_labels.size());
+          for (std::size_t i = 0; i < cc_labels.size(); ++i) {
+            mask.pixels[i] = cc_labels[i] >= 0 ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
+          }
           loaded.timing.select_ms = elapsed_ms(select_start);
 
           // Per-slice stage log (MSCEER's own stdout above reports the MSC
@@ -257,14 +314,19 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
           // so parallel compute lanes don't interleave mid-line.
           {
             float imin = std::numeric_limits<float>::max(), imax = std::numeric_limits<float>::lowest();
-            for (float v : loaded.original.pixels) { imin = std::min(imin, v); imax = std::max(imax, v); }
+            for (float v : base.pixels) { imin = std::min(imin, v); imax = std::max(imax, v); }
             float fmin = std::numeric_limits<float>::max(), fmax = std::numeric_limits<float>::lowest();
             for (float v : filtered.pixels) { fmin = std::min(fmin, v); fmax = std::max(fmax, v); }
             std::ostringstream oss;
             oss << "[mscoupon] slice " << loaded.job.slice_index << " ("
                 << loaded.job.input_path.filename().string() << "): image[" << imin << "," << imax
-                << "] filtered[" << fmin << "," << fmax << "] regions=" << seg.features.size()
-                << " kept=" << keep_ids.size() << "\n";
+                << "] filtered[" << fmin << "," << fmax << "]";
+            // The measured landmarks, so a run is reproducible from its log.
+            for (const auto& tp : base_normalizers) {
+              oss << " norm[" << tp.low << "," << tp.high << "]";
+            }
+            oss << " regions=" << seg.features.size()
+                << " kept=" << keep_ids.size() << " cc=" << n_cc << "\n";
             std::cerr << oss.str();
           }
 
@@ -282,12 +344,11 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
             processed.label_width = loaded.original.width;
             processed.label_height = loaded.original.height;
           }
-          if (cfg.matching.enabled) {
-            processed.width = loaded.original.width;
-            processed.height = loaded.original.height;
-            processed.keep_ids = keep_ids;             // keep_ids also used by build_mask above
-            processed.match_labels = std::move(labels);
-          }
+          // Per-slice CC nodes: the matcher's input + the CC/global label rasters.
+          processed.width = loaded.original.width;
+          processed.height = loaded.original.height;
+          processed.cc_labels = std::move(cc_labels);
+          processed.node_stats = std::move(node_stats);
           processed.timing = loaded.timing;
           compute_out.push(std::move(processed));
         }
@@ -310,6 +371,10 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
           const auto write_start = Clock::now();
           write_tiff_mask_u8(processed.job.mask_output_path, processed.mask);
           write_segment_table_csv(processed.job.table_output_path, processed.table);
+          if (cfg.matching.write_cc_labels && !processed.cc_labels.empty()) {
+            write_tiff_int32(processed.job.cc_label_output_path, processed.width,
+                             processed.height, processed.cc_labels);
+          }
           if (cfg.debug_output.write_filter_tiff && processed.filtered_image.has_value()) {
             write_tiff_float32(processed.job.filter_output_path, *processed.filtered_image);
           }
@@ -346,11 +411,15 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
     matcher_thread = std::thread([&]() {
       try {
         SliceMatcher matcher;
+        matcher.configure(cfg.statistics, cfg.msc.manifold != "descending");
         std::map<int, ProcessedSlice> pending;
+        std::map<int, std::filesystem::path> global_path_of;   // slice -> global TIFF
         int expected = 0;
 
         auto consume = [&](ProcessedSlice&& ps) {
-          matcher.add_slice(ps.match_labels, ps.width, ps.height, ps.keep_ids, ps.table, ps.job.slice_index);
+          matcher.add_slice(ps.cc_labels, ps.width, ps.height, ps.node_stats,
+                            ps.job.slice_index, cfg.assembly.connectivity);
+          global_path_of[ps.job.slice_index] = ps.job.global_label_output_path;
           write_queue.push(std::move(ps));
         };
 
@@ -373,9 +442,20 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
 
         std::vector<FeatureMapRow> map_rows;
         std::vector<GlobalFeatureStat> global_rows;
-        matcher.finalize(map_rows, global_rows);
+        // Relabel pass: per-slice GLOBAL id rasters (needs the resolved ids, so it
+        // runs after finalize -- a late slice can retroactively merge earlier ids).
+        // Each raster is written and dropped as it is produced; collecting them
+        // first would hold the whole stack in RAM (~100 GB at 2500 slices).
+        matcher.finalize(map_rows, global_rows, [&](GlobalLabelRaster&& r) {
+          if (!cfg.matching.write_global_labels) return;
+          const auto it = global_path_of.find(r.slice_index);
+          if (it != global_path_of.end()) {
+            write_tiff_int32(it->second, r.width, r.height, r.data);
+          }
+        });
         write_feature_map_csv(cfg.output.folder / cfg.matching.map_template, map_rows);
-        write_global_table_csv(cfg.output.folder / cfg.matching.global_table_template, global_rows);
+        write_global_table_csv(cfg.output.folder / cfg.matching.global_table_template, global_rows,
+                               cfg.statistics);
       } catch (...) {
         capture_error(std::current_exception());
       }

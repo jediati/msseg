@@ -39,7 +39,14 @@ add_msseg_instance(mscoupon
     lib/mscoupon/filter.cpp
     lib/mscoupon/msc_stage.cpp
     lib/mscoupon/stats.cpp
+    lib/mscoupon/measure_util.cpp
+    lib/mscoupon/gmm.cpp
+    lib/mscoupon/histogram_peaks.cpp
+    lib/mscoupon/region_measure.cpp
+    lib/mscoupon/measure_config.cpp
+    lib/mscoupon/normalize.cpp
     lib/mscoupon/query.cpp
+    lib/mscoupon/cc_stage.cpp
     lib/mscoupon/matcher.cpp
     lib/mscoupon/pipeline.cpp
 )
