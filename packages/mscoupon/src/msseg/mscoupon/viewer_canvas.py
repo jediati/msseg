@@ -58,6 +58,10 @@ class SliceCanvas(tk.Frame):
         # controller draws its own feedback as canvas items tagged "draw",
         # which render() keeps above each fresh blit.
         self.tool = None
+        # Optional callback() fired after the view transform changes (zoom,
+        # pan, fit) -- screen-space annotations must be redrawn at the new
+        # scale/offset.
+        self.on_view_changed = None
         self._hud_mode = None        # None | "busy" (animated) | "stale" (static)
         self._hud_text = ""
         self._hud_job = None
@@ -70,20 +74,28 @@ class SliceCanvas(tk.Frame):
         self.canvas.bind("<ButtonPress-1>", self._drag_start)
         self.canvas.bind("<B1-Motion>", self._drag_move)
         self.canvas.bind("<ButtonRelease-1>", self._drag_end)
-        # Middle-drag always pans, so a drawing tool on button 1 never locks
-        # navigation out.
+        # Middle-drag and right-drag always pan, so a drawing tool on button 1
+        # never locks navigation out.
         self.canvas.bind("<ButtonPress-2>", self._pan_start)
         self.canvas.bind("<B2-Motion>", self._pan_move)
         self.canvas.bind("<ButtonRelease-2>", lambda e: setattr(self, "_drag", None))
+        self.canvas.bind("<ButtonPress-3>", self._pan_start)
+        self.canvas.bind("<B3-Motion>", self._pan_move)
+        self.canvas.bind("<ButtonRelease-3>", lambda e: setattr(self, "_drag", None))
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Leave>", self._on_leave)
 
     # -- content ------------------------------------------------------- #
-    def set_base(self, array=None, path=None):
+    def set_base(self, array=None, path=None, reset_array=False):
         """Set the base image from an in-memory array and/or a file path
         (the path is used pyramidally by large_image when available). The
         large_image source is cached by path so repeated renders of the same
-        slice (e.g. dragging the persistence slider) don't re-open the file."""
+        slice (e.g. dragging the persistence slider) don't re-open the file.
+        reset_array=True drops a previously-set in-memory array, so a
+        path-only base (the preview fallback) actually renders via the
+        pyramidal source instead of the stale array."""
+        if reset_array and array is None:
+            self._base = None
         if path != self._source_path:
             self._source = None
             self._source_path = path
@@ -129,6 +141,7 @@ class SliceCanvas(tk.Frame):
         self.view_x = (self.image_width - w * self.scale) / 2
         self.view_y = (self.image_height - h * self.scale) / 2
         self._schedule()
+        self._view_changed()
 
     # -- interaction --------------------------------------------------- #
     def _on_wheel(self, e):
@@ -142,6 +155,11 @@ class SliceCanvas(tk.Frame):
         self.view_x = ix - sx * self.scale
         self.view_y = iy - sy * self.scale
         self._schedule()
+        self._view_changed()
+
+    def _view_changed(self):
+        if self.on_view_changed is not None:
+            self.on_view_changed()
 
     def _drag_start(self, e):
         if self.tool is not None and self.tool.on_press(e):
@@ -169,6 +187,7 @@ class SliceCanvas(tk.Frame):
         self.view_x = vx - (e.x - sx) * self.scale
         self.view_y = vy - (e.y - sy) * self.scale
         self._schedule()
+        self._view_changed()
 
     def screen_to_image(self, sx, sy):
         """Map a canvas pixel (sx, sy) to full-resolution base pixel (ix, iy).

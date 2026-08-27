@@ -68,6 +68,17 @@ def test_box_picks_intersecting_regions():
     assert touched_ids(make("box", [(12.0, 12.0), (8.0, 8.0)]), lab, np) == {0, 2, 5, 9}
 
 
+def test_taps_sample_points_independently():
+    lab = blocks_raster()
+    # Three taps in three blocks: no connecting segments, so the block the
+    # (5,15)-(15,5) diagonal would cross is NOT picked up...
+    pts = [(5.0, 5.0), (5.0, 15.0), (15.0, 5.0)]
+    assert touched_ids(make("taps", pts), lab, np) == {0, 5, 2}
+    # ...whereas a squiggle through the same points is.
+    assert 9 in touched_ids(make("squiggle", pts), lab, np)
+    assert touched_ids(make("taps", [(-3.0, -3.0)]), lab, np) == set()
+
+
 def test_polygon_picks_enclosed_regions_only():
     lab = blocks_raster()
     # Triangle over the top-left block only.
@@ -169,7 +180,7 @@ def test_json_round_trip():
     store.add("squiggle", [(1.5, 2.25), (3.0, 4.0)], 1, "s0.tiff", 0, 0)
     store.add("box", [(0.0, 0.0), (5.0, 5.0)], 3, "s1.tiff", 0, 1)
     doc = store.to_json()
-    assert doc["version"] == 1 and doc["n_classes"] == 4
+    assert doc["version"] == 2 and doc["n_classes"] == 4
     back = LabelStore.from_json(doc)
     assert back.n_classes == 4
     assert [it.uid for it in back.interactions] == [1, 2]
@@ -180,13 +191,44 @@ def test_json_round_trip():
     assert c.uid == 3
 
 
-def test_rebind_by_basename():
+def test_rebind_qualified_keys():
     store = LabelStore(n_classes=3)
-    store.add("squiggle", [(0, 0), (1, 1)], 1, "b.tiff", 5, 5)   # stale hints
-    store.add("squiggle", [(0, 0), (1, 1)], 2, "gone.tiff", 0, 0)
-    subseqs = [{"name": "s", "files": [r"C:\x\a.tiff", r"C:\x\b.tiff"]}]
+    store.add("squiggle", [(0, 0), (1, 1)], 1, "spears/b.tiff", 5, 5)  # stale hints
+    store.add("squiggle", [(0, 0), (1, 1)], 2, "spears/gone.tiff", 0, 0)
+    subseqs = [{"name": "s", "folder": "spears",
+                "files": [r"C:\x\a.tiff", r"C:\x\b.tiff"]}]
     unbound = store.rebind(subseqs)
     assert unbound == 1
-    it = store.for_slice("b.tiff")[0]
+    it = store.for_slice("spears/b.tiff")[0]
     assert (it.si, it.li) == (0, 1) and it.bound
-    assert not store.for_slice("gone.tiff")[0].bound
+    assert not store.for_slice("spears/gone.tiff")[0].bound
+
+
+def test_rebind_migrates_unambiguous_legacy_keys():
+    store = LabelStore(n_classes=3)
+    store.add("squiggle", [(0, 0), (1, 1)], 1, "b.tiff")     # v1 bare basename
+    subseqs = [{"name": "s", "folder": "spears",
+                "files": [r"C:\x\a.tiff", r"C:\x\b.tiff"]}]
+    assert store.rebind(subseqs) == 0
+    it = store.interactions[0]
+    assert it.slice_key == "spears/b.tiff", "legacy key upgraded in place"
+    assert (it.si, it.li) == (0, 1)
+
+
+def test_rebind_leaves_ambiguous_legacy_keys_unbound():
+    store = LabelStore(n_classes=3)
+    store.add("squiggle", [(0, 0), (1, 1)], 1, "a.tiff")     # v1 bare basename
+    subseqs = [{"name": "s1", "folder": "spears", "files": [r"C:\x\a.tiff"]},
+               {"name": "s2", "folder": "tomo", "files": [r"C:\y\a.tiff"]}]
+    assert store.rebind(subseqs) == 1
+    it = store.interactions[0]
+    assert not it.bound and it.slice_key == "a.tiff", "ambiguous: kept, not guessed"
+
+
+def test_rebind_qualified_beats_basename_fallback():
+    store = LabelStore(n_classes=3)
+    store.add("squiggle", [(0, 0), (1, 1)], 1, "tomo/a.tiff")
+    subseqs = [{"name": "s1", "folder": "spears", "files": [r"C:\x\a.tiff"]},
+               {"name": "s2", "folder": "tomo", "files": [r"C:\y\a.tiff"]}]
+    assert store.rebind(subseqs) == 0
+    assert (store.interactions[0].si, store.interactions[0].li) == (1, 0)

@@ -43,6 +43,7 @@ from .common import (log, natural_key, list_tiffs, _wheel_delta,
                      _parse_sigmas, _format_sigmas, group_contiguous)
 from .widgets import ScrollFrame, jump_scale, scrolled_listbox
 from .engine import ComputeEngine
+from . import session
 
 
 # --------------------------------------------------------------------------- #
@@ -58,9 +59,15 @@ class MscouponApp:
         self.root.title("mscoupon viewer")
 
         # --- data model -------------------------------------------------- #
-        self.folder = ""
-        self.all_files = []                      # files in the browsed folder
-        self.subsequences = []                   # [{"name": str, "files": [paths]}]
+        # A SESSION is the top-level object: data folders, the sequences made
+        # from them, named compute profiles (one active), run settings, and --
+        # in the labeler -- labels and model references.
+        self.folders = []                        # [{"path": str, "name": str}]
+        self.active_folder_idx = None            # index into self.folders
+        self.all_files = []                      # ACTIVE folder's TIFF paths
+        self.subsequences = []                   # [{"name","folder","files":[abs paths]}]
+        self.profiles = [session.default_profile()]
+        self.active_profile_idx = 0
         self.filter_cards = [self._new_filter_card()]   # trailing "none" card appended
         # Base-channel chain (typically a single `normalize` stage). Statistics
         # and pixel thresholds are measured against its output, while
@@ -112,6 +119,12 @@ class MscouponApp:
         self.status_var = tk.StringVar(value="Ready.")
         self.hover_var = tk.StringVar(value="")
         self._hover_ctx = None                           # cached arrays for the hover readout
+        # Image preview (click / drag over the TIFF list, before any Run):
+        # transient, last-writer-wins against _refresh_render, never touches
+        # the engine. Loads are debounced and LRU-cached (~4 float32 slices).
+        self._preview_after = None
+        self._preview_path = None
+        self._preview_cache = {}                          # path -> float32 array (LRU)
         self.autosave_var = tk.BooleanVar(value=bool(autosave))
 
         # --- layout ------------------------------------------------------ #
@@ -139,7 +152,7 @@ class MscouponApp:
             side="bottom", fill="x")
 
         if initial and os.path.isdir(initial):
-            self._set_folder(initial)
+            self._add_folder_path(initial)
 
         # Auto-save on a timer rather than a trace per widget: a trace has to be
         # remembered every time a control is added, and the one that is forgotten
@@ -257,9 +270,12 @@ class MscouponApp:
     def _build_toolbar(self, parent):
         bar = ttk.Frame(parent)
         bar.pack(side="top", fill="x")
-        self.load_btn = ttk.Button(bar, text="Load config.json…",
-                                   command=self._load_config)
-        self.load_btn.pack(side="left", padx=(6, 2), pady=3)
+        self.save_session_btn = ttk.Button(bar, text="Save session…",
+                                           command=self._save_session_as)
+        self.save_session_btn.pack(side="left", padx=(6, 2), pady=3)
+        self.load_btn = ttk.Button(bar, text="Load session…",
+                                   command=self._load_session)
+        self.load_btn.pack(side="left", padx=2)
         self.restore_btn = ttk.Button(bar, text="Restore last",
                                       command=self._restore_last)
         self.restore_btn.pack(side="left", padx=2)
@@ -451,7 +467,9 @@ class MscouponApp:
         load just replaced.
         """
         state = "normal" if enabled else "disabled"
-        for btn in (getattr(self, "load_btn", None), getattr(self, "restore_btn", None)):
+        for btn in (getattr(self, "load_btn", None),
+                    getattr(self, "restore_btn", None),
+                    getattr(self, "profile_load_btn", None)):
             if btn is not None:
                 try:
                     btn.config(state=state)
@@ -462,16 +480,45 @@ class MscouponApp:
     # Left panel
     # ------------------------------------------------------------------ #
     def _build_left(self):
-        # 1. Sequences
-        c = ttk.LabelFrame(self.left, text="1. Sequences")
+        # 0. Compute profile: the named parameter set the panel below edits.
+        c = ttk.LabelFrame(self.left, text="0. Compute profile")
         c.pack(fill="x", padx=6, pady=4)
-        ttk.Button(c, text="Browse folder…", command=self._browse_folder).pack(fill="x", padx=4, pady=2)
+        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
+        self.profile_var = tk.StringVar(value=self.profiles[0]["name"])
+        self.profile_combo = ttk.Combobox(row, textvariable=self.profile_var,
+                                          state="readonly", width=22)
+        self.profile_combo.pack(side="left", fill="x", expand=True)
+        self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_selected)
+        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
+        ttk.Button(row, text="New", command=self._profile_new, width=5).pack(side="left")
+        ttk.Button(row, text="Dup", command=self._profile_duplicate, width=5).pack(side="left", padx=2)
+        ttk.Button(row, text="Rename…", command=self._profile_rename, width=8).pack(side="left", padx=2)
+        ttk.Button(row, text="Delete", command=self._profile_delete, width=6).pack(side="left", padx=2)
+        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
+        ttk.Button(row, text="Save profile…",
+                   command=self._save_profile).pack(side="left", fill="x", expand=True, padx=(0, 2))
+        self.profile_load_btn = ttk.Button(row, text="Load profile…",
+                                           command=self._load_profile)
+        self.profile_load_btn.pack(side="left", fill="x", expand=True, padx=(2, 0))
+        self._refresh_profile_combo()
+
+        # 1. Session: data folders and the sequences made from them.
+        c = ttk.LabelFrame(self.left, text="1. Session")
+        c.pack(fill="x", padx=6, pady=4)
+        ttk.Label(c, text="Folders:").pack(anchor="w", padx=4)
+        self.folder_list = self._scrolled_listbox(c, height=4, exportselection=False)
+        self.folder_list.bind("<<ListboxSelect>>", self._on_folder_selected)
+        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
+        ttk.Button(row, text="Add folder…", command=self._add_folder).pack(side="left")
+        ttk.Button(row, text="Remove", command=self._remove_folder).pack(side="left", padx=4)
         # Production folders hold thousands of files -> scrollable list.
+        # Clicking / dragging over the list previews the image on the right.
         self.file_list = self._scrolled_listbox(c, selectmode="extended", height=10,
                                                 exportselection=False)
-        ttk.Button(c, text="Make subsequence from selection",
+        self._bind_preview()
+        ttk.Button(c, text="Make sequence from selection",
                    command=self._make_subsequence).pack(fill="x", padx=4, pady=2)
-        ttk.Label(c, text="Subsequences:").pack(anchor="w", padx=4)
+        ttk.Label(c, text="Sequences:").pack(anchor="w", padx=4)
         self.subseq_list = self._scrolled_listbox(c, height=4, exportselection=False)
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
         ttk.Button(row, text="Remove", command=self._remove_subsequence).pack(side="left")
@@ -527,12 +574,9 @@ class MscouponApp:
         ttk.Entry(row, textvariable=self.concurrent_slices_var, width=5).pack(side="left", padx=2)
         self.run_btn = ttk.Button(c, text="Run with selected", command=self._run)
         self.run_btn.pack(fill="x", padx=4, pady=4)
-
-        # 5. Export
-        c = ttk.LabelFrame(self.left, text="7. Export")
-        c.pack(fill="x", padx=6, pady=4)
-        ttk.Button(c, text="Export config.json…", command=self._export_config).pack(
-            fill="x", padx=4, pady=4)
+        # (config.json export is on hold -- it will return as a bundle of the
+        # compute profile AND the trained model. _config_for/_write_configs stay
+        # as its dormant seed and as the selftest's AppConfig-equivalence probe.)
 
     def _chain(self, chain):
         """(card list, containing frame) for one of the two filter chains.
@@ -681,38 +725,115 @@ class MscouponApp:
         self._rebuild_filter_cards(chain)
 
     # ------------------------------------------------------------------ #
-    # Sequence browser
+    # Session browser: folders and sequences
     # ------------------------------------------------------------------ #
-    def _browse_folder(self):
-        folder = filedialog.askdirectory()
+    def _add_folder(self):
+        folder = filedialog.askdirectory(title="Add a data folder to the session")
         if folder:
-            self._set_folder(folder)
+            self._add_folder_path(folder)
 
-    def _set_folder(self, folder):
-        self.folder = folder
-        self.all_files = list_tiffs(folder)
+    def _add_folder_path(self, path):
+        """Add one folder to the session (dialog-free; the selftest and the
+        `initial` ctor argument use this directly). Returns its index, or None
+        when the path is already in the session."""
+        norm = os.path.normpath(path)
+        for i, f in enumerate(self.folders):
+            if os.path.normpath(f["path"]) == norm:
+                self.status_var.set(f"Folder already in session: {f['name']}")
+                self._set_active_folder(i)
+                return None
+        name = session.folder_display_name(path, [f["name"] for f in self.folders])
+        self.folders.append({"path": path, "name": name})
+        self._refresh_folder_list()
+        idx = len(self.folders) - 1
+        self._set_active_folder(idx)
+        return idx
+
+    def _remove_folder(self):
+        sel = list(self.folder_list.curselection())
+        if not sel:
+            return
+        idx = sel[0]
+        name = self.folders[idx]["name"]
+        referencing = [s for s in self.subsequences if s.get("folder") == name]
+        if referencing:
+            if not messagebox.askyesno(
+                    "mscoupon", f"Folder '{name}' is used by {len(referencing)} "
+                    "sequence(s), which will be removed too. Continue?"):
+                return
+            self.subsequences = [s for s in self.subsequences
+                                 if s.get("folder") != name]
+            self._refresh_subseq_list()
+        del self.folders[idx]
+        self._refresh_folder_list()
+        if not self.folders:
+            self.active_folder_idx = None
+            self.all_files = []
+            self.file_list.delete(0, "end")
+        else:
+            self._set_active_folder(min(idx, len(self.folders) - 1))
+
+    def _refresh_folder_list(self):
+        self.folder_list.delete(0, "end")
+        for f in self.folders:
+            self.folder_list.insert("end", f["name"])
+        if self.active_folder_idx is not None and self.folders:
+            self.folder_list.selection_clear(0, "end")
+            self.folder_list.selection_set(self.active_folder_idx)
+
+    def _on_folder_selected(self, _event=None):
+        sel = list(self.folder_list.curselection())
+        if sel:
+            self._set_active_folder(sel[0])
+
+    def _set_active_folder(self, idx):
+        """Make folders[idx] the browsed folder: its TIFFs fill file_list
+        (positional index there ⇄ self.all_files index, as before)."""
+        if not (0 <= idx < len(self.folders)):
+            return
+        self.active_folder_idx = idx
+        folder = self.folders[idx]
+        self.all_files = list_tiffs(folder["path"])
         self.file_list.delete(0, "end")
         for f in self.all_files:
             self.file_list.insert("end", os.path.basename(f))
-        self.status_var.set(f"{len(self.all_files)} TIFFs in {folder}")
+        self._refresh_folder_list()
+        self.status_var.set(f"{len(self.all_files)} TIFFs in {folder['name']} "
+                            f"({folder['path']})")
+
+    def _folder_by_name(self, name):
+        for f in self.folders:
+            if f["name"] == name:
+                return f
+        return None
 
     def _refresh_subseq_list(self):
         """Repaint subseq_list from self.subsequences, which is the only writer.
 
         The piecewise insert/delete the browser used to do has no inverse, and
-        loading a config replaces the whole list at once.
+        loading a session replaces the whole list at once.
         """
         self.subseq_list.delete(0, "end")
         for s in self.subsequences:
-            self.subseq_list.insert("end", s["name"])
+            self.subseq_list.insert("end", self._sequence_row_text(s))
+
+    @staticmethod
+    def _sequence_row_text(s):
+        return session.sequence_row_text(s)
 
     def _make_subsequence(self):
+        if self.active_folder_idx is None:
+            self.status_var.set("Add a folder first.")
+            return
         sel = list(self.file_list.curselection())
         if not sel:
             return
         files = [self.all_files[i] for i in sel]
-        name = f"seq{len(self.subsequences) + 1} ({len(files)})"
-        self.subsequences.append({"name": name, "files": files})
+        folder = self.folders[self.active_folder_idx]["name"]
+        stem = lambda p: os.path.splitext(os.path.basename(p))[0]
+        name = (f"{folder} {stem(files[0])}" if len(files) == 1
+                else f"{folder} {stem(files[0])}-{stem(files[-1])}")
+        self.subsequences.append({"name": name, "folder": folder, "files": files})
         self._refresh_subseq_list()
 
     def _remove_subsequence(self):
@@ -724,6 +845,82 @@ class MscouponApp:
     def _clear_subsequences(self):
         self.subsequences.clear()
         self._refresh_subseq_list()
+
+    # ------------------------------------------------------------------ #
+    # Image preview (no priming): click / drag over the TIFF list
+    # ------------------------------------------------------------------ #
+    _PREVIEW_CACHE_MAX = 4        # float32 slices (~40 MB each on 3232^2)
+
+    def _bind_preview(self):
+        # add="+" keeps Tk's extended-selectmode rubber-band working, so the
+        # same drag that previews also selects files for "Make sequence".
+        self.file_list.bind("<Button-1>", self._on_filelist_click, add="+")
+        self.file_list.bind("<B1-Motion>", self._on_filelist_click, add="+")
+
+    def _on_filelist_click(self, event):
+        idx = self.file_list.nearest(event.y)
+        if not (0 <= idx < len(self.all_files)):
+            return
+        # Debounce: dragging fires per motion event, but a ~40 MB TIFF load
+        # should happen once per rest, not per pixel.
+        if self._preview_after is not None:
+            try:
+                self.root.after_cancel(self._preview_after)
+            except tk.TclError:
+                pass
+        self._preview_after = self.root.after(40, self._preview_apply, idx)
+
+    def _preview_apply(self, idx):
+        self._preview_after = None
+        if self.viewer is None or not (0 <= idx < len(self.all_files)):
+            return
+        path = self.all_files[idx]
+        arr = self._preview_cache.get(path)
+        if arr is None:
+            try:
+                import numpy as np
+                from PIL import Image
+                arr = np.asarray(Image.open(path), dtype=np.float32)
+                if arr.ndim == 3:
+                    arr = arr.mean(axis=2).astype(np.float32)
+                arr = np.ascontiguousarray(arr)
+            except Exception as exc:
+                # Fall back to the pyramidal path-only source (large_image);
+                # reset_array drops any stale in-memory base first.
+                log(f"preview load failed for {os.path.basename(path)}: {exc}")
+                first = self.viewer._base is None and self.viewer._source is None
+                self.viewer.set_base(array=None, path=path, reset_array=True)
+                self._preview_path = path
+                self.viewer.set_overlays([])
+                self.viewer.set_window(self.vmin_var.get(), self.vmax_var.get())
+                self.viewer.fit() if first else self.viewer.render()
+                self.status_var.set(f"preview: {os.path.basename(path)}")
+                return
+            self._preview_cache[path] = arr
+            while len(self._preview_cache) > self._PREVIEW_CACHE_MAX:
+                self._preview_cache.pop(next(iter(self._preview_cache)))
+        else:
+            # Re-insert for LRU recency.
+            self._preview_cache[path] = self._preview_cache.pop(path)
+        first = self.viewer._base is None and self.viewer._source is None
+        self.viewer.set_base(array=arr, path=path)
+        self._preview_path = path
+        self.viewer.set_overlays([])
+        self.viewer.set_window(self.vmin_var.get(), self.vmax_var.get())
+        if first:
+            self.viewer.fit()
+        else:
+            self.viewer.render()
+        self.status_var.set(f"preview: {os.path.basename(path)}")
+
+    def _repreview_if_active(self):
+        """Re-apply the base window to an active preview. The window sliders
+        call _refresh_render, which early-returns while nothing is primed --
+        this keeps them live for previews too."""
+        if (self.viewer is not None and self._preview_path is not None
+                and not self.primed):
+            self.viewer.set_window(self.vmin_var.get(), self.vmax_var.get())
+            self.viewer.render()
 
     # ------------------------------------------------------------------ #
     # Right panel
@@ -1031,36 +1228,234 @@ class MscouponApp:
             return 0
 
     def _params_json(self, cores=None):
-        try:
-            pct = float(self.persist_pct_var.get())
-        except ValueError:
-            pct = 10.0
+        """The priming params for the ACTIVE profile as edited right now, plus
+        the session-level core count (cores > 1 selects MSCEER's partitioned
+        builder -- see session.profile_params_json). Drives which per-feature
+        fields exist, so the query dropdown, the primed pipelines and a saved
+        profile all agree."""
         if cores is None:
             cores = self._cores_per_slice()
-        msc = {"manifold": self.manifold_var.get(),
-               "persistence_percent": pct,
-               "accurate_ascending": self.accurate_var.get(),
-               "accurate_descending": self.accurate_var.get()}
+        return session.profile_params_json(self._profile_from_ui(), cores)
+
+    # ------------------------------------------------------------------ #
+    # Compute profiles: the left panel edits the ACTIVE one
+    # ------------------------------------------------------------------ #
+    def _profile_from_ui(self):
+        """Snapshot the panel into a profile dict (JSON/writer-shaped)."""
+        try:
+            pct = float(self.persist_pct_var.get())
+        except (ValueError, tk.TclError):
+            pct = 10.0
         radius = self._ext_radius()
-        if radius > 0:
-            msc["extremum_sample_radius"] = radius
-        if cores > 1:
-            # Partitioned builder + N-way parallelism drives MSCEER's discrete
-            # gradient, partitioned MSC construction, and manifold labeling
-            # (msc2d.cpp compute_with_algorithm). filter/omp threads are governed
-            # separately (only in the CLI, via execution.threads_per_slice).
-            msc["compute_algorithm"] = "partitioned"
-            msc["requested_parallelism"] = cores
-        return json.dumps({
+        name = "default"
+        if 0 <= self.active_profile_idx < len(self.profiles):
+            name = self.profiles[self.active_profile_idx].get("name", name)
+        return {
+            "name": name,
             "filters": config_io.filters_to_json(self.filter_cards),
             "base_filters": config_io.filters_to_json(self.base_cards),
-            "msc": msc,
-            # Drives which per-feature fields exist, so the query dropdown, the
-            # primed pipelines and an exported config all agree.
+            "msc": {"manifold": self.manifold_var.get(),
+                    "persistence_percent": pct,
+                    "accurate": bool(self.accurate_var.get()),
+                    "extremum_sample_radius": radius},
             "statistics": config_io.statistics_to_json(
                 self._stat_channel_cards(), self._stat_reductions(),
                 self.stat_extremum_var.get(), radius),
-        })
+            "selection": {
+                "feature_filters": config_io.queries_to_json(self.query_cards),
+                "pixel_filters": config_io.pixel_filters_to_json(self.pixel_cards),
+                "connectivity": int(self.connectivity_var.get()),
+                "min_area": self._min_area(),
+            },
+        }
+
+    def _apply_profile_to_ui(self, profile, setvar, notes):
+        """Push one profile onto the panel. The ORDER mirrors the old
+        _apply_state and is load-bearing: scalars, then the statistics spec
+        (the query dropdowns are generated from the field universe it defines),
+        then the card chains -- topo before base, because the base rebuild is
+        what resets _normalize_readouts."""
+        msc = profile.get("msc") or {}
+        if msc.get("manifold"):
+            setvar(self.manifold_var, msc["manifold"])
+        setvar(self.accurate_var, bool(msc.get("accurate")))
+        setvar(self.ext_radius_var, str(int(msc.get("extremum_sample_radius") or 0)))
+        sel = profile.get("selection") or {}
+        min_area = sel.get("min_area")
+        setvar(self.min_area_var, "" if min_area is None else str(int(min_area)))
+        if sel.get("connectivity"):
+            setvar(self.connectivity_var, int(sel["connectivity"]))
+        # The cap and the live value are independent vars and _persist_pct
+        # clamps live against the cap, so both follow the profile (a session's
+        # view block may override the live value afterwards).
+        pct = msc.get("persistence_percent")
+        if pct is not None:
+            setvar(self.persist_pct_var, f"{float(pct):g}")
+            setvar(self.persist_live_var, f"{float(pct):g}")
+
+        stats = config_io.statistics_from_json(profile.get("statistics"), notes)
+        self._apply_stat_state({"stat_channels": stats["channels"],
+                                "stat_reductions": stats["reductions"],
+                                "stat_extremum": stats["extremum"]}, setvar)
+
+        fields = config_io.query_fields(
+            json.dumps({"statistics": profile.get("statistics") or {}}))
+        self.filter_cards = (config_io.filters_from_json(profile.get("filters"), notes)
+                             + [self._new_filter_card()])
+        self.base_cards = (config_io.filters_from_json(profile.get("base_filters"), notes)
+                           + [self._new_filter_card()])
+        self.query_cards = (config_io.queries_from_json(sel.get("feature_filters"),
+                                                        fields, notes)
+                            + [self._new_query_card()])
+        self.pixel_cards = (config_io.pixel_filters_from_json(sel.get("pixel_filters"),
+                                                              notes)
+                            + [self._new_pixel_card()])
+        self._rebuild_filter_cards()
+        self._rebuild_filter_cards("base")
+        self._rebuild_query_cards()
+        self._rebuild_pixel_cards()
+        self._refresh_channel_picker()
+        self._refresh_stat_summary()
+
+    def _snapshot_active_profile(self):
+        if 0 <= self.active_profile_idx < len(self.profiles):
+            self.profiles[self.active_profile_idx] = self._profile_from_ui()
+
+    def _refresh_profile_combo(self):
+        combo = getattr(self, "profile_combo", None)
+        if combo is None:
+            return
+        names = [p["name"] for p in self.profiles]
+        try:
+            combo.config(values=names)
+        except tk.TclError:
+            return
+        if 0 <= self.active_profile_idx < len(names):
+            self.profile_var.set(names[self.active_profile_idx])
+
+    def _switch_profile(self, idx):
+        """Activate profiles[idx]. Primed data belongs to the previous
+        profile's parameters, so it is dropped -- sequences, folders and (in
+        the labeler) labels are untouched."""
+        if not (0 <= idx < len(self.profiles)) or idx == self.active_profile_idx:
+            self._refresh_profile_combo()
+            return
+        self._snapshot_active_profile()
+        self.engine.reset()
+        self._hover_ctx = None
+        self._selection_dirty = False
+        self.active_profile_idx = idx
+        notes = []
+
+        def setvar(var, value):
+            try:
+                var.set(value)
+            except (tk.TclError, ValueError, TypeError):
+                notes.append(f"ignored unusable value {value!r}")
+
+        self._apply_profile_to_ui(self.profiles[idx], setvar, notes)
+        self._refresh_profile_combo()
+        self._rebuild_flat_slices()
+        try:
+            self.rerun_btn.config(state="disabled")
+            if not self._run_active:
+                self.run_btn.config(state="normal")
+        except tk.TclError:
+            pass
+        try:
+            self._update_busy()
+            self._refresh_render()
+        except Exception as exc:
+            log(f"redraw after profile switch failed: {exc}")
+        for msg in notes:
+            log(msg)
+        self.status_var.set(f"Profile '{self.profiles[idx]['name']}' active - "
+                            "Run to prime.")
+
+    def _on_profile_selected(self, _event=None):
+        name = self.profile_var.get()
+        for i, p in enumerate(self.profiles):
+            if p["name"] == name:
+                self._switch_profile(i)
+                return
+
+    def _profile_new(self):
+        self._snapshot_active_profile()
+        name = session.dedupe_profile_name("profile",
+                                           [p["name"] for p in self.profiles])
+        self.profiles.append(session.default_profile(name))
+        self._switch_profile(len(self.profiles) - 1)
+
+    def _profile_duplicate(self):
+        self._snapshot_active_profile()
+        src = self.profiles[self.active_profile_idx]
+        dup = json.loads(json.dumps(src))
+        dup["name"] = session.dedupe_profile_name(src["name"],
+                                                  [p["name"] for p in self.profiles])
+        self.profiles.append(dup)
+        self._switch_profile(len(self.profiles) - 1)
+
+    def _profile_rename(self):
+        from tkinter import simpledialog
+        current = self.profiles[self.active_profile_idx]["name"]
+        name = simpledialog.askstring("mscoupon", "Profile name:",
+                                      initialvalue=current, parent=self.root)
+        if not name or name == current:
+            return
+        name = session.dedupe_profile_name(
+            name, [p["name"] for i, p in enumerate(self.profiles)
+                   if i != self.active_profile_idx])
+        self.profiles[self.active_profile_idx]["name"] = name
+        self._refresh_profile_combo()
+
+    def _profile_delete(self):
+        if len(self.profiles) <= 1:
+            self.status_var.set("A session keeps at least one profile.")
+            return
+        idx = self.active_profile_idx
+        name = self.profiles[idx]["name"]
+        if not messagebox.askyesno("mscoupon", f"Delete profile '{name}'?"):
+            return
+        del self.profiles[idx]
+        self.active_profile_idx = -1          # force the switch to re-apply
+        self._switch_profile(min(idx, len(self.profiles) - 1))
+
+    def _save_profile(self):
+        self._snapshot_active_profile()
+        profile = self.profiles[self.active_profile_idx]
+        path = filedialog.asksaveasfilename(
+            title="Save compute profile", defaultextension=".json",
+            initialfile=f"{profile['name']}.profile.json",
+            filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        blob = config_io.serialize_session(session.profile_file_doc(profile))
+        if config_io.write_session_text(blob, path):
+            self.status_var.set(f"Wrote {path}")
+        else:
+            self.status_var.set(f"Could not write {path}")
+
+    def _load_profile(self):
+        path = filedialog.askopenfilename(title="Load compute profile",
+                                          filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        doc = config_io.read_json_file(path)
+        if doc is None:
+            self.status_var.set(f"Could not read {path}")
+            return
+        notes = []
+        profile = session.profile_from_json(doc, notes)
+        self._snapshot_active_profile()
+        profile["name"] = session.dedupe_profile_name(
+            profile["name"], [p["name"] for p in self.profiles])
+        self.profiles.append(profile)
+        self._switch_profile(len(self.profiles) - 1)
+        for msg in notes:
+            log(msg)
+        if notes:
+            self.status_var.set(f"Loaded profile '{profile['name']}' - "
+                                + "; ".join(notes[:2]))
 
     def _stat_channel_cards(self):
         """The `statistics.channels[]` model, in slot order."""
@@ -1133,6 +1528,7 @@ class MscouponApp:
         elif kind == "primed":
             self.run_btn.config(state="normal")
             self._set_load_enabled(True)
+            self._chan_cache.clear()      # derived rasters belong to the old run
             self._rebuild_flat_slices()
             self.status_var.set(f"Primed {len(self.primed)} subsequence(s), "
                                 f"{len(self.flat_slices)} slices.")
@@ -1433,6 +1829,7 @@ class MscouponApp:
             return
         cur = self._current()
         if cur is None or not self.primed:
+            self._repreview_if_active()   # window sliders stay live for previews
             return
         try:
             import numpy as np
@@ -1590,56 +1987,43 @@ class MscouponApp:
     # ------------------------------------------------------------------ #
     # Export
     # ------------------------------------------------------------------ #
-    def _export_config(self):
-        if not self.subsequences:
-            messagebox.showinfo("mscoupon", "Define at least one subsequence first.")
-            return
-        out_dir = filedialog.askdirectory(title="Choose an output folder for config(s)")
-        if not out_dir:
-            return
-        paths = self._write_configs(out_dir)
-        self.status_var.set(f"Wrote {len(paths)} config(s) to {out_dir}")
-        messagebox.showinfo("mscoupon", "Exported:\n" + "\n".join(os.path.basename(p) for p in paths))
+    def _config_for(self, files, output_folder, profile=None, folder=None):
+        """The AppConfig dict for one file list under one profile (the active
+        one by default).
 
-    def _config_for(self, files, output_folder, folder=None):
-        """The AppConfig dict for one file list.
-
-        Single source of truth for both the exported config_N.json and the
-        auto-saved session, so the two cannot drift apart.
+        DORMANT UI-wise: config.json export is on hold until it returns as a
+        bundle of the compute profile AND the trained model. Kept because it is
+        the seed of that export and the selftest's AppConfig-equivalence probe.
         """
-        try:
-            pct = float(self.persist_pct_var.get())
-        except ValueError:
-            pct = 10.0
-        min_area = None
-        if self.min_area_var.get().strip():
-            try:
-                min_area = int(self.min_area_var.get())
-            except ValueError:
-                min_area = None
+        if profile is None:
+            profile = self._profile_from_ui()
+        msc = profile.get("msc") or {}
+        sel = profile.get("selection") or {}
+        stats = config_io.statistics_from_json(profile.get("statistics"))
         return config_io.build_config(
             files=files,
             output_folder=output_folder,
-            filters=self.filter_cards,
-            base_filters=self.base_cards,
-            persistence_percent=pct,
-            manifold=self.manifold_var.get(),
-            accurate=self.accurate_var.get(),
-            extremum_sample_radius=self._ext_radius(),
-            min_area=min_area,
-            feature_filters=self.query_cards,
-            pixel_filters=self.pixel_cards,
-            connectivity=self.connectivity_var.get(),
+            filters=profile.get("filters") or [],
+            base_filters=profile.get("base_filters") or [],
+            persistence_percent=float(msc.get("persistence_percent") or 10.0),
+            manifold=str(msc.get("manifold") or "ascending"),
+            accurate=bool(msc.get("accurate")),
+            extremum_sample_radius=int(msc.get("extremum_sample_radius") or 0),
+            min_area=sel.get("min_area"),
+            feature_filters=sel.get("feature_filters") or [],
+            pixel_filters=sel.get("pixel_filters") or [],
+            connectivity=int(sel.get("connectivity") or 6),
             cores_per_slice=self._cores_per_slice(),
             concurrent_slices=self._concurrent_slices(),
-            stat_channels=self._stat_channel_cards(),
-            stat_reductions=self._stat_reductions(),
-            stat_extremum=self.stat_extremum_var.get(),
+            stat_channels=stats["channels"],
+            stat_reductions=stats["reductions"],
+            stat_extremum=stats["extremum"],
             folder=folder,
         )
 
     def _write_configs(self, out_dir):
-        """Write one config.json per subsequence; returns the written paths."""
+        """Write one config.json per sequence; returns the written paths.
+        (Dormant, see _config_for.)"""
         paths = []
         for i, s in enumerate(self.subsequences):
             cfg = self._config_for(s["files"], os.path.join(out_dir, f"out_{i}"))
@@ -1649,29 +2033,26 @@ class MscouponApp:
         return paths
 
     # ------------------------------------------------------------------ #
-    # Load a config / restore the last session / auto-save
+    # Session save/load/restore/auto-save
     #
-    # All of this is best-effort. A config may be hand-edited, may name a folder
-    # that has since moved, or may predate a schema change, and none of that may
-    # raise inside a Tk callback -- there it surfaces as a traceback on stderr
-    # and a button that appeared to do nothing. Problems are collected as notes
-    # and shown in the status bar (in full via log()) rather than as dialogs: one
-    # dialog per skipped file in a 20-file multi-select is unusable.
+    # All of this is best-effort. A session may be hand-edited, may name a
+    # folder that has since moved, or may predate a schema change, and none of
+    # that may raise inside a Tk callback -- there it surfaces as a traceback
+    # on stderr and a button that appeared to do nothing. Problems are
+    # collected as notes and shown in the status bar (in full via log())
+    # rather than as dialogs.
     # ------------------------------------------------------------------ #
     _AUTOSAVE_MS = 4000
 
-    def _gui_state(self):
-        """The GUI-only half of a session: what AppConfig cannot express.
+    def _view_state(self):
+        """The transient view half of a session (what neither a profile nor
+        the folder/sequence model expresses).
 
-        Carries no timestamp on purpose -- the auto-save decides whether to write
-        by comparing this text against the last text written, and a clock would
-        differ on every tick and write forever.
+        Carries no timestamp on purpose -- the auto-save decides whether to
+        write by comparing this text against the last text written, and a
+        clock would differ on every tick and write forever.
         """
         return {
-            "version": config_io.SESSION_VERSION,
-            "folder": self.folder,
-            "subsequences": [{"name": s["name"], "files": list(s["files"])}
-                             for s in self.subsequences],
             "persist_live": self.persist_live_var.get(),
             "seg_source": self.seg_source_var.get(),
             "background": self.background_var.get(),
@@ -1683,22 +2064,33 @@ class MscouponApp:
             "vmax_filt": float(self.vmax_filt_var.get()),
         }
 
-    def _session_state(self):
-        """A valid AppConfig for the FIRST subsequence -- so the saved session is
-        still `mscoupon --config`-runnable -- plus the GUI half under "_gui"."""
-        files = list(self.subsequences[0]["files"]) if self.subsequences else []
-        folder = self.folder or (os.path.dirname(files[0]) if files else ".")
-        cfg = self._config_for(files, os.path.join(folder, "out_0"), folder=folder)
-        return config_io.build_session(cfg, self._gui_state())
+    def _session_doc(self):
+        """The whole session as one v2 document (folders, sequences, every
+        profile, run settings, view state; subclasses add labels/models)."""
+        self._snapshot_active_profile()
+        active = "default"
+        if 0 <= self.active_profile_idx < len(self.profiles):
+            active = self.profiles[self.active_profile_idx]["name"]
+        return session.build_session_doc(
+            app=self.SESSION_APP,
+            folders=self.folders,
+            sequences=self.subsequences,
+            profiles=self.profiles,
+            active_profile=active,
+            run={"cores_per_slice": self._cores_per_slice(),
+                 "concurrent_slices": self._concurrent_slices()},
+            view=self._view_state())
 
-    def _apply_state(self, state, gui=None, notes=None):
-        """Push a `config_io.config_to_state()` dict onto the widgets.
+    def _apply_session_doc(self, doc, source="session", notes=None):
+        """THE apply path: push a session document onto the whole app.
 
-        Each step is guarded on its own, so a value one widget rejects costs that
-        control and not the rest of the load.
+        The order mirrors the old _apply_state and is load-bearing: drop the
+        compute state FIRST (the parameters that produced it are being
+        replaced), then run settings, folders, sequences, profiles (the active
+        one lands on the widgets), view state, and finally settle the UI.
         """
-        gui = gui or {}
         notes = notes if notes is not None else []
+        sdoc = session.session_doc_from_json(doc, notes)
 
         def setvar(var, value):
             try:
@@ -1706,89 +2098,81 @@ class MscouponApp:
             except (tk.TclError, ValueError, TypeError):
                 notes.append(f"ignored unusable value {value!r}")
 
-        # 1. Drop the compute state FIRST, before anything rebuilds against it:
-        # the parameters that produced it are being replaced, so every primed
-        # stack, cached slice, assembly and hover context is now stale.
-        # (engine.reset() leaves a running assembly worker running: its result
-        # lands as not-accepted via the bumped token, and the pipes are not
-        # re-entrant, so a second worker must not start beside it.)
+        # 1. Compute state first. (engine.reset() leaves a running assembly
+        # worker running: its result lands as not-accepted via the bumped
+        # token, and the pipes are not re-entrant.)
         self.engine.reset()
         self._hover_ctx = None
         self._selection_dirty = False
 
-        # 2. Scalars.
-        if state.get("manifold"):
-            setvar(self.manifold_var, state["manifold"])
-        setvar(self.accurate_var, bool(state.get("accurate")))
-        setvar(self.ext_radius_var, str(int(state.get("extremum_sample_radius") or 0)))
-        min_area = state.get("min_area")
-        setvar(self.min_area_var, "" if min_area is None else str(int(min_area)))
-        if state.get("connectivity"):
-            setvar(self.connectivity_var, int(state["connectivity"]))
-        if state.get("cores_per_slice"):
-            setvar(self.cores_per_slice_var, int(state["cores_per_slice"]))
-        if state.get("concurrent_slices"):
-            setvar(self.concurrent_slices_var, int(state["concurrent_slices"]))
-        # The cap and the live value are independent vars and _persist_pct clamps
-        # live against the cap, so restoring a 30% cap while live still read 10%
-        # would render at a threshold the config never asked for.
-        pct = state.get("persistence_percent")
-        if pct is not None:
-            setvar(self.persist_pct_var, f"{float(pct):g}")
-            setvar(self.persist_live_var, f"{float(pct):g}")
-        if gui.get("persist_live") is not None:
-            setvar(self.persist_live_var, str(gui["persist_live"]))
+        # 2. Session-level run settings.
+        run = sdoc.get("run") or {}
+        if run.get("cores_per_slice"):
+            setvar(self.cores_per_slice_var, int(run["cores_per_slice"]))
+        if run.get("concurrent_slices"):
+            setvar(self.concurrent_slices_var, int(run["concurrent_slices"]))
 
-        # 2b. The measurement spec, restored BEFORE the query cards: their
-        # dropdowns are generated from the field universe it defines, so
-        # rebuilding them first would offer the previous spec's channels.
-        self._apply_stat_state(state, setvar)
+        # 3. Folders. A missing folder is kept (with a note): the session
+        # still describes it, and a network share may come back.
+        self.folders = []
+        for f in sdoc.get("folders") or []:
+            if not os.path.isdir(f["path"]):
+                notes.append(f"folder not found: {f['path']}")
+            self.folders.append(dict(f))
+        self.active_folder_idx = 0 if self.folders else None
+        if self.active_folder_idx is not None:
+            self._set_active_folder(0)
+        else:
+            self.all_files = []
+            try:
+                self.file_list.delete(0, "end")
+            except tk.TclError:
+                pass
+        self._refresh_folder_list()
 
-        # 3./4. Card chains, each with the trailing add-row the GUI expects, then
-        # rebuilt in _build_left's order: the BASE rebuild is what resets
-        # _normalize_readouts, so running it first would leave the topo chain's
-        # readouts bound to destroyed widgets.
-        self.filter_cards = list(state.get("filters") or []) + [self._new_filter_card()]
-        self.base_cards = list(state.get("base_filters") or []) + [self._new_filter_card()]
-        self.query_cards = list(state.get("feature_filters") or []) + [self._new_query_card()]
-        self.pixel_cards = list(state.get("pixel_filters") or []) + [self._new_pixel_card()]
-        self._rebuild_filter_cards()
-        self._rebuild_filter_cards("base")
-        self._rebuild_query_cards()
-        self._rebuild_pixel_cards()
-        self._refresh_channel_picker()
-        self._refresh_stat_summary()
+        # 4. Sequences, resolved basenames -> absolute paths per folder.
+        by_name = {f["name"]: f for f in self.folders}
+        self.subsequences = []
+        for s in sdoc.get("sequences") or []:
+            files = session.resolve_sequence_files(s, by_name, notes)
+            files = self._existing_files(files, len(self.subsequences) + 1, notes)
+            if not files:
+                notes.append(f"sequence {s.get('name')!r}: no files found - skipped")
+                continue
+            stem = lambda p: os.path.splitext(os.path.basename(p))[0]
+            name = s.get("name") or f"{s['folder']} {stem(files[0])}-{stem(files[-1])}"
+            self.subsequences.append({"name": name, "folder": s["folder"],
+                                      "files": files})
+        self._refresh_subseq_list()
 
-        # 5. Input side. A folder that has moved is not fatal -- the subsequences
-        # carry absolute paths of their own.
-        folder = gui.get("folder") or state.get("folder") or ""
-        if folder and os.path.isdir(folder):
-            self._set_folder(folder)
-        elif folder:
-            notes.append(f"folder not found: {folder}")
+        # 5. Profiles; the active one lands on the widgets.
+        self.profiles = sdoc["profiles"]
+        names = [p["name"] for p in self.profiles]
+        self.active_profile_idx = names.index(sdoc["active_profile"])
+        self._refresh_profile_combo()
+        self._apply_profile_to_ui(self.profiles[self.active_profile_idx],
+                                  setvar, notes)
 
-        # 6. Subsequences, resolved by the caller (it sees every document).
-        if state.get("subsequences") is not None:
-            self.subsequences = list(state["subsequences"])
-            self._refresh_subseq_list()
-
-        # 7. View state, all optional.
+        # 6. View state, all optional.
+        view = sdoc.get("view") or {}
+        if view.get("persist_live") is not None:
+            setvar(self.persist_live_var, str(view["persist_live"]))
         for key, var in (("alpha", self.alpha_var), ("vmin", self.vmin_var),
                          ("vmax", self.vmax_var), ("vmin_filt", self.vmin_filt_var),
                          ("vmax_filt", self.vmax_filt_var)):
-            if gui.get(key) is not None:
+            if view.get(key) is not None:
                 try:
-                    setvar(var, float(gui[key]))
+                    setvar(var, float(view[key]))
                 except (TypeError, ValueError):
-                    notes.append(f"ignored {key}={gui[key]!r}")
-        if gui.get("seg_source"):
-            setvar(self.seg_source_var, str(gui["seg_source"]))
-        if gui.get("background"):
-            setvar(self.background_var, str(gui["background"]))
-        if gui.get("mask") is not None:
-            setvar(self.mask_var, bool(gui["mask"]))
+                    notes.append(f"ignored {key}={view[key]!r}")
+        if view.get("seg_source"):
+            setvar(self.seg_source_var, str(view["seg_source"]))
+        if view.get("background"):
+            setvar(self.background_var, str(view["background"]))
+        if view.get("mask") is not None:
+            setvar(self.mask_var, bool(view["mask"]))
 
-        # 8. Settle the UI. Nothing is primed, so Rerun has nothing to redo --
+        # 7. Settle the UI. Nothing is primed, so Rerun has nothing to redo --
         # the next step is Run.
         self._rebuild_flat_slices()
         try:
@@ -1802,63 +2186,34 @@ class MscouponApp:
             self._refresh_render()
         except Exception as exc:            # a stale render must not eat the load
             log(f"redraw after load failed: {exc}")
-        return notes
 
-    def _apply_documents(self, docs, source):
-        """Apply already-parsed config documents: `[(path, doc_or_None), ...]`.
-
-        Parameters come from the FIRST readable document. Subsequences come from
-        the `_gui` half when a single session file carries them, and otherwise
-        one per document -- which is what makes a multi-select of the
-        `config_0..config_N` that Export wrote reconstruct all N stacks.
-        """
-        notes = []
-        good = []
-        for path, doc in docs:
-            if doc is None:
-                notes.append(f"could not read {os.path.basename(path)}")
-            else:
-                good.append((path, doc))
-        if not good:
-            for msg in notes:
-                log(msg)
-            self.status_var.set("Could not read any config; nothing changed.")
-            return
-
-        cfg0, gui0 = config_io.split_session(good[0][1])
-        state = config_io.config_to_state(cfg0, fields=self._query_fields(), notes=notes)
-
-        saved = gui0.get("subsequences")
-        if len(good) == 1 and isinstance(saved, list) and saved:
-            raw = [(s.get("name"), s.get("files")) for s in saved
-                   if isinstance(s, dict)]
-        else:
-            raw = []
-            for _path, doc in good:
-                cfg, _gui = config_io.split_session(doc)
-                one = config_io.config_to_state(cfg)
-                raw.append((None, one["files"]))
-
-        subs = []
-        for name, files in raw:
-            files = [f for f in (files or []) if isinstance(f, str) and f]
-            files = self._existing_files(files, len(subs) + 1, notes)
-            if not files:
-                notes.append(f"seq{len(subs) + 1}: no files found - skipped")
-                continue
-            subs.append({"name": name or f"seq{len(subs) + 1} ({len(files)})",
-                         "files": files})
-        state["subsequences"] = subs
-
-        self._apply_state(state, gui0, notes)
         for msg in notes:
             log(msg)
-        summary = f"Loaded {source}: {len(subs)} subsequence(s)"
+        summary = f"Loaded {source}: {len(self.subsequences)} sequence(s), " \
+                  f"{len(self.profiles)} profile(s)"
         if notes:
             summary += " — " + "; ".join(notes[:2])
             if len(notes) > 2:
                 summary += f" (+{len(notes) - 2} more, see the log)"
         self.status_var.set(summary)
+        return notes
+
+    def _apply_session_docs(self, docs, source):
+        """Route parsed documents to the right apply path: a single v2 session
+        applies directly; anything else (a v1 session, a multi-select of
+        exported config_N.json) imports through the legacy converter."""
+        good = [(p, d) for p, d in docs if d is not None]
+        if not good:
+            for p, _d in docs:
+                log(f"could not read {os.path.basename(str(p))}")
+            self.status_var.set("Could not read any file; nothing changed.")
+            return
+        if len(good) == 1 and session.is_session_doc(good[0][1]):
+            self._apply_session_doc(good[0][1], source)
+        else:
+            notes = []
+            doc = session.legacy_docs_to_session(docs, notes)
+            self._apply_session_doc(doc, f"{source} (imported)", notes)
 
     @staticmethod
     def _existing_files(files, index, notes):
@@ -1880,18 +2235,30 @@ class MscouponApp:
                          f"files missing")
         return present
 
-    def _load_config(self):
+    def _load_session(self):
         if self._run_active:
             self.status_var.set("Busy priming — wait for the run to finish.")
             return
         paths = filedialog.askopenfilenames(
-            title="Load config.json (multi-select = one subsequence per file)",
-            filetypes=[("Config JSON", "*.json"), ("All files", "*.*")])
+            title="Load session (or legacy config.json files)",
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")])
         paths = list(paths or [])
         if not paths:
             return
-        self._apply_documents([(p, config_io.read_json_file(p)) for p in paths],
-                              f"{len(paths)} config(s)")
+        self._apply_session_docs([(p, config_io.read_json_file(p)) for p in paths],
+                                 f"{len(paths)} file(s)")
+
+    def _save_session_as(self):
+        path = filedialog.asksaveasfilename(
+            title="Save session", defaultextension=".json",
+            initialfile="session.json", filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        blob = config_io.serialize_session(self._session_doc())
+        if config_io.write_session_text(blob, path):
+            self.status_var.set(f"Wrote {path}")
+        else:
+            self.status_var.set(f"Could not write {path}")
 
     def _restore_last(self):
         if self._run_active:
@@ -1902,7 +2269,7 @@ class MscouponApp:
         if doc is None:
             self.status_var.set(f"No saved session at {path}")
             return
-        self._apply_documents([(path, doc)], "last session")
+        self._apply_session_docs([(path, doc)], "last session")
 
     # -- auto-save ------------------------------------------------------ #
     def _schedule_autosave(self):
@@ -1929,7 +2296,7 @@ class MscouponApp:
         UI thread owns (subsequences, the card lists, the Tk vars) and never
         primed/_slices/_assembly, which the workers write.
         """
-        blob = config_io.serialize_session(self._session_state())
+        blob = config_io.serialize_session(self._session_doc())
         if blob == self._autosave_last:
             return
         if config_io.write_session_text(blob, config_io.session_path(app=self.SESSION_APP)):
@@ -1987,8 +2354,15 @@ def _selftest():
     # user's saved session.
     app = MscouponApp(root, autosave=False)
 
-    # Synthetic file browser state -> subsequence grouping.
-    app.all_files = [f"/data/asdf_{i:04d}.tiff" for i in [11, 12, 13, 25, 26]]
+    # Synthetic session state: one folder (nonexistent on purpose; every path
+    # below must stay total), its TIFF list faked positionally.
+    data_dir = r"C:\data"
+    app.folders = [{"path": data_dir, "name": "data"}]
+    app.active_folder_idx = 0
+    app._refresh_folder_list()
+    assert app.folder_list.size() == 1
+    app.all_files = [os.path.join(data_dir, f"asdf_{i:04d}.tiff")
+                     for i in [11, 12, 13, 25, 26]]
     app.file_list.delete(0, "end")
     for f in app.all_files:
         app.file_list.insert("end", os.path.basename(f))
@@ -1996,12 +2370,33 @@ def _selftest():
     assert runs == [[0, 1, 2, 3, 4]], runs
     assert group_contiguous([0, 1, 2, 4, 5]) == [[0, 1, 2], [4, 5]]
 
-    # Two subsequences from two contiguous selections.
+    # Folder naming: collisions qualify with trailing path parts.
+    assert session.folder_display_name(r"D:\other\data", ["data"]) == "other/data"
+
+    # Two sequences from two contiguous selections; each is stamped with the
+    # active folder and renders folder-qualified with its start-end span.
     app.file_list.selection_set(0, 2); app._make_subsequence()
     app.file_list.selection_clear(0, "end")
     app.file_list.selection_set(3, 4); app._make_subsequence()
     assert len(app.subsequences) == 2, app.subsequences
     assert [len(s["files"]) for s in app.subsequences] == [3, 2]
+    assert all(s["folder"] == "data" for s in app.subsequences)
+    assert app.subsequences[0]["name"] == "data asdf_0011-asdf_0013"
+    assert app._sequence_row_text(app.subsequences[0]) == \
+        "data  [asdf_0011 – asdf_0013] (3)"
+    assert app.subseq_list.get(1) == "data  [asdf_0025 – asdf_0026] (2)"
+
+    # Preview plumbing (pure parts): a click schedules a debounced load; a
+    # missing file falls back without raising and still records the preview.
+    class _Ev:
+        y = 5
+    app._on_filelist_click(_Ev())
+    if app._preview_after is not None:
+        app.root.after_cancel(app._preview_after)
+        app._preview_after = None
+    app._preview_apply(0)               # C:\data doesn't exist -> fallback path
+    if app.viewer is not None:
+        assert app._preview_path == app.all_files[0]
 
     # Filter chain: choose blur -> a trailing none card is appended.
     app._on_filter_op_change(0, "blur")
@@ -2100,27 +2495,32 @@ def _selftest():
         sentinel = json.load(open(app._write_configs(d)[0]))
         assert sentinel["base_filters"][0]["params"]["omit_value"] == 43.0
 
-        # Session round-trip: loading what the viewer saved must put every
-        # control back, and re-exporting must reproduce the same config.
+        # Session round-trip (v2 doc): loading what the viewer saved must put
+        # every control back, and re-exporting must reproduce the same config.
         before = json.load(open(app._write_configs(d)[0]))
-        doc = app._session_state()
-        assert "_gui" in doc, "the session carries the GUI half"
-        assert len(doc["_gui"]["subsequences"]) == 2
-        cfg2, gui2 = config_io.split_session(doc)
-        assert "_gui" not in cfg2, "the wrapper must not leak into the AppConfig"
+        doc = app._session_doc()
+        assert session.is_session_doc(doc)
+        assert len(doc["sequences"]) == 2
+        assert doc["sequences"][0]["files"] == [
+            "asdf_0011.tiff", "asdf_0012.tiff", "asdf_0013.tiff"], \
+            "the doc stores basenames under the folder reference"
+        assert doc["folders"] == [{"path": data_dir, "name": "data"}]
 
         # Clobber every widget-backed value, then restore from the session.
         app._clear_subsequences()
+        app.folders = []; app.active_folder_idx = None; app._refresh_folder_list()
         app.filter_cards = [app._new_filter_card()]; app._rebuild_filter_cards()
         app.base_cards = [app._new_filter_card()]; app._rebuild_filter_cards("base")
         app.query_cards = [app._new_query_card()]; app._rebuild_query_cards()
         app.pixel_cards = [app._new_pixel_card()]; app._rebuild_pixel_cards()
         app.persist_pct_var.set("99"); app.connectivity_var.set(26)
         app.manifold_var.set("descending"); app.min_area_var.set("7")
-        app._apply_documents([(os.path.join(d, "last_session.json"), doc)], "test")
+        app._apply_session_docs([(os.path.join(d, "last_session.json"), doc)], "test")
 
         assert len(app.subsequences) == 2, app.subsequences
         assert app.subseq_list.size() == 2, "the listbox must follow the model"
+        assert app.folders == [{"path": data_dir, "name": "data"}]
+        assert app.subsequences[0]["folder"] == "data"
         assert app.subsequences[0]["files"] == before["input"]["files"]
         assert app.filter_cards[0]["operation"] == "blur"
         assert app.filter_cards[0]["params"]["sigma"] == 2.0
@@ -2137,7 +2537,7 @@ def _selftest():
         assert float(app.persist_pct_var.get()) == 10.0
         assert app.manifold_var.get() == "ascending"
         assert app.connectivity_var.get() == 6
-        assert app.min_area_var.get() == "", "a config without segments clears the gate"
+        assert app.min_area_var.get() == "", "a profile without min_area clears the gate"
         # A load must leave no primed/assembly state behind -- the parameters
         # that produced it were just replaced.
         assert app.primed == [] and app.flat_slices == [] and not app._slices
@@ -2148,20 +2548,27 @@ def _selftest():
         assert after == before, (before, after)
 
         # A blank no-data sentinel must come back BLANK, not as the default 0.0.
+        def _setvar(var, value):
+            var.set(value)
         app.base_cards[0]["params"]["omit_value"] = ""
-        doc_b = app._session_state()
-        cfg_b, gui_b = config_io.split_session(doc_b)
-        app._apply_state(config_io.config_to_state(cfg_b), gui_b)
-        assert app.base_cards[0]["params"]["omit_value"] == "",             app.base_cards[0]["params"]
+        app._apply_profile_to_ui(session.profile_from_json(app._profile_from_ui()),
+                                 _setvar, [])
+        assert app.base_cards[0]["params"]["omit_value"] == "", \
+            app.base_cards[0]["params"]
         app.base_cards[0]["params"]["omit_value"] = 43.0
 
-        # Junk must not raise into the mainloop, and an unreadable document must
-        # leave the state alone rather than half-applying it.
-        app._apply_state(config_io.config_to_state({"msc": "nonsense", "filters": 7}))
-        kept = [dict(s) for s in app.subsequences]
-        app._apply_documents([(os.path.join(d, "gone.json"), None)], "missing")
-        assert app.subsequences == kept, "a failed load changes nothing"
+        # Junk must not raise into the mainloop (a garbage doc reads as an
+        # empty session), and an unreadable document must leave the state
+        # alone rather than half-applying it.
+        app._apply_session_doc({"profiles": "junk", "sequences": 7,
+                                "folders": "nope"})
+        assert app.subsequences == [] and len(app.profiles) == 1
+        app._apply_session_docs([(os.path.join(d, "gone.json"), None)], "missing")
+        assert app.subsequences == [], "a failed load changes nothing"
         assert isinstance(config_io.session_path(), str) and config_io.session_path()
+        # Restore the real session for everything below.
+        app._apply_session_docs([(os.path.join(d, "last_session.json"), doc)], "test")
+        assert len(app.subsequences) == 2
 
         # Restore the chains the remaining checks below expect.
         app.filter_cards = [{"operation": "blur", "params": {"sigma": 2.0}},
@@ -2194,15 +2601,14 @@ def _selftest():
         assert block["reductions"] == ["mean", "min", "max"], block
         assert "statistics" in json.load(open(app._write_configs(d)[0]))
 
-        # The spec must survive a session round trip -- the whole block used to
+        # The spec must survive a profile round trip -- the whole block used to
         # be dropped on load except extremum_sample_radius.
-        doc_s = app._session_state()
-        cfg_s, gui_s = config_io.split_session(doc_s)
-        state_s = config_io.config_to_state(cfg_s)
-        assert state_s["stat_reductions"] == ["mean", "min", "max"], state_s
+        prof_s = session.profile_from_json(app._profile_from_ui())
+        stats_s = config_io.statistics_from_json(prof_s["statistics"])
+        assert stats_s["reductions"] == ["mean", "min", "max"], stats_s
         app.stat_kind_vars["blur"][0].set(False)          # perturb, then restore
         app.stat_reduction_vars["std"].set(True)
-        app._apply_state(state_s, gui_s)
+        app._apply_profile_to_ui(prof_s, _setvar, [])
         assert app.stat_kind_vars["blur"][0].get(), "blur channel restored"
         assert app._stat_reductions() == ["mean", "min", "max"], app._stat_reductions()
         assert _parse_sigmas(app.stat_kind_vars["hessian"][1].get()) == [0.7, 1.5, 3.0]
@@ -2250,8 +2656,50 @@ def _selftest():
         for on, _sig in app.stat_kind_vars.values():
             on.set(False)
         app.stat_reduction_vars["std"].set(True)
-    print("selftest OK: sequences, filters, base chain, stat channels, assembly tiers, "
-          "per-slice selection, pixel trim, export, config load + session round-trip")
+
+        # --- compute profiles ---------------------------------------------- #
+        # Switching snapshots the edited profile verbatim, restores the other
+        # one's widgets, and drops the (fake) primed state.
+        app._snapshot_active_profile()
+        prof_a = json.loads(json.dumps(app.profiles[app.active_profile_idx]))
+        app._profile_new()
+        assert len(app.profiles) == 2 and app.active_profile_idx == 1
+        assert app.filter_cards[0]["operation"] == "none", "new profile = defaults"
+        assert app.primed == [] and app.flat_slices == []
+        app._switch_profile(0)
+        app._snapshot_active_profile()
+        assert app.profiles[0] == prof_a, "switch snapshots the profile verbatim"
+        assert app.filter_cards[0]["operation"] == "blur", "profile A restored"
+        assert app.profiles[1]["name"] == "profile"
+        assert app.profile_var.get() == prof_a["name"]
+
+        # Profile file round trip through the on-disk format.
+        prof_path = os.path.join(d, "a.profile.json")
+        blob = config_io.serialize_session(session.profile_file_doc(app.profiles[0]))
+        assert config_io.write_session_text(blob, prof_path)
+        loaded = session.profile_from_json(config_io.read_json_file(prof_path))
+        loaded["name"] = app.profiles[0]["name"]     # file doc keeps the name; be explicit
+        assert loaded == app.profiles[0], "profile file round trip is lossless"
+
+        # --- legacy v1 import ----------------------------------------------- #
+        # An old AppConfig+_gui session imports as folders + sequences + ONE
+        # "imported" profile (replacing the profile list).
+        cfg_v1 = app._config_for(app.subsequences[0]["files"], "out")
+        gui_v1 = {"version": 1, "folder": data_dir,
+                  "subsequences": [{"name": s["name"], "files": list(s["files"])}
+                                   for s in app.subsequences],
+                  "persist_live": "5", "alpha": 0.25}
+        v1 = config_io.build_session(cfg_v1, gui_v1)
+        app._apply_session_docs([("last_session_v1.json", v1)], "legacy")
+        assert len(app.subsequences) == 2
+        assert app.subsequences[0]["folder"] == "data"
+        assert [p["name"] for p in app.profiles] == ["imported"]
+        assert app.filter_cards[0]["operation"] == "blur", "v1 filters imported"
+        assert float(app.alpha_var.get()) == 0.25
+        assert app.persist_live_var.get() == "5"
+    print("selftest OK: session (folders/sequences/preview), filters, base chain, "
+          "stat channels, assembly tiers, per-slice selection, pixel trim, "
+          "profiles + switch + file round-trip, session v2 round-trip, legacy import")
     root.destroy()
 
 

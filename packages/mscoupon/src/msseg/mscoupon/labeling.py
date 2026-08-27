@@ -31,7 +31,12 @@ CLASS_COLORS = [
 ]
 MAX_CLASSES = len(CLASS_COLORS)      # includes class 0
 
-TOOLS = ("squiggle", "box", "polygon")
+# "taps" is a set of INDEPENDENT sample points (no connecting segments): each
+# point picks exactly the region under it. It is what the SHIFT-accept gesture
+# records -- one taps interaction per predicted class, one point per accepted
+# region -- so accepted predictions stay geometric and re-resolve after a
+# recompute like every other gesture. It is not offered in the tool selector.
+TOOLS = ("squiggle", "box", "polygon", "taps")
 
 
 def class_color_hex(class_id):
@@ -126,9 +131,11 @@ class LabelStore:
         return None
 
     # -- persistence ---------------------------------------------------- #
+    # version 2: slice keys are folder-qualified ("folder/basename"); v1 files
+    # carried bare basenames and are migrated on rebind() when unambiguous.
     def to_json(self):
         return {
-            "version": 1,
+            "version": 2,
             "app": "mscoupon-labeler",
             "n_classes": self.n_classes,
             "classes": [{"id": k, "color": class_color_hex(k)}
@@ -157,17 +164,34 @@ class LabelStore:
         return store
 
     def rebind(self, subsequences):
-        """Re-derive the (si, li) hints by matching each interaction's file
-        basename against ``subsequences`` ([{"name", "files"}]). Unmatched
-        interactions keep slice_key but get si=li=None (kept, shown greyed).
-        Returns the number left unbound."""
-        by_name = {}
+        """Re-derive the (si, li) hints by matching each interaction's
+        folder-qualified slice key (``"folder/basename"``) against
+        ``subsequences`` ([{"name", "folder", "files"}]).
+
+        Legacy (v1) bare-basename keys match by basename ONLY when the
+        basename is unambiguous across the session, and are upgraded in place
+        to the qualified form -- the next save writes v2 keys. An ambiguous or
+        missing key leaves the interaction unbound (kept, shown greyed) rather
+        than silently binding to the first match, which is what the old
+        first-wins behaviour did. Returns the number left unbound."""
+        by_key = {}                      # "folder/basename" -> (si, li)
+        by_base = {}                     # basename -> [(qualified_key, si, li)]
         for si, s in enumerate(subsequences):
+            folder = str(s.get("folder") or "")
             for li, path in enumerate(s.get("files", [])):
-                by_name.setdefault(os.path.basename(path), (si, li))
+                base = os.path.basename(path)
+                key = f"{folder}/{base}"
+                by_key.setdefault(key, (si, li))
+                by_base.setdefault(base, []).append((key, si, li))
         unbound = 0
         for it in self.interactions:
-            hit = by_name.get(it.slice_key)
+            hit = by_key.get(it.slice_key)
+            if hit is None and "/" not in it.slice_key:
+                candidates = by_base.get(it.slice_key, [])
+                if len(candidates) == 1:            # unambiguous: migrate
+                    key, si, li = candidates[0]
+                    it.slice_key = key
+                    hit = (si, li)
             it.si, it.li = hit if hit is not None else (None, None)
             unbound += hit is None
         self.rev += 1
@@ -201,12 +225,22 @@ def touched_ids(interaction, labels, np):
               last point (a region merely overlapping the box counts).
     polygon:  every region under the filled (auto-closed) lasso, outline
               included so a degenerate sliver still picks what it was drawn on.
+    taps:     each point sampled independently (no connecting segments).
     """
     h, w = labels.shape
     pts = interaction.points
     if not pts:
         return set()
-    if interaction.tool == "box":
+    if interaction.tool == "taps":
+        vals = []
+        for (x, y) in pts:
+            ys, xs = line_pixels(x, y, x, y, w, h, np)
+            if len(ys):
+                vals.append(labels[ys, xs])
+        if not vals:
+            return set()
+        vals = np.unique(np.concatenate(vals))
+    elif interaction.tool == "box":
         (x0, y0), (x1, y1) = pts[0], pts[-1]
         xa, xb = sorted((int(round(x0)), int(round(x1))))
         ya, yb = sorted((int(round(y0)), int(round(y1))))

@@ -34,9 +34,10 @@ import sys
 import json
 import time
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, messagebox
 
 from . import config_io
+from . import session
 from .app import MscouponApp
 from .common import log
 from .widgets import ScrollFrame
@@ -74,29 +75,37 @@ class DrawController:
     stored image points each move so zooming mid-drag stays consistent."""
 
     MIN_SCREEN_PX = 3      # squiggle/lasso point spacing (screen px)
+    _SHIFT = 0x0001        # Tk event.state modifier bit
 
     def __init__(self, app):
         self.app = app
         self._pts = None           # image-coord points of the gesture in flight
         self._last_screen = None
+        self._accept = False       # SHIFT-box: accept predictions under the box
 
     def _image_pt(self, e):
         v = self.app.viewer
         return (v.view_x + e.x * v.scale, v.view_y + e.y * v.scale)
 
     def on_press(self, e):
-        if self.app.active_class_var.get() <= 0:
-            return False           # no class armed -> pan as in the viewer
         if self.app._current() is None:
             return False           # nothing on screen to label
+        # SHIFT = the accept tool: a box, regardless of the selected tool or
+        # armed class, that turns the predictions under it into real labels.
+        self._accept = bool(e.state & self._SHIFT)
+        if not self._accept and self.app.active_class_var.get() <= 0:
+            return False           # no class armed -> pan as in the viewer
         self._pts = [self._image_pt(e)]
         self._last_screen = (e.x, e.y)
         return True
 
+    def _tool(self):
+        return "box" if self._accept else self.app.tool_var.get()
+
     def on_move(self, e):
         if self._pts is None:
             return False
-        if self.app.tool_var.get() == "box":
+        if self._tool() == "box":
             # A box is its two corners: the anchor plus the live corner.
             if len(self._pts) > 1:
                 self._pts[-1] = self._image_pt(e)
@@ -114,7 +123,12 @@ class DrawController:
         if self._pts is None:
             return False
         pts, self._pts = self._pts, None
+        accept, self._accept = self._accept, False
         self.app.viewer.canvas.delete("draw")
+        if accept:
+            if len(pts) >= 2:
+                self.app._accept_predictions(pts)
+            return True
         tool = self.app.tool_var.get()
         # A single-click tap IS a squiggle (the polyline's start point is always
         # part of the gesture); box/lasso need an actual drag to mean anything.
@@ -127,19 +141,25 @@ class DrawController:
         v = self.app.viewer
         c = v.canvas
         c.delete("draw")
-        cls = self.app.active_class_var.get()
-        color = class_color_hex(cls) if 0 < cls < MAX_CLASSES else "#ffffff"
+        if self._accept:
+            color = "#ffffff"          # accept box: neutral, dashed
+        else:
+            cls = self.app.active_class_var.get()
+            color = class_color_hex(cls) if 0 < cls < MAX_CLASSES else "#ffffff"
         scr = [((x - v.view_x) / v.scale, (y - v.view_y) / v.scale)
                for x, y in self._pts]
         if len(scr) < 2:
             return
-        if self.app.tool_var.get() == "box":
+        if self._tool() == "box":
             (x0, y0), (x1, y1) = scr[0], scr[-1]
-            c.create_rectangle(x0, y0, x1, y1, outline=color, width=2, tags="draw")
+            kw = {"outline": color, "width": 2, "tags": "draw"}
+            if self._accept:
+                kw["dash"] = (4, 3)
+            c.create_rectangle(x0, y0, x1, y1, **kw)
         else:
             flat = [coord for pt in scr for coord in pt]
             c.create_line(*flat, fill=color, width=2, tags="draw")
-            if self.app.tool_var.get() == "polygon":
+            if self._tool() == "polygon":
                 # Preview the auto-close edge.
                 c.create_line(scr[-1][0], scr[-1][1], scr[0][0], scr[0][1],
                               fill=color, width=1, dash=(3, 2), tags="draw")
@@ -157,10 +177,16 @@ class LabelerApp(MscouponApp):
         # which-interactions-touch-this-region hover lookup.
         self._class_luts = {}
         self._hover_key = None     # (si, li, region) whose geometry is on screen
+        self._hover_uid = None     # row-hovered interaction whose geometry shows
         # Classifier state: model + its feature-column order, and per-slice
         # predicted region->class arrays keyed by the commit they were made at.
         self._clf = None
         self._clf_names = None
+        self._clf_kind = "dense FC"
+        self.model_kind_var = tk.StringVar(master=root, value="dense FC")
+        # Session-level model references: saved/loaded pickles + their feature
+        # fingerprint, for the profile-compatibility check.
+        self.models = []           # [{"path","fingerprint","kind","statistics"}]
         self._pred = {}            # (si, li) -> (commit, region_class uint8)
         self.show_pred_var = tk.BooleanVar(master=root, value=False)
         # Master overlay switch (Tab toggles it): base image only when off.
@@ -183,6 +209,8 @@ class LabelerApp(MscouponApp):
         self._build_label_panel()
         if self.viewer is not None:
             self.viewer.tool = DrawController(self)
+            # Zoom/pan invalidates screen-space annotation geometry.
+            self.viewer.on_view_changed = self._redraw_hover_geometry
         self._bind_hotkeys()
 
     # ------------------------------------------------------------------ #
@@ -209,6 +237,14 @@ class LabelerApp(MscouponApp):
     def _on_regions_toggle(self):
         self.seg_source_var.set("msc" if self.show_regions_var.get() else "none")
         self._on_seg_source_change()
+
+    def _handle_event(self, ev):
+        if ev[0] == "primed":
+            # The commit bump already invalidates these; dropping them outright
+            # also frees the old run's arrays.
+            self._class_luts.clear()
+            self._pred.clear()
+        super()._handle_event(ev)
 
     def _build_live_panel(self, parent):
         live = ttk.LabelFrame(parent, text="Live parameters")
@@ -327,8 +363,11 @@ class LabelerApp(MscouponApp):
         return self._labels_cache_for(si, li, rec, np)[3]
 
     def _slice_key(self, si, li):
+        """Folder-qualified slice identity ("folder/basename") -- basenames
+        collide across a session's folders, so the folder is part of the key."""
         try:
-            return os.path.basename(self.subsequences[si]["files"][li])
+            s = self.subsequences[si]
+            return f"{s.get('folder', '')}/{os.path.basename(s['files'][li])}"
         except (IndexError, KeyError, TypeError):
             return None
 
@@ -349,6 +388,58 @@ class LabelerApp(MscouponApp):
         self._rebuild_class_panels()
         self._refresh_render()
         self.status_var.set(f"#{it.uid} {tool} -> class {cls} ({slice_key})")
+
+    def _accept_predictions(self, pts):
+        """SHIFT-box release: turn the classifier's predictions under the box
+        into real labels -- one "taps" interaction per predicted class, one
+        point per accepted region (its first pixel inside the box), so the
+        acceptance is geometric and re-resolves after a recompute like any
+        other gesture. One undo step for the whole batch."""
+        cur = self._current()
+        if cur is None or len(pts) < 2:
+            return
+        si, li = cur
+        rec = self.engine.record(si, li)
+        pr = self._pred.get((si, li))
+        if rec is None or rec.get("labels") is None or pr is None \
+                or pr[0] != rec.get("commit"):
+            self.status_var.set("Accept needs predictions - Classify first.")
+            return
+        import numpy as np
+        labels = rec["labels"]
+        region_class = pr[1]
+        h, w = labels.shape
+        (x0, y0), (x1, y1) = pts[0], pts[-1]
+        xa, xb = sorted((int(round(x0)), int(round(x1))))
+        ya, yb = sorted((int(round(y0)), int(round(y1))))
+        xa, xb = max(xa, 0), min(xb, w - 1)
+        ya, yb = max(ya, 0), min(yb, h - 1)
+        if xa > xb or ya > yb:
+            return
+        sub = labels[ya:yb + 1, xa:xb + 1]
+        by_class = {}
+        for r in np.unique(sub):
+            r = int(r)
+            if r < 0 or r >= len(region_class):
+                continue
+            k = int(region_class[r])
+            if not (1 <= k < self.store.n_classes):
+                continue
+            yy, xx = np.argwhere(sub == r)[0]     # a pixel of r inside the box
+            by_class.setdefault(k, []).append((float(xa + xx), float(ya + yy)))
+        if not by_class:
+            self.status_var.set("No predicted classes under the box.")
+            return
+        slice_key = self._slice_key(si, li)
+        self._push_history()
+        n = 0
+        for k in sorted(by_class):
+            self.store.add("taps", by_class[k], k, slice_key, si, li)
+            n += len(by_class[k])
+        self._rebuild_class_panels()
+        self._refresh_render()
+        self.status_var.set(f"Accepted {n} predicted region(s) into "
+                            f"{len(by_class)} class(es)")
 
     def _delete_interaction(self, uid):
         if self.store.get(uid) is None:
@@ -423,6 +514,9 @@ class LabelerApp(MscouponApp):
         self.root.bind("<Control-z>", self._on_undo_key)
         self.root.bind("<Control-y>", self._on_undo_key)
         self.root.bind("<Tab>", self._on_tab_toggle)
+        # 'R': one keystroke = train + immediate reclassify.
+        self.root.bind("r", self._train_and_classify)
+        self.root.bind("R", self._train_and_classify)
 
     def _typing(self):
         """True while a text-entry widget owns the keyboard focus."""
@@ -491,10 +585,13 @@ class LabelerApp(MscouponApp):
         # Bottom rows pack first (side="bottom") so the classes holder takes
         # exactly the remaining cavity. The classifier rows are bottommost.
         row = ttk.Frame(panel); row.pack(side="bottom", fill="x", padx=4, pady=(2, 8))
-        ttk.Button(row, text="Train / retrain",
+        ttk.Combobox(row, textvariable=self.model_kind_var, state="readonly",
+                     values=["random forest", "dense FC"], width=12
+                     ).pack(side="left", padx=(0, 2))
+        ttk.Button(row, text="Train (R)",
                    command=self._train_classifier).pack(side="left", fill="x",
-                                                        expand=True, padx=(0, 2))
-        self.classify_btn = ttk.Button(row, text="Classify / reclassify",
+                                                        expand=True, padx=2)
+        self.classify_btn = ttk.Button(row, text="Classify",
                                        state="disabled", command=self._classify)
         self.classify_btn.pack(side="left", fill="x", expand=True, padx=2)
         ttk.Checkbutton(row, text="show", variable=self.show_pred_var,
@@ -673,6 +770,10 @@ class LabelerApp(MscouponApp):
         if it.tool == "box" and len(scr) >= 2:
             (x0, y0), (x1, y1) = scr[0], scr[-1]
             c.create_rectangle(x0, y0, x1, y1, outline=color, width=3, tags=tags)
+        elif it.tool == "taps":          # independent sample points
+            for x, y in scr:
+                c.create_oval(x - 4, y - 4, x + 4, y + 4, outline=color,
+                              width=3, tags=tags)
         elif len(scr) >= 2:
             pts = scr + [scr[0]] if it.tool == "polygon" else scr
             flat = [coord for pt in pts for coord in pt]
@@ -687,12 +788,35 @@ class LabelerApp(MscouponApp):
             return
         self.viewer.canvas.delete("ihover")
         self._hover_key = None
+        self._hover_uid = uid
         self._draw_interaction_geometry(self.store.get(uid))
 
     def _hide_interaction_geometry(self):
         if self.viewer is not None:
             self.viewer.canvas.delete("ihover")
         self._hover_key = None
+        self._hover_uid = None
+
+    def _redraw_hover_geometry(self):
+        """Re-project whatever hover geometry is on screen after a zoom/pan
+        (the items are drawn in screen coordinates)."""
+        v = self.viewer
+        if v is None or (self._hover_uid is None and self._hover_key is None):
+            return
+        v.canvas.delete("ihover")
+        if self._hover_uid is not None:
+            self._draw_interaction_geometry(self.store.get(self._hover_uid))
+            return
+        si, li, region = self._hover_key
+        rec = self.engine.record(si, li)
+        if rec is None or rec.get("labels") is None:
+            return
+        import numpy as np
+        touch = self._touch_map_for(si, li, rec, np)
+        for it in self.store.for_slice(self._slice_key(si, li)):
+            ids = touch.get(it.uid)
+            if ids and region in ids:
+                self._draw_interaction_geometry(it)
 
     def _on_hover(self, ix, iy=None):
         """The inherited readout, plus: hovering a LABELED pixel draws every
@@ -717,6 +841,7 @@ class LabelerApp(MscouponApp):
         if key == self._hover_key:
             return
         self._hover_key = key
+        self._hover_uid = None            # canvas hover replaces row hover
         v.canvas.delete("ihover")
         if key is None:
             return
@@ -809,16 +934,18 @@ class LabelerApp(MscouponApp):
         return mat
 
     def _train_classifier(self):
-        """Fit a random forest on the labeled regions' statistics rows.
+        """Fit the selected model kind on the labeled regions' statistics rows.
 
-        Chosen for exactly this data shape: a few hundred labels, tens of
-        features of which only a handful matter (trees select thresholds per
-        feature, so the noise dimensions that dragged k-means across the label
-        boundary are simply never split on), no scaling sensitivity, and
-        millisecond retrains. feature_importances_ names the dimensions that
-        actually matter (logged)."""
+        Random forest is the default for exactly this data shape: a few
+        hundred labels, tens of features of which only a handful matter (trees
+        select thresholds per feature, so the noise dimensions that dragged
+        k-means across the label boundary are simply never split on), no
+        scaling sensitivity, and millisecond retrains -- with
+        feature_importances_ naming the dimensions that matter (logged).
+        "dense FC" is a small MLP behind an in-pipeline StandardScaler for
+        when the boundary is not axis-aligned."""
         try:
-            from sklearn.ensemble import RandomForestClassifier
+            import sklearn  # noqa: F401
         except ImportError:
             self.status_var.set("scikit-learn is not installed - "
                                 "pip install scikit-learn to enable training")
@@ -850,46 +977,147 @@ class LabelerApp(MscouponApp):
         if len(set(y.tolist())) < 2:
             self.status_var.set("Need labels from at least 2 classes to train.")
             return
-        use_oob = len(y) >= 20
-        clf = RandomForestClassifier(n_estimators=200, class_weight="balanced",
-                                     oob_score=use_oob, n_jobs=-1, random_state=0)
+        kind = self.model_kind_var.get()
+        clf = self._make_model(kind, len(y))
+        self._compute_badge("Training")
         t0 = time.perf_counter()
-        clf.fit(X, y)
+        try:
+            clf.fit(X, y)
+        finally:
+            self._clear_compute_badge()
         dt_ms = 1e3 * (time.perf_counter() - t0)
         self._clf = clf
         self._clf_names = names
+        self._clf_kind = kind
         self.classify_btn.config(state="normal")
-        top = sorted(zip(names, clf.feature_importances_),
-                     key=lambda t: -t[1])[:8]
-        log("classifier trained: " + "  ".join(f"{n}={v:.3f}" for n, v in top))
-        acc = f", OOB acc {clf.oob_score_:.1%}" if use_oob else ""
-        self.status_var.set(f"Trained on {len(y)} labeled regions in "
-                            f"{dt_ms:.0f} ms{acc} - top: "
-                            + ", ".join(n for n, _v in top[:3]))
+        if hasattr(clf, "feature_importances_"):
+            top = sorted(zip(names, clf.feature_importances_),
+                         key=lambda t: -t[1])[:8]
+            log("classifier trained: " + "  ".join(f"{n}={v:.3f}" for n, v in top))
+            hint = " - top: " + ", ".join(n for n, _v in top[:3])
+            acc = (f", OOB acc {clf.oob_score_:.1%}"
+                   if getattr(clf, "oob_score", False) else "")
+        else:                                # dense FC: no per-feature story
+            acc = f", train acc {clf.score(X, y):.1%}"
+            hint = ""
+        self.status_var.set(f"Trained {kind} on {len(y)} labeled regions in "
+                            f"{dt_ms:.0f} ms{acc}{hint}")
+
+    @staticmethod
+    def _make_model(kind, n_samples):
+        if kind == "dense FC":
+            # The scaler lives INSIDE the pipeline: an MLP needs standardized
+            # inputs, and keeping it in the estimator means the pickle /
+            # predict paths stay identical to the forest's.
+            from sklearn.pipeline import make_pipeline
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.neural_network import MLPClassifier
+            return make_pipeline(
+                StandardScaler(),
+                MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=1000,
+                              random_state=0))
+        from sklearn.ensemble import RandomForestClassifier
+        return RandomForestClassifier(n_estimators=200, class_weight="balanced",
+                                      oob_score=n_samples >= 20, n_jobs=-1,
+                                      random_state=0)
+
+    def _train_and_classify(self, _e=None):
+        """'R': one keystroke = retrain + reclassify."""
+        if self._typing():
+            return
+        before = self._clf
+        self._train_classifier()
+        if self._clf is not None and self._clf is not before:
+            self._classify()
+
+    # -- computing badge on the image plane (top-left canvas HUD) -------- #
+    def _compute_badge(self, text):
+        if self.viewer is not None:
+            self.viewer.set_hud("busy", text)
+            try:
+                self.root.update_idletasks()   # paint before the blocking fit
+            except tk.TclError:
+                pass
+
+    def _clear_compute_badge(self):
+        self._update_busy()      # restores busy/stale/none per engine state
+
+    # -- model <-> profile compatibility --------------------------------- #
+    def _expected_feature_names(self):
+        """The feature set the ACTIVE profile's statistics produce -- a pure
+        schema call, no priming. None when the compiled extension is absent
+        (the fallback field list would falsely block)."""
+        try:
+            from msseg import mscoupon as ext
+            if not getattr(ext, "_HAVE_EXTENSION", False):
+                return None
+        except ImportError:
+            return None
+        fields = config_io.query_fields(self._params_json())
+        return [n for n in fields if n not in _NON_FEATURE_FIELDS]
+
+    def _check_model_compat(self, names, context):
+        """None when `names` matches the active profile's statistics schema;
+        else a blocking message naming the exact mismatch. Compared as SETS:
+        the feature matrix is assembled by name, so order never matters."""
+        expected = self._expected_feature_names()
+        if expected is None:
+            log(f"model compatibility check skipped ({context}): "
+                "compiled extension not available")
+            return None
+        want, have = set(names), set(expected)
+        if want == have:
+            return None
+        prof = "?"
+        if 0 <= self.active_profile_idx < len(self.profiles):
+            prof = self.profiles[self.active_profile_idx]["name"]
+        missing = sorted(want - have)
+        extra = sorted(have - want)
+        parts = []
+        if missing:
+            parts.append("model needs: " + ", ".join(missing[:6])
+                         + ("…" if len(missing) > 6 else ""))
+        if extra:
+            parts.append("profile adds: " + ", ".join(extra[:6])
+                         + ("…" if len(extra) > 6 else ""))
+        return (f"Model does not match profile '{prof}' statistics "
+                f"({context}) - " + "; ".join(parts)
+                + ". Switch profiles or retrain.")
 
     def _classify(self):
         """Predict a class for EVERY region of every computed slice and show
-        the result as a translucent layer under the drawn labels."""
+        the result as a translucent layer under the drawn labels. BLOCKS with
+        a message when the model's features don't match the active profile
+        (replacing the old silent per-slice skip)."""
         if self._clf is None:
             self.status_var.set("Train first.")
             return
+        msg = self._check_model_compat(self._clf_names, "classify")
+        if msg:
+            messagebox.showerror("mscoupon labeler", msg)
+            self.status_var.set(msg)
+            return
         import numpy as np
         count = 0
+        self._compute_badge("Classifying")
         t0 = time.perf_counter()
-        for si, li, key, rec, table in self._iter_stat_slices():
-            mat = self._feature_matrix(table, self._clf_names, np)
-            fids = table.column("feature_id")
-            if mat is None or fids is None:
-                continue
-            pred = self._clf.predict(mat).astype(np.uint8)
-            labels = rec["labels"]
-            K = int(labels.max()) + 1 if labels.size else 1
-            region_class = np.zeros(max(K, 1), np.uint8)
-            fid = fids.astype(int)
-            ok = (fid >= 0) & (fid < len(region_class))
-            region_class[fid[ok]] = pred[ok]
-            self._pred[(si, li)] = (rec.get("commit"), region_class)
-            count += 1
+        try:
+            for si, li, key, rec, table in self._iter_stat_slices():
+                mat = self._feature_matrix(table, self._clf_names, np)
+                fids = table.column("feature_id")
+                if mat is None or fids is None:
+                    continue
+                pred = self._clf.predict(mat).astype(np.uint8)
+                labels = rec["labels"]
+                K = int(labels.max()) + 1 if labels.size else 1
+                region_class = np.zeros(max(K, 1), np.uint8)
+                fid = fids.astype(int)
+                ok = (fid >= 0) & (fid < len(region_class))
+                region_class[fid[ok]] = pred[ok]
+                self._pred[(si, li)] = (rec.get("commit"), region_class)
+                count += 1
+        finally:
+            self._clear_compute_badge()
         self.show_pred_var.set(True)
         self._refresh_render()
         self.status_var.set(f"Classified {count} slice(s) in "
@@ -911,10 +1139,26 @@ class LabelerApp(MscouponApp):
         self.status_var.set(f"Wrote {path}")
 
     def _save_classifier_to(self, path):
+        """Pickle v2: model + feature names + kind + the statistics block it
+        was trained under (the fingerprint the session records). v1 pickles
+        (no kind/statistics) still load."""
         import pickle
+        self._snapshot_active_profile()
+        stats = dict(self.profiles[self.active_profile_idx].get("statistics") or {})
         with open(path, "wb") as f:
-            pickle.dump({"app": "mscoupon-labeler-classifier", "version": 1,
-                         "names": self._clf_names, "model": self._clf}, f)
+            pickle.dump({"app": "mscoupon-labeler-classifier", "version": 2,
+                         "kind": self._clf_kind, "names": self._clf_names,
+                         "model": self._clf, "statistics": stats}, f)
+        self._record_model(path, stats)
+
+    def _record_model(self, path, statistics):
+        """Register a saved/loaded model on the session (deduped by path)."""
+        entry = {"path": os.path.abspath(path),
+                 "fingerprint": list(self._clf_names or []),
+                 "kind": self._clf_kind,
+                 "statistics": dict(statistics or {})}
+        self.models = [m for m in self.models if m.get("path") != entry["path"]]
+        self.models.append(entry)
 
     def _load_classifier(self):
         path = filedialog.askopenfilename(title="Load classifier",
@@ -923,10 +1167,11 @@ class LabelerApp(MscouponApp):
             return
         try:
             self._load_classifier_from(path)
-        except Exception as exc:     # missing sklearn, wrong file, version skew
+        except Exception as exc:     # missing sklearn, wrong file, incompat
+            messagebox.showerror("mscoupon labeler", str(exc))
             self.status_var.set(f"Could not load classifier: {exc}")
             return
-        self.status_var.set(f"Loaded classifier from {path} "
+        self.status_var.set(f"Loaded {self._clf_kind} from {path} "
                             f"({len(self._clf_names)} features)")
 
     def _load_classifier_from(self, path):
@@ -937,9 +1182,19 @@ class LabelerApp(MscouponApp):
                 or doc.get("app") != "mscoupon-labeler-classifier"
                 or "model" not in doc or not doc.get("names")):
             raise ValueError("not a labeler classifier file")
+        # The compatibility gate: a model trained under different statistics
+        # is refused OUTRIGHT (per-feature values would silently mean the
+        # wrong thing), before anything is installed.
+        msg = self._check_model_compat(doc["names"], "load")
+        if msg:
+            raise ValueError(msg)
         self._clf = doc["model"]
         self._clf_names = list(doc["names"])
+        self._clf_kind = str(doc.get("kind") or "random forest")
+        if self._clf_kind in ("random forest", "dense FC"):
+            self.model_kind_var.set(self._clf_kind)
         self.classify_btn.config(state="normal")
+        self._record_model(path, doc.get("statistics") or {})
 
     def _export_csv(self):
         """Resolved region -> class table: one row per living MSC region of
@@ -1016,22 +1271,43 @@ class LabelerApp(MscouponApp):
             f.write("\n".join(lines) + "\n")
         return covered, skipped
 
-    def _gui_state(self):
-        d = super()._gui_state()
-        d["labels"] = self.store.to_json()   # rides the inherited 4s autosave
+    def _view_state(self):
+        d = super()._view_state()
         d["tool"] = self.tool_var.get()
         return d
 
-    def _apply_state(self, state, gui=None, notes=None):
-        notes = super()._apply_state(state, gui, notes if notes is not None else [])
-        gui = gui or {}
-        if gui.get("labels"):
+    def _session_doc(self):
+        doc = super()._session_doc()
+        doc["labels"] = self.store.to_json()   # rides the inherited 4s autosave
+        doc["models"] = [dict(m) for m in self.models]
+        return doc
+
+    def _apply_session_doc(self, doc, source="session", notes=None):
+        notes = super()._apply_session_doc(doc, source,
+                                           notes if notes is not None else [])
+        sdoc = session.session_doc_from_json(doc)
+        # The store installs AFTER sequences exist, so rebind sees them (and
+        # migrates legacy bare-basename keys against the qualified identity).
+        if sdoc.get("labels"):
             try:
-                self._install_store(LabelStore.from_json(gui["labels"]))
+                self._install_store(LabelStore.from_json(sdoc["labels"]))
             except Exception as exc:
                 notes.append(f"labels not restored: {exc}")
-        if gui.get("tool") in TOOLS:
-            self.tool_var.set(gui["tool"])
+        else:
+            self._install_store(LabelStore())
+        self.models = list(sdoc.get("models") or [])
+        # Lazily reload the most recent model whose pickle still exists; a
+        # failure (moved file, incompatible profile) is a note, never fatal.
+        for entry in reversed(self.models):
+            if os.path.isfile(entry.get("path", "")):
+                try:
+                    self._load_classifier_from(entry["path"])
+                except Exception as exc:
+                    notes.append(f"model not reloaded: {exc}")
+                break
+        view = sdoc.get("view") or {}
+        if view.get("tool") in TOOLS:
+            self.tool_var.set(view["tool"])
         # Keep the regions toggle in sync with whatever seg_source restored to.
         self.show_regions_var.set(self.seg_source_var.get() == "msc")
         return notes
@@ -1077,12 +1353,17 @@ def _selftest():
     assert app._needed_level() == "slice"
     app.show_regions_var.set(True); app._on_regions_toggle()
 
-    # Fake one primed slice: 4 blocks with SPARSE living ids, -1 border.
+    # Fake one primed slice: 4 blocks with SPARSE living ids, -1 border. The
+    # session has one (nonexistent) folder; slice identity is folder-qualified.
     lab = np.full((20, 20), -1, np.int32)
     lab[2:10, 2:10] = 0; lab[2:10, 10:18] = 2
     lab[10:18, 2:10] = 5; lab[10:18, 10:18] = 9
-    files = [os.path.join("/data", "s0.tiff")]
-    app.subsequences = [{"name": "seq1", "files": files}]
+    data_dir = r"C:\labdata"
+    files = [os.path.join(data_dir, "s0.tiff")]
+    app.folders = [{"path": data_dir, "name": "data"}]
+    app.active_folder_idx = 0
+    app._refresh_folder_list()
+    app.subsequences = [{"name": "seq1", "folder": "data", "files": files}]
     zeros = np.zeros((20, 20), np.float32)
     app.primed = [{"files": files, "base": [zeros], "filtered": [zeros],
                    "pipes": [None], "normalizers": [[]]}]
@@ -1101,7 +1382,8 @@ def _selftest():
     app.active_class_var.set(2)
     app._commit_interaction("squiggle", [(3.0, 5.0), (15.0, 5.0)])  # {0,2} -> 2
     assert [it.uid for it in app.store.interactions] == [1, 2]
-    assert app.store.interactions[0].slice_key == "s0.tiff"
+    assert app.store.interactions[0].slice_key == "data/s0.tiff", \
+        "slice identity is folder-qualified"
 
     # Resolution + LUT: later interaction painted over the earlier one.
     lut = app._class_lut_for(0, 0, rec, np)
@@ -1144,15 +1426,16 @@ def _selftest():
     assert all(it.class_id == 1 for it in app.store.interactions)
     assert app.active_class_var.get() == 0
 
-    # Session round-trip: the store rides _gui_state and _apply_state.
-    g = app._gui_state()
-    assert g["labels"]["n_classes"] == 2 and len(g["labels"]["interactions"]) == 2
+    # Session round-trip: the store rides the v2 session doc.
+    sdoc = app._session_doc()
+    assert sdoc["labels"]["n_classes"] == 2
+    assert len(sdoc["labels"]["interactions"]) == 2
+    assert sdoc["sequences"][0]["folder"] == "data"
     app.store = LabelStore()             # clobber
-    state = config_io.config_to_state({}, notes=[])
-    state["subsequences"] = app.subsequences
-    app._apply_state(state, g)
+    app._apply_session_doc(sdoc, "test")
     assert len(app.store.interactions) == 2
-    assert all(it.bound for it in app.store.interactions), "rebind by basename"
+    assert all(it.bound for it in app.store.interactions), \
+        "rebind by folder-qualified key"
 
     # Export writes labels.json alongside the config(s).
     with tempfile.TemporaryDirectory() as td:
@@ -1160,9 +1443,9 @@ def _selftest():
         assert os.path.basename(paths[-1]) == "labels.json"
         with open(paths[-1], encoding="utf-8") as f:
             doc = json.load(f)
-        assert doc["version"] == 1 and len(doc["interactions"]) == 2
+        assert doc["version"] == 2 and len(doc["interactions"]) == 2
 
-    # The round-trip's _apply_state reset the engine; re-fake the primed slice
+    # The round-trip's apply reset the engine; re-fake the primed slice
     # for the interactive-behavior checks below.
     app.primed = [{"files": files, "base": [zeros], "filtered": [zeros],
                    "pipes": [None], "normalizers": [[]]}]
@@ -1202,6 +1485,12 @@ def _selftest():
         assert app.viewer.canvas.find_withtag("ihover"), "hover geometry drawn"
         app._hide_interaction_geometry()
         assert not app.viewer.canvas.find_withtag("ihover")
+        # A view change (zoom/pan) must re-project the geometry, not drop it.
+        app._show_interaction_geometry(uid0)
+        app._redraw_hover_geometry()
+        assert app.viewer.canvas.find_withtag("ihover"), \
+            "geometry survives a view change"
+        app._hide_interaction_geometry()
         s0 = app.viewer.scale
         app._on_row_click(uid0)
         assert app.viewer.scale == s0, "recenter keeps the zoom level"
@@ -1226,8 +1515,8 @@ def _selftest():
             rows = f.read().strip().splitlines()
         assert rows[0] == "slice,region_id,class,predicted,area,mean_base"
         assert len(rows) == 5
-        assert rows[1] == "s0.tiff,0,1,,64,1.5"    # predicted blank pre-classify
-        assert rows[4] == "s0.tiff,9,1,,112,4.5"
+        assert rows[1] == "data/s0.tiff,0,1,,64,1.5"   # blank pre-classify
+        assert rows[4] == "data/s0.tiff,9,1,,112,4.5"
 
     # Train + classify (skipped when scikit-learn isn't installed).
     try:
@@ -1239,12 +1528,20 @@ def _selftest():
               "checks skipped")
     if have_sklearn:
         from msseg.viz import min_colors as _mc
+        from unittest import mock as _mock
+        # The fake FeatureTable's schema is not the real profile's, so pin the
+        # expected-feature source to it (the real _expected_feature_names is a
+        # pure schema call; the check logic below is what's under test).
+        app._expected_feature_names = lambda: ["area", "mean_base"]
+        assert app.model_kind_var.get() == "dense FC", "dense FC is the default"
+        app.model_kind_var.set("random forest")
         app.n_classes_var.set(3)
         app._on_n_classes_change()
         app.active_class_var.set(2)
         app._commit_interaction("squiggle", [(12.0, 12.0), (15.0, 15.0)])  # {9} -> 2
         app._train_classifier()
         assert app._clf is not None, "training must produce a model"
+        assert app._clf_kind == "random forest"
         assert "min_x" not in app._clf_names and "ext_x" not in app._clf_names
         app._classify()
         pr = app._pred.get((0, 0))
@@ -1252,19 +1549,74 @@ def _selftest():
         assert pr[1].shape == (10,)
         assert set(int(v) for v in pr[1][[0, 2, 5, 9]]) <= {1, 2}
         assert app.show_pred_var.get()
+        if app.viewer is not None:
+            assert app.viewer._hud_mode is None, "computing badge cleared"
         ovs = app._seg_overlays(0, 0, rec3, None, np, _mc)
         assert len(ovs) == 3, "regions + prediction layer + drawn labels"
         assert int(ovs[1]["lut"][:, 3].max()) < 255, "prediction layer is translucent"
-        # Classifier save/load round trip, and predictions in the CSV.
+
+        # Dense FC kind: same buttons, scaler inside the pickled pipeline.
+        app.model_kind_var.set("dense FC")
+        app._train_classifier()
+        assert app._clf_kind == "dense FC"
+        app._classify()
+        assert app._pred, "dense FC classifies"
+        app.model_kind_var.set("random forest")
+
+        # 'R' = train + immediate reclassify in one call.
+        app._pred.clear()
+        app._train_and_classify()
+        assert app._clf_kind == "random forest" and app._pred, \
+            "'R' retrains and reclassifies"
+
+        # SHIFT-accept: the predictions under a box become one "taps"
+        # interaction per predicted class -- geometric, and ONE undo step.
+        n_before = len(app.store.interactions)
+        app._accept_predictions([(2.0, 2.0), (17.0, 17.0)])   # covers all 4
+        added = app.store.interactions[n_before:]
+        assert added and all(it.tool == "taps" for it in added)
+        assert sum(len(it.points) for it in added) == 4, "all regions accepted"
+        rc_now = labeling.resolve_slice(app.store.for_slice("data/s0.tiff"),
+                                        lab, np)
+        pr_now = app._pred[(0, 0)][1]
+        for r in (0, 2, 5, 9):
+            assert rc_now[r] == pr_now[r], "accepted labels match predictions"
+        app._undo()
+        assert len(app.store.interactions) == n_before, "batch accept = one undo"
+
+        # Classifier save/load round trip, session model refs, and the CSV.
         with tempfile.TemporaryDirectory() as td:
             clf_path = os.path.join(td, "classifier.pkl")
             app._save_classifier_to(clf_path)
+            assert app.models and app.models[-1]["fingerprint"] == ["area", "mean_base"]
+            assert app.models[-1]["kind"] == "random forest"
+            sdoc2 = app._session_doc()
+            assert sdoc2["models"] and sdoc2["models"][-1]["path"] == \
+                os.path.abspath(clf_path)
             app._clf = None
             app._clf_names = None
             app.classify_btn.config(state="disabled")
+            # The compatibility gate: an incompatible profile refuses the load
+            # outright, and Classify blocks with a message instead of silently
+            # skipping slices.
+            app._expected_feature_names = lambda: ["area", "mean_base", "std_blur_s1.5"]
+            try:
+                app._load_classifier_from(clf_path)
+                raise AssertionError("load must refuse an incompatible model")
+            except ValueError as exc:
+                assert "std_blur_s1.5" in str(exc), exc
+            assert app._clf is None, "nothing installed on refusal"
+            app._expected_feature_names = lambda: ["area", "mean_base"]
             app._load_classifier_from(clf_path)
             assert app._clf is not None and app._clf_names == ["area", "mean_base"]
             assert str(app.classify_btn.cget("state")) == "normal"
+            app._expected_feature_names = lambda: ["area", "mean_base", "extra"]
+            msg = app._check_model_compat(app._clf_names, "test")
+            assert msg is not None and "extra" in msg
+            with _mock.patch.object(messagebox, "showerror") as _err:
+                app._classify()
+                assert _err.called, "classify must block on mismatch"
+            app._expected_feature_names = lambda: ["area", "mean_base"]
             app._classify()
             csv2 = os.path.join(td, "labels2.csv")
             covered2, _sk = app._write_labels_csv(csv2)
@@ -1274,13 +1626,22 @@ def _selftest():
             preds = [r.split(",")[3] for r in rows2[1:]]
             assert all(v in ("1", "2") for v in preds), "predicted column filled"
 
+    # A re-prime (engine "done") bumps the commit, so every commit-keyed cache
+    # (per-slice records, class LUTs, predictions) self-invalidates -- the
+    # "stale overlays after adding a folder and re-running" regression.
+    c0 = app._commit_id
+    app.engine.work_q.put(("done", []))
+    app.engine.poll()
+    assert app._commit_id == c0 + 1, "re-prime must bump the commit"
+
     # The labeler's session file never collides with the viewer's.
     assert config_io.session_path(app=app.SESSION_APP) != config_io.session_path()
 
     root.destroy()
     print("labeler selftest OK: tiers, gestures, resolution order, LUT cache, "
-          "overlay stack, class-count clamp, session round-trip, export, "
-          "undo/redo, tap-squiggle, hover geometry, click-to-center, CSV")
+          "overlay stack, class-count clamp, session round-trip (qualified "
+          "keys), export, undo/redo, tap-squiggle, hover geometry, "
+          "click-to-center, CSV, model kinds + compat gate + 'R'")
     return 0
 
 

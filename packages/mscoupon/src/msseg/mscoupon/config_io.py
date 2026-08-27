@@ -234,8 +234,10 @@ def filters_to_json(filters: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if _is_nullfloat(op, k):
                 # Blank here means "keep every pixel", which is a real setting and
                 # must survive as null -- dropping it would silently restore the
-                # default sentinel instead.
-                params[k] = None if v == "" else float(v)
+                # default sentinel instead. None passes through so an
+                # already-normalized list is a fixed point (profiles store the
+                # normalized form and re-normalize on every snapshot).
+                params[k] = None if v in ("", None) else float(v)
             elif v != "":
                 params[k] = v
         out.append({"operation": op, "params": params})

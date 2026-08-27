@@ -237,6 +237,11 @@ class ComputeEngine:
             self.primed = payload
             self.assembly.clear()
             self.slices.clear()
+            # A re-prime replaces every raster, so records made under the old
+            # priming must never satisfy the new one -- and neither must any
+            # caller-side cache keyed on the commit (the labeler's class LUTs
+            # and predictions). Bumping the generation invalidates them all.
+            self.commit_id += 1
             return ("primed",)
         if kind == "assembly":
             token, si, out = payload
