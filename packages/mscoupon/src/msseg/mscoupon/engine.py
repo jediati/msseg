@@ -68,7 +68,12 @@ class ComputeEngine:
     def start_run(self, subseqs, params, run_info):
         """Prime `subseqs` (list of {"name", "files"} dicts) with `params`
         (the params_json string). `run_info` carries the UI's concurrency
-        numbers for the log line so the worker never reads Tk state."""
+        numbers for the log line so the worker never reads Tk state.
+
+        A subsequence carrying `"_reuse": <primed entry>` is NOT re-primed --
+        the caller vouches that the entry was primed under identical
+        parameters and files (incremental runs: adding a sequence must not
+        recompute the ones already primed)."""
         self.run_active = True
         t = threading.Thread(target=self._run_worker,
                              args=(subseqs, params, run_info), daemon=True)
@@ -118,9 +123,12 @@ class ComputeEngine:
                           if k not in ("compute_algorithm", "requested_parallelism")}
             params_serial = json.dumps({"filters": filters, "msc": msc_serial})
             use_serial = "compute_algorithm" not in msc
-            total = sum(len(s["files"]) for s in subseqs)
+            n_reused = sum(1 for s in subseqs if s.get("_reuse") is not None)
+            total = sum(len(s["files"]) for s in subseqs
+                        if s.get("_reuse") is None)
             log("=" * 60)
-            log(f"RUN: {len(subseqs)} subsequence(s), {total} slices")
+            log(f"RUN: {len(subseqs)} subsequence(s), {total} slices to prime"
+                + (f" ({n_reused} sequence(s) reused)" if n_reused else ""))
             log(f"  filters: {[f['operation'] for f in filters] or ['(none)']}")
             log(f"  base_filters: {[f['operation'] for f in base_filters] or ['(none)']}")
             log(f"  msc: manifold={msc.get('manifold')} "
@@ -143,6 +151,12 @@ class ComputeEngine:
             done = 0
             primed = []
             for s in subseqs:
+                reuse = s.get("_reuse")
+                if reuse is not None:
+                    log(f"subsequence: {os.path.basename(s['files'][0])} .. "
+                        f"({len(s['files'])} slices) -- reusing primed MSC")
+                    primed.append(reuse)
+                    continue
                 log(f"subsequence: {os.path.basename(s['files'][0])} .. "
                     f"({len(s['files'])} slices)")
                 base_slices, filt_slices, pipes, norms = [], [], [], []

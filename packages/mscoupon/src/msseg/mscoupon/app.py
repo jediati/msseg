@@ -519,7 +519,22 @@ class MscouponApp:
         ttk.Button(c, text="Make sequence from selection",
                    command=self._make_subsequence).pack(fill="x", padx=4, pady=2)
         ttk.Label(c, text="Sequences:").pack(anchor="w", padx=4)
-        self.subseq_list = self._scrolled_listbox(c, height=4, exportselection=False)
+        holder = ttk.Frame(c); holder.pack(fill="x", padx=4, pady=2)
+        self.subseq_list = ttk.Treeview(holder, columns=("msc", "annot"),
+                                        height=7, selectmode="extended")
+        self.subseq_list.heading("#0", text="sequence / image")
+        self.subseq_list.heading("msc", text="msc")
+        self.subseq_list.heading("annot", text="annot")
+        self.subseq_list.column("#0", width=190, stretch=True)
+        self.subseq_list.column("msc", width=38, anchor="center", stretch=False)
+        self.subseq_list.column("annot", width=44, anchor="center", stretch=False)
+        sb = ttk.Scrollbar(holder, orient="vertical",
+                           command=self.subseq_list.yview)
+        self.subseq_list.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.subseq_list.pack(side="left", fill="both", expand=True)
+        # Clicking a TIFF row under a sequence navigates the viewer to it.
+        self.subseq_list.bind("<<TreeviewSelect>>", self._on_seq_tree_select)
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
         ttk.Button(row, text="Remove", command=self._remove_subsequence).pack(side="left")
         ttk.Button(row, text="Clear all", command=self._clear_subsequences).pack(side="left", padx=4)
@@ -808,14 +823,57 @@ class MscouponApp:
         return None
 
     def _refresh_subseq_list(self):
-        """Repaint subseq_list from self.subsequences, which is the only writer.
+        """Repaint the sequence tree from self.subsequences, which is the only
+        writer: one top-level row per sequence, its TIFFs as children, with
+        per-slice "msc" (primed) and "annot" (labeler interaction count)
+        columns."""
+        tree = self.subseq_list
+        open_seqs = {iid for iid in tree.get_children()
+                     if tree.item(iid, "open")}
+        tree.delete(*tree.get_children())
+        for si, s in enumerate(self.subsequences):
+            marks = [(self._slice_msc_mark(si, li), self._annotation_count(si, li))
+                     for li in range(len(s.get("files") or []))]
+            seq_msc = "Y" if marks and all(m[0] == "Y" for m in marks) else ""
+            seq_annot = sum(m[1] for m in marks)
+            iid = f"q{si}"
+            tree.insert("", "end", iid=iid, text=self._sequence_row_text(s),
+                        values=(seq_msc, str(seq_annot) if seq_annot else ""),
+                        open=iid in open_seqs)
+            for li, path in enumerate(s.get("files") or []):
+                msc, annot = marks[li]
+                tree.insert(iid, "end", iid=f"q{si}:{li}",
+                            text=os.path.basename(path),
+                            values=(msc, str(annot) if annot else ""))
 
-        The piecewise insert/delete the browser used to do has no inverse, and
-        loading a session replaces the whole list at once.
-        """
-        self.subseq_list.delete(0, "end")
-        for s in self.subsequences:
-            self.subseq_list.insert("end", self._sequence_row_text(s))
+    def _slice_msc_mark(self, si, li):
+        """"Y" when the slice has a primed MSC under the current sequences."""
+        try:
+            p = self.primed[si]
+            if (p["files"] == self.subsequences[si]["files"]
+                    and li < len(p["pipes"])):
+                return "Y"
+        except (IndexError, KeyError, TypeError):
+            pass
+        return ""
+
+    def _annotation_count(self, si, li):
+        """Interactions on one slice; the labeler overrides this (the viewer
+        has no annotations, so its column stays blank)."""
+        return 0
+
+    def _on_seq_tree_select(self, _event=None):
+        sel = self.subseq_list.selection()
+        if not sel or ":" not in sel[0]:
+            return                        # a sequence row: selection only
+        left, li = sel[0].split(":")
+        try:
+            si, li = int(left[1:]), int(li)
+            idx = self.flat_slices.index((si, li))
+        except ValueError:
+            return                        # not primed yet -> nothing to show
+        if idx != int(round(float(self.slice_var.get()))):
+            self._goto_slice(idx)
 
     @staticmethod
     def _sequence_row_text(s):
@@ -837,9 +895,11 @@ class MscouponApp:
         self._refresh_subseq_list()
 
     def _remove_subsequence(self):
-        sel = list(self.subseq_list.curselection())
-        for i in reversed(sel):
-            del self.subsequences[i]
+        # A selected TIFF child counts as its sequence.
+        sis = {int(iid.split(":")[0][1:]) for iid in self.subseq_list.selection()}
+        for si in sorted(sis, reverse=True):
+            if 0 <= si < len(self.subsequences):
+                del self.subsequences[si]
         self._refresh_subseq_list()
 
     def _clear_subsequences(self):
@@ -989,11 +1049,7 @@ class MscouponApp:
         # slice slider (global, linearized over all subsequences)
         row = ttk.Frame(live); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="Slice:").pack(side="left")
-        self.slice_scale = self._scale(row, from_=0, to=0, orient="horizontal",
-                                       command=self._on_slice_change)
-        self.slice_scale.pack(side="left", fill="x", expand=True, padx=4)
-        self.slice_label = ttk.Label(row, text="-")
-        self.slice_label.pack(side="left")
+        self._build_slice_nav(row)
 
         # per-channel windowing: each pair maps 0->1 onto that channel's own min->max
         row = ttk.Frame(live); row.pack(fill="x", padx=4, pady=2)
@@ -1488,9 +1544,27 @@ class MscouponApp:
             return
         self._set_load_enabled(False)
         self.run_btn.config(state="disabled")
-        self.status_var.set("Priming…")
         params = self._params_json()
         subseqs = [dict(s) for s in self.subsequences]
+        # Incremental priming: a sequence already primed under the SAME compute
+        # parameters (cores excluded -- parallelism doesn't change results) and
+        # the same files is reused instead of recomputed, so adding a sequence
+        # never re-primes the rest. Any parameter/statistics change misses the
+        # fingerprint and re-primes everything.
+        fingerprint = self._params_json(cores=1)
+        reused = 0
+        if fingerprint == getattr(self, "_primed_fingerprint", None) and self.primed:
+            by_files = {tuple(p["files"]): p for p in self.primed}
+            for s in subseqs:
+                hit = by_files.get(tuple(s["files"]))
+                if hit is not None:
+                    s["_reuse"] = hit
+                    reused += 1
+        self._pending_fingerprint = fingerprint
+        need = len(subseqs) - reused
+        self.status_var.set(f"Priming… ({reused} of {len(subseqs)} sequence(s) "
+                            f"reused)" if reused else "Priming…")
+        log(f"run: {need} sequence(s) to prime, {reused} reused")
         # The concurrency numbers ride along for the worker's log line, so it
         # never reads Tk state off the UI thread.
         self.engine.start_run(subseqs, params,
@@ -1529,7 +1603,10 @@ class MscouponApp:
             self.run_btn.config(state="normal")
             self._set_load_enabled(True)
             self._chan_cache.clear()      # derived rasters belong to the old run
+            # This priming's parameters are now the reuse fingerprint.
+            self._primed_fingerprint = getattr(self, "_pending_fingerprint", None)
             self._rebuild_flat_slices()
+            self._refresh_subseq_list()   # "msc" column follows the primed set
             self.status_var.set(f"Primed {len(self.primed)} subsequence(s), "
                                 f"{len(self.flat_slices)} slices.")
             cur = self._current()
@@ -1539,14 +1616,76 @@ class MscouponApp:
         elif kind == "assembly_done":
             self._on_assembly_done(ev[1], ev[2])
 
+    def _build_slice_nav(self, row):
+        """Slice navigation: back/forward buttons side by side, then a
+        (scrollable) dropdown of the input images, replacing the old slider."""
+        ttk.Button(row, text="<", width=3,
+                   command=lambda: self._step_slice(-1)).pack(side="left", padx=(4, 1))
+        ttk.Button(row, text=">", width=3,
+                   command=lambda: self._step_slice(+1)).pack(side="left", padx=(1, 2))
+        self.slice_combo = ttk.Combobox(row, state="readonly", width=34)
+        self.slice_combo.pack(side="left", fill="x", expand=True, padx=(2, 4))
+        self.slice_combo.bind("<<ComboboxSelected>>", self._on_slice_combo)
+
+    def _slice_nav_text(self, si, li):
+        s = self.subsequences[si] if si < len(self.subsequences) else None
+        folder = s.get("folder", "?") if s else "?"
+        try:
+            base = os.path.basename(self.primed[si]["files"][li])
+        except (IndexError, KeyError, TypeError):
+            base = f"[{li}]"
+        return f"{folder}/{base}"
+
+    def _sync_slice_combo(self):
+        combo = getattr(self, "slice_combo", None)
+        if combo is None:
+            return
+        idx = int(round(float(self.slice_var.get())))
+        try:
+            if 0 <= idx < len(self.flat_slices):
+                combo.current(idx)
+            else:
+                combo.set("")
+        except tk.TclError:
+            pass
+
+    def _on_slice_combo(self, _event=None):
+        idx = self.slice_combo.current()
+        if idx >= 0:
+            self._goto_slice(idx)
+
+    def _step_slice(self, delta):
+        idx = int(round(float(self.slice_var.get()))) + delta
+        if 0 <= idx < len(self.flat_slices):
+            self._goto_slice(idx)
+
+    def _goto_slice(self, idx):
+        """Navigate to flat slice `idx`: THE one entry point for slice moves
+        (dropdown, buttons, tree clicks, row clicks)."""
+        if not (0 <= idx < len(self.flat_slices)):
+            return
+        self.slice_var.set(idx)
+        self._sync_slice_combo()
+        si, _li = self.flat_slices[idx]
+        # Only what this view needs, for this slice: browsing the stack with
+        # the MSC overlay costs one slice's work, not the whole 3D assembly.
+        self._request_assembly(si)
+        self._refresh_render()
+
     def _rebuild_flat_slices(self):
         self.flat_slices = []
         for si, p in enumerate(self.primed):
             for li in range(len(p["pipes"])):
                 self.flat_slices.append((si, li))
-        n = max(0, len(self.flat_slices) - 1)
-        self.slice_scale.config(to=n)
+        combo = getattr(self, "slice_combo", None)
+        if combo is not None:
+            try:
+                combo.config(values=[self._slice_nav_text(si, li)
+                                     for si, li in self.flat_slices])
+            except tk.TclError:
+                pass
         self.slice_var.set(0)
+        self._sync_slice_combo()
 
     def _current(self):
         """Return (subseq_idx, local_idx) for the current global slice, or None."""
@@ -1565,22 +1704,16 @@ class MscouponApp:
         self._refresh_render()
 
     def _on_slice_change(self, _value=None):
-        # The Scale isn't bound to slice_var directly, so store the slider's value
-        # here before reading _current() (which reads slice_var).
+        """Compat shim for older callers: navigate by flat index (or refresh
+        the current slice when called without one)."""
         if _value is not None:
             try:
-                self.slice_var.set(int(round(float(_value))))
+                self._goto_slice(int(round(float(_value))))
+                return
             except (ValueError, tk.TclError):
-                pass
-        cur = self._current()
-        if cur is None:
-            return
-        si, li = cur
-        self.slice_label.config(text=f"{self.subsequences[si]['name']} [{li}]")
-        # Only what this view needs, for this slice: browsing the stack with the
-        # MSC overlay costs one slice's work, not the whole 3D assembly.
-        self._request_assembly(si)
-        self._refresh_render()
+                return
+        idx = int(round(float(self.slice_var.get())))
+        self._goto_slice(idx)
 
     def _min_area(self):
         s = self.min_area_var.get().strip()
@@ -2384,7 +2517,12 @@ def _selftest():
     assert app.subsequences[0]["name"] == "data asdf_0011-asdf_0013"
     assert app._sequence_row_text(app.subsequences[0]) == \
         "data  [asdf_0011 – asdf_0013] (3)"
-    assert app.subseq_list.get(1) == "data  [asdf_0025 – asdf_0026] (2)"
+    # The sequence view is a tree: TIFF children under each sequence, with
+    # msc/annot columns (nothing primed and no annotations -> blank).
+    assert app.subseq_list.item("q1", "text") == "data  [asdf_0025 – asdf_0026] (2)"
+    assert len(app.subseq_list.get_children("q0")) == 3
+    assert app.subseq_list.item("q0:0", "text") == "asdf_0011.tiff"
+    assert tuple(app.subseq_list.item("q0:0", "values")) == ("", "")
 
     # Preview plumbing (pure parts): a click schedules a debounced load; a
     # missing file falls back without raising and still records the preview.
@@ -2518,7 +2656,8 @@ def _selftest():
         app._apply_session_docs([(os.path.join(d, "last_session.json"), doc)], "test")
 
         assert len(app.subsequences) == 2, app.subsequences
-        assert app.subseq_list.size() == 2, "the listbox must follow the model"
+        assert len(app.subseq_list.get_children()) == 2, \
+            "the tree must follow the model"
         assert app.folders == [{"path": data_dir, "name": "data"}]
         assert app.subsequences[0]["folder"] == "data"
         assert app.subsequences[0]["files"] == before["input"]["files"]
@@ -2680,6 +2819,17 @@ def _selftest():
         loaded = session.profile_from_json(config_io.read_json_file(prof_path))
         loaded["name"] = app.profiles[0]["name"]     # file doc keeps the name; be explicit
         assert loaded == app.profiles[0], "profile file round trip is lossless"
+
+        # --- incremental priming -------------------------------------------- #
+        # A subsequence carrying "_reuse" skips the worker entirely, so adding
+        # a sequence never re-primes the ones already computed.
+        fake_primed = {"files": ["x.tif"], "base": [], "filtered": [],
+                       "pipes": [None], "normalizers": [[]]}
+        eng2 = ComputeEngine(lambda si, level, li: {})
+        eng2._run_worker([{"name": "s", "files": ["x.tif"],
+                           "_reuse": fake_primed}], app._params_json(), {})
+        evs = [e[0] for e in eng2.poll()]
+        assert "primed" in evs and eng2.primed == [fake_primed]
 
         # --- legacy v1 import ----------------------------------------------- #
         # An old AppConfig+_gui session imports as folders + sequences + ONE

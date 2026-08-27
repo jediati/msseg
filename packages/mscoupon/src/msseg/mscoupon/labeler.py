@@ -245,6 +245,21 @@ class LabelerApp(MscouponApp):
             self._class_luts.clear()
             self._pred.clear()
         super()._handle_event(ev)
+        if ev[0] == "primed":
+            self._rebuild_class_panels()      # slice 0 is now on screen
+        elif ev[0] == "assembly_done":
+            self._update_class_titles()       # a new record can change counts
+
+    def _goto_slice(self, idx):
+        cur = self._current()
+        before = self._slice_key(*cur) if cur is not None else None
+        super()._goto_slice(idx)
+        cur = self._current()
+        after = self._slice_key(*cur) if cur is not None else None
+        if after != before:
+            # The class panels list the ON-SLICE interactions only; swap them
+            # with the slice.
+            self._rebuild_class_panels()
 
     def _build_live_panel(self, parent):
         live = ttk.LabelFrame(parent, text="Live parameters")
@@ -253,11 +268,7 @@ class LabelerApp(MscouponApp):
         # slice slider (global, linearized over all subsequences)
         row = ttk.Frame(live); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="Slice:").pack(side="left")
-        self.slice_scale = self._scale(row, from_=0, to=0, orient="horizontal",
-                                       command=self._on_slice_change)
-        self.slice_scale.pack(side="left", fill="x", expand=True, padx=4)
-        self.slice_label = ttk.Label(row, text="-")
-        self.slice_label.pack(side="left")
+        self._build_slice_nav(row)
 
         # per-channel windowing (same pairs as the viewer)
         row = ttk.Frame(live); row.pack(fill="x", padx=4, pady=2)
@@ -333,26 +344,31 @@ class LabelerApp(MscouponApp):
         return overlays
 
     def _labels_cache_for(self, si, li, rec, np):
-        """(commit, rev, lut, {uid: touched ids}) for one slice, memoized on
-        (commit, store.rev): a gesture bumps rev (rebuild only this), a Rerun
-        bumps the commit (a fresh labels raster arrives and the interactions
-        re-resolve against it -- which is how annotations survive persistence
-        changes). The touch map falls out of the same rasterization pass the
-        LUT needs, so the hover lookup costs nothing extra."""
+        """(commit, rev, lut, {uid: touched ids}, per-class region counts) for
+        one slice, memoized on (commit, store.rev): a gesture bumps rev
+        (rebuild only this), a Rerun bumps the commit (a fresh labels raster
+        arrives and the interactions re-resolve against it -- which is how
+        annotations survive persistence changes). The touch map and the counts
+        fall out of the same rasterization pass the LUT needs, so the hover
+        lookup and the class-title totals cost nothing extra."""
         key = (si, li)
         commit = rec.get("commit")
         cached = self._class_luts.get(key)
         if cached is not None and cached[0] == commit and cached[1] == self.store.rev:
             return cached
         lut, touch = None, {}
+        counts = np.zeros(MAX_CLASSES, np.int64)
         slice_key = self._slice_key(si, li)
         if slice_key is not None:
             its = self.store.for_slice(slice_key)
             if its:
                 sets = touched_sets(its, rec["labels"], np)
                 touch = {it.uid: ids for it, ids in sets}
-                lut = class_lut(resolve_sets(sets, rec["labels"], np), np)
-        entry = (commit, self.store.rev, lut, touch)
+                region_class = resolve_sets(sets, rec["labels"], np)
+                lut = class_lut(region_class, np)
+                counts = np.bincount(region_class,
+                                     minlength=MAX_CLASSES)[:MAX_CLASSES]
+        entry = (commit, self.store.rev, lut, touch, counts)
         self._class_luts[key] = entry
         return entry
 
@@ -361,6 +377,10 @@ class LabelerApp(MscouponApp):
 
     def _touch_map_for(self, si, li, rec, np):
         return self._labels_cache_for(si, li, rec, np)[3]
+
+    def _annotation_count(self, si, li):
+        key = self._slice_key(si, li)
+        return len(self.store.for_slice(key)) if key else 0
 
     def _slice_key(self, si, li):
         """Folder-qualified slice identity ("folder/basename") -- basenames
@@ -514,9 +534,11 @@ class LabelerApp(MscouponApp):
         self.root.bind("<Control-z>", self._on_undo_key)
         self.root.bind("<Control-y>", self._on_undo_key)
         self.root.bind("<Tab>", self._on_tab_toggle)
-        # 'R': one keystroke = train + immediate reclassify.
+        # 'R': one keystroke = train + immediate reclassify. 'C': classify.
         self.root.bind("r", self._train_and_classify)
         self.root.bind("R", self._train_and_classify)
+        self.root.bind("c", self._on_classify_key)
+        self.root.bind("C", self._on_classify_key)
 
     def _typing(self):
         """True while a text-entry widget owns the keyboard focus."""
@@ -591,7 +613,7 @@ class LabelerApp(MscouponApp):
         ttk.Button(row, text="Train (R)",
                    command=self._train_classifier).pack(side="left", fill="x",
                                                         expand=True, padx=2)
-        self.classify_btn = ttk.Button(row, text="Classify",
+        self.classify_btn = ttk.Button(row, text="Classify (C)",
                                        state="disabled", command=self._classify)
         self.classify_btn.pack(side="left", fill="x", expand=True, padx=2)
         ttk.Checkbutton(row, text="show", variable=self.show_pred_var,
@@ -606,6 +628,9 @@ class LabelerApp(MscouponApp):
         row = ttk.Frame(panel); row.pack(side="bottom", fill="x", padx=4, pady=2)
         ttk.Button(row, text="Export as CSV…",
                    command=self._export_csv).pack(fill="x")
+        row = ttk.Frame(panel); row.pack(side="bottom", fill="x", padx=4, pady=2)
+        ttk.Button(row, text="Make image training set…",
+                   command=self._make_training_set).pack(fill="x")
         row = ttk.Frame(panel); row.pack(side="bottom", fill="x", padx=4, pady=2)
         ttk.Button(row, text="Save labels…",
                    command=self._save_labels).pack(side="left", fill="x", expand=True, padx=(0, 2))
@@ -636,7 +661,9 @@ class LabelerApp(MscouponApp):
         self._refresh_render()
 
     def _rebuild_class_panels(self):
-        """Full repaint from the store (interaction counts are small).
+        """Full repaint from the store (interaction counts are small). Also
+        repaints the sequence tree, whose "annot" column counts per-slice
+        interactions.
 
         The subpanels split the holder's height equally (uniform grid rows);
         each one scrolls its own interaction list, so a class with many
@@ -644,6 +671,7 @@ class LabelerApp(MscouponApp):
         for w in list(self.classes_holder.winfo_children()):
             w.destroy()
         self._class_panels = {}
+        visible = self._visible_interactions()
         for k in range(1, self.store.n_classes):
             frame = ttk.LabelFrame(self.classes_holder, text=f"Class {k}")
             self.classes_holder.rowconfigure(k - 1, weight=1, uniform="cls")
@@ -662,9 +690,53 @@ class LabelerApp(MscouponApp):
             # Small minimum height: the grid's equal weights own the real size.
             lst.canvas.configure(height=48)
             lst.pack(side="top", fill="both", expand=True, padx=2, pady=(0, 2))
-            for it in self.store.interactions:
+            for it in visible:
                 if it.class_id == k:
                     self._build_interaction_row(lst.inner, it)
+        self._update_class_titles()
+        self._refresh_subseq_list()      # keep the tree's annot counts live
+
+    def _visible_interactions(self):
+        """The interactions listed in the class panels: the CURRENT slice's
+        only (they swap with every slice change); everything when no slice is
+        on screen (nothing primed yet, or a freshly loaded session)."""
+        cur = self._current()
+        if cur is None:
+            return list(self.store.interactions)
+        key = self._slice_key(*cur)
+        return [it for it in self.store.interactions if it.slice_key == key]
+
+    def _class_totals(self):
+        """ALL-slice totals per class: (annotations, labeled regions). Region
+        counts come from the per-slice resolution caches, so only slices that
+        carry interactions AND a computed record contribute (the rest have
+        nothing to count yet)."""
+        import numpy as np
+        annot = {}
+        slices = {}                      # slice_key -> (si, li), bound only
+        for it in self.store.interactions:
+            annot[it.class_id] = annot.get(it.class_id, 0) + 1
+            if it.bound:
+                slices.setdefault(it.slice_key, (it.si, it.li))
+        regions = {}
+        for _key, (si, li) in slices.items():
+            rec = self.engine.record(si, li)
+            if rec is None or rec.get("labels") is None:
+                continue
+            counts = self._labels_cache_for(si, li, rec, np)[4]
+            for k in range(1, self.store.n_classes):
+                if k < len(counts) and counts[k]:
+                    regions[k] = regions.get(k, 0) + int(counts[k])
+        return annot, regions
+
+    def _update_class_titles(self):
+        annot, regions = self._class_totals()
+        for k, frame in self._class_panels.items():
+            try:
+                frame.configure(text=f"Class {k} — annot: {annot.get(k, 0)} — "
+                                     f"regions: {regions.get(k, 0)}")
+            except tk.TclError:
+                pass
 
     def _build_interaction_row(self, parent, it):
         # Plain-tk widgets so the rows share the list's white background.
@@ -864,9 +936,7 @@ class LabelerApp(MscouponApp):
                 idx = self.flat_slices.index((it.si, it.li))
             except ValueError:
                 return
-            # Setting the scale drives _on_slice_change (slider sync, per-slice
-            # assembly request, re-render) exactly like a user drag.
-            self.slice_scale.set(idx)
+            self._goto_slice(idx)
         cx = sum(x for x, _y in it.points) / len(it.points)
         cy = sum(y for _x, y in it.points) / len(it.points)
         w = max(v.canvas.winfo_width(), 1)
@@ -989,6 +1059,7 @@ class LabelerApp(MscouponApp):
         self._clf = clf
         self._clf_names = names
         self._clf_kind = kind
+        self._pred.clear()               # predictions belong to the old model
         self.classify_btn.config(state="normal")
         if hasattr(clf, "feature_importances_"):
             top = sorted(zip(names, clf.feature_importances_),
@@ -1029,6 +1100,12 @@ class LabelerApp(MscouponApp):
         self._train_classifier()
         if self._clf is not None and self._clf is not before:
             self._classify()
+
+    def _on_classify_key(self, _e=None):
+        """'C': classify/reclassify with the current model."""
+        if self._typing() or self._clf is None:
+            return
+        self._classify()
 
     # -- computing badge on the image plane (top-left canvas HUD) -------- #
     def _compute_badge(self, text):
@@ -1103,19 +1180,8 @@ class LabelerApp(MscouponApp):
         t0 = time.perf_counter()
         try:
             for si, li, key, rec, table in self._iter_stat_slices():
-                mat = self._feature_matrix(table, self._clf_names, np)
-                fids = table.column("feature_id")
-                if mat is None or fids is None:
-                    continue
-                pred = self._clf.predict(mat).astype(np.uint8)
-                labels = rec["labels"]
-                K = int(labels.max()) + 1 if labels.size else 1
-                region_class = np.zeros(max(K, 1), np.uint8)
-                fid = fids.astype(int)
-                ok = (fid >= 0) & (fid < len(region_class))
-                region_class[fid[ok]] = pred[ok]
-                self._pred[(si, li)] = (rec.get("commit"), region_class)
-                count += 1
+                if self._predict_slice(si, li, rec, np) is not None:
+                    count += 1
         finally:
             self._clear_compute_badge()
         self.show_pred_var.set(True)
@@ -1123,6 +1189,137 @@ class LabelerApp(MscouponApp):
         self.status_var.set(f"Classified {count} slice(s) in "
                             f"{1e3 * (time.perf_counter() - t0):.0f} ms - "
                             "predictions shown under your labels")
+
+    def _predict_slice(self, si, li, rec, np):
+        """The slice's region->class predictions at rec's commit, computing
+        and caching them when a model is loaded. Callers gate schema
+        compatibility (this only checks that a model exists)."""
+        pr = self._pred.get((si, li))
+        if pr is not None and pr[0] == rec.get("commit"):
+            return pr[1]
+        if self._clf is None:
+            return None
+        table = rec.get("stats")
+        if getattr(table, "values", None) is None:
+            return None
+        mat = self._feature_matrix(table, self._clf_names, np)
+        fids = table.column("feature_id")
+        if mat is None or fids is None:
+            return None
+        pred = self._clf.predict(mat).astype(np.uint8)
+        labels = rec["labels"]
+        K = int(labels.max()) + 1 if labels.size else 1
+        region_class = np.zeros(max(K, 1), np.uint8)
+        fid = fids.astype(int)
+        ok = (fid >= 0) & (fid < len(region_class))
+        region_class[fid[ok]] = pred[ok]
+        self._pred[(si, li)] = (rec.get("commit"), region_class)
+        return region_class
+
+    # -- training-set export --------------------------------------------- #
+    def _ensure_slice_record(self, si, li):
+        """The slice's record at the current commit, computing it SYNCHRONOUSLY
+        when the lazy per-slice tier hasn't visited it yet (the training-set
+        export needs every slice, not just the browsed ones). Caller must
+        ensure no assembly worker is running (the pipes are stateful)."""
+        rec = self.engine.record(si, li)
+        if rec is not None and rec.get("labels") is not None:
+            return rec
+        try:
+            import numpy as np
+            from msseg import mscoupon as ext
+        except ImportError:
+            return None
+        params = dict(self._assembly_params(si, "slice", li))
+        params["commit"] = self.engine.commit_id
+        tm = {"persist": 0.0, "labels": 0.0, "stats": 0.0,
+              "query": 0.0, "rasters": 0.0}
+        try:
+            rec = self.engine._slice_result(si, li, params, ext, np, tm)
+        except Exception as exc:
+            log(f"slice ({si},{li}) record failed: {exc}")
+            return None
+        self.engine.slices[(si, li)] = rec
+        return rec
+
+    def _make_training_set(self):
+        """Pick a folder; write `train/` (the raw input TIFFs) and `labels/`
+        (per-pixel class-id masks from the classifier, with user annotations
+        winning where they disagree) -- the raw material for a UNet-style
+        image model later."""
+        if not self.primed:
+            self.status_var.set("Run first - the masks need computed regions.")
+            return
+        if self.engine.asm_running or self.engine.asm_pending is not None:
+            self.status_var.set("Busy computing - try again in a moment.")
+            return
+        out = filedialog.askdirectory(title="Choose a folder for the training set")
+        if not out:
+            return
+        written, skipped = self._write_training_set(out)
+        msg = (f"Training set: {written} image(s) -> {os.path.join(out, 'train')} "
+               f"+ masks -> {os.path.join(out, 'labels')}")
+        if skipped:
+            msg += f" ({skipped} slice(s) skipped - no labels or predictions)"
+        self.status_var.set(msg)
+
+    def _write_training_set(self, out_dir):
+        import shutil
+        import numpy as np
+        from PIL import Image
+        train_dir = os.path.join(out_dir, "train")
+        labels_dir = os.path.join(out_dir, "labels")
+        os.makedirs(train_dir, exist_ok=True)
+        os.makedirs(labels_dir, exist_ok=True)
+        # Gate the model ONCE: under a mismatched profile the masks fall back
+        # to annotations alone rather than silently wrong predictions.
+        use_model = (self._clf is not None and
+                     self._check_model_compat(self._clf_names,
+                                              "training-set export") is None)
+        written = skipped = 0
+        try:
+            for si, p in enumerate(self.primed):
+                for li in range(len(p["pipes"])):
+                    self._compute_badge(f"Exporting {si}:{li}")
+                    rec = self._ensure_slice_record(si, li)
+                    key = self._slice_key(si, li)
+                    if rec is None or rec.get("labels") is None or key is None:
+                        skipped += 1
+                        continue
+                    labels = rec["labels"]
+                    K = int(labels.max()) + 1 if labels.size else 1
+                    combined = np.zeros(max(K, 1), np.uint8)
+                    if use_model:
+                        pred = self._predict_slice(si, li, rec, np)
+                        if pred is not None:
+                            combined = pred.copy()
+                    user = resolve_slice(self.store.for_slice(key), labels, np)
+                    combined[user > 0] = user[user > 0]    # annotations win
+                    if not combined.any():
+                        skipped += 1                       # nothing to teach
+                        continue
+                    mask = np.zeros(labels.shape, np.uint8)
+                    valid = labels >= 0
+                    mask[valid] = combined[labels[valid]]
+                    src = p["files"][li]
+                    folder = "seq"
+                    if si < len(self.subsequences):
+                        folder = self.subsequences[si].get("folder") or "seq"
+                    safe = folder.replace("/", "_").replace("\\", "_")
+                    base = os.path.basename(src)
+                    stem, _ext = os.path.splitext(base)
+                    try:
+                        shutil.copy2(src, os.path.join(train_dir, f"{safe}__{base}"))
+                    except OSError as exc:
+                        log(f"training set: could not copy {src}: {exc}")
+                        skipped += 1
+                        continue
+                    Image.fromarray(mask).save(
+                        os.path.join(labels_dir, f"{safe}__{stem}.tiff"))
+                    written += 1
+        finally:
+            self._clear_compute_badge()
+        return written, skipped
 
     # -- classifier persistence (pickle: the sklearn-native format) ------ #
     def _save_classifier(self):
@@ -1384,6 +1581,22 @@ def _selftest():
     assert [it.uid for it in app.store.interactions] == [1, 2]
     assert app.store.interactions[0].slice_key == "data/s0.tiff", \
         "slice identity is folder-qualified"
+    # The sequence tree's columns track priming + per-slice annotations.
+    app._refresh_subseq_list()
+    assert tuple(app.subseq_list.item("q0:0", "values")) == ("Y", "2")
+    assert tuple(app.subseq_list.item("q0", "values")) == ("Y", "2")
+
+    # The class panels list ON-SLICE interactions only (they swap with the
+    # slice); the titles carry ALL-slice annot/region totals.
+    other = app.store.add("squiggle", [(0.0, 0.0)], 1, "data/other.tiff")
+    app._rebuild_class_panels()
+    assert len(app._visible_interactions()) == 2, "on-slice interactions only"
+    t1 = str(app._class_panels[1].cget("text"))
+    assert "annot: 2" in t1 and "regions: 2" in t1, t1   # box + off-slice; {5,9}
+    t2 = str(app._class_panels[2].cget("text"))
+    assert "annot: 1" in t2 and "regions: 2" in t2, t2   # squiggle; {0,2}
+    app.store.remove(other.uid)
+    app._rebuild_class_panels()
 
     # Resolution + LUT: later interaction painted over the earlier one.
     lut = app._class_lut_for(0, 0, rec, np)
@@ -1569,6 +1782,11 @@ def _selftest():
         assert app._clf_kind == "random forest" and app._pred, \
             "'R' retrains and reclassifies"
 
+        # 'C' = classify with the current model.
+        app._pred.clear()
+        app._on_classify_key()
+        assert app._pred, "'C' reclassifies"
+
         # SHIFT-accept: the predictions under a box become one "taps"
         # interaction per predicted class -- geometric, and ONE undo step.
         n_before = len(app.store.interactions)
@@ -1625,6 +1843,38 @@ def _selftest():
                 rows2 = f.read().strip().splitlines()
             preds = [r.split(",")[3] for r in rows2[1:]]
             assert all(v in ("1", "2") for v in preds), "predicted column filled"
+
+            # Training-set export: raw TIFF into train/, class-id mask into
+            # labels/ (classifier predictions, user annotations winning).
+            from PIL import Image as _Img
+            src_dir = os.path.join(td, "src")
+            os.makedirs(src_dir)
+            src_tif = os.path.join(src_dir, "s0.tiff")
+            _Img.fromarray(zeros).save(src_tif)
+            app.folders = [{"path": src_dir, "name": "data"}]
+            app.subsequences = [{"name": "seq1", "folder": "data",
+                                 "files": [src_tif]}]
+            app.primed = [{"files": [src_tif], "base": [zeros],
+                           "filtered": [zeros], "pipes": [None],
+                           "normalizers": [[]]}]
+            app._rebuild_flat_slices()
+            rec5 = dict(rec3, commit=app._commit_id)
+            app._slices[(0, 0)] = rec5
+            out_dir = os.path.join(td, "tset")
+            written, skipped_ts = app._write_training_set(out_dir)
+            assert (written, skipped_ts) == (1, 0), (written, skipped_ts)
+            assert os.path.isfile(os.path.join(out_dir, "train", "data__s0.tiff"))
+            mask = np.asarray(_Img.open(
+                os.path.join(out_dir, "labels", "data__s0.tiff")))
+            assert mask.shape == (20, 20) and mask.dtype == np.uint8
+            assert mask[0, 0] == 0, "background (-1) stays class 0"
+            assert mask[5, 5] > 0, "labeled region carries its class id"
+            # User annotations win over predictions where they disagree.
+            rc_user = labeling.resolve_slice(
+                app.store.for_slice("data/s0.tiff"), lab, np)
+            for r, px in ((0, (5, 5)), (9, (12, 12))):
+                if rc_user[r] > 0:
+                    assert mask[px] == rc_user[r]
 
     # A re-prime (engine "done") bumps the commit, so every commit-keyed cache
     # (per-slice records, class LUTs, predictions) self-invalidates -- the
