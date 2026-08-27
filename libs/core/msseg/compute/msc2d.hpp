@@ -6,27 +6,44 @@
 #include <vector>
 
 #include "diffg/image.hpp"
+#include "msseg/compute/channel_stats.hpp"
 #include "msseg/graph/msc_graph.hpp"
 #include "msseg/workflow/params.hpp"
+#include "msseg/workflow/stat_channels.hpp"
 
 namespace msseg {
+
+struct StatChannelBank;
 
 // Compute the 2D Morse-Smale complex over a filtered slice, simplify to the
 // configured persistence, and return the ascending/descending 2-manifold
 // label image (row-major, one label per pixel). Requires depth == 1.
 std::vector<int> compute_msc2d_labels(const diffg::Image<float>& filtered, const Msc2DParams& cfg);
 
-// Aggregated statistics for one 2D feature (a living 2-manifold at the current
-// persistence). Sums/sumsq are mergeable so per-base-manifold stats combine cheaply
-// when rolled up to living features; means/std are derived (mean = sum/area).
-// `min/max_x/y` is the bounding box.
+// Geometry and extremum machinery for one 2D feature (a living 2-manifold at the
+// current persistence). `min/max_x/y` is the bounding box.
+//
+// The per-channel AGGREGATES do not live here -- they live in a parallel flat
+// ChannelStats table owned by the pipeline, indexed by the same feature order.
+// That is what lets a workflow ask for a twelve-channel scale-space stack
+// without this struct growing a member per channel: see
+// Msc2DPipeline::feature_channels().
+//
+// What remains here is what is NOT a measurement: the bounding box, the slice
+// metadata `relevance` needs, and the extremum machinery. `filt_min`/`filt_max`
+// stay because they LOCATE the seeding critical point -- they are computed
+// whenever the extremum is wanted, whether or not "filtered" is a measurement
+// channel at all.
 struct Msc2DFeatureStat {
   NodeId feature_id = -1;   // living extremum compact id == label value
   std::int64_t area = 0;
-  double base_sum = 0.0, base_sumsq = 0.0;   // on the original (unfiltered) image
-  float base_min = 0.0f, base_max = 0.0f;
-  double filt_sum = 0.0, filt_sumsq = 0.0;   // on the filtered (topology) field
+  // Extent of the filtered (topology) field over the feature. Extremum
+  // machinery, not a statistic -- the `filtered` measurement channel is what a
+  // workflow queries as min_filtered/max_filtered.
   float filt_min = 0.0f, filt_max = 0.0f;
+  // Slice-level finite base-channel percentiles used by `relevance_base`.
+  // These are metadata shared by every feature in a slice, not mergeable stats.
+  float base_relevance_floor = 0.0f, base_relevance_ceiling = 0.0f;
   int min_x = 0, min_y = 0, max_x = 0, max_y = 0;
 
   // The feature's SEEDING extremum: the minimum for ascending manifolds, the
@@ -36,10 +53,9 @@ struct Msc2DFeatureStat {
   // base manifold instead of accumulating them. That is why `ext_filtered` can
   // sit above `filt_min`: persistence, not depth, decides which minimum
   // survives, so a deep low-persistence basin can merge into a shallower one.
-  // `ext_base` samples the BASE channel there -- a single pixel, or the mean
-  // over a window (see Msc2DParams::extremum_sample_radius).
+  // Every measurement channel is sampled there too, as ChannelStats::ext().
   float ext_x = -1.0f, ext_y = -1.0f;
-  float ext_base = 0.0f, ext_filtered = 0.0f;
+  float ext_filtered = 0.0f;
 };
 
 // Two-phase 2D pipeline. build() runs the heavy MSC compute once, keeps the MSCEER
@@ -64,18 +80,35 @@ class Msc2DPipeline {
   Msc2DPipeline& operator=(const Msc2DPipeline&) = delete;
 
   // Heavy lift: compute the MSC over `filtered`, cache the base decomposition +
-  // per-manifold stats (base stats over `base`, i.e. the original image; topology
-  // stats over `filtered`). `base` and `filtered` must share dimensions and be 2D
-  // (depth == 1). The initial persistence follows `cfg`, which also caps the
-  // cancellation hierarchy (the max selectable persistence).
+  // per-manifold statistics over every measurement channel `cfg.stats` asks for.
+  // `base` and `filtered` must share dimensions and be 2D (depth == 1). The
+  // initial persistence follows `cfg`, which also caps the cancellation
+  // hierarchy (the max selectable persistence).
+  //
+  // The two arguments carry ROLES that the measurement channel set does not:
+  // `filtered` is the topology field the MSC runs on and the field whose extent
+  // locates each feature's seeding critical point; `base` is the raster the
+  // derived scale-space channels are computed FROM and the one `relevance` is
+  // measured on. Either may additionally be a measurement channel, but a derived
+  // channel is measure-only and can be neither.
+  //
+  // `bank`, when non-null, is a caller-owned channel bank to measure against
+  // instead of building one here. It must have been resolved from the same
+  // spec. The CLI passes one because the connected-component stage measures the
+  // very same channels a moment later, and the scale-space stack should be
+  // traversed once per slice; the GUI passes nullptr so the rasters are freed
+  // as soon as the per-manifold cells are accumulated, rather than held for
+  // every primed slice.
   void build(const diffg::Image<float>& base, const diffg::Image<float>& filtered,
-             const Msc2DParams& cfg);
+             const Msc2DParams& cfg, const StatChannelBank* bank = nullptr);
 
   int width() const;
   int height() const;
   // Value range (max - min) of the filtered field, for percent->absolute.
   float value_range() const;
   float current_persistence() const;
+  float base_relevance_floor() const;
+  float base_relevance_ceiling() const;
 
   // Re-threshold at an absolute persistence via native cancellation: remap base
   // labels to their living representatives and roll up cached stats. Cheap relative
@@ -85,8 +118,14 @@ class Msc2DPipeline {
   // Feature id per pixel (row-major) at the current persistence: the living
   // extremum compact id, or -1 where the base was unlabeled.
   const std::vector<int>& labels() const;
-  // Per-living-feature aggregated statistics at the current persistence.
+  // Per-living-feature geometry + extremum at the current persistence.
   std::vector<Msc2DFeatureStat> feature_stats() const;
+  // The resolved measurement channels, in slot order. This is the schema for
+  // feature_channels(): slot k of every feature is channels()[k].
+  const std::vector<ResolvedStatChannel>& channels() const;
+  // Per-living-feature per-channel aggregates at the current persistence,
+  // indexed in lockstep with feature_stats().
+  const ChannelStats& feature_channels() const;
   // The statistics build() was asked for. Fields the spec excludes are left at
   // zero in the structs above, so a consumer turning stats into named rows must
   // consult this rather than emitting every member.

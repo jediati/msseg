@@ -53,6 +53,11 @@ class SliceCanvas(tk.Frame):
         self._job = None
         self._drag = None
         self.on_hover = None         # optional callback(ix, iy) | callback(None)
+        # Optional drawing-tool controller with on_press/on_move/on_release(e)
+        # -> bool. Returning True claims the event (suppresses the pan); the
+        # controller draws its own feedback as canvas items tagged "draw",
+        # which render() keeps above each fresh blit.
+        self.tool = None
         self._hud_mode = None        # None | "busy" (animated) | "stale" (static)
         self._hud_text = ""
         self._hud_job = None
@@ -64,7 +69,12 @@ class SliceCanvas(tk.Frame):
         self.canvas.bind("<Button-5>", lambda e: self._zoom(e.x, e.y, 1.25))
         self.canvas.bind("<ButtonPress-1>", self._drag_start)
         self.canvas.bind("<B1-Motion>", self._drag_move)
-        self.canvas.bind("<ButtonRelease-1>", lambda e: setattr(self, "_drag", None))
+        self.canvas.bind("<ButtonRelease-1>", self._drag_end)
+        # Middle-drag always pans, so a drawing tool on button 1 never locks
+        # navigation out.
+        self.canvas.bind("<ButtonPress-2>", self._pan_start)
+        self.canvas.bind("<B2-Motion>", self._pan_move)
+        self.canvas.bind("<ButtonRelease-2>", lambda e: setattr(self, "_drag", None))
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Leave>", self._on_leave)
 
@@ -134,9 +144,25 @@ class SliceCanvas(tk.Frame):
         self._schedule()
 
     def _drag_start(self, e):
-        self._drag = (e.x, e.y, self.view_x, self.view_y)
+        if self.tool is not None and self.tool.on_press(e):
+            self._drag = None
+            return
+        self._pan_start(e)
 
     def _drag_move(self, e):
+        if self.tool is not None and self.tool.on_move(e):
+            return
+        self._pan_move(e)
+
+    def _drag_end(self, e):
+        if self.tool is not None:
+            self.tool.on_release(e)
+        self._drag = None
+
+    def _pan_start(self, e):
+        self._drag = (e.x, e.y, self.view_x, self.view_y)
+
+    def _pan_move(self, e):
         if not self._drag:
             return
         sx, sy, vx, vy = self._drag
@@ -299,6 +325,7 @@ class SliceCanvas(tk.Frame):
         self.canvas.create_image(screen_x, screen_y, anchor="nw", image=self._photo, tags="view")
         if self._hud_mode is not None:
             self.canvas.tag_raise("hud")   # keep the HUD above the freshly-blitted image
+        self.canvas.tag_raise("draw")      # tool rubber-band items (no-op when unused)
         t_blit = time.perf_counter()
 
         # Only log slow frames (the first fit / a heavy composite) so live

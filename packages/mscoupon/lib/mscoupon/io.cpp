@@ -1,5 +1,7 @@
 #include "mscoupon/io.hpp"
 
+#include "mscoupon/query.hpp"
+
 #include <cstdint>
 #include <fstream>
 #include <stdexcept>
@@ -59,58 +61,39 @@ void write_feature_map_csv(const std::filesystem::path& path, const std::vector<
 }
 
 void write_global_table_csv(const std::filesystem::path& path,
-                            const std::vector<GlobalFeatureStat>& stats,
+                            const GlobalFeatureTable& table,
                             const StatisticsConfig& cfg) {
   std::ofstream out(path);
   if (!out.good()) {
     throw std::runtime_error("Failed to write global table: " + path.string());
   }
-  // Columns follow the active statistics spec, so a run that does not compute a
-  // channel does not emit a column of zeros for it. The per-slice column names
-  // come from the first row -- every row carries the same keys.
-  const msseg::StatsSpec& spec = cfg.spec;
+  // Header AND values come from one projection, so they cannot drift: a run that
+  // does not compute a channel emits no column for it, and a twelve-channel
+  // scale-space stack needs no edit here at all. The per-slice reductions are the
+  // one tail the channel schema does not name -- their keys come from the first
+  // row, and every row carries the same keys.
+  const mscoupon::FeatureTable projected =
+      global_feature_table(table.rows, table.channels, table.schema, cfg.spec);
+
   std::vector<std::string> ps_names;
-  if (!stats.empty()) {
-    for (const auto& [k, v] : stats.front().per_slice) ps_names.push_back(k);
+  if (!table.rows.empty()) {
+    for (const auto& kv : table.rows.front().per_slice) ps_names.push_back(kv.first);
   }
 
-  out << "global_id,voxel_count,num_slices,first_slice,last_slice,"
-         "min_x,min_y,min_z,max_x,max_y,max_z";
-  const auto channel_header = [&](const char* suffix) {
-    if (spec.mean) out << ",mean_" << suffix;
-    if (spec.min) out << ",min_" << suffix;
-    if (spec.max) out << ",max_" << suffix;
-    if (spec.std) out << ",std_" << suffix;
-  };
-  if (spec.base_channel) channel_header("base");
-  if (spec.filtered_channel) channel_header("filtered");
-  if (spec.extremum) out << ",ext_x,ext_y,ext_z,ext_base,ext_filtered";
+  for (std::size_t c = 0; c < projected.fields.size(); ++c) {
+    out << (c == 0 ? "" : ",") << projected.fields[c].name;
+  }
   for (const auto& n : ps_names) out << "," << n;
   out << "\n";
 
-  for (const auto& row : stats) {
-    out << row.global_id << "," << row.voxel_count << "," << row.num_slices << "," << row.first_slice << ","
-        << row.last_slice << "," << row.min_x << "," << row.min_y << "," << row.min_z << "," << row.max_x << ","
-        << row.max_y << "," << row.max_z;
-    if (spec.base_channel) {
-      if (spec.mean) out << "," << row.mean_base;
-      if (spec.min) out << "," << row.min_base;
-      if (spec.max) out << "," << row.max_base;
-      if (spec.std) out << "," << row.std_base;
+  for (std::size_t r = 0; r < projected.n_rows; ++r) {
+    for (std::size_t c = 0; c < projected.fields.size(); ++c) {
+      out << (c == 0 ? "" : ",") << projected.at(r, c);
     }
-    if (spec.filtered_channel) {
-      if (spec.mean) out << "," << row.mean_filtered;
-      if (spec.min) out << "," << row.min_filtered;
-      if (spec.max) out << "," << row.max_filtered;
-      if (spec.std) out << "," << row.std_filtered;
-    }
-    if (spec.extremum) {
-      out << "," << row.ext_x << "," << row.ext_y << "," << row.ext_z << "," << row.ext_base
-          << "," << row.ext_filtered;
-    }
+    const auto& per_slice = table.rows[r].per_slice;
     for (const auto& n : ps_names) {
-      const auto it = row.per_slice.find(n);
-      out << "," << (it == row.per_slice.end() ? 0.0 : it->second);
+      const auto it = per_slice.find(n);
+      out << "," << (it == per_slice.end() ? 0.0 : it->second);
     }
     out << "\n";
   }

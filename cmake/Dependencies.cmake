@@ -43,7 +43,7 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(diffg
   GIT_REPOSITORY https://github.com/jediati/diffg.git
-  GIT_TAG a9503a0a204e6c7dd898469506ad4cab7c328242   # morphology + label_mask (4nn CC)
+  GIT_TAG bdf5623be9b1563518cdd05ff644f74ed6c5e48a   # + batched multi-filter bank (apply_filter_bank)
 )
 FetchContent_Declare(msceer
   GIT_REPOSITORY https://github.com/sci-visus/MSCEER.git

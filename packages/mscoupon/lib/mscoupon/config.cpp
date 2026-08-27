@@ -1,5 +1,7 @@
 #include "mscoupon/config.hpp"
 
+#include "msseg/workflow/stat_channels.hpp"
+
 #include <fstream>
 #include <stdexcept>
 #include <string_view>
@@ -162,21 +164,74 @@ void parse_statistics_json(const nlohmann::json& root, StatisticsConfig& stats) 
     if (!arr.is_array()) throw std::runtime_error("statistics.channels must be an array.");
     stats.spec.base_channel = false;
     stats.spec.filtered_channel = false;
+    stats.spec.derived.clear();
     for (const auto& item : arr) {
-      const auto name = item.get<std::string>();
-      if (name == "base") {
-        stats.spec.base_channel = true;
-      } else if (name == "filtered") {
-        stats.spec.filtered_channel = true;
-      } else {
-        throw std::runtime_error("statistics.channels[] must be base/filtered (got '" + name + "').");
+      // A bare string is one of the two rasters the pipeline already builds; an
+      // object requests a DERIVED scale-space channel measured off `base`.
+      if (item.is_string()) {
+        const auto name = item.get<std::string>();
+        if (name == "base") {
+          stats.spec.base_channel = true;
+        } else if (name == "filtered") {
+          stats.spec.filtered_channel = true;
+        } else {
+          throw std::runtime_error(
+              "statistics.channels[] string must be base/filtered (got '" + name +
+              "'); a derived channel is an object like "
+              "{\"kind\": \"blur\", \"sigmas\": [1.0]}.");
+        }
+        continue;
       }
+      if (!item.is_object()) {
+        throw std::runtime_error("statistics.channels[] must be a string or an object.");
+      }
+      msseg::StatChannelRequest req;
+      set_if_present(item, "kind", req.kind);
+      if (req.kind == "base") { stats.spec.base_channel = true; continue; }
+      if (req.kind == "filtered") { stats.spec.filtered_channel = true; continue; }
+      if (!msseg::is_derived_channel_kind(req.kind)) {
+        std::string known = "base, filtered";
+        for (const auto& k : msseg::derived_channel_kinds()) known += ", " + k;
+        throw std::runtime_error("statistics.channels[].kind '" + req.kind +
+                                 "' is not known. Available: " + known + ".");
+      }
+      if (item.contains("sigmas") && !item.at("sigmas").is_null()) {
+        req.sigmas = item.at("sigmas").get<std::vector<double>>();
+      } else if (item.contains("sigma") && !item.at("sigma").is_null()) {
+        req.sigmas = {item.at("sigma").get<double>()};   // singular convenience
+      }
+      set_if_present(item, "sort_by_absolute_value", req.sort_by_absolute_value);
+      set_if_present(item, "name", req.name);
+      stats.spec.derived.push_back(std::move(req));
     }
+    // Resolve now so a bad sigma or a duplicate channel name is a config error
+    // rather than a surprise on the first slice.
+    (void)msseg::resolve_stat_channels(stats.spec);
   }
   parse_reductions(s, "reductions", stats.spec.mean, stats.spec.min, stats.spec.max,
                    stats.spec.std);
   set_if_present(s, "extremum", stats.spec.extremum);
   set_if_present(s, "extremum_sample_radius", stats.spec.extremum_sample_radius);
+  if (s.contains("relevance") && !s.at("relevance").is_null()) {
+    const auto& r = s.at("relevance");
+    if (r.is_boolean()) {
+      stats.spec.relevance = r.get<bool>();
+    } else if (r.is_object()) {
+      set_if_present(r, "enabled", stats.spec.relevance);
+      set_if_present(r, "low_percentile", stats.spec.relevance_low_percentile);
+      set_if_present(r, "high_percentile", stats.spec.relevance_high_percentile);
+    } else {
+      throw std::runtime_error("statistics.relevance must be a boolean or object.");
+    }
+  }
+  const double rel_lo = stats.spec.relevance_low_percentile;
+  const double rel_hi = stats.spec.relevance_high_percentile;
+  if (rel_lo < 0.0 || rel_lo > 100.0 || rel_hi < 0.0 || rel_hi > 100.0 ||
+      rel_lo > rel_hi) {
+    throw std::runtime_error(
+        "statistics.relevance percentiles must satisfy 0 <= low_percentile <= "
+        "high_percentile <= 100.");
+  }
 
   if (s.contains("per_slice") && !s.at("per_slice").is_null()) {
     const auto& p = s.at("per_slice");

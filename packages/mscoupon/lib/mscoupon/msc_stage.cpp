@@ -44,21 +44,20 @@ std::vector<int> compute_msc_labels(const Image2D& filtered_image, const MscConf
   return msseg::compute_msc2d_labels(filtered, to_msc_params(cfg, msseg::StatsSpec{}));
 }
 
-SliceSegmentation segment_slice_pipeline(const Image2D& original, const Image2D& filtered,
-                                         const MscConfig& cfg, const msseg::StatsSpec& stats) {
-  const auto to_diffg = [](const Image2D& img) {
-    diffg::Image<float> out(diffg::Dimensions{
-        static_cast<std::size_t>(img.width), static_cast<std::size_t>(img.height), 1});
-    std::copy(img.pixels.begin(), img.pixels.end(), out.data());
-    return out;
-  };
-
+SliceSegmentation segment_slice_pipeline(const diffg::Image<float>& base,
+                                         const diffg::Image<float>& filtered,
+                                         const MscConfig& cfg, const msseg::StatsSpec& stats,
+                                         const msseg::StatChannelBank& bank) {
   msseg::Msc2DPipeline pipe;
-  pipe.build(to_diffg(original), to_diffg(filtered), to_msc_params(cfg, stats));
+  pipe.build(base, filtered, to_msc_params(cfg, stats), &bank);
 
   SliceSegmentation seg;
   seg.labels = pipe.labels();
   seg.features = pipe.feature_stats();
+  seg.feature_channels = pipe.feature_channels();
+  seg.channels = pipe.channels();
+  seg.base_relevance_floor = pipe.base_relevance_floor();
+  seg.base_relevance_ceiling = pipe.base_relevance_ceiling();
   return seg;
 }
 

@@ -8,6 +8,8 @@
 #include <string>
 #include <unordered_set>
 
+#include "mscoupon/query.hpp"
+
 namespace mscoupon {
 namespace {
 
@@ -99,7 +101,8 @@ void SliceMatcher::unite_first_seen(int a, int b) {
 }
 
 void SliceMatcher::add_slice(const std::vector<int>& cc_labels, int width, int height,
-                             const std::vector<CcNodeStat>& node_stats, int slice_index,
+                             const std::vector<CcNodeStat>& node_stats,
+                             const msseg::ChannelStats& node_channels, int slice_index,
                              int connectivity) {
   const int n = static_cast<int>(node_stats.size());
   const int node_base = static_cast<int>(parent_.size());
@@ -108,6 +111,7 @@ void SliceMatcher::add_slice(const std::vector<int>& cc_labels, int width, int h
     node_stat_.push_back(node_stats[static_cast<std::size_t>(c)]);
     node_slice_.push_back(slice_index);
   }
+  node_channels_.append(node_channels);
 
   // Cross-slice linking to the previously added slice by the connectivity stencil
   // (6 -> same (x,y) only; 18 -> + 4-neighbours; 26 -> full 3x3).
@@ -142,8 +146,7 @@ void SliceMatcher::add_slice(const std::vector<int>& cc_labels, int width, int h
   prev_node_base_ = node_base;
 }
 
-void SliceMatcher::finalize(std::vector<FeatureMapRow>& map_out,
-                            std::vector<GlobalFeatureStat>& table_out,
+void SliceMatcher::finalize(std::vector<FeatureMapRow>& map_out, GlobalFeatureTable& table_out,
                             std::vector<GlobalLabelRaster>& rasters_out) {
   rasters_out.clear();
   finalize(map_out, table_out, [&rasters_out](GlobalLabelRaster&& r) {
@@ -151,11 +154,11 @@ void SliceMatcher::finalize(std::vector<FeatureMapRow>& map_out,
   });
 }
 
-void SliceMatcher::finalize(std::vector<FeatureMapRow>& map_out,
-                            std::vector<GlobalFeatureStat>& table_out,
+void SliceMatcher::finalize(std::vector<FeatureMapRow>& map_out, GlobalFeatureTable& table_out,
                             const GlobalRasterSink& emit) {
   map_out.clear();
-  table_out.clear();
+  table_out.rows.clear();
+  table_out.schema = channel_schema_;
   const int N = static_cast<int>(parent_.size());
   if (N == 0) return;
 
@@ -188,8 +191,15 @@ void SliceMatcher::finalize(std::vector<FeatureMapRow>& map_out,
   // (x, y, z) always names one real voxel.
   std::vector<int> ext_z(static_cast<std::size_t>(next_gid), -1);
   std::vector<const CcNodeStat*> ext_node(static_cast<std::size_t>(next_gid), nullptr);
+  // The winning component's global node index, so its channel tuple can be
+  // copied wholesale rather than reduced field by field.
+  std::vector<int> ext_source(static_cast<std::size_t>(next_gid), -1);
   // Per-slice quantity samples, for the reductions across slices.
   PerSliceAcc per_slice(static_cast<std::size_t>(next_gid), stats_.per_slice_quantities);
+
+  // Voxel-pooled per-channel aggregates, one row per global feature.
+  msseg::ChannelStats gid_channels;
+  gid_channels.reset(static_cast<std::size_t>(next_gid), node_channels_.channels(), stats_.spec);
 
   for (int node = 0; node < N; ++node) {
     const int gid = gid_of_node[node];
@@ -200,12 +210,8 @@ void SliceMatcher::finalize(std::vector<FeatureMapRow>& map_out,
       init[static_cast<std::size_t>(gid)] = 1;
     } else {
       a.area += p.area;
-      a.base_sum += p.base_sum;
-      a.base_sumsq += p.base_sumsq;
-      a.filt_sum += p.filt_sum;
-      a.filt_sumsq += p.filt_sumsq;
-      a.base_min = std::min(a.base_min, p.base_min);
-      a.base_max = std::max(a.base_max, p.base_max);
+      a.base_relevance_floor = std::min(a.base_relevance_floor, p.base_relevance_floor);
+      a.base_relevance_ceiling = std::max(a.base_relevance_ceiling, p.base_relevance_ceiling);
       a.filt_min = std::min(a.filt_min, p.filt_min);
       a.filt_max = std::max(a.filt_max, p.filt_max);
       a.min_x = std::min(a.min_x, p.min_x);
@@ -213,6 +219,8 @@ void SliceMatcher::finalize(std::vector<FeatureMapRow>& map_out,
       a.min_y = std::min(a.min_y, p.min_y);
       a.max_y = std::max(a.max_y, p.max_y);
     }
+    gid_channels.merge_region(static_cast<std::size_t>(gid), node_channels_,
+                              static_cast<std::size_t>(node));
     const int z = node_slice_[static_cast<std::size_t>(node)];
     min_z[gid] = std::min(min_z[gid], z);
     max_z[gid] = std::max(max_z[gid], z);
@@ -234,23 +242,22 @@ void SliceMatcher::finalize(std::vector<FeatureMapRow>& map_out,
       if (better) {
         best = &p;
         ext_z[static_cast<std::size_t>(gid)] = z;
+        ext_source[static_cast<std::size_t>(gid)] = node;
       }
     }
     per_slice.add(gid, p);
   }
 
-  const auto stddev = [](double sum, double sumsq, std::size_t area) -> float {
-    if (area == 0) return 0.0f;
-    const double m = sum / static_cast<double>(area);
-    const double var = sumsq / static_cast<double>(area) - m * m;
-    return var > 0.0 ? static_cast<float>(std::sqrt(var)) : 0.0f;
-  };
+  // Resolve the base channel's slot once; `relevance_base` reads its extent.
+  int base_slot = -1;
+  for (std::size_t k = 0; k < channel_schema_.size(); ++k) {
+    if (channel_schema_[k].name == "base") base_slot = static_cast<int>(k);
+  }
 
   // Master table, in global-id (appearance) order so gid == row index.
-  table_out.reserve(static_cast<std::size_t>(next_gid));
+  table_out.rows.reserve(static_cast<std::size_t>(next_gid));
   for (int gid = 0; gid < next_gid; ++gid) {
     const CcNodeStat& a = acc[static_cast<std::size_t>(gid)];
-    const double area = a.area > 0 ? static_cast<double>(a.area) : 1.0;
     GlobalFeatureStat s;
     s.global_id = gid;
     s.voxel_count = a.area;
@@ -259,22 +266,29 @@ void SliceMatcher::finalize(std::vector<FeatureMapRow>& map_out,
     s.last_slice = max_z[gid];
     s.min_x = a.min_x; s.min_y = a.min_y; s.min_z = min_z[gid];
     s.max_x = a.max_x; s.max_y = a.max_y; s.max_z = max_z[gid];
-    s.mean_base = static_cast<float>(a.base_sum / area);
-    s.min_base = a.base_min; s.max_base = a.base_max;
-    s.std_base = stddev(a.base_sum, a.base_sumsq, a.area);
-    s.mean_filtered = static_cast<float>(a.filt_sum / area);
-    s.min_filtered = a.filt_min; s.max_filtered = a.filt_max;
-    s.std_filtered = stddev(a.filt_sum, a.filt_sumsq, a.area);
+    if (stats_.spec.relevance && stats_.spec.base_channel && base_slot >= 0) {
+      const msseg::ChannelAccum& b =
+          gid_channels.cell(static_cast<std::size_t>(gid), static_cast<std::size_t>(base_slot));
+      s.relevance_base = static_cast<float>(
+          relevance_base_value(b.min, b.max, a.base_relevance_floor, a.base_relevance_ceiling));
+    }
     if (const CcNodeStat* e = ext_node[static_cast<std::size_t>(gid)]) {
       s.ext_x = e->ext_x;
       s.ext_y = e->ext_y;
       s.ext_z = ext_z[static_cast<std::size_t>(gid)];
-      s.ext_base = e->ext_base;
       s.ext_filtered = e->ext_filtered;
+      // The whole channel tuple comes from that one component, so a position
+      // from one slice is never paired with a value from another.
+      const int src = ext_source[static_cast<std::size_t>(gid)];
+      if (src >= 0) {
+        gid_channels.copy_ext(static_cast<std::size_t>(gid), node_channels_,
+                              static_cast<std::size_t>(src));
+      }
     }
     per_slice.finish(gid, stats_, s.per_slice);
-    table_out.push_back(s);
+    table_out.rows.push_back(s);
   }
+  table_out.channels = std::move(gid_channels);
 
   // Per-slice -> global map (segment_id == per-slice CC id) and relabeled rasters.
   //

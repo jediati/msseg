@@ -178,6 +178,39 @@ FloatArray filter_chain(const FloatArray& image, const std::string& params_json)
   return out;
 }
 
+// The measurement channels of one slice, as pixels: (names, (C, h, w) float32).
+//
+// The GUI's 3D assembly runs in Python over whole slices, so it needs the same
+// scale-space rasters the CLI measures on. They are computed per slice and
+// dropped again rather than cached with each primed slice -- twelve float32
+// rasters per slice would dominate a primed subsequence's memory.
+py::tuple stat_channel_images(const FloatArray& base, const FloatArray& filtered,
+                              const std::string& params_json) {
+  std::size_t bh = 0, bw = 0, fh = 0, fw = 0;
+  const diffg::Image<float> base_img = to_image(base, bh, bw);
+  const diffg::Image<float> filt_img = to_image(filtered, fh, fw);
+  if (bh != fh || bw != fw) throw std::runtime_error("base and filtered must share shape");
+  const msseg::StatsSpec spec = parse_stats_spec(parse_params(params_json));
+
+  msseg::StatChannelBank bank;
+  {
+    py::gil_scoped_release release;
+    bank = msseg::build_stat_channels(base_img, filt_img, spec);
+  }
+
+  py::list names;
+  for (const auto& c : bank.channels) names.append(py::str(c.name));
+
+  const auto n = static_cast<py::ssize_t>(bank.size());
+  FloatArray out({n, static_cast<py::ssize_t>(bh), static_cast<py::ssize_t>(bw)});
+  float* dst = static_cast<float*>(out.request().ptr);
+  const std::size_t plane = bh * bw;
+  for (std::size_t k = 0; k < bank.size(); ++k) {
+    std::memcpy(dst + k * plane, bank.channel(k), plane * sizeof(float));
+  }
+  return py::make_tuple(std::move(names), std::move(out));
+}
+
 // Build a primed Msc2DPipeline over `base` (original image) + `filtered` (the
 // topology field, already filter-chained). Both are float32 (h,w).
 msseg::Msc2DPipeline prime_slice(const FloatArray& base, const FloatArray& filtered,
@@ -206,16 +239,76 @@ py::array_t<std::int32_t> pipeline_labels(const msseg::Msc2DPipeline& pipe) {
   return out;
 }
 
-// Per-surviving-feature statistics as a list of dicts (derived fields).
+// Per-surviving-feature statistics, COLUMNAR: the field names once, then one
+// (n_features, n_fields) float64 array.
+//
+// The previous shape -- one dict per feature -- allocated a py::str and a dict
+// entry per field per feature on every persistence change. A twelve-channel
+// scale-space stack is ~50 fields, so that is hundreds of thousands of Python
+// objects per slider commit; as a block it is one buffer copy. The Python side
+// (assembly.py) is already structure-of-arrays, so this removes a conversion.
+py::tuple pipeline_feature_table(const msseg::Msc2DPipeline& pipe) {
+  const mscoupon::FeatureTable table = mscoupon::feature_table(
+      pipe.feature_stats(), pipe.feature_channels(), pipe.channels(), pipe.stats());
+
+  py::list names;
+  for (const auto& f : table.fields) names.append(py::str(f.name));
+
+  py::array_t<double> values({static_cast<py::ssize_t>(table.n_rows),
+                              static_cast<py::ssize_t>(table.fields.size())});
+  if (!table.values.empty()) {
+    std::memcpy(values.request().ptr, table.values.data(), table.values.size() * sizeof(double));
+  }
+  return py::make_tuple(std::move(names), std::move(values));
+}
+
+// Back-compatible list-of-dicts view, built from the same table. Convenient for
+// small readouts; prefer feature_table() anywhere the feature count is large.
 py::list pipeline_feature_stats(const msseg::Msc2DPipeline& pipe) {
+  const mscoupon::FeatureTable table = mscoupon::feature_table(
+      pipe.feature_stats(), pipe.feature_channels(), pipe.channels(), pipe.stats());
   py::list rows;
-  const msseg::StatsSpec& spec = pipe.stats();
-  for (const auto& s : pipe.feature_stats()) {
+  for (std::size_t r = 0; r < table.n_rows; ++r) {
     py::dict d;
-    for (const auto& [k, v] : mscoupon::feature_row(s, spec)) d[py::str(k)] = v;
+    for (std::size_t c = 0; c < table.fields.size(); ++c) {
+      d[py::str(table.fields[c].name)] = table.at(r, c);
+    }
     rows.append(std::move(d));
   }
   return rows;
+}
+
+// The measurement channels a params JSON resolves to, as a list of dicts
+// {name, kind, sigma}. The GUI's channel picker and its image-background
+// dropdown are generated from this.
+py::list stat_channels_py(const std::string& params_json) {
+  const msseg::StatsSpec spec = parse_stats_spec(parse_params(params_json));
+  py::list out;
+  for (const auto& c : msseg::resolve_stat_channels(spec)) {
+    py::dict d;
+    d["name"] = c.name;
+    d["kind"] = c.kind;
+    d["sigma"] = c.sigma;
+    out.append(std::move(d));
+  }
+  return out;
+}
+
+// The full field schema: one dict per column, {name, channel, reduction}. The
+// GUI builds its two-level [channel][reduction] picker from this rather than
+// parsing names like "mean_blur_s0.7" -- and so "min_x" is never mistaken for
+// reduction "min" on a channel "x".
+py::list feature_schema_py(const std::string& params_json) {
+  const msseg::StatsSpec spec = parse_stats_spec(parse_params(params_json));
+  py::list out;
+  for (const auto& f : mscoupon::feature_schema(spec)) {
+    py::dict d;
+    d["name"] = f.name;
+    d["channel"] = f.channel;
+    d["reduction"] = f.reduction;
+    out.append(std::move(d));
+  }
+  return out;
 }
 
 // The field names a given statistics spec produces. The GUI builds its field
@@ -238,6 +331,37 @@ std::vector<bool> evaluate_queries(const py::list& rows, const std::string& quer
     }
     keep.push_back(mscoupon::row_passes(row, queries));
   }
+  return keep;
+}
+
+// Evaluate the query chain against a COLUMNAR table: the field names once, then
+// an (n, f) float64 block. Field names resolve to column indices once for the
+// whole table rather than being hashed per feature, which is what keeps a wide
+// channel set usable on a slider.
+std::vector<bool> evaluate_queries_table(const std::vector<std::string>& names,
+                                         const py::array_t<double, py::array::c_style |
+                                                                   py::array::forcecast>& values,
+                                         const std::string& queries_json) {
+  const auto info = values.request();
+  if (info.ndim != 2) throw std::runtime_error("values must be a 2-D (n, f) array");
+  const auto n_rows = static_cast<std::size_t>(info.shape[0]);
+  const auto n_cols = static_cast<std::size_t>(info.shape[1]);
+  if (n_cols != names.size()) {
+    throw std::runtime_error("values has " + std::to_string(n_cols) +
+                             " columns but " + std::to_string(names.size()) + " names");
+  }
+
+  mscoupon::FeatureTable table;
+  table.fields.reserve(names.size());
+  for (const auto& n : names) table.fields.push_back(mscoupon::FeatureField{n, "", ""});
+  table.n_rows = n_rows;
+  const double* src = static_cast<const double*>(info.ptr);
+  table.values.assign(src, src + n_rows * n_cols);
+
+  const std::vector<mscoupon::FeatureQuery> queries = parse_feature_queries(queries_json);
+  const mscoupon::CompiledQueries compiled = mscoupon::compile_queries(table, queries);
+  std::vector<bool> keep(n_rows);
+  for (std::size_t r = 0; r < n_rows; ++r) keep[r] = mscoupon::row_passes(table, r, compiled);
   return keep;
 }
 
@@ -435,24 +559,46 @@ PYBIND11_MODULE(mscoupon_py, m) {
       .def("current_persistence", &msseg::Msc2DPipeline::current_persistence)
       .def("value_range", &msseg::Msc2DPipeline::value_range,
            "Filtered-field value range (max-min), for percent->absolute persistence.")
+      .def("base_relevance_floor", &msseg::Msc2DPipeline::base_relevance_floor)
+      .def("base_relevance_ceiling", &msseg::Msc2DPipeline::base_relevance_ceiling)
       .def("width", &msseg::Msc2DPipeline::width)
       .def("height", &msseg::Msc2DPipeline::height)
       .def("labels", &pipeline_labels, "Feature id per pixel (int32 h,w) at the current persistence.")
       .def("feature_stats", &pipeline_feature_stats,
-           "Per-living-feature statistics (list of dicts) at the current persistence.");
+           "Per-living-feature statistics (list of dicts) at the current persistence.")
+      .def("feature_table", &pipeline_feature_table,
+           "Columnar per-living-feature statistics: (field_names, (n, f) float64 array). "
+           "Prefer this over feature_stats() -- it is one buffer copy rather than a dict "
+           "per feature, which is what keeps a wide channel set usable on a slider.");
 
   m.def("prime_slice", &prime_slice, py::arg("base"), py::arg("filtered"),
         py::arg("params_json") = std::string(),
         "Build a primed Msc2DPipeline over base (original) + filtered (topology field, "
         "already filter-chained), both float32 (h,w). params_json['msc'] configures it.");
+  m.def("evaluate_queries_table", &evaluate_queries_table, py::arg("names"),
+        py::arg("values"), py::arg("queries_json"),
+        "Evaluate a feature-query chain against a columnar table (names + (n, f) float64). "
+        "Same evaluator as evaluate_queries, but names resolve to columns once for the whole "
+        "table instead of once per feature.");
   m.def("evaluate_queries", &evaluate_queries, py::arg("rows"), py::arg("queries_json"),
         "Evaluate a feature-query chain (JSON array of {field,op,value[,value2]}) against a "
         "list of feature-stat dicts; returns a list of bool keep flags. Shared 2D/3D evaluator.");
 
   m.def("feature_fields", &feature_fields_py, py::arg("params_json") = std::string(),
-        "Sorted field names the given params JSON's statistics block produces, i.e. exactly "
-        "the fields feature_filters may name. Derived from the same schema the CLI validates "
-        "against, so the GUI dropdown cannot drift out of sync.");
+        "Field names the given params JSON's statistics block produces, in table order, i.e. "
+        "exactly the fields feature_filters may name. Derived from the same schema the CLI "
+        "validates against, so the GUI dropdown cannot drift out of sync.");
+  m.def("stat_channel_images", &stat_channel_images, py::arg("base"), py::arg("filtered"),
+        py::arg("params_json") = std::string(),
+        "The slice's measurement channels as pixels: (names, (C, h, w) float32), in the same "
+        "slot order as stat_channels(). Used by the GUI's 3D assembly so it measures exactly "
+        "what the CLI does.");
+  m.def("feature_schema", &feature_schema_py, py::arg("params_json") = std::string(),
+        "Per-column schema as dicts {name, channel, reduction}, in table order. Drives the "
+        "GUI's two-level channel/reduction pickers without re-parsing field names.");
+  m.def("stat_channels", &stat_channels_py, py::arg("params_json") = std::string(),
+        "The measurement channels the params JSON resolves to, as dicts {name, kind, sigma} "
+        "in slot order -- base/filtered plus every derived scale-space channel.");
 
   m.def("fit_gmm", &fit_gmm, py::arg("image"), py::arg("params_json") = std::string(),
         "Fit a 1-D Gaussian mixture to the pixels of a real numeric array of any shape "

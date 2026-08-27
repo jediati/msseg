@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <random>
 #include <stdexcept>
@@ -17,6 +18,7 @@
 #include "mscoupon/filter.hpp"
 #include "mscoupon/gmm.hpp"
 #include "mscoupon/histogram_peaks.hpp"
+#include "mscoupon/io.hpp"
 #include "mscoupon/matcher.hpp"
 #include "mscoupon/measure_config.hpp"
 #include "mscoupon/normalize.hpp"
@@ -78,18 +80,69 @@ int distinct_features(const std::vector<int>& labels) {
   return static_cast<int>(ids.size());
 }
 
-// Build a per-CC node stat with the given area and constant base/filtered value.
-mscoupon::CcNodeStat cc_node(std::size_t area, float base = 1.0f, float filt = 1.0f) {
-  mscoupon::CcNodeStat s;
-  s.area = area;
-  s.base_sum = static_cast<double>(base) * area;
-  s.base_sumsq = static_cast<double>(base) * base * area;
-  s.filt_sum = static_cast<double>(filt) * area;
-  s.filt_sumsq = static_cast<double>(filt) * filt * area;
-  s.base_min = base; s.base_max = base;
-  s.filt_min = filt; s.filt_max = filt;
-  s.min_x = 0; s.min_y = 0; s.max_x = 0; s.max_y = 0;
-  return s;
+// Image2D -> diffg::Image, for tests that build a measurement channel bank.
+diffg::Image<float> to_diffg2d(const mscoupon::Image2D& img) {
+  diffg::Image<float> out(diffg::Dimensions{static_cast<std::size_t>(img.width),
+                                            static_cast<std::size_t>(img.height), 1});
+  std::copy(img.pixels.begin(), img.pixels.end(), out.data());
+  return out;
+}
+
+// The measurement spec the matcher tests use: the base channel only, so the
+// channel plane has exactly one slot and "slot 0" means base everywhere below.
+const msseg::StatsSpec& base_spec() {
+  static const msseg::StatsSpec spec{};
+  return spec;
+}
+
+// A slice's CC payload: the geometry stats plus the per-channel plane the
+// matcher now takes alongside them. Both are indexed by component id.
+struct CcSlice {
+  std::vector<mscoupon::CcNodeStat> stats;
+  msseg::ChannelStats channels;
+};
+
+struct NodeSpec {
+  std::size_t area;
+  float base = 1.0f;
+  float filt = 1.0f;
+};
+
+// Build a slice of CC nodes, each with a constant base/filtered value.
+CcSlice cc_slice(std::initializer_list<NodeSpec> nodes) {
+  CcSlice out;
+  out.channels.reset(nodes.size(), 1, base_spec());
+  std::size_t i = 0;
+  for (const NodeSpec& n : nodes) {
+    mscoupon::CcNodeStat s;
+    s.area = n.area;
+    s.filt_min = n.filt; s.filt_max = n.filt;
+    s.min_x = 0; s.min_y = 0; s.max_x = 0; s.max_y = 0;
+    out.stats.push_back(s);
+    msseg::ChannelAccum& a = out.channels.cell(i, 0);
+    a.sum = static_cast<double>(n.base) * static_cast<double>(n.area);
+    a.sumsq = static_cast<double>(n.base) * n.base * static_cast<double>(n.area);
+    a.min = n.base; a.max = n.base;
+    ++i;
+  }
+  return out;
+}
+
+// Configure a matcher with the base-only channel schema the helpers above build.
+void configure_base(mscoupon::SliceMatcher& m, const mscoupon::StatisticsConfig& cfg,
+                    bool ascending = true) {
+  m.configure(cfg, ascending, msseg::resolve_stat_channels(cfg.spec));
+}
+
+// One named field of one row of the 3D master table, via the same columnar
+// projection the CSV writer uses.
+double global_field(const mscoupon::GlobalFeatureTable& t, std::size_t row,
+                    const std::string& name) {
+  const auto projected =
+      mscoupon::global_feature_table(t.rows, t.channels, t.schema, base_spec());
+  const int c = projected.column(name);
+  expect(c >= 0, "the 3D table advertises the requested field");
+  return c < 0 ? 0.0 : projected.at(row, static_cast<std::size_t>(c));
 }
 
 // global id for a per-slice CC id (segment_id in the map == CC component id).
@@ -134,59 +187,111 @@ void test_sequence_stride() {
 
 void test_matcher_links_overlap() {
   mscoupon::SliceMatcher m;
+  configure_base(m, mscoupon::StatisticsConfig{});
   // Slice 0 CC: comp0 (px 0-1), comp1 (px 3-4); -1 = background. 6-neighbor.
-  m.add_slice({0, 0, -1, 1, 1}, 5, 1, {cc_node(2), cc_node(2)}, 0, 6);
+  const CcSlice s0 = cc_slice({{2}, {2}});
+  m.add_slice({0, 0, -1, 1, 1}, 5, 1, s0.stats, s0.channels, 0, 6);
   // Slice 1 CC: comp0 (px 0-1) overlaps slice-0 comp0; slice-0 comp1 has no successor.
-  m.add_slice({0, 0, -1, -1, -1}, 5, 1, {cc_node(2)}, 1, 6);
+  const CcSlice s1 = cc_slice({{2}});
+  m.add_slice({0, 0, -1, -1, -1}, 5, 1, s1.stats, s1.channels, 1, 6);
 
   std::vector<mscoupon::FeatureMapRow> map;
-  std::vector<mscoupon::GlobalFeatureStat> table;
+  mscoupon::GlobalFeatureTable table;
   std::vector<mscoupon::GlobalLabelRaster> rasters;
   m.finalize(map, table, rasters);
 
   expect(map.size() == 3, "three (slice, cc) members");
   expect(global_for(map, 0, 0) == global_for(map, 1, 0), "overlapping component shares a global id");
   expect(global_for(map, 0, 1) != global_for(map, 0, 0), "non-overlapping component is distinct");
-  expect(table.size() == 2, "two global features");
+  expect(table.rows.size() == 2, "two global features");
   expect(rasters.size() == 2, "one relabeled raster per slice");
 }
 
 void test_matcher_merge_unifies() {
   mscoupon::SliceMatcher m;
-  m.add_slice({0, 0, -1, 1, 1}, 5, 1, {cc_node(2), cc_node(2)}, 0, 6);
+  configure_base(m, mscoupon::StatisticsConfig{});
+  const CcSlice s0 = cc_slice({{2}, {2}});
+  m.add_slice({0, 0, -1, 1, 1}, 5, 1, s0.stats, s0.channels, 0, 6);
   // A single slice-1 component spans both columns -> bridges the two slice-0 comps.
-  m.add_slice({0, 0, 0, 0, 0}, 5, 1, {cc_node(5)}, 1, 6);
+  const CcSlice s1 = cc_slice({{5}});
+  m.add_slice({0, 0, 0, 0, 0}, 5, 1, s1.stats, s1.channels, 1, 6);
 
   std::vector<mscoupon::FeatureMapRow> map;
-  std::vector<mscoupon::GlobalFeatureStat> table;
+  mscoupon::GlobalFeatureTable table;
   std::vector<mscoupon::GlobalLabelRaster> rasters;
   m.finalize(map, table, rasters);
 
-  expect(table.size() == 1, "merge unifies into one global feature");
+  expect(table.rows.size() == 1, "merge unifies into one global feature");
   expect(global_for(map, 0, 0) == global_for(map, 0, 1), "both prior components unified");
   expect(global_for(map, 0, 0) == global_for(map, 1, 0), "current component unified with priors");
-  expect(table[0].voxel_count == 9, "voxel count sums all members (2+2+5)");
-  expect(table[0].first_slice == 0 && table[0].last_slice == 1, "spans both slices");
-  expect(table[0].num_slices == 2, "counts two distinct slices");
+  expect(table.rows[0].voxel_count == 9, "voxel count sums all members (2+2+5)");
+  expect(table.rows[0].first_slice == 0 && table.rows[0].last_slice == 1, "spans both slices");
+  expect(table.rows[0].num_slices == 2, "counts two distinct slices");
   // The relabeled slice-0 raster carries the surviving global id everywhere it was set.
-  expect(rasters[0].data[0] == table[0].global_id && rasters[0].data[3] == table[0].global_id,
+  expect(rasters[0].data[0] == table.rows[0].global_id &&
+             rasters[0].data[3] == table.rows[0].global_id,
          "relabel pass writes the unified global id into slice 0");
 }
 
 void test_matcher_first_seen_ids() {
   mscoupon::SliceMatcher m;
+  configure_base(m, mscoupon::StatisticsConfig{});
   // Two distinct components in one slice -> global ids in appearance (node) order.
-  m.add_slice({0, 0, -1, 1, 1}, 5, 1, {cc_node(2, 3.0f), cc_node(2, 7.0f)}, 0, 6);
+  const CcSlice s0 = cc_slice({{2, 3.0f}, {2, 7.0f}});
+  m.add_slice({0, 0, -1, 1, 1}, 5, 1, s0.stats, s0.channels, 0, 6);
 
   std::vector<mscoupon::FeatureMapRow> map;
-  std::vector<mscoupon::GlobalFeatureStat> table;
+  mscoupon::GlobalFeatureTable table;
   std::vector<mscoupon::GlobalLabelRaster> rasters;
   m.finalize(map, table, rasters);
   expect(global_for(map, 0, 0) == 0, "first-seen component -> global 0");
   expect(global_for(map, 0, 1) == 1, "next component -> global 1");
-  // Extended base stats aggregate from the node payloads.
-  expect(std::abs(table[0].mean_base - 3.0f) < 1e-5f, "global 0 mean_base from its node");
-  expect(std::abs(table[1].mean_base - 7.0f) < 1e-5f, "global 1 mean_base from its node");
+  // Base-channel aggregates now come out of the channel plane, read by name.
+  expect(std::abs(global_field(table, 0, "mean_base") - 3.0) < 1e-5,
+         "global 0 mean_base from its node");
+  expect(std::abs(global_field(table, 1, "mean_base") - 7.0) < 1e-5,
+         "global 1 mean_base from its node");
+}
+
+void test_matcher_relevance_range() {
+  CcSlice a = cc_slice({{1, 3.0f}});
+  a.channels.cell(0, 0).min = 1.0f; a.channels.cell(0, 0).max = 5.0f;
+  a.stats[0].base_relevance_floor = 0.0f; a.stats[0].base_relevance_ceiling = 10.0f;
+  CcSlice b = cc_slice({{1, 4.0f}});
+  b.channels.cell(0, 0).min = 2.0f; b.channels.cell(0, 0).max = 9.0f;
+  b.stats[0].base_relevance_floor = 1.0f; b.stats[0].base_relevance_ceiling = 11.0f;
+
+  mscoupon::SliceMatcher m;
+  configure_base(m, mscoupon::StatisticsConfig{});
+  m.add_slice({0}, 1, 1, a.stats, a.channels, 0, 6);
+  m.add_slice({0}, 1, 1, b.stats, b.channels, 1, 6);
+  std::vector<mscoupon::FeatureMapRow> map;
+  mscoupon::GlobalFeatureTable table;
+  std::vector<mscoupon::GlobalLabelRaster> rasters;
+  m.finalize(map, table, rasters);
+  expect(table.rows.size() == 1, "overlapping relevance nodes merge");
+  expect(std::abs(table.rows[0].relevance_base - 8.0f / 12.0f) < 1e-6f,
+         "global relevance uses global base extent and carried slice range");
+}
+
+void test_global_csv_includes_relevance() {
+  const auto path = std::filesystem::temp_directory_path() / "mscoupon_relevance.csv";
+  mscoupon::GlobalFeatureTable table;
+  mscoupon::GlobalFeatureStat row;
+  row.relevance_base = 0.25f;
+  table.rows.push_back(row);
+  table.schema = msseg::resolve_stat_channels(base_spec());
+  table.channels.reset(1, table.schema.size(), base_spec());
+  mscoupon::write_global_table_csv(path, table, mscoupon::StatisticsConfig{});
+  std::ifstream input(path);
+  const std::string text((std::istreambuf_iterator<char>(input)),
+                         std::istreambuf_iterator<char>());
+  expect(text.find("relevance_base") != std::string::npos,
+         "global CSV advertises relevance_base");
+  expect(text.find(",0.25") != std::string::npos,
+         "global CSV writes the relevance value");
+  input.close();
+  std::filesystem::remove(path);
 }
 
 void test_cc_stage_trim_and_split() {
@@ -200,9 +305,12 @@ void test_cc_stage_trim_and_split() {
   // in-plane components (px0-1 and px3).
   std::vector<mscoupon::PixelFilter> rules = {{"base", "keep", "ge", 2.0}};
   std::vector<int> cc; std::vector<mscoupon::CcNodeStat> stats;
+  msseg::ChannelStats cc_channels;
+  const msseg::StatChannelBank bank =
+      msseg::build_stat_channels(to_diffg2d(base), to_diffg2d(filt), base_spec());
   const int n = mscoupon::label_selected_components(labels, 5, 1, base, filt, keep, rules, 6,
-                                                    /*ascending=*/true, msseg::StatsSpec{}, cc,
-                                                    stats);
+                                                    /*ascending=*/true, base_spec(), bank,
+                                                    0.0f, 10.0f, cc, stats, cc_channels);
   expect(n == 2, "trim splits the selected region into two components");
   expect(cc[2] == -1, "trimmed pixel (value < 2) is background");
   expect(cc[4] == -1, "unselected region 2 is background");
@@ -218,44 +326,56 @@ void test_cc_stage_trim_and_split() {
          "component extremum ignores the trimmed-away minimum");
   expect(stats[0].ext_x >= 0.0f && stats[0].ext_x <= 1.0f, "extremum lies inside its component");
   expect(std::abs(stats[1].ext_x - 3.0f) < 1e-6f, "second component's extremum is its own pixel");
+  expect(stats[0].base_relevance_floor == 0.0f &&
+             stats[0].base_relevance_ceiling == 10.0f,
+         "CC carries the slice relevance range");
 }
 
 // A 3D feature must inherit the extremum of its DEEPEST constituent slice, and
 // as a tuple: reducing ext_x and ext_base independently would report a position
 // from one slice with a value from another.
 void test_matcher_carries_extremal_tuple() {
-  const auto node = [](std::size_t area, float ext_filtered, float ext_base, float ext_x) {
+  // One 2x1 component per slice, carrying its own extremum tuple.
+  const auto slice_of = [](std::size_t area, float ext_filtered, float ext_base, float ext_x) {
+    CcSlice out;
+    out.channels.reset(1, 1, base_spec());
     mscoupon::CcNodeStat s;
     s.area = area;
-    s.base_sum = static_cast<double>(area);
-    s.base_min = 0.0f; s.base_max = 1.0f;
     s.min_x = 0; s.max_x = 1; s.min_y = 0; s.max_y = 1;
-    s.ext_filtered = ext_filtered; s.ext_base = ext_base;
+    s.ext_filtered = ext_filtered;
     s.ext_x = ext_x; s.ext_y = 0.0f;
-    return s;
+    out.stats.push_back(s);
+    msseg::ChannelAccum& a = out.channels.cell(0, 0);
+    a.sum = static_cast<double>(area); a.min = 0.0f; a.max = 1.0f;
+    out.channels.set_ext(0, 0, ext_base);
+    return out;
   };
-  // One 2x1 component per slice, all overlapping -> a single 3D feature. The
-  // deepest (lowest ext_filtered) is the MIDDLE slice, so a first- or last-wins
-  // bug would be invisible in a two-slice test.
+  // All overlapping -> a single 3D feature. The deepest (lowest ext_filtered) is
+  // the MIDDLE slice, so a first- or last-wins bug would be invisible in a
+  // two-slice test.
   const std::vector<int> cc = {0, 0};
   mscoupon::SliceMatcher m;
   mscoupon::StatisticsConfig cfg;
   cfg.per_slice_quantities = {"area"};
-  m.configure(cfg, /*ascending=*/true);
-  m.add_slice(cc, 2, 1, {node(2, 0.9f, 0.50f, 0.0f)}, 0, 6);
-  m.add_slice(cc, 2, 1, {node(4, 0.1f, 0.11f, 1.0f)}, 1, 6);
-  m.add_slice(cc, 2, 1, {node(6, 0.5f, 0.30f, 0.0f)}, 2, 6);
+  configure_base(m, cfg);
+  const CcSlice a = slice_of(2, 0.9f, 0.50f, 0.0f);
+  const CcSlice b = slice_of(4, 0.1f, 0.11f, 1.0f);
+  const CcSlice c = slice_of(6, 0.5f, 0.30f, 0.0f);
+  m.add_slice(cc, 2, 1, a.stats, a.channels, 0, 6);
+  m.add_slice(cc, 2, 1, b.stats, b.channels, 1, 6);
+  m.add_slice(cc, 2, 1, c.stats, c.channels, 2, 6);
 
   std::vector<mscoupon::FeatureMapRow> map;
-  std::vector<mscoupon::GlobalFeatureStat> table;
+  mscoupon::GlobalFeatureTable table;
   std::vector<mscoupon::GlobalLabelRaster> rasters;
   m.finalize(map, table, rasters);
 
-  expect(table.size() == 1, "the three slices link into one global feature");
-  const auto& g = table.front();
+  expect(table.rows.size() == 1, "the three slices link into one global feature");
+  const auto& g = table.rows.front();
   expect(g.num_slices == 3, "feature spans three slices");
   expect(std::abs(g.ext_filtered - 0.1f) < 1e-6f, "ascending 3D extremum is the minimum");
-  expect(std::abs(g.ext_base - 0.11f) < 1e-6f, "ext_base comes from the SAME slice");
+  expect(std::abs(global_field(table, 0, "ext_base") - 0.11) < 1e-6,
+         "ext_base comes from the SAME slice");
   expect(std::abs(g.ext_x - 1.0f) < 1e-6f, "ext_x comes from the same slice too");
   expect(g.ext_z == 1, "ext_z names the middle slice");
 
@@ -268,23 +388,29 @@ void test_matcher_carries_extremal_tuple() {
 
 // A descending manifold seeds from the maximum, so the merge must flip.
 void test_matcher_extremum_follows_manifold_direction() {
-  const auto node = [](float ext_filtered) {
+  const auto slice_of = [](float ext_filtered) {
+    CcSlice out;
+    out.channels.reset(1, 1, base_spec());
     mscoupon::CcNodeStat s;
     s.area = 2; s.min_x = 0; s.max_x = 1; s.min_y = 0; s.max_y = 1;
-    s.ext_filtered = ext_filtered; s.ext_base = ext_filtered;
-    return s;
+    s.ext_filtered = ext_filtered;
+    out.stats.push_back(s);
+    out.channels.set_ext(0, 0, ext_filtered);
+    return out;
   };
   const std::vector<int> cc = {0, 0};
   mscoupon::SliceMatcher m;
-  m.configure(mscoupon::StatisticsConfig{}, /*ascending=*/false);
-  m.add_slice(cc, 2, 1, {node(0.2f)}, 0, 6);
-  m.add_slice(cc, 2, 1, {node(0.8f)}, 1, 6);
+  configure_base(m, mscoupon::StatisticsConfig{}, /*ascending=*/false);
+  const CcSlice a = slice_of(0.2f);
+  const CcSlice b = slice_of(0.8f);
+  m.add_slice(cc, 2, 1, a.stats, a.channels, 0, 6);
+  m.add_slice(cc, 2, 1, b.stats, b.channels, 1, 6);
 
   std::vector<mscoupon::FeatureMapRow> map;
-  std::vector<mscoupon::GlobalFeatureStat> table;
+  mscoupon::GlobalFeatureTable table;
   std::vector<mscoupon::GlobalLabelRaster> rasters;
   m.finalize(map, table, rasters);
-  expect(std::abs(table.front().ext_filtered - 0.8f) < 1e-6f,
+  expect(std::abs(table.rows.front().ext_filtered - 0.8f) < 1e-6f,
          "descending 3D extremum is the maximum");
 }
 
@@ -326,6 +452,30 @@ void test_config_matching_flag() {
   std::filesystem::remove_all(dir);
 }
 
+void test_relevance_config() {
+  mscoupon::StatisticsConfig stats;
+  mscoupon::parse_statistics_json(
+      nlohmann::json::parse(
+          R"({"statistics":{"relevance":{"enabled":true,"low_percentile":1.0,"high_percentile":99.0}}})"),
+      stats);
+  expect(stats.spec.relevance, "relevance config enables the field");
+  expect(stats.spec.relevance_low_percentile == 1.0 &&
+             stats.spec.relevance_high_percentile == 99.0,
+         "relevance percentiles parse");
+
+  bool rejected = false;
+  try {
+    mscoupon::StatisticsConfig invalid;
+    mscoupon::parse_statistics_json(
+        nlohmann::json::parse(
+            R"({"statistics":{"relevance":{"low_percentile":99.0,"high_percentile":1.0}}})"),
+        invalid);
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  expect(rejected, "relevance rejects reversed percentiles");
+}
+
 void test_msc2d_pipeline_monotone_and_stats() {
   const int w = 48, h = 48;
   const diffg::Image<float> field = make_wells(w, h);
@@ -334,11 +484,24 @@ void test_msc2d_pipeline_monotone_and_stats() {
   cfg.manifold = "ascending";
   cfg.persistence_absolute = 0.0f;
   cfg.persistence_percent.reset();
+  cfg.stats.relevance_low_percentile = 25.0;
+  cfg.stats.relevance_high_percentile = 75.0;
 
   msseg::Msc2DPipeline pipe;
   pipe.build(field, field, cfg);  // base == filtered here (topology on the raw field)
   expect(pipe.width() == w && pipe.height() == h, "pipeline reports image dims");
   expect(pipe.value_range() > 0.0f, "value range is positive");
+  std::vector<float> sorted(field.data(), field.data() + field.size());
+  std::sort(sorted.begin(), sorted.end());
+  const auto percentile = [&](double q) {
+    const double hq = static_cast<double>(sorted.size() - 1) * q / 100.0;
+    const std::size_t lo = static_cast<std::size_t>(std::floor(hq));
+    const std::size_t hi = static_cast<std::size_t>(std::ceil(hq));
+    return sorted[lo] + (sorted[hi] - sorted[lo]) * static_cast<float>(hq - lo);
+  };
+  expect(std::abs(pipe.base_relevance_floor() - percentile(25.0)) < 1e-6f &&
+             std::abs(pipe.base_relevance_ceiling() - percentile(75.0)) < 1e-6f,
+         "pipeline relevance range uses linear percentiles");
 
   // At persistence 0 the finest decomposition has multiple minima basins.
   pipe.select_persistence(0.0f);
@@ -359,12 +522,15 @@ void test_msc2d_pipeline_monotone_and_stats() {
   for (int v : pipe.labels())
     if (v >= 0) { area_of[v] += 1; ++labeled; }
   std::int64_t feat_area_sum = 0;
-  for (const auto& f : feats) {
+  for (std::size_t r = 0; r < feats.size(); ++r) {
+    const msseg::Msc2DFeatureStat f = feats[r];
     feat_area_sum += f.area;
     const auto it = area_of.find(static_cast<int>(f.feature_id));
     expect(it != area_of.end() && it->second == f.area,
            "feature area matches its label pixel count");
-    expect(f.base_min <= f.base_max, "feature base min<=max");
+    const msseg::ChannelAccum& b = pipe.feature_channels().cell(r, 0);
+    expect(pipe.channels()[0].name == "base", "slot 0 is the base channel");
+    expect(b.min <= b.max, "feature base min<=max");
     expect(f.min_x <= f.max_x && f.min_y <= f.max_y, "feature bbox ordering");
   }
   expect(feat_area_sum == labeled, "aggregated feature areas sum to labeled pixels");
@@ -450,22 +616,27 @@ void test_msc2d_extremum_stats() {
   const auto at = [&](const diffg::Image<float>& img, int x, int y) {
     return img.data()[static_cast<std::size_t>(y) * w + x];
   };
-  const auto check_seed = [&](const msseg::Msc2DFeatureStat& f, bool asc) {
+  // ext_<channel> lives in the channel plane; slot 0 is "base" here.
+  const auto check_seed = [&](const msseg::Msc2DPipeline& p,
+                              const msseg::Msc2DFeatureStat& f, std::size_t row, bool asc) {
     const int px = static_cast<int>(f.ext_x), py = static_cast<int>(f.ext_y);
     expect(f.ext_x == static_cast<float>(px) && f.ext_y == static_cast<float>(py),
            "the extremum sits on a real pixel");
     expect(px >= f.min_x && px <= f.max_x && py >= f.min_y && py <= f.max_y,
            "extremum lies inside the feature's bounding box");
     expect(f.ext_filtered == at(field, px, py), "ext_filtered is the field at the extremum");
-    expect(f.ext_base == at(base, px, py), "ext_base samples the BASE channel at the extremum");
+    expect(p.channels()[0].name == "base", "slot 0 is the base channel");
+    expect(p.feature_channels().ext(row, 0) == at(base, px, py),
+           "ext_base samples the BASE channel at the extremum");
     expect(f.ext_filtered == (asc ? f.filt_min : f.filt_max),
            "the seed is the feature's most extreme pixel in the chosen direction");
   };
 
   std::unordered_map<int, msseg::Msc2DFeatureStat> fine;
-  for (const auto& f : pipe.feature_stats()) {
-    check_seed(f, true);
-    fine[static_cast<int>(f.feature_id)] = f;
+  const auto fine_feats = pipe.feature_stats();
+  for (std::size_t r = 0; r < fine_feats.size(); ++r) {
+    check_seed(pipe, fine_feats[r], r, true);
+    fine[static_cast<int>(fine_feats[r].feature_id)] = fine_feats[r];
   }
 
   // A merged feature inherits the SURVIVING minimum, so its seed is unchanged by
@@ -477,7 +648,7 @@ void test_msc2d_extremum_stats() {
     expect(it != fine.end(), "surviving feature id was present at the finest level");
     expect(f.ext_x == it->second.ext_x && f.ext_y == it->second.ext_y,
            "the surviving extremum does not move when the persistence rises");
-    expect(f.ext_filtered == it->second.ext_filtered && f.ext_base == it->second.ext_base,
+    expect(f.ext_filtered == it->second.ext_filtered,
            "the surviving extremum keeps its sampled values");
     expect(f.ext_filtered >= f.filt_min, "the seed value is within the merged feature's range");
   }
@@ -489,8 +660,9 @@ void test_msc2d_extremum_stats() {
   dpipe.build(base, field, dsc);
   dpipe.select_persistence(0.0f);
   int dsc_features = 0;
-  for (const auto& f : dpipe.feature_stats()) {
-    check_seed(f, false);
+  const auto dsc_feats = dpipe.feature_stats();
+  for (std::size_t r = 0; r < dsc_feats.size(); ++r) {
+    check_seed(dpipe, dsc_feats[r], r, false);
     ++dsc_features;
   }
   expect(dsc_features > 0, "descending decomposition produced features");
@@ -526,13 +698,30 @@ void test_msc2d_extremum_sample_radius() {
   blurred.build(base, field, cfg);
   blurred.select_persistence(0.0f);
 
+  // ext_base now lives in the channel plane, at the "base" slot.
+  const auto base_slot = [](const msseg::Msc2DPipeline& p) {
+    for (std::size_t k = 0; k < p.channels().size(); ++k) {
+      if (p.channels()[k].name == "base") return k;
+    }
+    throw std::runtime_error("no base channel");
+  };
+  const auto ext_base_of = [&](const msseg::Msc2DPipeline& p, int fid) {
+    const auto feats = p.feature_stats();
+    for (std::size_t r = 0; r < feats.size(); ++r) {
+      if (static_cast<int>(feats[r].feature_id) == fid) {
+        return p.feature_channels().ext(r, base_slot(p));
+      }
+    }
+    throw std::runtime_error("feature id not found");
+  };
   const auto seed_of = [](const msseg::Msc2DPipeline& p, int fid) {
     for (const auto& f : p.feature_stats())
       if (static_cast<int>(f.feature_id) == fid) return f;
     throw std::runtime_error("feature id not found");
   };
   for (const auto& f : sharp.feature_stats()) {
-    const auto b = seed_of(blurred, static_cast<int>(f.feature_id));
+    const int fid = static_cast<int>(f.feature_id);
+    const auto b = seed_of(blurred, fid);
     expect(b.ext_x == f.ext_x && b.ext_y == f.ext_y, "the sample radius does not move the extremum");
     const int px = static_cast<int>(f.ext_x);
     const int py = static_cast<int>(f.ext_y);
@@ -544,27 +733,52 @@ void test_msc2d_extremum_sample_radius() {
         ++n;
       }
     }
-    expect(std::abs(b.ext_base - static_cast<float>(sum / n)) < 1e-4f,
+    const float sharp_ext = ext_base_of(sharp, fid);
+    const float blurred_ext = ext_base_of(blurred, fid);
+    expect(std::abs(blurred_ext - static_cast<float>(sum / n)) < 1e-4f,
            "radius 1 averages the clamped 3x3 base window");
-    expect(f.ext_base == base.data()[static_cast<std::size_t>(py) * w + px],
+    expect(sharp_ext == base.data()[static_cast<std::size_t>(py) * w + px],
            "radius 0 reads the single critical pixel");
-    expect(b.ext_base != f.ext_base, "the sample radius actually changes ext_base");
+    expect(blurred_ext != sharp_ext, "the sample radius actually changes ext_base");
   }
 }
 
-void test_feature_query() {
-  // A synthetic feature: area 100, base mean 5, filtered mean 2, bbox 10x20.
+// Project one synthetic feature under `spec` and return its row as a map.
+// Base slot carries sum 500 / sumsq 2600 / extent [1, 9] over area 100 (mean 5);
+// filtered slot, when the spec enables it, carries sum 200 / sumsq 500 / [0, 4].
+std::unordered_map<std::string, double> synthetic_row(const msseg::StatsSpec& spec) {
   msseg::Msc2DFeatureStat s;
   s.feature_id = 3;
   s.area = 100;
-  s.base_sum = 500.0;  s.base_sumsq = 2600.0;  s.base_min = 1.0f;  s.base_max = 9.0f;
-  s.filt_sum = 200.0;  s.filt_sumsq = 500.0;   s.filt_min = 0.0f;  s.filt_max = 4.0f;
+  s.base_relevance_floor = 0.0f; s.base_relevance_ceiling = 10.0f;
+  s.filt_min = 0.0f; s.filt_max = 4.0f;
   s.min_x = 5; s.max_x = 14; s.min_y = 0; s.max_y = 19;
-  s.ext_x = 7.0f; s.ext_y = 11.0f; s.ext_base = 1.5f; s.ext_filtered = 0.0f;
+  s.ext_x = 7.0f; s.ext_y = 11.0f; s.ext_filtered = 0.0f;
+
+  const auto schema = msseg::resolve_stat_channels(spec);
+  msseg::ChannelStats channels;
+  channels.reset(1, schema.size(), spec);
+  for (std::size_t k = 0; k < schema.size(); ++k) {
+    msseg::ChannelAccum& a = channels.cell(0, k);
+    if (schema[k].name == "filtered") {
+      a.sum = 200.0; a.sumsq = 500.0; a.min = 0.0f; a.max = 4.0f;
+      channels.set_ext(0, k, 0.0f);
+    } else {
+      a.sum = 500.0; a.sumsq = 2600.0; a.min = 1.0f; a.max = 9.0f;
+      channels.set_ext(0, k, 1.5f);
+    }
+  }
+  const auto table = mscoupon::feature_table({s}, channels, schema, spec);
+  return mscoupon::feature_row(table, 0);
+}
+
+void test_feature_query() {
   msseg::StatsSpec spec;  // defaults: base channel, all reductions, extremum on
-  const auto row = mscoupon::feature_row(s, spec);
+  const auto row = synthetic_row(spec);
 
   expect(std::abs(row.at("mean_base") - 5.0) < 1e-9, "mean_base = base_sum/area");
+  expect(std::abs(row.at("relevance_base") - 8.0 / 11.0) < 1e-9,
+         "relevance_base uses the shifted slice range");
   expect(std::abs(row.at("bbox_w") - 10.0) < 1e-9, "bbox_w = max_x-min_x+1");
   expect(std::abs(row.at("bbox_h") - 20.0) < 1e-9, "bbox_h = max_y-min_y+1");
 
@@ -588,6 +802,14 @@ void test_feature_query() {
   expect(mscoupon::is_feature_field("ext_base", spec) && mscoupon::is_feature_field("area", spec),
          "is_feature_field accepts real statistics");
   expect(!mscoupon::is_feature_field("ext_bse", spec), "is_feature_field rejects a typo");
+  expect(mscoupon::is_feature_field("relevance_base", spec),
+         "relevance_base is in the default schema");
+  expect(mscoupon::row_passes(row, {Q("relevance_base", "gt", 0.7)}),
+         "relevance_base is queryable");
+  expect(mscoupon::relevance_base_value(0.0, 0.0, 0.0, 0.0) == 0.0,
+         "zero-over-zero relevance is defined as zero");
+  expect(std::isinf(mscoupon::relevance_base_value(0.0, 1.0, 0.0, 0.0)),
+         "nonzero-over-zero relevance is positive infinity");
 
   // The filtered aggregates had no reader anywhere, so they are off by default
   // -- and a config still naming one must fail loudly rather than silently
@@ -599,20 +821,104 @@ void test_feature_query() {
   with_filtered.filtered_channel = true;
   expect(mscoupon::is_feature_field("mean_filtered", with_filtered),
          "opting the filtered channel back in restores them");
+  msseg::StatsSpec no_relevance = spec;
+  no_relevance.relevance = false;
+  expect(!mscoupon::is_feature_field("relevance_base", no_relevance),
+         "disabling relevance removes it from the schema");
 
   // Turning a reduction off removes exactly that field, on every channel.
   msseg::StatsSpec no_std = spec;
   no_std.std = false;
-  const auto lean = mscoupon::feature_row(s, no_std);
+  const auto lean = synthetic_row(no_std);
   expect(lean.find("std_base") == lean.end(), "a disabled reduction is not emitted");
   expect(lean.count("mean_base") == 1, "the others are unaffected");
 
-  // feature_fields() is derived from feature_row, so the GUI dropdown and config
-  // validation cannot disagree about what exists.
+  // feature_fields() and the projected table share one schema, so the GUI
+  // dropdown, the CSV header and config validation cannot disagree.
   const auto names = mscoupon::feature_fields(spec);
-  expect(std::is_sorted(names.begin(), names.end()), "feature_fields is sorted");
   expect(names.size() == row.size(), "feature_fields matches the row it describes");
   for (const auto& n : names) expect(row.count(n) == 1, "every advertised field is produced");
+  const auto schema = mscoupon::feature_schema(spec);
+  expect(schema.size() == names.size(), "feature_schema and feature_fields agree in size");
+  for (std::size_t i = 0; i < schema.size(); ++i) {
+    expect(schema[i].name == names[i], "feature_schema and feature_fields agree in order");
+  }
+}
+
+// A derived channel request expands to one measurement channel per sigma (two
+// for hessian), and every reduction of every channel becomes a queryable field.
+void test_derived_stat_channels() {
+  msseg::StatsSpec spec;
+  spec.mean = true; spec.min = true; spec.max = true; spec.std = false;
+  spec.derived.push_back(msseg::StatChannelRequest{"blur", {0.7, 1.5, 3.0}, true, ""});
+  spec.derived.push_back(msseg::StatChannelRequest{"hessian", {1.5}, true, ""});
+
+  const auto channels = msseg::resolve_stat_channels(spec);
+  expect(channels.size() == 1 + 3 + 2, "base + three blurs + two hessian eigenvalues");
+  expect(channels[0].name == "base", "base keeps slot 0");
+  expect(channels[1].name == "blur_s0.7", "sigma renders with %g");
+  expect(channels[3].name == "blur_s3", "a whole sigma drops its trailing zero");
+  expect(channels[4].name == "hess_largest_s1.5" || channels[4].name == "hessian_largest_s1.5",
+         "hessian expands to a largest slot first");
+  expect(channels[5].kind == "hessian" && channels[5].slot_in_request == 1,
+         "and a smallest slot second");
+
+  // Every channel contributes its enabled reductions plus an extremum sample.
+  expect(mscoupon::is_feature_field("mean_blur_s1.5", spec), "derived aggregates are queryable");
+  expect(mscoupon::is_feature_field("max_blur_s3", spec), "on every requested sigma");
+  expect(mscoupon::is_feature_field("ext_blur_s1.5", spec),
+         "and the seeding extremum is sampled on each");
+  expect(!mscoupon::is_feature_field("std_blur_s1.5", spec),
+         "a disabled reduction is off on derived channels too");
+  expect(!mscoupon::is_feature_field("mean_blur_s2", spec), "an unrequested sigma has no field");
+
+  // The schema carries channel and reduction structurally, so the GUI never has
+  // to parse "mean_blur_s0.7" -- and min_x is not read as min-of-channel-x.
+  const auto schema = mscoupon::feature_schema(spec);
+  bool saw_geometry = false, saw_derived = false;
+  for (const auto& f : schema) {
+    if (f.name == "min_x") {
+      expect(f.channel.empty() && f.reduction.empty(), "min_x is geometry, not a reduction");
+      saw_geometry = true;
+    }
+    if (f.name == "mean_blur_s0.7") {
+      expect(f.channel == "blur_s0.7" && f.reduction == "mean",
+             "a derived column names its channel and reduction");
+      saw_derived = true;
+    }
+  }
+  expect(saw_geometry && saw_derived, "both column kinds are present");
+
+  // An empty derived list is exactly the previous two-channel behaviour.
+  msseg::StatsSpec plain;
+  expect(msseg::resolve_stat_channels(plain).size() == 1, "default spec is base only");
+}
+
+// The measured values must be the filters diffg would compute on their own.
+void test_stat_channel_bank_matches_single_filters() {
+  const int w = 24, h = 20;
+  diffg::Image<float> base(diffg::Dimensions{static_cast<std::size_t>(w),
+                                             static_cast<std::size_t>(h), 1});
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      base.data()[static_cast<std::size_t>(y) * w + x] =
+          static_cast<float>(std::sin(0.3 * x) * std::cos(0.2 * y) + 0.01 * x * y);
+    }
+  }
+  msseg::StatsSpec spec;
+  spec.derived.push_back(msseg::StatChannelRequest{"blur", {1.5}, true, ""});
+  const auto bank = msseg::build_stat_channels(base, base, spec);
+  expect(bank.size() == 2, "base plus one derived channel");
+  expect(bank.channel(0) == base.data(), "the base channel is aliased, not copied");
+
+  msseg::FilterParams blur;
+  blur.operation = "blur";
+  blur.params["sigma"] = 1.5;
+  const auto reference = msseg::apply_filter(base, blur);
+  for (std::size_t i = 0; i < reference.size(); ++i) {
+    expect(bank.channel(1)[i] == reference.data()[i],
+           "the bank is bit-identical to the standalone filter");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,16 +1611,21 @@ int main() try {
   test_matcher_links_overlap();
   test_matcher_merge_unifies();
   test_matcher_first_seen_ids();
+  test_matcher_relevance_range();
+  test_global_csv_includes_relevance();
   test_cc_stage_trim_and_split();
   test_matcher_carries_extremal_tuple();
   test_matcher_extremum_follows_manifold_direction();
   test_config_matching_flag();
+  test_relevance_config();
   test_msc2d_pipeline_monotone_and_stats();
   test_msc2d_pipeline_consistency();
   test_msc2d_pipeline_descending();
   test_msc2d_extremum_stats();
   test_msc2d_extremum_sample_radius();
   test_feature_query();
+  test_derived_stat_channels();
+  test_stat_channel_bank_matches_single_filters();
   test_gmm_default_preset_survives_low_intensities();
   test_gmm_recovers_two_gaussians();
   test_gmm_omit_zeros();

@@ -17,7 +17,7 @@ Pure Python + numpy + scipy (all mscoupon deps); importable/testable headlessly.
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -98,25 +98,52 @@ def per_slice_cc(mask: np.ndarray, connectivity: int = 6):
     return lbl.astype(np.int64), int(n)
 
 
+def chan_col(name: str, part: str) -> str:
+    """Column key for one measurement channel's accumulator.
+
+    Namespaced so a channel called e.g. "min_x" could never collide with the
+    geometry columns; the C++ side gets this for free by indexing slots.
+    """
+    return f"ch:{name}:{part}"
+
+
+_CHANNEL_PARTS = ("sum", "sumsq", "min", "max", "ext")
+
+
 def node_stats(lbl: np.ndarray, n: int, base: np.ndarray, filt: np.ndarray,
-               ascending: bool = True) -> Dict[str, np.ndarray]:
+               ascending: bool = True, relevance_floor: float = 0.0,
+               relevance_ceiling: float = 0.0,
+               channels: Optional[Sequence[Tuple[str, np.ndarray]]] = None,
+               ) -> Dict[str, np.ndarray]:
     """Per-component (1..n) statistics from the actual pixel sets. Structure-of-
-    arrays indexed 0..n-1. Sums use bincount; min/max/bbox use ndimage (C-fast).
+    arrays indexed 0..n-1. Sums use bincount; min/max/bbox use ufunc.at.
 
     `ascending` picks the side the seeding extremum comes from, mirroring
     ``mscoupon::label_selected_components``: the pixel attaining the component's
     filtered minimum (ascending) or maximum (descending). It is taken from the
     component's own pixels rather than inherited from the MSC feature, because
-    the pixel trim runs first and can remove the feature's true extremum."""
-    from scipy import ndimage
+    the pixel trim runs first and can remove the feature's true extremum.
+
+    `channels` is the measurement set: [(name, raster)], mirroring the resolved
+    slot list on the C++ side. Each contributes sum/sumsq/min/max plus its value
+    at the seeding extremum. `filt` is still read separately and unconditionally,
+    because its extent is what LOCATES that extremum -- exactly as `filt_min`/
+    `filt_max` survive on Msc2DFeatureStat whether or not `filtered` is measured.
+    Defaults to the base channel alone, which is the default StatsSpec.
+    """
     h, w = lbl.shape
+    if channels is None:
+        channels = [("base", base)]
     out: Dict[str, np.ndarray] = {}
     if n == 0:
-        for k in ("area", "base_sum", "base_sumsq", "filt_sum", "filt_sumsq",
-                  "base_min", "base_max", "filt_min", "filt_max",
+        for k in ("area", "filt_min", "filt_max",
+                  "base_relevance_floor", "base_relevance_ceiling",
                   "min_x", "max_x", "min_y", "max_y",
-                  "ext_x", "ext_y", "ext_base", "ext_filtered"):
+                  "ext_x", "ext_y", "ext_filtered"):
             out[k] = np.zeros(0, dtype=np.float64)
+        for name, _ in channels:
+            for part in _CHANNEL_PARTS:
+                out[chan_col(name, part)] = np.zeros(0, dtype=np.float64)
         return out
     # Everything below works on the compressed foreground vectors, not the full
     # raster. `ndimage.minimum`/`maximum`/`minimum_position` with an index array
@@ -126,13 +153,8 @@ def node_stats(lbl: np.ndarray, n: int, base: np.ndarray, filt: np.ndarray,
     flat = lbl.ravel()
     fg = flat > 0
     idx = flat[fg] - 1                                   # 0..n-1
-    b = base.ravel()[fg].astype(np.float64)
     f = filt.ravel()[fg].astype(np.float64)
     out["area"] = np.bincount(idx, minlength=n).astype(np.float64)
-    out["base_sum"] = np.bincount(idx, weights=b, minlength=n)
-    out["base_sumsq"] = np.bincount(idx, weights=b * b, minlength=n)
-    out["filt_sum"] = np.bincount(idx, weights=f, minlength=n)
-    out["filt_sumsq"] = np.bincount(idx, weights=f * f, minlength=n)
 
     def _reduce(op, values, init):
         acc = np.full(n, init, dtype=np.float64)
@@ -140,8 +162,18 @@ def node_stats(lbl: np.ndarray, n: int, base: np.ndarray, filt: np.ndarray,
         # A component with no pixels keeps the sentinel; report 0 rather than inf.
         return np.where(np.isfinite(acc), acc, 0.0)
 
-    out["base_min"] = _reduce(np.minimum, b, np.inf)
-    out["base_max"] = _reduce(np.maximum, b, -np.inf)
+    # One compressed vector per measurement channel, kept for the extremum pass.
+    chan_values: List[Tuple[str, np.ndarray]] = []
+    for name, raster in channels:
+        v = np.asarray(raster).ravel()[fg].astype(np.float64)
+        chan_values.append((name, v))
+        out[chan_col(name, "sum")] = np.bincount(idx, weights=v, minlength=n)
+        out[chan_col(name, "sumsq")] = np.bincount(idx, weights=v * v, minlength=n)
+        out[chan_col(name, "min")] = _reduce(np.minimum, v, np.inf)
+        out[chan_col(name, "max")] = _reduce(np.maximum, v, -np.inf)
+
+    out["base_relevance_floor"] = np.full(n, relevance_floor, dtype=np.float64)
+    out["base_relevance_ceiling"] = np.full(n, relevance_ceiling, dtype=np.float64)
     out["filt_min"] = _reduce(np.minimum, f, np.inf)
     out["filt_max"] = _reduce(np.maximum, f, -np.inf)
 
@@ -159,7 +191,8 @@ def node_stats(lbl: np.ndarray, n: int, base: np.ndarray, filt: np.ndarray,
     # C++, which keeps the first strictly-better pixel in scan order.
     ext_val = out["filt_min"] if ascending else out["filt_max"]
     ext_x = np.full(n, -1.0); ext_y = np.full(n, -1.0)
-    ext_base = np.zeros(n); ext_filt = np.zeros(n)
+    ext_filt = np.zeros(n)
+    ext_chan = {name: np.zeros(n) for name, _ in chan_values}
     hit = np.nonzero(f == ext_val[idx])[0]
     if hit.size:
         pos = np.full(n, -1, dtype=np.int64)
@@ -168,10 +201,15 @@ def node_stats(lbl: np.ndarray, n: int, base: np.ndarray, filt: np.ndarray,
         sel = pos[have]
         ext_x[have] = px[sel]
         ext_y[have] = py[sel]
-        ext_base[have] = b[sel]
         ext_filt[have] = f[sel]
+        # Every channel is sampled at the SAME pixel, so a scale-space stack
+        # reports what the seed looks like at each scale.
+        for name, v in chan_values:
+            ext_chan[name][have] = v[sel]
     out["ext_x"], out["ext_y"] = ext_x, ext_y
-    out["ext_base"], out["ext_filtered"] = ext_base, ext_filt
+    out["ext_filtered"] = ext_filt
+    for name, _ in chan_values:
+        out[chan_col(name, "ext")] = ext_chan[name]
     return out
 
 
@@ -181,6 +219,14 @@ def _std(sum_: np.ndarray, sumsq: np.ndarray, area: np.ndarray) -> np.ndarray:
     mean = sum_ / area
     var = sumsq / area - mean * mean
     return np.sqrt(np.clip(var, 0.0, None))
+
+
+def _relevance_base(f_m: float, f_s: float, floor: float, ceiling: float) -> float:
+    numerator = float(f_s) - float(f_m)
+    denominator = float(f_m) + (float(ceiling) - float(floor))
+    if denominator == 0.0:
+        return 0.0 if numerator == 0.0 else float("inf")
+    return numerator / denominator
 
 
 # --------------------------------------------------------------------------- #
@@ -194,6 +240,12 @@ def assemble_cc(
     pixel_rules: Sequence[Dict[str, Any]] = (),
     connectivity: int = 6,
     ascending: bool = True,
+    relevance_enabled: bool = True,
+    relevance_low_percentile: float = 0.0,
+    relevance_high_percentile: float = 100.0,
+    channels_list: Optional[Sequence[Sequence[Tuple[str, np.ndarray]]]] = None,
+    reductions: Sequence[str] = ("mean", "min", "max", "std"),
+    extremum: bool = True,
     timing: Optional[Dict[str, float]] = None,
 ):
     """Assemble a stack into 3D connected components.
@@ -204,13 +256,27 @@ def assemble_cc(
         base_list, filt_list: [Z] the base (original) and filtered rasters.
         pixel_rules: pixel intensity trim chain (see apply_pixel_filters).
         connectivity: 6/18/26 (drives in-plane CC + cross-slice stencil).
+        channels_list: [Z] measurement channels per slice, [(name, raster)], in
+                       the run's resolved slot order. None means the base channel
+                       alone, which is the default StatsSpec. This is where the
+                       scale-space stack enters: the GUI materializes it per
+                       slice via ``mscoupon.stat_channel_images``.
+        reductions:    which aggregates to emit per channel, mirroring
+                       ``statistics.reductions``.
+        extremum:      emit the seeding-extremum block.
 
     Returns dict:
         cc_labels:     [Z] per-slice CC id raster (-1 bg, 0..n_z-1).
         global_labels: [Z] per-slice GLOBAL id raster (-1 bg, 0..G-1).
-        global_table:  [G] stat dicts (global_id, voxel_count, mean/min/max/std for
-                       base & filtered, bbox_w/h/d, num_slices).
+        global_table:  [G] stat dicts: identity + extent, then one field per
+                       (reduction, channel) named exactly as the 2D schema and
+                       the CLI's global_segments.csv name them, then the extremum
+                       block, then the per-slice reductions.
         n_global:      G.
+
+    Reductions over a channel are VOXEL-pooled, matching ``SliceMatcher``: a mean
+    of per-slice means would weight by slice count rather than by area. The
+    per-slice (area/bbox) reductions are the ones that run across slices.
     """
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
@@ -218,6 +284,8 @@ def assemble_cc(
     if timing is None:
         timing = {}
     Z = len(labels_list)
+    if not (0.0 <= relevance_low_percentile <= relevance_high_percentile <= 100.0):
+        raise ValueError("relevance percentiles must satisfy 0 <= low <= high <= 100")
     offsets = _OFFSETS.get(connectivity, _OFFSETS[6])
 
     # --- per-slice: select -> trim -> CC -> node stats (streaming) --------- #
@@ -241,7 +309,18 @@ def assemble_cc(
         lbls.append(lbl)
 
         t = _t()
-        st = node_stats(lbl, n, base_list[z], filt_list[z], ascending)
+        finite_base = np.asarray(base_list[z])[np.isfinite(base_list[z])]
+        if relevance_enabled and finite_base.size:
+            floor = (finite_base.min() if relevance_low_percentile == 0.0 else
+                     np.percentile(finite_base, relevance_low_percentile))
+            ceiling = (finite_base.max() if relevance_high_percentile == 100.0 else
+                       np.percentile(finite_base, relevance_high_percentile))
+        else:
+            floor = ceiling = 0.0
+        slice_channels = (list(channels_list[z]) if channels_list is not None
+                          else [("base", base_list[z])])
+        st = node_stats(lbl, n, base_list[z], filt_list[z], ascending,
+                        float(floor), float(ceiling), slice_channels)
         timing["node_stats"] += _t() - t
         for k, v in st.items():
             node_cols.setdefault(k, []).append(v)
@@ -315,9 +394,27 @@ def assemble_cc(
         return acc
 
     area_g = reduce_sum("area")
-    base_sum_g, base_sq_g = reduce_sum("base_sum"), reduce_sum("base_sumsq")
-    filt_sum_g, filt_sq_g = reduce_sum("filt_sum"), reduce_sum("filt_sumsq")
-    base_min_g, base_max_g = reduce_min("base_min"), reduce_max("base_max")
+    # Channel names in slot order, taken from the first slice that had any.
+    channel_names: List[str] = []
+    if channels_list is not None:
+        seen = set()
+        for per_slice_channels in channels_list:
+            for name, _ in per_slice_channels:
+                if name not in seen:
+                    seen.add(name)
+                    channel_names.append(name)
+    else:
+        channel_names = ["base"]
+    chan_g = {}
+    for name in channel_names:
+        chan_g[name] = {
+            "sum": reduce_sum(chan_col(name, "sum")),
+            "sumsq": reduce_sum(chan_col(name, "sumsq")),
+            "min": reduce_min(chan_col(name, "min")),
+            "max": reduce_max(chan_col(name, "max")),
+        }
+    relevance_floor_g = reduce_min("base_relevance_floor")
+    relevance_ceiling_g = reduce_max("base_relevance_ceiling")
     filt_min_g, filt_max_g = reduce_min("filt_min"), reduce_max("filt_max")
     min_x_g, max_x_g = reduce_min("min_x"), reduce_max("max_x")
     min_y_g, max_y_g = reduce_min("min_y"), reduce_max("max_y")
@@ -331,8 +428,6 @@ def assemble_cc(
         gz = np.unique(comp * np.int64(Z) + z_of)
         num_slices_g = np.bincount((gz // Z).astype(np.int64), minlength=n_global)
 
-    std_base_g = _std(base_sum_g, base_sq_g, area_g)
-    std_filt_g = _std(filt_sum_g, filt_sq_g, area_g)
     area_safe = np.where(area_g > 0, area_g, 1.0)
 
     # Seeding extremum: pick the constituent NODE whose ext_filtered is most
@@ -340,7 +435,8 @@ def assemble_cc(
     # would pair a position from one slice with a value from another.
     ext_x_g = np.full(n_global, -1.0); ext_y_g = np.full(n_global, -1.0)
     ext_z_g = np.full(n_global, -1, dtype=np.int64)
-    ext_base_g = np.zeros(n_global); ext_filt_g = np.zeros(n_global)
+    ext_filt_g = np.zeros(n_global)
+    ext_chan_g = {name: np.zeros(n_global) for name in channel_names}
     if N and "ext_filtered" in cols:
         key = cols["ext_filtered"] if ascending else -cols["ext_filtered"]
         best = np.full(n_global, np.inf)
@@ -356,8 +452,11 @@ def assemble_cc(
         ext_x_g[take] = cols["ext_x"][w]
         ext_y_g[take] = cols["ext_y"][w]
         ext_z_g[take] = z_of[w]
-        ext_base_g[take] = cols["ext_base"][w]
         ext_filt_g[take] = cols["ext_filtered"][w]
+        for name in channel_names:
+            key_col = chan_col(name, "ext")
+            if key_col in cols:
+                ext_chan_g[name][take] = cols[key_col][w]
 
     # Per-slice reductions: how the footprint varies across the slices a feature
     # spans. Unlike the field statistics, which pool voxels.
@@ -381,28 +480,52 @@ def assemble_cc(
         ps[f"{name}_min"] = np.where(np.isfinite(lo), lo, 0.0)
         ps[f"{name}_max"] = np.where(np.isfinite(hi), hi, 0.0)
         ps[f"{name}_std"] = np.sqrt(np.clip(s2 / count_safe - mean * mean, 0.0, None))
+    # Precompute each channel's derived reductions once for the whole table
+    # rather than per row.
+    want = set(reductions)
+    chan_fields: Dict[str, np.ndarray] = {}
+    for name in channel_names:
+        acc = chan_g[name]
+        if "mean" in want:
+            chan_fields[f"mean_{name}"] = acc["sum"] / area_safe
+        if "min" in want:
+            chan_fields[f"min_{name}"] = acc["min"]
+        if "max" in want:
+            chan_fields[f"max_{name}"] = acc["max"]
+        if "std" in want:
+            chan_fields[f"std_{name}"] = _std(acc["sum"], acc["sumsq"], area_g)
+
+    base_acc = chan_g.get("base")
     global_table: List[dict] = []
     for gid in range(n_global):
         a = float(area_g[gid])
-        global_table.append({
+        row = {
             "global_id": gid,
             "area": a, "voxel_count": a,
-            "mean_base": float(base_sum_g[gid] / area_safe[gid]),
-            "min_base": float(base_min_g[gid]), "max_base": float(base_max_g[gid]),
-            "std_base": float(std_base_g[gid]),
-            "mean_filtered": float(filt_sum_g[gid] / area_safe[gid]),
-            "min_filtered": float(filt_min_g[gid]), "max_filtered": float(filt_max_g[gid]),
-            "std_filtered": float(std_filt_g[gid]),
             "num_slices": int(num_slices_g[gid]),
             "bbox_w": int(max_x_g[gid] - min_x_g[gid] + 1) if a else 0,
             "bbox_h": int(max_y_g[gid] - min_y_g[gid] + 1) if a else 0,
             "bbox_d": int(max_z_g[gid] - min_z_g[gid] + 1) if a else 0,
-            "ext_x": float(ext_x_g[gid]), "ext_y": float(ext_y_g[gid]),
-            "ext_z": int(ext_z_g[gid]),
-            "ext_base": float(ext_base_g[gid]),
-            "ext_filtered": float(ext_filt_g[gid]),
-            **{k: float(v[gid]) for k, v in ps.items()},
-        })
+        }
+        for field, values in chan_fields.items():
+            row[field] = float(values[gid])
+        if relevance_enabled and base_acc is not None:
+            row["relevance_base"] = _relevance_base(
+                base_acc["min"][gid], base_acc["max"][gid],
+                relevance_floor_g[gid], relevance_ceiling_g[gid])
+        if extremum:
+            row["ext_x"] = float(ext_x_g[gid])
+            row["ext_y"] = float(ext_y_g[gid])
+            row["ext_z"] = int(ext_z_g[gid])
+            for name in channel_names:
+                # `filtered` is reported once, as ext_filtered below; emitting it
+                # here too would produce the same key twice. Keeping that key last
+                # matches the C++ schema's column order.
+                if name != "filtered":
+                    row[f"ext_{name}"] = float(ext_chan_g[name][gid])
+            row["ext_filtered"] = float(ext_filt_g[gid])
+        row.update({k: float(v[gid]) for k, v in ps.items()})
+        global_table.append(row)
 
     timing["reduce"] = _t() - _t_reduce
 

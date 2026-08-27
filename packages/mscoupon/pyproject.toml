@@ -21,6 +21,7 @@ dependencies = [
 [project.scripts]
 mscoupon = "msseg.mscoupon.analysis:main"
 mscoupon-gui = "msseg.mscoupon.app:main"
+mscoupon-labeler = "msseg.mscoupon.labeler:main"
 
 [tool.scikit-build]
 # src-layout: ship msseg/mscoupon/ (namespace package, no msseg/__init__.py).

@@ -30,103 +30,30 @@ import sys
 import re
 import json
 import time
-import queue
-import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from . import config_io
 from .config_io import FILTER_SCHEMA, FILTER_OPERATIONS, QUERY_OPS, query_fields
-
-
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
-def log(msg):
-    """Command-line stage logging (alongside MSCEER's own stdout, which is left
-    verbose on purpose -- it reports the data's critical-point/cancellation
-    structure). Launch mscoupon-gui from a terminal to see all of it."""
-    print(f"[mscoupon] {msg}", flush=True)
-
-
-def natural_key(path: str):
-    """Natural sort key (so asdf_2 < asdf_10)."""
-    name = os.path.basename(path)
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
-
-
-def list_tiffs(folder: str):
-    """Naturally-sorted .tif/.tiff files in `folder`."""
-    try:
-        entries = [os.path.join(folder, f) for f in os.listdir(folder)
-                   if f.lower().endswith((".tif", ".tiff"))]
-    except OSError:
-        return []
-    return sorted(entries, key=natural_key)
-
-
-def _wheel_delta(event):
-    """Scroll units for one wheel event, normalized across platforms.
-
-    Windows/macOS report a signed `delta` (120 per notch); X11 sends Button-4/5
-    with no delta at all. Positive result = scroll down.
-    """
-    num = getattr(event, "num", 0)
-    if num == 4:
-        return -1
-    if num == 5:
-        return 1
-    return int(-getattr(event, "delta", 0) / 120) or 0
-
-
-def _bind_click_to_value(scale):
-    """Make a ttk.Scale jump to the clicked/dragged position (absolute) instead of
-    stepping toward it by a page increment. Approximates the trough as the full
-    widget width; the endpoints clamp to from/to."""
-    def jump(event):
-        w = scale.winfo_width()
-        if w <= 1:
-            return None
-        frac = min(max(event.x / w, 0.0), 1.0)
-        lo = float(scale.cget("from"))
-        hi = float(scale.cget("to"))
-        scale.set(lo + frac * (hi - lo))
-        return "break"
-    scale.bind("<Button-1>", jump)
-    scale.bind("<B1-Motion>", jump)
-
-
-def _id_lut(raster, min_colors, np):
-    """RGBA color LUT indexed by non-negative label id (the canvas treats id<0 as
-    transparent background). Colors come from the shared min_colors palette."""
-    K = int(raster.max()) + 1 if raster.size else 1
-    lut = np.zeros((max(K, 1), 4), np.uint8)
-    ids = np.arange(max(K, 1))
-    lut[:, :3] = (min_colors(ids) * 255).astype(np.uint8)
-    lut[:, 3] = 255
-    return lut
-
-
-def group_contiguous(indices):
-    """Group a sorted list of indices into contiguous runs -> list of lists."""
-    runs, cur = [], []
-    for i in sorted(indices):
-        if cur and i == cur[-1] + 1:
-            cur.append(i)
-        else:
-            if cur:
-                runs.append(cur)
-            cur = [i]
-    if cur:
-        runs.append(cur)
-    return runs
+# Shared helpers live in common.py (re-exported here so existing imports of
+# `msseg.mscoupon.app` keep working) and the small reusable widgets in
+# widgets.py -- both are shared with the labeler app.
+from .common import (log, natural_key, list_tiffs, _wheel_delta,
+                     _bind_click_to_value, _id_lut, FeatureTable,
+                     _parse_sigmas, _format_sigmas, group_contiguous)
+from .widgets import ScrollFrame, jump_scale, scrolled_listbox
+from .engine import ComputeEngine
 
 
 # --------------------------------------------------------------------------- #
 # Application
 # --------------------------------------------------------------------------- #
 class MscouponApp:
-    def __init__(self, root, initial=None):
+    # The per-app session-file identity (config_io.session_path(app=...));
+    # subclasses (the labeler) override it so their sessions never collide.
+    SESSION_APP = "mscoupon"
+
+    def __init__(self, root, initial=None, autosave=True):
         self.root = root
         self.root.title("mscoupon viewer")
 
@@ -143,28 +70,13 @@ class MscouponApp:
         self._normalize_readouts = []            # StringVars, one per normalize card
         self.query_cards = [self._new_query_card()]     # per-slice selection (2D) cards
         self.pixel_cards = [self._new_pixel_card()]     # pixel intensity trim cards
-        # primed[subseq_idx] = {"files":[...], "pipes":[pipe|None], "base":[arr],
-        #                       "filtered":[arr]}  (populated by Run)
-        self.primed = []
+        # The UI-free compute core: primed stacks, per-slice cache, assemblies,
+        # worker threads. The engine's state is also reachable through the
+        # delegating properties below (self.primed, self._slices, ...) so the
+        # rest of the class -- and the selftest -- reads as before.
+        self.engine = ComputeEngine(self._assembly_params)
         self.flat_slices = []                    # [(subseq_idx, local_idx)] linearized
-        # subseq_idx -> 3D assembly result (cc/global label rasters + global table).
-        # Only populated at the "global" level -- see _needed_level().
-        self._assembly = {}
-        # (subseq_idx, local_idx) -> per-slice result at some commit:
-        #   {commit, labels, stats, kept, cc (optional)}
-        # The per-slice tiers write here; the global tier fills it for every slice
-        # as a by-product, so navigating after a full assembly costs nothing.
-        self._slices = {}
-        self._work_q = queue.Queue()
-        # Async assembly (off the UI thread): pipes are stateful, so only ONE
-        # assembly worker runs at a time (single-flight); newer requests supersede.
-        self._asm_token = 0
-        self._asm_running = False
-        self._asm_running_si = None              # subsequence the worker is assembling
-        self._asm_pending = None                 # (token, si, level, li) latest requested
-        self._commit_id = 0                       # committed parameter generation
         self._pump_started = False
-        self._run_active = False                 # priming worker in flight
 
         # --- tk variables ------------------------------------------------ #
         self.persist_pct_var = tk.StringVar(value="10")
@@ -184,11 +96,29 @@ class MscouponApp:
         self.vmax_var = tk.DoubleVar(value=1.0)          #  of the base channel's range)
         self.vmin_filt_var = tk.DoubleVar(value=0.0)     # filtered window (fractions
         self.vmax_filt_var = tk.DoubleVar(value=1.0)     #  of the filtered channel's range)
+        # Measurement channels (`statistics.channels[]`): the two rasters the
+        # pipeline already builds, plus derived scale-space responses measured on
+        # the base channel. One card per kind; the sigma list is the cross-product
+        # that makes a multi-scale stack one line of config instead of many.
+        self.stat_base_var = tk.BooleanVar(value=True)
+        self.stat_filtered_var = tk.BooleanVar(value=False)
+        self.stat_kind_vars = {}       # kind -> (BooleanVar, StringVar sigmas)
+        self.stat_reduction_vars = {}  # reduction -> BooleanVar
+        self.stat_extremum_var = tk.BooleanVar(value=True)
+        # Rasters for a derived channel are computed on demand for the slice on
+        # screen and cached by (subsequence, slice, channel). Holding the whole
+        # stack would cost one float32 raster per channel per primed slice.
+        self._chan_cache = {}
         self.status_var = tk.StringVar(value="Ready.")
         self.hover_var = tk.StringVar(value="")
         self._hover_ctx = None                           # cached arrays for the hover readout
+        self.autosave_var = tk.BooleanVar(value=bool(autosave))
 
         # --- layout ------------------------------------------------------ #
+        # The toolbar packs first: self.paned takes the cavity with expand=True,
+        # so anything packed "top" after it would be stacked underneath.
+        self._build_toolbar(root)
+
         self.paned = ttk.PanedWindow(root, orient="horizontal")
         self.paned.pack(fill="both", expand=True)
 
@@ -196,25 +126,8 @@ class MscouponApp:
         # filter/query cards are added, so it scrolls: a canvas carries the real
         # panel and `self.left` IS that inner frame, which leaves _build_left()
         # and every section below it untouched.
-        self.left_pane = ttk.Frame(self.paned, width=376)
-        self.left_canvas = tk.Canvas(self.left_pane, width=360, highlightthickness=0,
-                                     borderwidth=0, takefocus=0)
-        left_scroll = ttk.Scrollbar(self.left_pane, orient="vertical",
-                                    command=self.left_canvas.yview)
-        self.left_canvas.configure(yscrollcommand=left_scroll.set)
-        left_scroll.pack(side="right", fill="y")
-        self.left_canvas.pack(side="left", fill="both", expand=True)
-
-        self.left = ttk.Frame(self.left_canvas)
-        self._left_window = self.left_canvas.create_window(
-            (0, 0), window=self.left, anchor="nw")
-        self.left.bind("<Configure>", self._on_left_content_resize)
-        self.left_canvas.bind("<Configure>", self._on_left_canvas_resize)
-        # Wheel scrolling is armed only while the pointer is over the panel: the
-        # slice canvas binds the wheel to zoom (viewer_canvas.py), so a permanent
-        # bind_all would hijack it.
-        self.left_canvas.bind("<Enter>", self._bind_left_wheel)
-        self.left_canvas.bind("<Leave>", self._unbind_left_wheel)
+        self.left_pane = ScrollFrame(self.paned, width=376, canvas_width=360)
+        self.left = self.left_pane.inner
 
         self.right = ttk.Frame(self.paned, width=900)
         self.paned.add(self.left_pane, weight=0)
@@ -227,6 +140,19 @@ class MscouponApp:
 
         if initial and os.path.isdir(initial):
             self._set_folder(initial)
+
+        # Auto-save on a timer rather than a trace per widget: a trace has to be
+        # remembered every time a control is added, and the one that is forgotten
+        # is the one whose value is lost. Disabled for --selftest, which builds a
+        # real app and must not touch the user's saved session.
+        self._autosave_last = ""         # last session text actually written
+        self._autosave_after = None      # pending root.after id
+        if autosave:
+            try:
+                self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+            except tk.TclError:
+                pass
+            self._schedule_autosave()
 
     # ------------------------------------------------------------------ #
     # Data-model factories
@@ -244,33 +170,293 @@ class MscouponApp:
         return {"channel": "", "mode": "keep", "op": "gt", "value": 0.0}
 
     # ------------------------------------------------------------------ #
-    # Left-panel scrolling
+    # Engine state (delegates)
     # ------------------------------------------------------------------ #
-    def _on_left_content_resize(self, _event=None):
-        """Sections were added/removed -> refresh the scrollable extent."""
-        self.left_canvas.configure(scrollregion=self.left_canvas.bbox("all"))
+    # The compute state lives in ComputeEngine; these properties keep the
+    # historical attribute names addressable (the selftest and this class both
+    # read and assign them).
+    @property
+    def primed(self):
+        return self.engine.primed
 
-    def _on_left_canvas_resize(self, event):
-        """Hold the inner frame at the canvas width so `fill="x"` still spans."""
-        self.left_canvas.itemconfigure(self._left_window, width=event.width)
+    @primed.setter
+    def primed(self, value):
+        self.engine.primed = value
 
-    def _left_scrollable(self):
-        box = self.left_canvas.bbox("all")
-        return bool(box) and box[3] > self.left_canvas.winfo_height()
+    @property
+    def _slices(self):
+        return self.engine.slices
 
-    def _bind_left_wheel(self, _event=None):
-        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            self.left_canvas.bind_all(seq, self._on_left_wheel)
+    @_slices.setter
+    def _slices(self, value):
+        self.engine.slices = value
 
-    def _unbind_left_wheel(self, _event=None):
-        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            self.left_canvas.unbind_all(seq)
+    @property
+    def _assembly(self):
+        return self.engine.assembly
 
-    def _on_left_wheel(self, event):
-        # Widgets with their own wheel binding (the sequence listbox) return
-        # "break" before this fires, so they scroll instead of the panel.
-        if self._left_scrollable():
-            self.left_canvas.yview_scroll(_wheel_delta(event), "units")
+    @_assembly.setter
+    def _assembly(self, value):
+        self.engine.assembly = value
+
+    @property
+    def _commit_id(self):
+        return self.engine.commit_id
+
+    @_commit_id.setter
+    def _commit_id(self, value):
+        self.engine.commit_id = value
+
+    @property
+    def _asm_token(self):
+        return self.engine.asm_token
+
+    @_asm_token.setter
+    def _asm_token(self, value):
+        self.engine.asm_token = value
+
+    @property
+    def _asm_running(self):
+        return self.engine.asm_running
+
+    @_asm_running.setter
+    def _asm_running(self, value):
+        self.engine.asm_running = value
+
+    @property
+    def _asm_running_si(self):
+        return self.engine.asm_running_si
+
+    @_asm_running_si.setter
+    def _asm_running_si(self, value):
+        self.engine.asm_running_si = value
+
+    @property
+    def _asm_pending(self):
+        return self.engine.asm_pending
+
+    @_asm_pending.setter
+    def _asm_pending(self, value):
+        self.engine.asm_pending = value
+
+    @property
+    def _run_active(self):
+        return self.engine.run_active
+
+    @_run_active.setter
+    def _run_active(self, value):
+        self.engine.run_active = value
+
+    @property
+    def _work_q(self):
+        return self.engine.work_q
+
+    # ------------------------------------------------------------------ #
+    # Toolbar
+    # ------------------------------------------------------------------ #
+    def _build_toolbar(self, parent):
+        bar = ttk.Frame(parent)
+        bar.pack(side="top", fill="x")
+        self.load_btn = ttk.Button(bar, text="Load config.json…",
+                                   command=self._load_config)
+        self.load_btn.pack(side="left", padx=(6, 2), pady=3)
+        self.restore_btn = ttk.Button(bar, text="Restore last",
+                                      command=self._restore_last)
+        self.restore_btn.pack(side="left", padx=2)
+        ttk.Checkbutton(bar, text="auto-save", variable=self.autosave_var,
+                        command=self._on_autosave_toggle).pack(side="left", padx=(10, 2))
+        self.autosave_label = ttk.Label(bar, text="", foreground="#555")
+        self.autosave_label.pack(side="left", padx=4)
+
+    def _build_statistics_panel(self):
+        """Which channels a feature is measured on, and with which reductions.
+
+        A derived channel is a Gaussian-derivative response computed on the base
+        raster; naming several sigmas on one row is the cross-product, so a
+        scale-space stack is one line rather than one row per (kind, sigma). They
+        are measure-only: the topology field is still `filters`, and the seeding
+        extremum is still located on it.
+        """
+        c = ttk.LabelFrame(self.left, text="5. Statistics channels")
+        c.pack(fill="x", padx=6, pady=4)
+
+        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
+        ttk.Checkbutton(row, text="base", variable=self.stat_base_var,
+                        command=self._on_stat_spec_change).pack(side="left")
+        ttk.Checkbutton(row, text="filtered", variable=self.stat_filtered_var,
+                        command=self._on_stat_spec_change).pack(side="left", padx=8)
+
+        for kind in config_io.DERIVED_CHANNEL_KINDS:
+            row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=1)
+            on = tk.BooleanVar(value=False)
+            sigmas = tk.StringVar(value="0.7, 1.5, 3.0")
+            ttk.Checkbutton(row, text=kind, variable=on, width=10,
+                            command=self._on_stat_spec_change).pack(side="left")
+            ttk.Label(row, text="sigmas:").pack(side="left")
+            entry = ttk.Entry(row, textvariable=sigmas, width=16)
+            entry.pack(side="left", padx=2)
+            # Commit on Enter / focus-out only: every keystroke would re-resolve
+            # the schema and rebuild the query dropdowns mid-typing.
+            entry.bind("<Return>", lambda e: self._on_stat_spec_change())
+            entry.bind("<FocusOut>", lambda e: self._on_stat_spec_change())
+            if kind == "hessian":
+                ttk.Label(row, text="(largest + smallest)").pack(side="left")
+            self.stat_kind_vars[kind] = (on, sigmas)
+
+        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=(4, 2))
+        ttk.Label(row, text="reductions:").pack(side="left")
+        for reduction in config_io.STAT_REDUCTIONS:
+            var = tk.BooleanVar(value=True)
+            self.stat_reduction_vars[reduction] = var
+            ttk.Checkbutton(row, text=reduction, variable=var,
+                            command=self._on_stat_spec_change).pack(side="left", padx=2)
+        ttk.Checkbutton(c, text="seeding extremum (ext_* per channel)",
+                        variable=self.stat_extremum_var,
+                        command=self._on_stat_spec_change).pack(anchor="w", padx=4)
+        self.stat_summary_var = tk.StringVar(value="")
+        ttk.Label(c, textvariable=self.stat_summary_var, foreground="#555",
+                  wraplength=330, justify="left").pack(anchor="w", padx=4, pady=(0, 3))
+        self._refresh_stat_summary()
+
+    def _apply_stat_state(self, state, setvar):
+        """Restore the `statistics` block into the panel's controls.
+
+        A config may name the same kind more than once (e.g. two `blur` entries
+        with different sigmas); the panel has one row per kind, so their sigma
+        lists are merged. That is lossless for what the panel can express and is
+        the only case where a reload does not reproduce the document verbatim.
+        """
+        channels = state.get("stat_channels")
+        if channels is None:
+            return
+        setvar(self.stat_base_var, any(c.get("kind") == "base" for c in channels))
+        setvar(self.stat_filtered_var, any(c.get("kind") == "filtered" for c in channels))
+        by_kind = {}
+        for card in channels:
+            kind = card.get("kind")
+            if kind in ("base", "filtered") or kind not in self.stat_kind_vars:
+                continue
+            for sigma in card.get("sigmas") or []:
+                by_kind.setdefault(kind, [])
+                if sigma not in by_kind[kind]:
+                    by_kind[kind].append(float(sigma))
+        for kind, (on, sigmas) in self.stat_kind_vars.items():
+            values = by_kind.get(kind)
+            setvar(on, bool(values))
+            if values:
+                setvar(sigmas, _format_sigmas(sorted(values)))
+
+        reductions = state.get("stat_reductions")
+        if reductions is not None:
+            for name, var in self.stat_reduction_vars.items():
+                setvar(var, name in reductions)
+        if state.get("stat_extremum") is not None:
+            setvar(self.stat_extremum_var, bool(state["stat_extremum"]))
+        self._chan_cache.clear()
+
+    def _refresh_channel_picker(self):
+        """Offer exactly the channels the current spec resolves to, keeping the
+        selection when it survives the change."""
+        combo = getattr(self, "background_combo", None)
+        if combo is None:
+            return
+        names = self._stat_channel_names()
+        # `filtered` is always displayable -- it is the topology field, whether or
+        # not a workflow also measures aggregates on it.
+        if "filtered" not in names:
+            names = names + ["filtered"]
+        try:
+            combo.config(values=names)
+        except tk.TclError:
+            return
+        if self.background_var.get() not in names:
+            self.background_var.set(names[0] if names else "base")
+
+    def _channel_raster(self, si, li, name, np):
+        """The named measurement channel for one slice, computed on demand.
+
+        Derived channels are not cached with the primed slice: twelve float32
+        rasters per slice would dominate a primed subsequence. They are cheap to
+        recompute for the one slice on screen, and the result is memoised per
+        (subsequence, slice, channel) so panning the persistence entry does not
+        redo it."""
+        # `primed` is a list indexed by subsequence, and a slice index can outrun
+        # a subsequence that was re-primed shorter, so both are bounds-checked:
+        # this runs from a render callback, where an IndexError surfaces as a
+        # Tkinter traceback rather than a failed call.
+        if si is None or si >= len(self.primed):
+            return None
+        p = self.primed[si]
+        if li is None or li >= len(p.get("base") or ()):
+            return None
+        if name in ("", "base"):
+            return p["base"][li]
+        if name == "filtered":
+            return p["filtered"][li]
+        key = (si, li, name)
+        hit = self._chan_cache.get(key)
+        if hit is not None:
+            return hit
+        try:
+            from msseg import mscoupon as engine
+        except Exception:
+            return p["base"][li]
+        if not hasattr(engine, "stat_channel_images"):
+            return p["base"][li]
+        try:
+            names, imgs = engine.stat_channel_images(
+                np.asarray(p["base"][li], dtype=np.float32),
+                np.asarray(p["filtered"][li], dtype=np.float32),
+                self._params_json())
+        except Exception as exc:
+            log(f"channel '{name}' unavailable: {exc}")
+            return p["base"][li]
+        names = list(names)
+        if name not in names:
+            return p["base"][li]
+        # Keep only the requested plane; holding all C would defeat the point.
+        raster = np.array(imgs[names.index(name)], copy=True)
+        if len(self._chan_cache) > 8:
+            self._chan_cache.clear()
+        self._chan_cache[key] = raster
+        return raster
+
+    def _refresh_stat_summary(self):
+        """Show the resolved channel count and field count -- the two numbers that
+        decide how wide every per-feature row is."""
+        try:
+            params = self._params_json()
+            n_ch = len(config_io.stat_channels(params))
+            n_fields = len(config_io.query_fields(params))
+        except Exception:
+            n_ch, n_fields = 0, 0
+        self.stat_summary_var.set(f"{n_ch} channels -> {n_fields} selectable fields")
+
+    def _on_stat_spec_change(self):
+        """The measurement spec changed: the field universe moved with it, so the
+        query cards and the channel pickers must be rebuilt, and anything primed
+        under the old spec is stale."""
+        self._chan_cache.clear()
+        self._refresh_stat_summary()
+        self._refresh_channel_picker()
+        self._rebuild_query_cards()
+        self._rebuild_pixel_cards()
+        self._mark_selection_dirty()
+
+    def _set_load_enabled(self, enabled):
+        """Gate Load/Restore on the priming worker.
+
+        The engine's "primed" event overwrites `self.primed` with no epoch guard, so a
+        load landing mid-run would leave a stack primed under the parameters the
+        load just replaced.
+        """
+        state = "normal" if enabled else "disabled"
+        for btn in (getattr(self, "load_btn", None), getattr(self, "restore_btn", None)):
+            if btn is not None:
+                try:
+                    btn.config(state=state)
+                except tk.TclError:
+                    pass
 
     # ------------------------------------------------------------------ #
     # Left panel
@@ -328,8 +514,11 @@ class MscouponApp:
         ttk.Label(row, text="Per-slice min area:").pack(side="left")
         ttk.Entry(row, textvariable=self.min_area_var, width=8).pack(side="left", padx=4)
 
-        # 4. Run
-        c = ttk.LabelFrame(self.left, text="5. Run")
+        # 5. Statistics channels
+        self._build_statistics_panel()
+
+        # 6. Run
+        c = ttk.LabelFrame(self.left, text="6. Run")
         c.pack(fill="x", padx=6, pady=4)
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="Cores/slice:").pack(side="left")
@@ -340,7 +529,7 @@ class MscouponApp:
         self.run_btn.pack(fill="x", padx=4, pady=4)
 
         # 5. Export
-        c = ttk.LabelFrame(self.left, text="6. Export")
+        c = ttk.LabelFrame(self.left, text="7. Export")
         c.pack(fill="x", padx=6, pady=4)
         ttk.Button(c, text="Export config.json…", command=self._export_config).pack(
             fill="x", padx=4, pady=4)
@@ -507,6 +696,16 @@ class MscouponApp:
             self.file_list.insert("end", os.path.basename(f))
         self.status_var.set(f"{len(self.all_files)} TIFFs in {folder}")
 
+    def _refresh_subseq_list(self):
+        """Repaint subseq_list from self.subsequences, which is the only writer.
+
+        The piecewise insert/delete the browser used to do has no inverse, and
+        loading a config replaces the whole list at once.
+        """
+        self.subseq_list.delete(0, "end")
+        for s in self.subsequences:
+            self.subseq_list.insert("end", s["name"])
+
     def _make_subsequence(self):
         sel = list(self.file_list.curselection())
         if not sel:
@@ -514,45 +713,41 @@ class MscouponApp:
         files = [self.all_files[i] for i in sel]
         name = f"seq{len(self.subsequences) + 1} ({len(files)})"
         self.subsequences.append({"name": name, "files": files})
-        self.subseq_list.insert("end", name)
+        self._refresh_subseq_list()
 
     def _remove_subsequence(self):
         sel = list(self.subseq_list.curselection())
         for i in reversed(sel):
             del self.subsequences[i]
-            self.subseq_list.delete(i)
+        self._refresh_subseq_list()
 
     def _clear_subsequences(self):
         self.subsequences.clear()
-        self.subseq_list.delete(0, "end")
+        self._refresh_subseq_list()
 
     # ------------------------------------------------------------------ #
     # Right panel
     # ------------------------------------------------------------------ #
     def _scale(self, parent, **kw):
-        """A ttk.Scale that jumps to the click/drag position (see _bind_click_to_value)."""
-        s = ttk.Scale(parent, **kw)
-        _bind_click_to_value(s)
-        return s
+        """A ttk.Scale that jumps to the click/drag position (see jump_scale)."""
+        return jump_scale(parent, **kw)
 
     @staticmethod
     def _scrolled_listbox(parent, **kw):
-        """A Listbox with a vertical scrollbar + mouse-wheel scrolling (production
-        folders have thousands of files)."""
-        frame = ttk.Frame(parent)
-        frame.pack(fill="x", padx=4, pady=2)
-        lb = tk.Listbox(frame, **kw)
-        sb = ttk.Scrollbar(frame, orient="vertical", command=lb.yview)
-        lb.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        lb.pack(side="left", fill="both", expand=True)
-        # "break" keeps the wheel here instead of also scrolling the left panel.
-        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):   # Button-4/5 = X11
-            lb.bind(seq, lambda e, w=lb: (w.yview_scroll(_wheel_delta(e), "units"), "break")[1])
-        return lb
+        return scrolled_listbox(parent, **kw)
 
     def _build_right(self):
-        self.render_frame = ttk.Frame(self.right)
+        # Three template methods so a subclass (the labeler) can replace the
+        # controls row or the live panel without touching the viewer area.
+        self._build_viewer_area(self.right)
+        self._build_image_controls(self.render_frame)
+        # hover readout (values under the cursor)
+        ttk.Label(self.render_frame, textvariable=self.hover_var, anchor="w",
+                  font=("TkFixedFont", 8)).pack(fill="x", padx=4)
+        self._build_live_panel(self.right)
+
+    def _build_viewer_area(self, parent):
+        self.render_frame = ttk.Frame(parent)
         self.render_frame.pack(side="top", fill="both", expand=True)
         self.canvas_holder = ttk.Frame(self.render_frame)
         self.canvas_holder.pack(fill="both", expand=True)
@@ -566,13 +761,18 @@ class MscouponApp:
             ttk.Label(self.canvas_holder,
                       text=f"(renderer unavailable: {exc})").pack(padx=8, pady=8)
 
-        # background image (base | filtered, drawn fully opaque) + overlay toggles
-        chan = ttk.Frame(self.render_frame); chan.pack(fill="x")
+    def _build_image_controls(self, parent):
+        # Background image, drawn fully opaque. A dropdown rather than two radios
+        # because every measurement channel is displayable -- looking at the
+        # scale-space response a query is thresholding is the point of having it.
+        chan = ttk.Frame(parent); chan.pack(fill="x")
         ttk.Label(chan, text="Image:").pack(side="left", padx=(4, 0))
         self.background_var = tk.StringVar(value="base")
-        for ch in ("base", "filtered"):
-            ttk.Radiobutton(chan, text=ch, variable=self.background_var, value=ch,
-                            command=self._refresh_render).pack(side="left", padx=4)
+        self.background_combo = ttk.Combobox(chan, textvariable=self.background_var,
+                                             values=["base", "filtered"], state="readonly",
+                                             width=18)
+        self.background_combo.pack(side="left", padx=4)
+        self.background_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_render())
         ttk.Label(chan, text="   Segmentation:").pack(side="left")
         # The four rasters are the pipeline's stages in order: every MSC region,
         # those surviving the per-slice selection, those after the pixel trim +
@@ -585,11 +785,8 @@ class MscouponApp:
         ttk.Checkbutton(chan, text="mask", variable=self.mask_var,
                         command=self._on_seg_source_change).pack(side="left", padx=(8, 4))
 
-        # hover readout (values under the cursor)
-        ttk.Label(self.render_frame, textvariable=self.hover_var, anchor="w",
-                  font=("TkFixedFont", 8)).pack(fill="x", padx=4)
-
-        live = ttk.LabelFrame(self.right, text="Live parameters")
+    def _build_live_panel(self, parent):
+        live = ttk.LabelFrame(parent, text="Live parameters")
         live.pack(side="bottom", fill="x", padx=6, pady=4)
 
         # slice slider (global, linearized over all subsequences)
@@ -653,6 +850,8 @@ class MscouponApp:
         self.rerun_btn.pack(fill="x", padx=4, pady=(2, 4))
 
     def _rebuild_query_cards(self):
+        if getattr(self, "queries_frame", None) is None:
+            return       # a subclass without the per-slice selection panel
         for w in list(self.queries_frame.winfo_children()):
             w.destroy()
         # Per-card labels showing "surviving before -> after" for that card, plus
@@ -670,17 +869,55 @@ class MscouponApp:
 
     def _query_fields(self):
         """Selectable statistic names, from the C++ schema so the dropdown offers
-        exactly what an exported config will validate against."""
-        return config_io.query_fields()
+        exactly what an exported config will validate against.
+
+        The live params JSON is passed, so switching a channel or a reduction on
+        changes what the dropdowns offer -- previously this asked for the DEFAULT
+        spec's fields and could never reflect the statistics block at all."""
+        return config_io.query_fields(self._params_json())
+
+    def _query_pickers(self):
+        """(channel order, reductions per channel) for the two-level field picker.
+
+        A twelve-channel stack is ~60 fields; one flat combobox of that length is
+        unusable, and the pair is how the fields are actually organised. The split
+        comes from the C++ schema rather than from parsing names, so `min_x` is
+        never read as the `min` reduction of a channel called `x`."""
+        return config_io.channels_and_reductions(self._params_json())
 
     def _build_query_card(self, idx, card):
         frame = ttk.Frame(self.queries_frame); frame.pack(fill="x", padx=2, pady=1)
-        field_var = tk.StringVar(value=card["field"])
-        combo = ttk.Combobox(frame, textvariable=field_var, values=[""] + self._query_fields(),
-                             state="readonly", width=13)
-        combo.pack(side="left", padx=1)
-        combo.bind("<<ComboboxSelected>>",
-                   lambda e, i=idx, v=field_var: self._on_query_field_change(i, v.get()))
+        order, by_channel = self._query_pickers()
+        channel, reduction = config_io.split_field(card["field"], self._params_json())
+        if not card["field"]:
+            channel, reduction = "", ""
+
+        chan_var = tk.StringVar(value=channel)
+        red_var = tk.StringVar(value=reduction)
+        chan_combo = ttk.Combobox(frame, textvariable=chan_var, values=[""] + order,
+                                  state="readonly", width=13)
+        chan_combo.pack(side="left", padx=1)
+        red_combo = ttk.Combobox(frame, textvariable=red_var,
+                                 values=by_channel.get(channel, []),
+                                 state="readonly", width=7)
+        red_combo.pack(side="left", padx=1)
+
+        def on_channel(_e=None, i=idx, cv=chan_var, rv=red_var, rc=red_combo):
+            choices = self._query_pickers()[1].get(cv.get(), [])
+            rc.config(values=choices)
+            # Keep the reduction if the new channel still offers it (switching
+            # sigma should not reset "max" back to nothing), else take the first.
+            if rv.get() not in choices:
+                rv.set(choices[0] if choices else "")
+            self._on_query_field_change(
+                i, config_io.compose_field(cv.get(), rv.get()) if cv.get() and rv.get() else "")
+
+        def on_reduction(_e=None, i=idx, cv=chan_var, rv=red_var):
+            self._on_query_field_change(
+                i, config_io.compose_field(cv.get(), rv.get()) if cv.get() and rv.get() else "")
+
+        chan_combo.bind("<<ComboboxSelected>>", on_channel)
+        red_combo.bind("<<ComboboxSelected>>", on_reduction)
         op_var = tk.StringVar(value=card["op"])
         op_var.trace_add("write", lambda *_, i=idx, v=op_var: self.query_cards[i].__setitem__("op", v.get()))
         ttk.Combobox(frame, textvariable=op_var, values=QUERY_OPS, state="readonly",
@@ -720,6 +957,8 @@ class MscouponApp:
 
     # -- pixel intensity trim cards ------------------------------------- #
     def _rebuild_pixel_cards(self):
+        if getattr(self, "pixels_frame", None) is None:
+            return       # a subclass without the pixel-trim panel
         for w in list(self.pixels_frame.winfo_children()):
             w.destroy()
         for idx, card in enumerate(self.pixel_cards):
@@ -816,151 +1055,53 @@ class MscouponApp:
             "filters": config_io.filters_to_json(self.filter_cards),
             "base_filters": config_io.filters_to_json(self.base_cards),
             "msc": msc,
+            # Drives which per-feature fields exist, so the query dropdown, the
+            # primed pipelines and an exported config all agree.
+            "statistics": config_io.statistics_to_json(
+                self._stat_channel_cards(), self._stat_reductions(),
+                self.stat_extremum_var.get(), radius),
         })
+
+    def _stat_channel_cards(self):
+        """The `statistics.channels[]` model, in slot order."""
+        cards = []
+        if self.stat_base_var.get():
+            cards.append({"kind": "base"})
+        if self.stat_filtered_var.get():
+            cards.append({"kind": "filtered"})
+        for kind, (on, sigmas) in self.stat_kind_vars.items():
+            if not on.get():
+                continue
+            values = _parse_sigmas(sigmas.get())
+            if values:
+                cards.append({"kind": kind, "sigmas": values})
+        return cards
+
+    def _stat_reductions(self):
+        return [r for r, v in self.stat_reduction_vars.items() if v.get()]
+
+    def _stat_channel_names(self):
+        """Resolved channel names for the current spec, for the pickers."""
+        try:
+            return [c["name"] for c in config_io.stat_channels(self._params_json())]
+        except Exception:
+            return ["base"]
 
     def _run(self):
         if not self.subsequences:
             messagebox.showinfo("mscoupon", "Define at least one subsequence first.")
             return
+        self._set_load_enabled(False)
         self.run_btn.config(state="disabled")
         self.status_var.set("Priming…")
         params = self._params_json()
         subseqs = [dict(s) for s in self.subsequences]
-        self._run_active = True
-        t = threading.Thread(target=self._run_worker, args=(subseqs, params), daemon=True)
-        t.start()
+        # The concurrency numbers ride along for the worker's log line, so it
+        # never reads Tk state off the UI thread.
+        self.engine.start_run(subseqs, params,
+                              {"cores_per_slice": self._cores_per_slice(),
+                               "concurrent_slices": self._concurrent_slices()})
         self._ensure_pump()
-
-    @staticmethod
-    def _apply_base_chain(arr, base_filters, engine, log):
-        """Run the base-channel chain, returning (raster, measured landmarks).
-
-        A `normalize` stage is measured here rather than inside
-        ``engine.filter_slice`` so the GUI can show the landmarks it resolved --
-        it is the same C++ measure and the same affine map, so the exported
-        config reproduces this exactly.
-        """
-        import numpy as np
-        from msseg.mscoupon.normalize import measure_two_point
-
-        cur = arr
-        measured = []
-        for i, f in enumerate(base_filters):
-            if f.get("operation") == "normalize":
-                params = dict(f.get("params", {}))
-                tp = measure_two_point(cur, **params)
-                cur = tp.apply(cur, clamp=bool(params.get("clamp", False)))
-                measured.append(tp)
-                log(f"  base[{i}] normalize({params.get('method', 'gmm')}) "
-                    f"-> low={tp.low:.6g} high={tp.high:.6g} "
-                    f"[{cur.min():.4g}, {cur.max():.4g}]")
-            else:
-                cur = engine.filter_slice(cur, json.dumps({"filter": f}))
-                log(f"  base[{i}] {f['operation']}({f.get('params', {})}) "
-                    f"-> min={cur.min():.4g} max={cur.max():.4g}")
-        return np.ascontiguousarray(cur, dtype=np.float32), measured
-
-    def _run_worker(self, subseqs, params):
-        try:
-            import numpy as np
-            from msseg import mscoupon as engine
-            from PIL import Image
-            p = json.loads(params)
-            filters = p.get("filters", [])
-            base_filters = p.get("base_filters", [])
-            msc = p.get("msc", {})
-            # Serial-MSC variant of the params, used as a graceful fallback if the
-            # linked MSCEER lacks the partitioned ComputeOptions surface.
-            msc_serial = {k: v for k, v in msc.items()
-                          if k not in ("compute_algorithm", "requested_parallelism")}
-            params_serial = json.dumps({"filters": filters, "msc": msc_serial})
-            use_serial = "compute_algorithm" not in msc
-            total = sum(len(s["files"]) for s in subseqs)
-            log("=" * 60)
-            log(f"RUN: {len(subseqs)} subsequence(s), {total} slices")
-            log(f"  filters: {[f['operation'] for f in filters] or ['(none)']}")
-            log(f"  base_filters: {[f['operation'] for f in base_filters] or ['(none)']}")
-            log(f"  msc: manifold={msc.get('manifold')} "
-                f"persistence_percent={msc.get('persistence_percent')} "
-                f"accurate={msc.get('accurate_ascending')} "
-                f"algorithm={msc.get('compute_algorithm', 'serial')} "
-                f"requested_parallelism={msc.get('requested_parallelism', 0)}")
-            # Concurrency picture: priming still walks slices serially in ONE daemon
-            # worker thread, but each slice's MSC (discrete gradient / partitioned
-            # construction / manifold labeling) runs cores/slice-way parallel inside
-            # MSCEER when compute_algorithm=partitioned. "Concurrent slices" (running
-            # whole slices at once) is honored by the exported CLI config, which has
-            # the full lane pipeline; the live GUI would additionally need the pybind
-            # bindings to release the GIL to overlap slices.
-            log(f"  concurrency: worker_thread={threading.current_thread().name!r} "
-                f"os.cpu_count={os.cpu_count()} "
-                f"cores/slice(MSC)={self._cores_per_slice()} "
-                f"concurrent_slices(export)={self._concurrent_slices()} "
-                f"scheduling=serial(1 slice at a time)")
-            done = 0
-            primed = []
-            for s in subseqs:
-                log(f"subsequence: {os.path.basename(s['files'][0])} .. "
-                    f"({len(s['files'])} slices)")
-                base_slices, filt_slices, pipes, norms = [], [], [], []
-                for path in s["files"]:
-                    t_slice = time.perf_counter()
-                    arr = np.asarray(Image.open(path), dtype=np.float32)
-                    if arr.ndim == 3:
-                        arr = arr.mean(axis=2).astype(np.float32)
-                    arr = np.ascontiguousarray(arr)
-                    t_load = time.perf_counter()
-                    log(f"slice {done + 1}/{total} {os.path.basename(path)}: "
-                        f"shape={arr.shape} min={arr.min():.4g} max={arr.max():.4g} "
-                        f"mean={arr.mean():.4g}")
-                    # Apply the filter chain step by step so each stage's params +
-                    # output range are logged (functionally == filter_chain).
-                    cur = arr
-                    for i, f in enumerate(filters):
-                        cur = engine.filter_slice(cur, json.dumps({"filter": f}))
-                        log(f"  filter[{i}] {f['operation']}({f.get('params', {})}) "
-                            f"-> min={cur.min():.4g} max={cur.max():.4g}")
-                    filt = np.ascontiguousarray(cur, dtype=np.float32)
-                    # Base channel: the raster statistics and pixel thresholds are
-                    # read from. Derived from the raw slice like `filters`, not
-                    # chained onto it, matching the C++ pipeline.
-                    base, slice_norms = self._apply_base_chain(arr, base_filters, engine, log)
-                    t_filter = time.perf_counter()
-                    if use_serial:
-                        pipe = engine.prime_slice(base, filt, params_serial)
-                    else:
-                        try:
-                            pipe = engine.prime_slice(base, filt, params)
-                        except RuntimeError as pe:
-                            msg = str(pe)
-                            if any(t in msg for t in ("BuilderMode", "ComputeOptions", "partitioned")):
-                                log(f"  WARN: partitioned MSC unavailable ({msg}); "
-                                    "falling back to serial MSC for remaining slices")
-                                use_serial = True
-                                pipe = engine.prime_slice(base, filt, params_serial)
-                            else:
-                                raise
-                    t_prime = time.perf_counter()
-                    n_at_build = len(pipe.feature_stats())
-                    log(f"  MSC primed: value_range={pipe.value_range():.4g} "
-                        f"regions@{msc.get('persistence_percent')}%={n_at_build}")
-                    log(f"  slice timings [thread={threading.current_thread().name!r}]: "
-                        f"load={1e3 * (t_load - t_slice):.0f}ms "
-                        f"filters={1e3 * (t_filter - t_load):.0f}ms "
-                        f"prime={1e3 * (t_prime - t_filter):.0f}ms "
-                        f"total={1e3 * (t_prime - t_slice):.0f}ms")
-                    base_slices.append(base); filt_slices.append(filt); pipes.append(pipe)
-                    norms.append(slice_norms)
-                    done += 1
-                    self._work_q.put(("progress", (done, total)))
-                primed.append({"files": s["files"], "base": base_slices,
-                               "filtered": filt_slices, "pipes": pipes,
-                               "normalizers": norms})
-            log(f"RUN complete: primed {total} slices")
-            self._work_q.put(("done", primed))
-        except Exception as exc:  # surfaced on the UI thread
-            log(f"ERROR: {exc}")
-            self._work_q.put(("error", exc))
 
     def _ensure_pump(self):
         """Start the work-queue pump if it isn't already running."""
@@ -969,33 +1110,29 @@ class MscouponApp:
             self.root.after(80, self._pump)
 
     def _pump(self):
-        try:
-            while True:
-                kind, payload = self._work_q.get_nowait()
-                self._handle_work(kind, payload)
-        except queue.Empty:
-            pass
+        for ev in self.engine.poll():
+            self._handle_event(ev)
         # Keep pumping while any async work (priming or assembly) is outstanding.
-        if self._run_active or self._asm_running or self._asm_pending is not None:
+        if self.engine.pending_work():
             self.root.after(80, self._pump)
         else:
             self._pump_started = False
 
-    def _handle_work(self, kind, payload):
+    def _handle_event(self, ev):
+        """UI half of one engine event (the engine bookkeeping already ran in
+        engine.poll())."""
+        kind = ev[0]
         if kind == "progress":
-            done, total = payload
+            done, total = ev[1]
             self.status_var.set(f"Priming slice {done}/{total}…")
         elif kind == "error":
-            self._run_active = False
             self.run_btn.config(state="normal")
-            self.status_var.set(f"Error: {payload}")
-            messagebox.showerror("mscoupon", str(payload))
-        elif kind == "done":
-            self._run_active = False
+            self._set_load_enabled(True)
+            self.status_var.set(f"Error: {ev[1]}")
+            messagebox.showerror("mscoupon", str(ev[1]))
+        elif kind == "primed":
             self.run_btn.config(state="normal")
-            self.primed = payload
-            self._assembly.clear()
-            self._slices.clear()
+            self._set_load_enabled(True)
             self._rebuild_flat_slices()
             self.status_var.set(f"Primed {len(self.primed)} subsequence(s), "
                                 f"{len(self.flat_slices)} slices.")
@@ -1003,8 +1140,8 @@ class MscouponApp:
             if cur is not None:
                 self._request_assembly(cur[0])   # off-thread; UI stays responsive
             self._refresh_render()
-        elif kind == "assembly":
-            self._on_assembly_done(*payload)
+        elif kind == "assembly_done":
+            self._on_assembly_done(ev[1], ev[2])
 
     def _rebuild_flat_slices(self):
         self.flat_slices = []
@@ -1128,14 +1265,12 @@ class MscouponApp:
         self._selection_dirty = False
         if getattr(self, "rerun_btn", None) is not None:
             self.rerun_btn.config(state="disabled")
-        self._commit_id += 1        # bumps the committed parameter generation
+        # Bumps the committed parameter generation and prunes the now-stale
+        # per-slice records (they are keyed by commit).
+        self.engine.commit_selection()
         cur = self._current()
         if cur is not None:
             self._request_assembly(cur[0])
-        # Cached per-slice records are keyed by commit, so they fall out of date
-        # automatically; drop them so memory does not grow one stack per Rerun.
-        self._slices = {k: v for k, v in self._slices.items()
-                        if v.get("commit") == self._commit_id}
         self._refresh_render()
 
     # -- assembly (off the UI thread; single-flight over the stateful pipes) --- #
@@ -1163,42 +1298,15 @@ class MscouponApp:
 
     def _slice_ready(self, si, li, level):
         """True iff slice `li` is cached at `level` for the current commit."""
-        rec = self._slices.get((si, li))
-        if rec is None or rec.get("commit") != self._commit_id:
-            return False
-        if level == "cc" and rec.get("cc") is None:
-            return False
-        if level == "global":
-            data = self._assembly.get(si)
-            return data is not None and data.get("_commit") == self._commit_id
-        return True
+        return self.engine.slice_ready(si, li, level)
 
-    def _request_assembly(self, si, level=None):
-        """Queue off-thread work for subsequence `si` at the current parameters.
-        Pipes are stateful (select_persistence mutates them), so only ONE worker
-        runs at a time; a newer request supersedes an in-flight one."""
-        if not self.primed or si is None:
-            return
-        cur = self._current()
-        li = cur[1] if cur is not None and cur[0] == si else 0
-        if level is None:
-            level = self._needed_level()
-        if self._slice_ready(si, li, level):
-            return                    # already have it at this tier
-        self._asm_token += 1
-        self._asm_pending = (self._asm_token, si, level, li)
-        self._launch_pending_assembly()
-        self._ensure_pump()
-        self._update_busy()
-
-    def _launch_pending_assembly(self):
-        if self._asm_running or self._asm_pending is None:
-            return
-        token, si, level, li = self._asm_pending
-        self._asm_pending = None
-        self._asm_running = True
-        self._asm_running_si = si
-        params = {
+    def _assembly_params(self, si, level, li):
+        """The parameter snapshot for one assembly work item. Called by the
+        engine on the UI thread when the item actually LAUNCHES, so the worker
+        measures against the spec the user had when they hit Rerun, not
+        whatever the panel says by the time it runs. The engine stamps
+        commit/level/li itself."""
+        return {
             "pct": self._persist_pct(),
             "queries": config_io.queries_to_json(self.query_cards),
             "pixels": config_io.pixel_filters_to_json(self.pixel_cards),
@@ -1206,15 +1314,30 @@ class MscouponApp:
             "min_area": self._min_area(),
             # Decides which side a 3D feature's seeding extremum comes from.
             "manifold": self.manifold_var.get(),
-            "commit": self._commit_id,
-            "level": level,
-            "li": li,
+            "json": self._params_json(),
+            "reductions": self._stat_reductions(),
+            "extremum": bool(self.stat_extremum_var.get()),
+            "name": self.subsequences[si]["name"],
         }
+
+    def _announce_assembly(self, si, level, li):
         what = self.subsequences[si]["name"]
         self.status_var.set(f"Assembling {what}…" if level == "global"
                             else f"Updating {what} [{li}]…")
-        threading.Thread(target=self._assemble_worker, args=(token, si, params),
-                         daemon=True).start()
+
+    def _request_assembly(self, si, level=None):
+        """Queue off-thread work for subsequence `si` at the current parameters
+        (see ComputeEngine.request_assembly for the single-flight semantics)."""
+        if not self.primed or si is None:
+            return
+        cur = self._current()
+        li = cur[1] if cur is not None and cur[0] == si else 0
+        if level is None:
+            level = self._needed_level()
+        launched = self.engine.request_assembly(si, li, level)
+        if launched is not None:
+            self._announce_assembly(*launched)
+        self._ensure_pump()
         self._update_busy()
 
     def _is_current_busy(self):
@@ -1239,153 +1362,11 @@ class MscouponApp:
         else:
             self.viewer.set_hud(None)
 
-    def _slice_result(self, si, li, params, engine, np, tm):
-        """Per-slice work for one slice: re-threshold, labels, stats, selection.
-        Returns the record cached in self._slices."""
-        p = self.primed[si]
-        pipe = p["pipes"][li]
-        pct, queries, min_area = params["pct"], params["queries"], params["min_area"]
-        qjson = json.dumps(queries)
-
-        # Re-thresholding is the dominant per-slice cost (MSCEER cancellation), and
-        # a Rerun triggered by a filter edit does not move persistence at all.
-        # Track what each pipe is already at and skip the no-op -- comparing the
-        # requested percentage rather than current_persistence(), because
-        # select_persistence clamps to the build-time cap, so a request above the
-        # cap would never compare equal.
-        applied = p.setdefault("_applied_pct", [None] * len(p["pipes"]))
-        t = time.perf_counter()
-        if applied[li] != pct:
-            pipe.select_persistence(pipe.value_range() * pct / 100.0)
-            applied[li] = pct
-        tm["persist"] += time.perf_counter() - t
-
-        t = time.perf_counter()
-        lab = np.asarray(pipe.labels())
-        tm["labels"] += time.perf_counter() - t
-
-        t = time.perf_counter()
-        stats = pipe.feature_stats()               # 2D region stats
-        sd = {int(f["feature_id"]): f for f in stats}
-        tm["stats"] += time.perf_counter() - t
-
-        t = time.perf_counter()
-        flags = engine.evaluate_queries(stats, qjson) if queries else [True] * len(stats)
-        kept = set()
-        for f, ok in zip(stats, flags):
-            if not ok:
-                continue
-            if min_area is not None and f.get("area", 0) < min_area:
-                continue
-            kept.add(int(f["feature_id"]))
-        tm["query"] += time.perf_counter() - t
-
-        return {"commit": params.get("commit", 0), "labels": lab, "stats": sd,
-                "kept": kept, "cc": None, "n_feat": len(stats)}
-
-    def _assemble_worker(self, token, si, params):
-        """Worker, tiered by params["level"] -- see _needed_level().
-
-        "slice"/"cc" touch only the visible slice; "global" does every slice and
-        the cross-slice assembly. Posts the result to the UI thread."""
-        try:
-            import numpy as np
-            from msseg import mscoupon as engine
-            from . import assembly as asm_mod
-            p = self.primed[si]
-            pct, queries = params["pct"], params["queries"]
-            pixels, conn = params["pixels"], params["connectivity"]
-            level, li0 = params["level"], params["li"]
-            ascending = params.get("manifold", "ascending") != "descending"
-            t0 = time.perf_counter()
-            # Per-stage wall clock. When a re-run feels slow the log has to say
-            # which stage owns it, not just the total.
-            tm = {"persist": 0.0, "labels": 0.0, "stats": 0.0, "query": 0.0, "rasters": 0.0}
-            name = self.subsequences[si]["name"]
-
-            if level != "global":
-                # --- cheap tiers: the visible slice only --------------------- #
-                rec = self._slice_result(si, li0, params, engine, np, tm)
-                if level == "cc":
-                    t = time.perf_counter()
-                    base = np.asarray(p["base"][li0], dtype=np.float32)
-                    filt = np.asarray(p["filtered"][li0], dtype=np.float32)
-                    tm["rasters"] += time.perf_counter() - t
-                    t = time.perf_counter()
-                    mask = asm_mod.selection_mask(rec["labels"], rec["kept"])
-                    mask = asm_mod.apply_pixel_filters(mask, base, filt, pixels)
-                    lbl, n = asm_mod.per_slice_cc(mask, conn)
-                    rec["cc"] = np.where(lbl > 0, lbl - 1, -1)
-                    tm["cc"] = time.perf_counter() - t
-                total = time.perf_counter() - t0
-                log(f"slice '{name}' [{li0}] level={level}: persistence={pct:.2f}% "
-                    f"selection={len(queries)} -> {len(rec['kept'])}/{rec['n_feat']} kept "
-                    f"({1e3 * total:.0f}ms)")
-                log("  stages: " + "  ".join(f"{k}={1e3 * v:.0f}ms"
-                                             for k, v in tm.items() if v > 0.0))
-                self._work_q.put(("assembly", (token, si, {"_level": level, "_li": li0,
-                                                           "_commit": params.get("commit", 0),
-                                                           "_slice": rec})))
-                return
-
-            # --- global: every slice + the cross-slice 3D assembly ----------- #
-            merged_labels, merged_stats, base_list, filt_list, kept_list = [], [], [], [], []
-            recs, n_feat = [], 0
-            for li in range(len(p["pipes"])):
-                rec = self._slice_result(si, li, params, engine, np, tm)
-                recs.append(rec)
-                n_feat += rec["n_feat"]
-                merged_labels.append(rec["labels"])
-                merged_stats.append(rec["stats"])
-                kept_list.append(rec["kept"])
-                t = time.perf_counter()
-                base_list.append(np.asarray(p["base"][li], dtype=np.float32))
-                filt_list.append(np.asarray(p["filtered"][li], dtype=np.float32))
-                tm["rasters"] += time.perf_counter() - t
-
-            t_sel = time.perf_counter()
-            asm_timing = {}
-            out = asm_mod.assemble_cc(merged_labels, kept_list, base_list, filt_list,
-                                      pixel_rules=pixels, connectivity=conn,
-                                      ascending=ascending, timing=asm_timing)
-            tm["assemble"] = time.perf_counter() - t_sel
-            out["merged_labels"] = merged_labels
-            out["merged_stats"] = merged_stats
-            out["kept_list"] = kept_list
-            out["_commit"] = params.get("commit", 0)
-            out["_level"] = "global"
-            # Hand back the per-slice records too, so navigating after a full
-            # assembly is free rather than re-deriving each slice on arrival.
-            out["_slices"] = recs
-            for li, rec in enumerate(recs):
-                rec["cc"] = out["cc_labels"][li]
-            total = time.perf_counter() - t0
-            log(f"assemble '{name}': persistence={pct:.2f}% "
-                f"conn={conn} selection={len(queries)} pixel_rules={len(pixels)} "
-                f"-> {out['n_global']} global features "
-                f"({1e3 * total:.0f}ms)")
-            log("  stages: " + "  ".join(f"{k}={1e3 * v:.0f}ms" for k, v in tm.items())
-                + f"   [{len(p['pipes'])} slices, {n_feat} features]")
-            if asm_timing:
-                log("  assemble: " + "  ".join(f"{k}={1e3 * v:.0f}ms"
-                                               for k, v in asm_timing.items()))
-            self._work_q.put(("assembly", (token, si, out)))
-        except Exception as exc:
-            log(f"ASSEMBLY ERROR: {exc}")
-            self._work_q.put(("assembly", (token, si, None)))
-
-    def _on_assembly_done(self, token, si, out):
-        self._asm_running = False
-        self._asm_running_si = None
-        if out is not None and token == self._asm_token:
-            if out.get("_level") == "global":
-                self._assembly[si] = out
-                # The global tier also produced every slice's record; cache them
-                # so navigating the stack afterwards needs no further work.
-                for li, rec in enumerate(out.pop("_slices", [])):
-                    self._slices[(si, li)] = rec
-            else:
-                self._slices[(si, out["_li"])] = out["_slice"]
+    def _on_assembly_done(self, si, accepted):
+        """UI half of an "assembly_done" event: the result (if accepted) is
+        already stored in the engine's caches; refresh the view if it concerns
+        the slice on screen, then let the engine start any superseding request."""
+        if accepted:
             cur = self._current()
             if cur is not None and cur[0] == si:
                 data = self._assembly.get(si)
@@ -1397,10 +1378,50 @@ class MscouponApp:
                     self.status_var.set(f"{self.subsequences[si]['name']} [{cur[1]}]: "
                                         f"{len(rec.get('kept', ()))} regions kept")
                 self._refresh_render()
-        self._launch_pending_assembly()   # process any newer request
+        launched = self.engine.launch_pending()   # process any newer request
+        if launched is not None:
+            self._announce_assembly(*launched)
         self._update_busy()               # clear the spinner if nothing is pending
 
     # -- rendering (reads only cached numpy rasters; never the live pipes) ---- #
+    def _seg_overlays(self, si, li, rec, data, np, min_colors):
+        """Build the overlay list for one slice (a subclass hook: the labeler
+        appends its class layer here).
+
+        Segmentation overlay: recolor the selected source's label raster by id.
+        MSC / MSC filtered / per-slice CC come from the per-slice cache, so they
+        render without the stack-wide 3D assembly ever running; only global CC
+        and the mask read `data`. `rec` and `data` are already commit-checked
+        (None when stale)."""
+        overlays = []
+        src = self.seg_source_var.get()
+        raster = None
+        if src == "msc" and rec is not None:
+            raster = rec["labels"]
+        elif src == "msc_kept" and rec is not None:
+            # The MSC regions that passed the per-slice selection, before the
+            # pixel trim and CC. Masked on the fly rather than cached: a LUT
+            # gather over the label raster is cheaper than holding another
+            # per-slice int32 raster for the whole stack.
+            from . import assembly as asm_mod
+            labels = rec["labels"]
+            keep = asm_mod.selection_mask(labels, rec["kept"])
+            raster = np.where(keep, labels, -1)
+        elif src == "cc" and rec is not None and rec.get("cc") is not None:
+            raster = rec["cc"]
+        elif src == "global" and data is not None:
+            raster = data["global_labels"][li]
+        if raster is not None:
+            overlays.append({"labels": raster, "lut": _id_lut(raster, min_colors, np),
+                             "visible": True})
+        if self.mask_var.get() and data is not None:
+            glob = data["global_labels"][li]                 # -1 bg, >=0 = kept feature
+            K = int(glob.max()) + 1 if glob.size else 1
+            mlut = np.zeros((max(K, 1), 4), np.uint8)
+            mlut[:, 0] = 255; mlut[:, 1] = 255; mlut[:, 3] = 255   # yellow where global>=0
+            overlays.append({"labels": glob, "lut": mlut, "visible": True})
+        return overlays
+
     def _refresh_render(self):
         self._update_persist_label()
         self._update_busy()
@@ -1427,48 +1448,33 @@ class MscouponApp:
             data = None               # stale 3D result: a Rerun superseded it
         self._hover_ctx = {"si": si, "li": li, "base": base, "filt": filt, "data": data}
 
-        # Segmentation overlay: recolor the selected source's label raster by id.
-        # MSC / MSC filtered / per-slice CC come from the per-slice cache, so they
-        # render without the stack-wide 3D assembly ever running; only global CC
-        # and the mask read `data`.
-        overlays = []
-        src = self.seg_source_var.get()
         rec = self._slices.get((si, li))
         if rec is not None and rec.get("commit") != self._commit_id:
             rec = None                    # stale: a Rerun superseded it
-        raster = None
-        if src == "msc" and rec is not None:
-            raster = rec["labels"]
-        elif src == "msc_kept" and rec is not None:
-            # The MSC regions that passed the per-slice selection, before the
-            # pixel trim and CC. Masked on the fly rather than cached: a LUT
-            # gather over the label raster is cheaper than holding another
-            # per-slice int32 raster for the whole stack.
-            from . import assembly as asm_mod
-            labels = rec["labels"]
-            keep = asm_mod.selection_mask(labels, rec["kept"])
-            raster = np.where(keep, labels, -1)
-        elif src == "cc" and rec is not None and rec.get("cc") is not None:
-            raster = rec["cc"]
-        elif src == "global" and data is not None:
-            raster = data["global_labels"][li]
-        if raster is not None:
-            overlays.append({"labels": raster, "lut": _id_lut(raster, min_colors, np),
-                             "visible": True})
-        if self.mask_var.get() and data is not None:
-            glob = data["global_labels"][li]                 # -1 bg, >=0 = kept feature
-            K = int(glob.max()) + 1 if glob.size else 1
-            mlut = np.zeros((max(K, 1), 4), np.uint8)
-            mlut[:, 0] = 255; mlut[:, 1] = 255; mlut[:, 3] = 255   # yellow where global>=0
-            overlays.append({"labels": glob, "lut": mlut, "visible": True})
+        overlays = self._seg_overlays(si, li, rec, data, np, min_colors)
 
         first = self.viewer._base is None and self.viewer._source is None
-        if self.background_var.get() == "filtered":
+        channel = self.background_var.get()
+        if channel == "filtered":
             self.viewer.set_base(array=filt, path=None)
             self.viewer.set_window(self.vmin_filt_var.get(), self.vmax_filt_var.get())
-        else:
+        elif channel in ("", "base"):
             self.viewer.set_base(array=base, path=p["files"][li])
             self.viewer.set_window(self.vmin_var.get(), self.vmax_var.get())
+        else:
+            # A derived scale-space channel: its range has nothing to do with the
+            # base channel's, so the window opens full rather than reusing either
+            # of the two hand-kept window pairs.
+            raster = self._channel_raster(si, li, channel, np)
+            if raster is None:
+                # The channel is not available for this slice (nothing primed yet,
+                # or an extension that cannot build it). Show the base rather than
+                # blanking the canvas.
+                self.viewer.set_base(array=base, path=p["files"][li])
+                self.viewer.set_window(self.vmin_var.get(), self.vmax_var.get())
+            else:
+                self.viewer.set_base(array=raster, path=None)
+                self.viewer.set_window(0.0, 1.0)
         self.viewer.set_overlays(overlays)
         self.viewer.set_alpha(self.alpha_var.get())
         if first:
@@ -1501,7 +1507,7 @@ class MscouponApp:
         stat2d = None
         if rec is not None:
             fid = int(rec["labels"][iy, ix])
-            stat2d = rec["stats"].get(fid)
+            stat2d = rec["stats"].row_of_feature(fid) if rec.get("stats") else None
             if rec.get("cc") is not None:
                 ccid = int(rec["cc"][iy, ix])
         if data is not None:
@@ -1534,12 +1540,12 @@ class MscouponApp:
         rec = self._slices.get((si, li))
         if rec is None or rec.get("commit") != self._commit_id:
             return None
-        rows = list(rec["stats"].values())
-        if not rows:
+        table = rec["stats"]
+        if table is None or not table.n_rows:
             return None
 
         active = [c for c in self.query_cards if c.get("field")]
-        counts = [len(rows)]
+        counts = [table.n_rows]
         if not active:
             return counts
         try:
@@ -1551,7 +1557,10 @@ class MscouponApp:
         # the CLI runs, so the numbers cannot disagree with a batch run.
         for k in range(1, len(active) + 1):
             qjson = json.dumps(config_io.queries_to_json(active[:k]))
-            flags = engine.evaluate_queries(rows, qjson)
+            if hasattr(engine, "evaluate_queries_table"):
+                flags = engine.evaluate_queries_table(table.names, table.values, qjson)
+            else:
+                flags = engine.evaluate_queries(table.rows(), qjson)
             counts.append(int(sum(1 for f in flags if f)))
         return counts
 
@@ -1592,8 +1601,12 @@ class MscouponApp:
         self.status_var.set(f"Wrote {len(paths)} config(s) to {out_dir}")
         messagebox.showinfo("mscoupon", "Exported:\n" + "\n".join(os.path.basename(p) for p in paths))
 
-    def _write_configs(self, out_dir):
-        """Write one config.json per subsequence; returns the written paths."""
+    def _config_for(self, files, output_folder, folder=None):
+        """The AppConfig dict for one file list.
+
+        Single source of truth for both the exported config_N.json and the
+        auto-saved session, so the two cannot drift apart.
+        """
         try:
             pct = float(self.persist_pct_var.get())
         except ValueError:
@@ -1604,28 +1617,352 @@ class MscouponApp:
                 min_area = int(self.min_area_var.get())
             except ValueError:
                 min_area = None
+        return config_io.build_config(
+            files=files,
+            output_folder=output_folder,
+            filters=self.filter_cards,
+            base_filters=self.base_cards,
+            persistence_percent=pct,
+            manifold=self.manifold_var.get(),
+            accurate=self.accurate_var.get(),
+            extremum_sample_radius=self._ext_radius(),
+            min_area=min_area,
+            feature_filters=self.query_cards,
+            pixel_filters=self.pixel_cards,
+            connectivity=self.connectivity_var.get(),
+            cores_per_slice=self._cores_per_slice(),
+            concurrent_slices=self._concurrent_slices(),
+            stat_channels=self._stat_channel_cards(),
+            stat_reductions=self._stat_reductions(),
+            stat_extremum=self.stat_extremum_var.get(),
+            folder=folder,
+        )
+
+    def _write_configs(self, out_dir):
+        """Write one config.json per subsequence; returns the written paths."""
         paths = []
         for i, s in enumerate(self.subsequences):
-            cfg = config_io.build_config(
-                files=s["files"],
-                output_folder=os.path.join(out_dir, f"out_{i}"),
-                filters=self.filter_cards,
-                base_filters=self.base_cards,
-                persistence_percent=pct,
-                manifold=self.manifold_var.get(),
-                accurate=self.accurate_var.get(),
-                extremum_sample_radius=self._ext_radius(),
-                min_area=min_area,
-                feature_filters=self.query_cards,
-                pixel_filters=self.pixel_cards,
-                connectivity=self.connectivity_var.get(),
-                cores_per_slice=self._cores_per_slice(),
-                concurrent_slices=self._concurrent_slices(),
-            )
+            cfg = self._config_for(s["files"], os.path.join(out_dir, f"out_{i}"))
             path = os.path.join(out_dir, f"config_{i}.json")
             config_io.dump_config(cfg, path)
             paths.append(path)
         return paths
+
+    # ------------------------------------------------------------------ #
+    # Load a config / restore the last session / auto-save
+    #
+    # All of this is best-effort. A config may be hand-edited, may name a folder
+    # that has since moved, or may predate a schema change, and none of that may
+    # raise inside a Tk callback -- there it surfaces as a traceback on stderr
+    # and a button that appeared to do nothing. Problems are collected as notes
+    # and shown in the status bar (in full via log()) rather than as dialogs: one
+    # dialog per skipped file in a 20-file multi-select is unusable.
+    # ------------------------------------------------------------------ #
+    _AUTOSAVE_MS = 4000
+
+    def _gui_state(self):
+        """The GUI-only half of a session: what AppConfig cannot express.
+
+        Carries no timestamp on purpose -- the auto-save decides whether to write
+        by comparing this text against the last text written, and a clock would
+        differ on every tick and write forever.
+        """
+        return {
+            "version": config_io.SESSION_VERSION,
+            "folder": self.folder,
+            "subsequences": [{"name": s["name"], "files": list(s["files"])}
+                             for s in self.subsequences],
+            "persist_live": self.persist_live_var.get(),
+            "seg_source": self.seg_source_var.get(),
+            "background": self.background_var.get(),
+            "mask": bool(self.mask_var.get()),
+            "alpha": float(self.alpha_var.get()),
+            "vmin": float(self.vmin_var.get()),
+            "vmax": float(self.vmax_var.get()),
+            "vmin_filt": float(self.vmin_filt_var.get()),
+            "vmax_filt": float(self.vmax_filt_var.get()),
+        }
+
+    def _session_state(self):
+        """A valid AppConfig for the FIRST subsequence -- so the saved session is
+        still `mscoupon --config`-runnable -- plus the GUI half under "_gui"."""
+        files = list(self.subsequences[0]["files"]) if self.subsequences else []
+        folder = self.folder or (os.path.dirname(files[0]) if files else ".")
+        cfg = self._config_for(files, os.path.join(folder, "out_0"), folder=folder)
+        return config_io.build_session(cfg, self._gui_state())
+
+    def _apply_state(self, state, gui=None, notes=None):
+        """Push a `config_io.config_to_state()` dict onto the widgets.
+
+        Each step is guarded on its own, so a value one widget rejects costs that
+        control and not the rest of the load.
+        """
+        gui = gui or {}
+        notes = notes if notes is not None else []
+
+        def setvar(var, value):
+            try:
+                var.set(value)
+            except (tk.TclError, ValueError, TypeError):
+                notes.append(f"ignored unusable value {value!r}")
+
+        # 1. Drop the compute state FIRST, before anything rebuilds against it:
+        # the parameters that produced it are being replaced, so every primed
+        # stack, cached slice, assembly and hover context is now stale.
+        # (engine.reset() leaves a running assembly worker running: its result
+        # lands as not-accepted via the bumped token, and the pipes are not
+        # re-entrant, so a second worker must not start beside it.)
+        self.engine.reset()
+        self._hover_ctx = None
+        self._selection_dirty = False
+
+        # 2. Scalars.
+        if state.get("manifold"):
+            setvar(self.manifold_var, state["manifold"])
+        setvar(self.accurate_var, bool(state.get("accurate")))
+        setvar(self.ext_radius_var, str(int(state.get("extremum_sample_radius") or 0)))
+        min_area = state.get("min_area")
+        setvar(self.min_area_var, "" if min_area is None else str(int(min_area)))
+        if state.get("connectivity"):
+            setvar(self.connectivity_var, int(state["connectivity"]))
+        if state.get("cores_per_slice"):
+            setvar(self.cores_per_slice_var, int(state["cores_per_slice"]))
+        if state.get("concurrent_slices"):
+            setvar(self.concurrent_slices_var, int(state["concurrent_slices"]))
+        # The cap and the live value are independent vars and _persist_pct clamps
+        # live against the cap, so restoring a 30% cap while live still read 10%
+        # would render at a threshold the config never asked for.
+        pct = state.get("persistence_percent")
+        if pct is not None:
+            setvar(self.persist_pct_var, f"{float(pct):g}")
+            setvar(self.persist_live_var, f"{float(pct):g}")
+        if gui.get("persist_live") is not None:
+            setvar(self.persist_live_var, str(gui["persist_live"]))
+
+        # 2b. The measurement spec, restored BEFORE the query cards: their
+        # dropdowns are generated from the field universe it defines, so
+        # rebuilding them first would offer the previous spec's channels.
+        self._apply_stat_state(state, setvar)
+
+        # 3./4. Card chains, each with the trailing add-row the GUI expects, then
+        # rebuilt in _build_left's order: the BASE rebuild is what resets
+        # _normalize_readouts, so running it first would leave the topo chain's
+        # readouts bound to destroyed widgets.
+        self.filter_cards = list(state.get("filters") or []) + [self._new_filter_card()]
+        self.base_cards = list(state.get("base_filters") or []) + [self._new_filter_card()]
+        self.query_cards = list(state.get("feature_filters") or []) + [self._new_query_card()]
+        self.pixel_cards = list(state.get("pixel_filters") or []) + [self._new_pixel_card()]
+        self._rebuild_filter_cards()
+        self._rebuild_filter_cards("base")
+        self._rebuild_query_cards()
+        self._rebuild_pixel_cards()
+        self._refresh_channel_picker()
+        self._refresh_stat_summary()
+
+        # 5. Input side. A folder that has moved is not fatal -- the subsequences
+        # carry absolute paths of their own.
+        folder = gui.get("folder") or state.get("folder") or ""
+        if folder and os.path.isdir(folder):
+            self._set_folder(folder)
+        elif folder:
+            notes.append(f"folder not found: {folder}")
+
+        # 6. Subsequences, resolved by the caller (it sees every document).
+        if state.get("subsequences") is not None:
+            self.subsequences = list(state["subsequences"])
+            self._refresh_subseq_list()
+
+        # 7. View state, all optional.
+        for key, var in (("alpha", self.alpha_var), ("vmin", self.vmin_var),
+                         ("vmax", self.vmax_var), ("vmin_filt", self.vmin_filt_var),
+                         ("vmax_filt", self.vmax_filt_var)):
+            if gui.get(key) is not None:
+                try:
+                    setvar(var, float(gui[key]))
+                except (TypeError, ValueError):
+                    notes.append(f"ignored {key}={gui[key]!r}")
+        if gui.get("seg_source"):
+            setvar(self.seg_source_var, str(gui["seg_source"]))
+        if gui.get("background"):
+            setvar(self.background_var, str(gui["background"]))
+        if gui.get("mask") is not None:
+            setvar(self.mask_var, bool(gui["mask"]))
+
+        # 8. Settle the UI. Nothing is primed, so Rerun has nothing to redo --
+        # the next step is Run.
+        self._rebuild_flat_slices()
+        try:
+            self.rerun_btn.config(state="disabled")
+            if not self._run_active:
+                self.run_btn.config(state="normal")
+        except tk.TclError:
+            pass
+        try:
+            self._update_busy()
+            self._refresh_render()
+        except Exception as exc:            # a stale render must not eat the load
+            log(f"redraw after load failed: {exc}")
+        return notes
+
+    def _apply_documents(self, docs, source):
+        """Apply already-parsed config documents: `[(path, doc_or_None), ...]`.
+
+        Parameters come from the FIRST readable document. Subsequences come from
+        the `_gui` half when a single session file carries them, and otherwise
+        one per document -- which is what makes a multi-select of the
+        `config_0..config_N` that Export wrote reconstruct all N stacks.
+        """
+        notes = []
+        good = []
+        for path, doc in docs:
+            if doc is None:
+                notes.append(f"could not read {os.path.basename(path)}")
+            else:
+                good.append((path, doc))
+        if not good:
+            for msg in notes:
+                log(msg)
+            self.status_var.set("Could not read any config; nothing changed.")
+            return
+
+        cfg0, gui0 = config_io.split_session(good[0][1])
+        state = config_io.config_to_state(cfg0, fields=self._query_fields(), notes=notes)
+
+        saved = gui0.get("subsequences")
+        if len(good) == 1 and isinstance(saved, list) and saved:
+            raw = [(s.get("name"), s.get("files")) for s in saved
+                   if isinstance(s, dict)]
+        else:
+            raw = []
+            for _path, doc in good:
+                cfg, _gui = config_io.split_session(doc)
+                one = config_io.config_to_state(cfg)
+                raw.append((None, one["files"]))
+
+        subs = []
+        for name, files in raw:
+            files = [f for f in (files or []) if isinstance(f, str) and f]
+            files = self._existing_files(files, len(subs) + 1, notes)
+            if not files:
+                notes.append(f"seq{len(subs) + 1}: no files found - skipped")
+                continue
+            subs.append({"name": name or f"seq{len(subs) + 1} ({len(files)})",
+                         "files": files})
+        state["subsequences"] = subs
+
+        self._apply_state(state, gui0, notes)
+        for msg in notes:
+            log(msg)
+        summary = f"Loaded {source}: {len(subs)} subsequence(s)"
+        if notes:
+            summary += " — " + "; ".join(notes[:2])
+            if len(notes) > 2:
+                summary += f" (+{len(notes) - 2} more, see the log)"
+        self.status_var.set(summary)
+
+    @staticmethod
+    def _existing_files(files, index, notes):
+        """Drop files that are no longer on disk.
+
+        When the containing folder itself is gone the per-file check is skipped:
+        stat()ing thousands of paths under a dead network share takes minutes,
+        and the answer is already known.
+        """
+        if not files:
+            return []
+        parent = os.path.dirname(files[0])
+        if parent and not os.path.isdir(parent):
+            notes.append(f"seq{index}: {parent} is not reachable - files kept as listed")
+            return list(files)
+        present = [f for f in files if os.path.isfile(f)]
+        if len(present) != len(files):
+            notes.append(f"seq{index}: {len(files) - len(present)} of {len(files)} "
+                         f"files missing")
+        return present
+
+    def _load_config(self):
+        if self._run_active:
+            self.status_var.set("Busy priming — wait for the run to finish.")
+            return
+        paths = filedialog.askopenfilenames(
+            title="Load config.json (multi-select = one subsequence per file)",
+            filetypes=[("Config JSON", "*.json"), ("All files", "*.*")])
+        paths = list(paths or [])
+        if not paths:
+            return
+        self._apply_documents([(p, config_io.read_json_file(p)) for p in paths],
+                              f"{len(paths)} config(s)")
+
+    def _restore_last(self):
+        if self._run_active:
+            self.status_var.set("Busy priming — wait for the run to finish.")
+            return
+        path = config_io.session_path(app=self.SESSION_APP)
+        doc = config_io.read_json_file(path)
+        if doc is None:
+            self.status_var.set(f"No saved session at {path}")
+            return
+        self._apply_documents([(path, doc)], "last session")
+
+    # -- auto-save ------------------------------------------------------ #
+    def _schedule_autosave(self):
+        if self._autosave_after is None:
+            try:
+                self._autosave_after = self.root.after(self._AUTOSAVE_MS,
+                                                       self._autosave_tick)
+            except tk.TclError:                 # window is going away
+                pass
+
+    def _autosave_tick(self):
+        self._autosave_after = None
+        try:
+            if self.autosave_var.get():
+                self._autosave_now()
+        except Exception as exc:      # a failed save must never stop the timer
+            log(f"auto-save skipped: {exc}")
+        self._schedule_autosave()
+
+    def _autosave_now(self):
+        """Write the session, but only when it actually differs.
+
+        Safe while a run or an assembly is in flight: this reads only state the
+        UI thread owns (subsequences, the card lists, the Tk vars) and never
+        primed/_slices/_assembly, which the workers write.
+        """
+        blob = config_io.serialize_session(self._session_state())
+        if blob == self._autosave_last:
+            return
+        if config_io.write_session_text(blob, config_io.session_path(app=self.SESSION_APP)):
+            self._autosave_last = blob
+            self.autosave_label.config(text=f"saved {time.strftime('%H:%M:%S')}")
+        else:
+            # Unwritable app-data directory: say so once and stop, rather than
+            # retrying every few seconds for the rest of the session.
+            self.autosave_label.config(text="auto-save unavailable")
+            self.autosave_var.set(False)
+
+    def _on_autosave_toggle(self):
+        if self.autosave_var.get():
+            try:
+                self._autosave_now()
+            except Exception as exc:
+                log(f"auto-save skipped: {exc}")
+        else:
+            self.autosave_label.config(text="auto-save off")
+
+    def _on_close(self):
+        try:
+            if self.autosave_var.get():
+                self._autosave_now()
+        except Exception as exc:
+            log(f"auto-save on close skipped: {exc}")
+        try:
+            if self._autosave_after is not None:
+                self.root.after_cancel(self._autosave_after)
+        except Exception:
+            pass
+        # The workers are daemon threads, so there is nothing to join.
+        self.root.destroy()
 
 
 # --------------------------------------------------------------------------- #
@@ -1646,7 +1983,9 @@ def _selftest():
     import tempfile
     root = tk.Tk()
     root.withdraw()
-    app = MscouponApp(root)
+    # autosave=False: this builds a real app, and a test must not overwrite the
+    # user's saved session.
+    app = MscouponApp(root, autosave=False)
 
     # Synthetic file browser state -> subsequence grouping.
     app.all_files = [f"/data/asdf_{i:04d}.tiff" for i in [11, 12, 13, 25, 26]]
@@ -1761,12 +2100,158 @@ def _selftest():
         sentinel = json.load(open(app._write_configs(d)[0]))
         assert sentinel["base_filters"][0]["params"]["omit_value"] == 43.0
 
+        # Session round-trip: loading what the viewer saved must put every
+        # control back, and re-exporting must reproduce the same config.
+        before = json.load(open(app._write_configs(d)[0]))
+        doc = app._session_state()
+        assert "_gui" in doc, "the session carries the GUI half"
+        assert len(doc["_gui"]["subsequences"]) == 2
+        cfg2, gui2 = config_io.split_session(doc)
+        assert "_gui" not in cfg2, "the wrapper must not leak into the AppConfig"
+
+        # Clobber every widget-backed value, then restore from the session.
+        app._clear_subsequences()
+        app.filter_cards = [app._new_filter_card()]; app._rebuild_filter_cards()
+        app.base_cards = [app._new_filter_card()]; app._rebuild_filter_cards("base")
+        app.query_cards = [app._new_query_card()]; app._rebuild_query_cards()
+        app.pixel_cards = [app._new_pixel_card()]; app._rebuild_pixel_cards()
+        app.persist_pct_var.set("99"); app.connectivity_var.set(26)
+        app.manifold_var.set("descending"); app.min_area_var.set("7")
+        app._apply_documents([(os.path.join(d, "last_session.json"), doc)], "test")
+
+        assert len(app.subsequences) == 2, app.subsequences
+        assert app.subseq_list.size() == 2, "the listbox must follow the model"
+        assert app.subsequences[0]["files"] == before["input"]["files"]
+        assert app.filter_cards[0]["operation"] == "blur"
+        assert app.filter_cards[0]["params"]["sigma"] == 2.0
+        assert app.filter_cards[-1]["operation"] == "none", "trailing add-card"
+        assert app.base_cards[0]["operation"] == "normalize"
+        assert app.base_cards[0]["params"]["omit_value"] == 43.0
+        assert app.base_cards[0]["params"]["low_from"] == "", "blank landmark stays blank"
+        assert app.base_cards[-1]["operation"] == "none"
+        assert app.query_cards[0]["field"] == "area"
+        assert app.query_cards[0]["value"] == 50.0
+        assert app.query_cards[-1]["field"] == ""
+        assert app.pixel_cards[0]["channel"] == "filtered"
+        assert app.pixel_cards[-1]["channel"] == ""
+        assert float(app.persist_pct_var.get()) == 10.0
+        assert app.manifold_var.get() == "ascending"
+        assert app.connectivity_var.get() == 6
+        assert app.min_area_var.get() == "", "a config without segments clears the gate"
+        # A load must leave no primed/assembly state behind -- the parameters
+        # that produced it were just replaced.
+        assert app.primed == [] and app.flat_slices == [] and not app._slices
+        assert app._asm_pending is None and app._selection_dirty is False
+        assert str(app.rerun_btn.cget("state")) == "disabled"
+
+        after = json.load(open(app._write_configs(d)[0]))
+        assert after == before, (before, after)
+
+        # A blank no-data sentinel must come back BLANK, not as the default 0.0.
+        app.base_cards[0]["params"]["omit_value"] = ""
+        doc_b = app._session_state()
+        cfg_b, gui_b = config_io.split_session(doc_b)
+        app._apply_state(config_io.config_to_state(cfg_b), gui_b)
+        assert app.base_cards[0]["params"]["omit_value"] == "",             app.base_cards[0]["params"]
+        app.base_cards[0]["params"]["omit_value"] = 43.0
+
+        # Junk must not raise into the mainloop, and an unreadable document must
+        # leave the state alone rather than half-applying it.
+        app._apply_state(config_io.config_to_state({"msc": "nonsense", "filters": 7}))
+        kept = [dict(s) for s in app.subsequences]
+        app._apply_documents([(os.path.join(d, "gone.json"), None)], "missing")
+        assert app.subsequences == kept, "a failed load changes nothing"
+        assert isinstance(config_io.session_path(), str) and config_io.session_path()
+
+        # Restore the chains the remaining checks below expect.
+        app.filter_cards = [{"operation": "blur", "params": {"sigma": 2.0}},
+                            app._new_filter_card()]
+
         # A workflow with no base chain must export exactly as it did before.
         app.base_cards = [app._new_filter_card()]
         plain = json.load(open(app._write_configs(d)[0]))
         assert "base_filters" not in plain
-    print("selftest OK: sequences, filters, base chain, assembly tiers, "
-          "per-slice selection, pixel trim, export")
+        # ... and neither does a workflow that never touched the statistics
+        # panel: the default spec is not emitted at all.
+        assert "statistics" not in plain, plain.get("statistics")
+
+        # --- measurement channels ---------------------------------------- #
+        # A scale-space stack: three sigmas x three kinds, hessian splitting into
+        # largest/smallest, so 3 + 3 + 6 derived channels on top of base.
+        app.stat_kind_vars["blur"][0].set(True)
+        app.stat_kind_vars["blur"][1].set("0.7, 1.5, 3.0")
+        app.stat_kind_vars["edges"][0].set(True)
+        app.stat_kind_vars["edges"][1].set("0.7, 1.5, 3.0")
+        app.stat_kind_vars["hessian"][0].set(True)
+        app.stat_kind_vars["hessian"][1].set("0.7, 1.5, 3.0")
+        app.stat_reduction_vars["std"].set(False)
+        cards = app._stat_channel_cards()
+        assert cards[0] == {"kind": "base"}, cards
+        assert {"kind": "blur", "sigmas": [0.7, 1.5, 3.0]} in cards, cards
+        assert app._stat_reductions() == ["mean", "min", "max"], app._stat_reductions()
+
+        block = json.loads(app._params_json())["statistics"]
+        assert block["reductions"] == ["mean", "min", "max"], block
+        assert "statistics" in json.load(open(app._write_configs(d)[0]))
+
+        # The spec must survive a session round trip -- the whole block used to
+        # be dropped on load except extremum_sample_radius.
+        doc_s = app._session_state()
+        cfg_s, gui_s = config_io.split_session(doc_s)
+        state_s = config_io.config_to_state(cfg_s)
+        assert state_s["stat_reductions"] == ["mean", "min", "max"], state_s
+        app.stat_kind_vars["blur"][0].set(False)          # perturb, then restore
+        app.stat_reduction_vars["std"].set(True)
+        app._apply_state(state_s, gui_s)
+        assert app.stat_kind_vars["blur"][0].get(), "blur channel restored"
+        assert app._stat_reductions() == ["mean", "min", "max"], app._stat_reductions()
+        assert _parse_sigmas(app.stat_kind_vars["hessian"][1].get()) == [0.7, 1.5, 3.0]
+
+        # The two-level picker must cover every field, and must not mistake the
+        # geometry columns for reductions of a channel.
+        order, by_channel = app._query_pickers()
+        assert config_io.GEOMETRY_CHANNEL in by_channel
+        assert "min_x" in by_channel[config_io.GEOMETRY_CHANNEL], by_channel
+        if "blur_s1.5" in by_channel:      # only with the extension built
+            assert "mean" in by_channel["blur_s1.5"], by_channel["blur_s1.5"]
+            assert config_io.compose_field("blur_s1.5", "mean") == "mean_blur_s1.5"
+            assert config_io.split_field("mean_blur_s1.5",
+                                         app._params_json()) == ("blur_s1.5", "mean")
+            fields = app._query_fields()
+            assert "mean_blur_s1.5" in fields and "std_blur_s1.5" not in fields, fields
+            # Every offered (channel, reduction) pair must name a real field.
+            for channel in order:
+                for reduction in by_channel[channel]:
+                    assert config_io.compose_field(channel, reduction) in fields
+
+        # The background dropdown resolves a channel NAME against the primed
+        # stack. `primed` is a list indexed by subsequence, and the render
+        # callback is the only caller -- so an accessor slip here shows up as a
+        # Tkinter traceback and a picture that never changes, not as an error.
+        import numpy as _np
+        saved_primed2 = app.primed
+        app.primed = []
+        assert app._channel_raster(0, 0, "base", _np) is None, "nothing primed -> None"
+        b0 = _np.full((4, 4), 1.0, _np.float32)
+        f0 = _np.full((4, 4), 2.0, _np.float32)
+        app.primed = [{"files": ["a.tif"], "base": [b0], "filtered": [f0],
+                       "pipes": [], "normalizers": []}]
+        assert app._channel_raster(0, 0, "base", _np) is b0
+        assert app._channel_raster(0, 0, "", _np) is b0, "blank name reads as base"
+        assert app._channel_raster(0, 0, "filtered", _np) is f0
+        assert app._channel_raster(1, 0, "base", _np) is None, "subsequence out of range"
+        assert app._channel_raster(0, 9, "base", _np) is None, "slice out of range"
+        # An unknown channel must degrade to the base raster, never to None: the
+        # renderer would otherwise blank the canvas.
+        assert app._channel_raster(0, 0, "no_such_channel", _np) is not None
+        app.primed = saved_primed2
+
+        # Restore the default spec so nothing below inherits a wide channel set.
+        for on, _sig in app.stat_kind_vars.values():
+            on.set(False)
+        app.stat_reduction_vars["std"].set(True)
+    print("selftest OK: sequences, filters, base chain, stat channels, assembly tiers, "
+          "per-slice selection, pixel trim, export, config load + session round-trip")
     root.destroy()
 
 

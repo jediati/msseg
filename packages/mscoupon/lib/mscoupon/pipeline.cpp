@@ -93,6 +93,8 @@ struct ProcessedSlice {
   // matcher links into 3D features, and the source for the CC / global label TIFFs.
   std::vector<int> cc_labels;               // -1 bg, 0..n-1
   std::vector<CcNodeStat> node_stats;       // per component
+  msseg::ChannelStats node_channels;        // per component, per measurement channel
+  std::vector<msseg::ResolvedStatChannel> channels;   // slot schema for node_channels
   int width = 0;
   int height = 0;
   StageTiming timing;
@@ -243,32 +245,63 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
                              : apply_filter_chain(loaded.original, cfg.base_filters,
                                                   &base_normalizers);
           Image2D filtered = apply_filter_chain(loaded.original, cfg.filters);
+
+          // The slice's measurement channels, built ONCE and shared by the MSC
+          // stage and the connected-component stage below. The derived
+          // scale-space responses collapse into a single diffg filter-bank
+          // traversal that shares its separable passes, which is what makes a
+          // multi-sigma stack affordable per slice.
+          const auto to_diffg = [](const Image2D& img) {
+            diffg::Image<float> out(diffg::Dimensions{
+                static_cast<std::size_t>(img.width), static_cast<std::size_t>(img.height), 1});
+            std::copy(img.pixels.begin(), img.pixels.end(), out.data());
+            return out;
+          };
+          diffg::ExecutionOptions bank_exec{};
+          bank_exec.threads = std::max(1, cfg.execution.threads_per_slice);
+          const diffg::Image<float> base_img = to_diffg(base);
+          const diffg::Image<float> filtered_img = to_diffg(filtered);
+          const msseg::StatChannelBank bank = msseg::build_stat_channels(
+              base_img, filtered_img, cfg.statistics.spec, bank_exec);
           loaded.timing.filter_ms = elapsed_ms(filter_start);
 
           // Merge-tree authoritative segmentation (same engine the GUI drives),
           // so an exported config reproduces the viewer's per-slice output.
           const auto msc_start = Clock::now();
           SliceSegmentation seg =
-              segment_slice_pipeline(base, filtered, cfg.msc, cfg.statistics.spec);
+              segment_slice_pipeline(base_img, filtered_img, cfg.msc, cfg.statistics.spec, bank);
           std::vector<int>& labels = seg.labels;
           loaded.timing.msc_ms = elapsed_ms(msc_start);
 
           const auto stats_start = Clock::now();
+          // The columnar per-feature statistics for this slice: one schema, one
+          // flat value block. Both the selection chain and the ext_* carry-over
+          // below read it, so the row is built once per feature per slice.
+          const FeatureTable feature_rows =
+              feature_table(seg.features, seg.feature_channels, seg.channels, cfg.statistics.spec);
+          const int ext_base_col = feature_rows.column("ext_base");
           SegmentTable table = compute_segment_table(base, labels, loaded.job.slice_index);
           // The CSV rows are accumulated over the base channel only; carry the
           // seeding critical point across from the MSC feature statistics so the
           // table reports the same ext_* the selection queries see.
           {
-            std::unordered_map<int, const msseg::Msc2DFeatureStat*> by_id;
-            by_id.reserve(seg.features.size() * 2);
-            for (const auto& f : seg.features) by_id.emplace(static_cast<int>(f.feature_id), &f);
+            std::unordered_map<int, std::size_t> row_of_id;
+            row_of_id.reserve(seg.features.size() * 2);
+            for (std::size_t i = 0; i < seg.features.size(); ++i) {
+              row_of_id.emplace(static_cast<int>(seg.features[i].feature_id), i);
+            }
             for (auto& row : table.rows) {
-              const auto it = by_id.find(row.segment_id);
-              if (it == by_id.end()) continue;   // background row (-1) has no extremum
-              row.ext_x = it->second->ext_x;
-              row.ext_y = it->second->ext_y;
-              row.ext_base = it->second->ext_base;
-              row.ext_filtered = it->second->ext_filtered;
+              const auto it = row_of_id.find(row.segment_id);
+              if (it == row_of_id.end()) continue;   // background row (-1) has no extremum
+              const msseg::Msc2DFeatureStat& f = seg.features[it->second];
+              row.ext_x = f.ext_x;
+              row.ext_y = f.ext_y;
+              row.ext_filtered = f.ext_filtered;
+              // ext_base only exists when `base` is a measurement channel.
+              row.ext_base = ext_base_col >= 0
+                                 ? static_cast<float>(feature_rows.at(
+                                       it->second, static_cast<std::size_t>(ext_base_col)))
+                                 : 0.0f;
             }
           }
           loaded.timing.stats_ms = elapsed_ms(stats_start);
@@ -279,10 +312,13 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
           // evaluator shared with the GUI).
           std::unordered_set<int> keep_ids = select_segment_ids(table, cfg.segments);
           if (!cfg.feature_filters.empty()) {
+            // Field names resolve to columns once for the whole slice, not once
+            // per feature.
+            const CompiledQueries compiled = compile_queries(feature_rows, cfg.feature_filters);
             std::unordered_set<int> pass;
-            for (const auto& f : seg.features) {
-              if (row_passes(feature_row(f, cfg.statistics.spec), cfg.feature_filters)) {
-                pass.insert(static_cast<int>(f.feature_id));
+            for (std::size_t i = 0; i < seg.features.size(); ++i) {
+              if (row_passes(feature_rows, i, compiled)) {
+                pass.insert(static_cast<int>(seg.features[i].feature_id));
               }
             }
             std::unordered_set<int> both;
@@ -294,11 +330,13 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
           // Pixel trim + per-slice connected components over the selected raster.
           std::vector<int> cc_labels;
           std::vector<CcNodeStat> node_stats;
+          msseg::ChannelStats node_channels;
           const int n_cc = label_selected_components(
               labels, base.width, base.height, base,
               filtered, keep_ids, cfg.pixel_filters, cfg.assembly.connectivity,
-              cfg.msc.manifold != "descending", cfg.statistics.spec,
-              cc_labels, node_stats);
+              cfg.msc.manifold != "descending", cfg.statistics.spec, bank,
+              seg.base_relevance_floor, seg.base_relevance_ceiling,
+              cc_labels, node_stats, node_channels);
           // Per-slice mask = the selected + trimmed CC foreground.
           Mask2D mask;
           mask.width = base.width;
@@ -349,6 +387,8 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
           processed.height = loaded.original.height;
           processed.cc_labels = std::move(cc_labels);
           processed.node_stats = std::move(node_stats);
+          processed.node_channels = std::move(node_channels);
+          processed.channels = seg.channels;
           processed.timing = loaded.timing;
           compute_out.push(std::move(processed));
         }
@@ -411,13 +451,14 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
     matcher_thread = std::thread([&]() {
       try {
         SliceMatcher matcher;
-        matcher.configure(cfg.statistics, cfg.msc.manifold != "descending");
+        matcher.configure(cfg.statistics, cfg.msc.manifold != "descending",
+                          msseg::resolve_stat_channels(cfg.statistics.spec));
         std::map<int, ProcessedSlice> pending;
         std::map<int, std::filesystem::path> global_path_of;   // slice -> global TIFF
         int expected = 0;
 
         auto consume = [&](ProcessedSlice&& ps) {
-          matcher.add_slice(ps.cc_labels, ps.width, ps.height, ps.node_stats,
+          matcher.add_slice(ps.cc_labels, ps.width, ps.height, ps.node_stats, ps.node_channels,
                             ps.job.slice_index, cfg.assembly.connectivity);
           global_path_of[ps.job.slice_index] = ps.job.global_label_output_path;
           write_queue.push(std::move(ps));
@@ -441,12 +482,12 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
         for (auto& kv : pending) consume(std::move(kv.second));
 
         std::vector<FeatureMapRow> map_rows;
-        std::vector<GlobalFeatureStat> global_rows;
+        GlobalFeatureTable global_table;
         // Relabel pass: per-slice GLOBAL id rasters (needs the resolved ids, so it
         // runs after finalize -- a late slice can retroactively merge earlier ids).
         // Each raster is written and dropped as it is produced; collecting them
         // first would hold the whole stack in RAM (~100 GB at 2500 slices).
-        matcher.finalize(map_rows, global_rows, [&](GlobalLabelRaster&& r) {
+        matcher.finalize(map_rows, global_table, [&](GlobalLabelRaster&& r) {
           if (!cfg.matching.write_global_labels) return;
           const auto it = global_path_of.find(r.slice_index);
           if (it != global_path_of.end()) {
@@ -454,8 +495,8 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
           }
         });
         write_feature_map_csv(cfg.output.folder / cfg.matching.map_template, map_rows);
-        write_global_table_csv(cfg.output.folder / cfg.matching.global_table_template, global_rows,
-                               cfg.statistics);
+        write_global_table_csv(cfg.output.folder / cfg.matching.global_table_template,
+                               global_table, cfg.statistics);
       } catch (...) {
         capture_error(std::current_exception());
       }

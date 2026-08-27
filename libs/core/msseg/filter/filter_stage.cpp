@@ -9,6 +9,7 @@
 #include "diffg/blur.hpp"
 #include "diffg/differentiator.hpp"
 #include "diffg/edges.hpp"
+#include "diffg/filter_bank.hpp"
 #include "diffg/hessian.hpp"
 #include "diffg/image.hpp"
 #include "diffg/labeling.hpp"
@@ -16,6 +17,7 @@
 #include "diffg/morphology.hpp"
 #include "diffg/options.hpp"
 #include "diffg/structure.hpp"
+#include "msseg/workflow/stat_channels.hpp"
 
 namespace msseg {
 namespace {
@@ -164,6 +166,75 @@ diffg::Image<float> apply_filter_chain(const diffg::Image<float>& input,
     current = apply_filter(current, filters[i]);
   }
   return current;
+}
+
+// --------------------------------------------------------------------------- //
+// Derived measurement channels (the scale-space stack).
+// --------------------------------------------------------------------------- //
+namespace {
+
+// One diffg request per (kind, sigma). A `hessian` request yields two output
+// channels, which is why the resolved list is walked in lockstep with the
+// request list rather than one-to-one.
+diffg::FilterRequest to_diffg_request(const ResolvedStatChannel& c) {
+  const diffg::Sigma sigma = diffg::Sigma::isotropic(c.sigma);
+  if (c.kind == "blur") return diffg::gaussian_filter(sigma);
+  if (c.kind == "gradmag" || c.kind == "edges") return diffg::gradient_magnitude_filter(sigma);
+  if (c.kind == "laplacian") return diffg::laplacian_filter(sigma);
+  if (c.kind == "hessian") return diffg::hessian_filter(sigma, c.sort_by_absolute_value);
+  throw std::runtime_error("Unknown derived statistics channel kind: '" + c.kind + "'.");
+}
+
+}  // namespace
+
+StatChannelBank build_stat_channels(const diffg::Image<float>& base,
+                                    const diffg::Image<float>& filtered,
+                                    const StatsSpec& spec,
+                                    const diffg::ExecutionOptions& exec) {
+  if (base.dims().width != filtered.dims().width ||
+      base.dims().height != filtered.dims().height ||
+      base.dims().depth != filtered.dims().depth) {
+    throw std::runtime_error("build_stat_channels: base and filtered dimensions differ.");
+  }
+
+  StatChannelBank bank;
+  bank.channels = resolve_stat_channels(spec);
+  bank.data.assign(bank.channels.size(), nullptr);
+
+  // Collect the derived slots, deduplicating requests: a `hessian` entry covers
+  // two consecutive resolved channels but is one diffg request.
+  std::vector<diffg::FilterRequest> requests;
+  std::vector<std::size_t> derived_slots;   // resolved index per derived output channel
+  for (std::size_t k = 0; k < bank.channels.size(); ++k) {
+    const ResolvedStatChannel& c = bank.channels[k];
+    if (c.kind == "base" || c.kind == "filtered") continue;
+    if (c.slot_in_request == 0) requests.push_back(to_diffg_request(c));
+    derived_slots.push_back(k);
+  }
+
+  if (!requests.empty()) {
+    diffg::FilterBankOptions options;
+    options.execution = exec;
+    const auto result =
+        diffg::apply_filter_bank(base.view(), requests, diffg::OutputShape::MultiChannel, options);
+    if (result.channel_count() != derived_slots.size()) {
+      throw std::runtime_error("build_stat_channels: filter bank returned " +
+                               std::to_string(result.channel_count()) + " channels, expected " +
+                               std::to_string(derived_slots.size()) + ".");
+    }
+    bank.derived = std::move(result.stacked);
+    for (std::size_t i = 0; i < derived_slots.size(); ++i) {
+      bank.data[derived_slots[i]] = bank.derived.channel_data(i);
+    }
+  }
+
+  // base/filtered are aliased last, after `derived` has stopped moving, so no
+  // pointer stored above can be invalidated by the move.
+  for (std::size_t k = 0; k < bank.channels.size(); ++k) {
+    if (bank.channels[k].kind == "base") bank.data[k] = base.data();
+    else if (bank.channels[k].kind == "filtered") bank.data[k] = filtered.data();
+  }
+  return bank;
 }
 
 }  // namespace msseg

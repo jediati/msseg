@@ -21,7 +21,14 @@ _EXPORTS = (
     "segment_slice",
     "prime_slice",
     "evaluate_queries",
+    "evaluate_queries_table",
     "feature_fields",
+    # The measurement-channel schema: what channels a spec resolves to, the
+    # per-column {name, channel, reduction} breakdown the GUI's pickers are built
+    # from, and the channel rasters its 3D assembly measures on.
+    "feature_schema",
+    "stat_channels",
+    "stat_channel_images",
     "fit_gmm",
     "measure_histogram",
     "measure_regions",

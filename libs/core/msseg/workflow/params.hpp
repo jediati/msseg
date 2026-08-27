@@ -3,6 +3,7 @@
 #include <array>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -25,6 +26,42 @@ struct FilterParams {
 // over the feature's pixels but a single distinguished pixel of it.
 enum class Reduction { Mean, Min, Max, Std, Sample };
 
+// One requested measurement channel, before expansion.
+//
+// `base` and `filtered` are the two rasters the pipeline already builds. Every
+// other kind is a DERIVED channel: a Gaussian-derivative response computed off
+// the BASE raster (i.e. after `base_filters`, so it reads in normalized units
+// whenever normalization is on). Derived channels are measure-only -- they are
+// never the topology field the MSC runs on, and never define the seeding
+// extremum; see the role note on Msc2DPipeline::build.
+//
+// `sigmas` is a cross-product: one request with three sigmas expands to three
+// channels (six for `hessian`, which yields two eigenvalues in 2D). Naming the
+// scales in one entry is how a scale-space stack is actually specified, and it
+// is also what lets the whole set collapse into a single diffg filter-bank
+// traversal that shares its separable passes.
+struct StatChannelRequest {
+  // "base" | "filtered" | "blur" | "edges" | "gradmag" | "laplacian" | "hessian"
+  std::string kind = "base";
+  // Empty for base/filtered (they take no scale); required otherwise.
+  std::vector<double> sigmas;
+  // `hessian` only. With true (diffg's default) the eigenvalues are ordered by
+  // magnitude, so "largest"/"smallest" mean largest/smallest |lambda|.
+  bool sort_by_absolute_value = true;
+  // Optional name prefix, replacing the generated one (e.g. "blur" -> "sharp").
+  std::string name;
+};
+
+// One channel after expansion: a stable name plus how to produce it. Resolved
+// once per run, so the hot loops index channels by SLOT and never by name.
+struct ResolvedStatChannel {
+  std::string name;           // "base", "filtered", "blur_s0.7", "hess_largest_s3"
+  std::string kind;           // the request kind it came from
+  double sigma = 0.0;         // 0 for base/filtered
+  int slot_in_request = 0;    // hessian: 0 = largest, 1 = smallest
+  bool sort_by_absolute_value = true;
+};
+
 // Aggregate reductions on the channels a workflow actually reads.
 //
 // The filtered channel defaults OFF: its aggregates (mean/min/max/std of the
@@ -36,8 +73,17 @@ enum class Reduction { Mean, Min, Max, Std, Sample };
 struct StatsSpec {
   bool base_channel = true;
   bool filtered_channel = false;
+  // Derived measurement channels, in config order. Empty (the default) is
+  // exactly the pre-existing two-channel behaviour.
+  std::vector<StatChannelRequest> derived;
   bool mean = true, min = true, max = true, std = true;
   bool extremum = true;
+  // Experimental merge-tree-inspired contrast on the base channel. The slice
+  // range used to shift values positive is selected by these percentiles:
+  // 0/100 means the absolute finite min/max; 1/99 gives a robust range.
+  bool relevance = true;
+  double relevance_low_percentile = 0.0;
+  double relevance_high_percentile = 100.0;
   // Radius (in pixels) of the square window used to sample the BASE channel at
   // the seeding extremum. 0 => the single critical pixel; r > 0 => the mean over
   // the (2r+1)^2 window, clamped at the image border, trading the exact critical

@@ -5,29 +5,6 @@
 #include <limits>
 
 namespace mscoupon {
-namespace {
-
-// Base-channel value at the seeding extremum: the single pixel for radius 0, or
-// the mean over the clamped (2r+1)^2 window. Mirrors the core's sampler so the
-// 3D extremum reads the same way the 2D one does.
-float sample_base(const Image2D& base, int width, int height, int px, int py, int radius) {
-  const auto at = [&](int x, int y) {
-    return base.pixels[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
-                       static_cast<std::size_t>(x)];
-  };
-  if (radius <= 0) return at(px, py);
-  const int x0 = std::max(0, px - radius), x1 = std::min(width - 1, px + radius);
-  const int y0 = std::max(0, py - radius), y1 = std::min(height - 1, py + radius);
-  double sum = 0.0;
-  int n = 0;
-  for (int y = y0; y <= y1; ++y) {
-    for (int x = x0; x <= x1; ++x) { sum += at(x, y); ++n; }
-  }
-  return n > 0 ? static_cast<float>(sum / n) : at(px, py);
-}
-
-}  // namespace
-
 bool pixel_predicate(float value, const std::string& op, double threshold) {
   const double v = static_cast<double>(value);
   if (op == "lt") return v < threshold;
@@ -43,8 +20,12 @@ int label_selected_components(const std::vector<int>& labels, int width, int hei
                               const std::vector<PixelFilter>& pixel_filters,
                               int connectivity, bool ascending,
                               const msseg::StatsSpec& stats,
+                              const msseg::StatChannelBank& bank,
+                              float base_relevance_floor,
+                              float base_relevance_ceiling,
                               std::vector<int>& cc_out,
-                              std::vector<CcNodeStat>& stats_out) {
+                              std::vector<CcNodeStat>& stats_out,
+                              msseg::ChannelStats& channels_out) {
   const std::size_t n_pix = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
 
   // 1. keep mask = selected region AND passes every pixel-filter rule.
@@ -94,14 +75,14 @@ int label_selected_components(const std::vector<int>& labels, int width, int hei
 
   // 3. per-component statistics from the actual pixel sets.
   const msseg::StatsSpec& spec = stats;
-  const bool want_base_sums = spec.base_channel && (spec.mean || spec.std);
-  const bool want_filt_sums = spec.filtered_channel && (spec.mean || spec.std);
   const bool want_filt_extent = spec.needs_filtered_extent();
+  const std::vector<const float*>& chan = bank.data;
 
   stats_out.assign(static_cast<std::size_t>(n_comp), CcNodeStat{});
+  channels_out.reset(static_cast<std::size_t>(n_comp), bank.size(), spec);
   for (auto& s : stats_out) {
-    s.base_min = std::numeric_limits<float>::max();
-    s.base_max = std::numeric_limits<float>::lowest();
+    s.base_relevance_floor = base_relevance_floor;
+    s.base_relevance_ceiling = base_relevance_ceiling;
     if (want_filt_extent) {
       s.filt_min = std::numeric_limits<float>::max();
       s.filt_max = std::numeric_limits<float>::lowest();
@@ -114,23 +95,18 @@ int label_selected_components(const std::vector<int>& labels, int width, int hei
     const int c = cc_out[i];
     if (c < 0) continue;
     CcNodeStat& s = stats_out[static_cast<std::size_t>(c)];
-    const float b = base.pixels[i];
     const int x = static_cast<int>(i) % width;
     const int y = static_cast<int>(i) / width;
     s.area += 1;
-    if (want_base_sums) { s.base_sum += b; s.base_sumsq += static_cast<double>(b) * b; }
-    s.base_min = std::min(s.base_min, b); s.base_max = std::max(s.base_max, b);
-    if (want_filt_sums || want_filt_extent) {
+    channels_out.add(static_cast<std::size_t>(c), i, chan);
+    if (want_filt_extent) {
       const float f = filtered.pixels[i];
-      if (want_filt_sums) { s.filt_sum += f; s.filt_sumsq += static_cast<double>(f) * f; }
-      if (want_filt_extent) {
-        if (ascending) {
-          if (f < s.filt_min) { s.filt_min = f; arg_ext[static_cast<std::size_t>(c)] = i; }
-          s.filt_max = std::max(s.filt_max, f);
-        } else {
-          if (f > s.filt_max) { s.filt_max = f; arg_ext[static_cast<std::size_t>(c)] = i; }
-          s.filt_min = std::min(s.filt_min, f);
-        }
+      if (ascending) {
+        if (f < s.filt_min) { s.filt_min = f; arg_ext[static_cast<std::size_t>(c)] = i; }
+        s.filt_max = std::max(s.filt_max, f);
+      } else {
+        if (f > s.filt_max) { s.filt_max = f; arg_ext[static_cast<std::size_t>(c)] = i; }
+        s.filt_min = std::min(s.filt_min, f);
       }
     }
     s.min_x = std::min(s.min_x, x); s.max_x = std::max(s.max_x, x);
@@ -147,8 +123,13 @@ int label_selected_components(const std::vector<int>& labels, int width, int hei
       s.ext_x = static_cast<float>(x);
       s.ext_y = static_cast<float>(y);
       s.ext_filtered = ascending ? s.filt_min : s.filt_max;
-      s.ext_base = sample_base(base, width, height, x, y, spec.extremum_sample_radius);
+      channels_out.sample_ext(c, x, y, width, height, spec.extremum_sample_radius, chan);
     }
+  }
+  // Components with no pixels would otherwise carry +/-FLT_MAX sentinels into
+  // the cross-slice merge and out to the global CSV.
+  for (std::size_t c = 0; c < static_cast<std::size_t>(n_comp); ++c) {
+    if (stats_out[c].area == 0) channels_out.clear_region(c);
   }
   return n_comp;
 }

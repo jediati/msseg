@@ -194,7 +194,10 @@ workflow does not ask for is not accumulated and does not become a field:
 
 ```jsonc
 "statistics": {
-  "channels": ["base"],                     // "filtered" opts its aggregates back in
+  "channels": [ "base",                     // "filtered" opts its aggregates back in
+                { "kind": "blur",    "sigmas": [0.7, 1.5, 3.0] },
+                { "kind": "edges",   "sigmas": [0.7, 1.5, 3.0] },
+                { "kind": "hessian", "sigmas": [0.7, 1.5, 3.0] } ],
   "reductions": ["mean", "min", "max", "std"],
   "extremum": true, "extremum_sample_radius": 0,
   "per_slice": { "quantities": ["area", "bbox_w", "bbox_h"],
@@ -211,8 +214,57 @@ schema, and the GUI dropdown is generated from it, so there is no hand-kept mirr
 to drift — the previous `QUERY_FIELDS` literal survives only as a headless
 fallback.
 
-**3D features now carry a seeding extremum** (`ext_x/y/z`, `ext_base`,
-`ext_filtered` on `GlobalFeatureStat`). Each per-slice CC node derives its own
+**A measurement channel is a scale-space response, not just base-or-filtered.**
+A bare string names one of the two rasters the pipeline already builds; an object
+names a **derived** channel (`blur`/`edges`/`gradmag`/`laplacian`/`hessian`),
+whose `sigmas` list is a cross-product — so the block above is twelve derived
+channels (`hessian` yields `hessian_largest_s1.5` *and* `hessian_smallest_s1.5`
+per sigma) plus `base`, giving fields like `mean_blur_s0.7`,
+`max_hessian_smallest_s3`, `ext_edges_s1.5`. Sigma renders with `%g`, so `3.0`
+becomes `s3`. The point is discrimination the intensity alone cannot give: a real
+void and a shallow dip inside metal can share a `mean_base` but not a curvature
+signature across scales. This per-feature vector is meant to become the design
+matrix for a later material/air model fit, which is why the row is columnar.
+
+Derived channels are **measure-only** — `filters` is still the sole topology
+field, and the seeding extremum is still located on it — and they are computed on
+the **base** raster (post-`base_filters`), so a normalized workflow measures them
+in normalized units. They resolve once per run
+(`msseg::resolve_stat_channels`, `libs/core/msseg/workflow/stat_channels.cpp`) and
+are materialized in ONE `diffg::apply_filter_bank` traversal that shares its
+separable passes: ~1 s/slice for twelve channels on 3232², against ~4 s for the
+MSC. `Msc2DPipeline::build` takes an optional caller-owned bank so the CLI's
+connected-component stage measures the same rasters without a second traversal,
+while the GUI passes none and frees them as soon as the per-manifold cells exist.
+
+**Per-channel aggregates live in a flat side table, not in the stat structs.**
+`msseg::ChannelStats` (`libs/core/msseg/compute/channel_stats.hpp`) is a
+region-major `n_regions × n_channels` array of `{sum, sumsq, min, max}` plus the
+per-channel value at the seeding extremum — the `PerSliceAcc` shape from
+`matcher.cpp`, one dimension up. `Msc2DFeatureStat`, `CcNodeStat` and
+`GlobalFeatureStat` keep only what is *not* a measurement (bbox, the extremum's
+position, and `filt_min`/`filt_max`, which locate it whether or not `filtered` is
+measured). Channels are addressed by **slot**, resolved once per run; nothing
+hashes a string inside a pixel loop. Adding a statistic used to mean editing four
+parallel structs, two hand-synced CSV column sequences and a numpy mirror — the
+`relevance_base` change touched 17 files; twelve channels × four reductions is not
+reachable that way.
+
+**The per-feature row is columnar** (`mscoupon::FeatureTable`): the schema once,
+then `n_rows × n_fields` doubles, row-major. `feature_schema()` returns
+`{name, channel, reduction}` per column, so the GUI builds two-level
+`[channel][reduction]` pickers without parsing `mean_blur_s0.7` — and without
+mistaking `min_x` for the `min` reduction of a channel `x`. `pipe.feature_table()`
+crosses pybind as `(names, (n, f) float64)` instead of a dict per feature, and
+`compile_queries` resolves field names to column indices once per slice rather
+than per feature. `global_segments.csv`'s header AND values now come from that one
+projection, so they cannot drift; an empty derived list reproduces the previous
+header byte-for-byte (`ext_base` still precedes `ext_filtered`). The per-slice
+`{stem}_segments.csv` keeps its own spec-blind `SegmentStat` rescan — unchanged,
+as `relevance_base` left it.
+
+**3D features now carry a seeding extremum** (`ext_x/y/z` and `ext_filtered` on
+`GlobalFeatureStat`, plus every channel sampled there in its `ChannelStats`). Each per-slice CC node derives its own
 from its pixels — argmin (asc) / argmax (dsc) of the filtered field, the same rule
 as 2D — rather than inheriting the MSC feature's: a CC node has no MSC identity
 left (the mask is a union of kept features) and the pixel trim runs first, so an

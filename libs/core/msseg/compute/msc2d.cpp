@@ -13,6 +13,7 @@
 
 #include "msc_2d_lib.h"
 
+#include "msseg/filter/filter_stage.hpp"
 #include "msseg/graph/msc_graph.hpp"
 
 namespace msseg {
@@ -126,9 +127,33 @@ std::vector<int> compute_msc2d_labels(const diffg::Image<float>& filtered, const
 // --------------------------------------------------------------------------- //
 namespace {
 
-// Merge two manifold statistics. The extremum fields (ext_*) are deliberately
-// NOT merged here: a living feature inherits the surviving critical point, which
-// select_persistence() stamps from the surviving base manifold afterwards.
+double percentile_linear(std::vector<double>& values, double q) {
+  const std::size_t n = values.size();
+  if (n == 0) return 0.0;
+  if (n == 1) return values[0];
+  const double h = static_cast<double>(n - 1) * (q / 100.0);
+  std::size_t lo = static_cast<std::size_t>(std::floor(h));
+  std::size_t hi = static_cast<std::size_t>(std::ceil(h));
+  hi = std::min(hi, n - 1);
+  lo = std::min(lo, hi);
+  std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(lo),
+                   values.end());
+  const double a = values[lo];
+  double b = a;
+  if (hi != lo) {
+    std::nth_element(values.begin() + static_cast<std::ptrdiff_t>(lo) + 1,
+                     values.begin() + static_cast<std::ptrdiff_t>(hi), values.end());
+    b = values[hi];
+  }
+  return a + (b - a) * (h - static_cast<double>(lo));
+}
+
+// Merge two manifolds' geometry + extremum machinery. The per-channel aggregates
+// are merged separately, by ChannelStats::merge_region, because they live in a
+// flat table rather than in this struct. The extremum fields (ext_*) are
+// deliberately NOT merged in either place: a living feature inherits the
+// surviving critical point, which select_persistence() stamps from the surviving
+// base manifold afterwards.
 void accumulate(Msc2DFeatureStat& dst, const Msc2DFeatureStat& src) {
   if (src.area == 0) return;
   if (dst.area == 0) {
@@ -138,40 +163,12 @@ void accumulate(Msc2DFeatureStat& dst, const Msc2DFeatureStat& src) {
     return;
   }
   dst.area += src.area;
-  dst.base_sum += src.base_sum;
-  dst.base_sumsq += src.base_sumsq;
-  dst.base_min = std::min(dst.base_min, src.base_min);
-  dst.base_max = std::max(dst.base_max, src.base_max);
-  dst.filt_sum += src.filt_sum;
-  dst.filt_sumsq += src.filt_sumsq;
   dst.filt_min = std::min(dst.filt_min, src.filt_min);
   dst.filt_max = std::max(dst.filt_max, src.filt_max);
   dst.min_x = std::min(dst.min_x, src.min_x);
   dst.min_y = std::min(dst.min_y, src.min_y);
   dst.max_x = std::max(dst.max_x, src.max_x);
   dst.max_y = std::max(dst.max_y, src.max_y);
-}
-
-// Sample the base channel around (px, py). `radius <= 0` reads the single pixel;
-// otherwise the mean over the (2*radius+1)^2 window, clamped at the border.
-float sample_base(const diffg::Image<float>& base, int width, int height, int px, int py,
-                  int radius) {
-  px = std::clamp(px, 0, width - 1);
-  py = std::clamp(py, 0, height - 1);
-  const auto at = [&](int x, int y) {
-    return base.data()[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
-                       static_cast<std::size_t>(x)];
-  };
-  if (radius <= 0) return at(px, py);
-  double sum = 0.0;
-  int n = 0;
-  for (int y = std::max(0, py - radius); y <= std::min(height - 1, py + radius); ++y) {
-    for (int x = std::max(0, px - radius); x <= std::min(width - 1, px + radius); ++x) {
-      sum += at(x, y);
-      ++n;
-    }
-  }
-  return n > 0 ? static_cast<float>(sum / n) : at(px, py);
 }
 
 }  // namespace
@@ -185,6 +182,8 @@ struct Msc2DPipeline::Impl {
   // Which statistics build() was asked for -- consumers need it to know which
   // fields in leaf_stats/features are meaningful.
   StatsSpec stats;
+  float base_relevance_floor = 0.0f;
+  float base_relevance_ceiling = 0.0f;
 
   // The MSC engine is kept alive so persistence re-thresholding uses MSCEER's
   // NATIVE cancellation hierarchy (setPersistence + ascending/descending2Manifolds),
@@ -195,12 +194,19 @@ struct Msc2DPipeline::Impl {
   std::unordered_map<int, int> nid_to_compact;
   // Per-base-manifold leaf statistics, indexed by compact base id.
   std::vector<Msc2DFeatureStat> leaf_stats;
+  // Per-base-manifold per-channel aggregates, same indexing. Held flat rather
+  // than inside leaf_stats so a twelve-channel stack costs one allocation for
+  // the slice instead of one per manifold.
+  ChannelStats leaf_channels;
+  // The measurement channels build() resolved, in slot order.
+  std::vector<ResolvedStatChannel> channels;
   // Compact base-extremum id per pixel (row-major), -1 where unlabeled.
   std::vector<int> base_labels;
 
   // Derived at the current persistence:
   std::vector<int> labels;                       // surviving feature id per pixel
   std::vector<Msc2DFeatureStat> features;        // aggregated per surviving feature
+  ChannelStats feature_channels;                 // per-channel aggregates, same order
 };
 
 Msc2DPipeline::Msc2DPipeline() : impl_(std::make_unique<Impl>()) {}
@@ -209,7 +215,7 @@ Msc2DPipeline::Msc2DPipeline(Msc2DPipeline&&) noexcept = default;
 Msc2DPipeline& Msc2DPipeline::operator=(Msc2DPipeline&&) noexcept = default;
 
 void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<float>& filtered,
-                          const Msc2DParams& cfg) {
+                          const Msc2DParams& cfg, const StatChannelBank* external_bank) {
   const int width = static_cast<int>(filtered.dims().width);
   const int height = static_cast<int>(filtered.dims().height);
   if (width <= 0 || height <= 0) throw std::runtime_error("Invalid image dimensions for MSC.");
@@ -268,16 +274,62 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
   // each select_persistence() -- the base constituents are what we precompute.
   const StatsSpec& spec = cfg.stats;
   impl_->stats = spec;
-  const bool want_base_sums = spec.base_channel && (spec.mean || spec.std);
-  const bool want_filt_sums = spec.filtered_channel && (spec.mean || spec.std);
   const bool want_filt_extent = spec.needs_filtered_extent();
+
+  // Resolve the measurement channels and materialize them once. The derived
+  // (scale-space) responses collapse into a single diffg filter-bank traversal;
+  // base/filtered are aliased, not copied. The bank stays alive only for this
+  // accumulation pass -- afterwards the per-manifold cells are all we keep, so a
+  // twelve-channel stack does not hold twelve rasters per primed slice.
+  diffg::ExecutionOptions bank_exec{};
+  bank_exec.threads = std::max(1, cfg.requested_parallelism);
+  StatChannelBank owned_bank;
+  if (external_bank == nullptr) {
+    owned_bank = build_stat_channels(base, filtered, spec, bank_exec);
+  }
+  const StatChannelBank& bank = external_bank != nullptr ? *external_bank : owned_bank;
+  impl_->channels = bank.channels;
+  const std::size_t n_ch = bank.size();
+  const std::vector<const float*>& chan = bank.data;
+  impl_->base_relevance_floor = 0.0f;
+  impl_->base_relevance_ceiling = 0.0f;
+  if (spec.relevance && spec.base_channel) {
+    const bool need_percentiles =
+        spec.relevance_low_percentile != 0.0 || spec.relevance_high_percentile != 100.0;
+    std::vector<double> finite_base;
+    if (need_percentiles) finite_base.reserve(npix);
+    float finite_min = std::numeric_limits<float>::max();
+    float finite_max = std::numeric_limits<float>::lowest();
+    std::size_t finite_count = 0;
+    for (std::size_t i = 0; i < npix; ++i) {
+      const float value = base.data()[i];
+      if (!std::isfinite(value)) continue;
+      finite_min = std::min(finite_min, value);
+      finite_max = std::max(finite_max, value);
+      ++finite_count;
+      if (need_percentiles) finite_base.push_back(static_cast<double>(value));
+    }
+    if (finite_count > 0) {
+      impl_->base_relevance_floor =
+          spec.relevance_low_percentile == 0.0
+              ? finite_min
+              : static_cast<float>(
+                    percentile_linear(finite_base, spec.relevance_low_percentile));
+      impl_->base_relevance_ceiling =
+          spec.relevance_high_percentile == 100.0
+              ? finite_max
+              : static_cast<float>(
+                    percentile_linear(finite_base, spec.relevance_high_percentile));
+    }
+  }
 
   std::vector<Msc2DFeatureStat>& leaf = impl_->leaf_stats;
   leaf.assign(num_base, Msc2DFeatureStat{});
+  impl_->leaf_channels.reset(num_base, n_ch, spec);
   for (std::size_t c = 0; c < num_base; ++c) {
     leaf[c].feature_id = static_cast<NodeId>(c);
-    leaf[c].base_min = std::numeric_limits<float>::max();
-    leaf[c].base_max = std::numeric_limits<float>::lowest();
+    leaf[c].base_relevance_floor = impl_->base_relevance_floor;
+    leaf[c].base_relevance_ceiling = impl_->base_relevance_ceiling;
     // Only sentinel the filtered extent when it is actually going to be filled;
     // otherwise a min/max sentinel would survive into merges and CSVs as a
     // 3.4e38 rather than an obvious zero.
@@ -298,30 +350,18 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
     const int c = impl_->base_labels[i];
     if (c < 0) continue;
     Msc2DFeatureStat& s = leaf[static_cast<std::size_t>(c)];
-    const float b = base.data()[i];
     const int x = static_cast<int>(i % static_cast<std::size_t>(width));
     const int y = static_cast<int>(i / static_cast<std::size_t>(width));
     s.area += 1;
-    if (want_base_sums) {
-      s.base_sum += b;
-      s.base_sumsq += static_cast<double>(b) * b;
-    }
-    s.base_min = std::min(s.base_min, b);
-    s.base_max = std::max(s.base_max, b);
-    if (want_filt_sums || want_filt_extent) {
+    impl_->leaf_channels.add(static_cast<std::size_t>(c), i, chan);
+    if (want_filt_extent) {
       const float f = filtered.data()[i];
-      if (want_filt_sums) {
-        s.filt_sum += f;
-        s.filt_sumsq += static_cast<double>(f) * f;
-      }
-      if (want_filt_extent) {
-        if (ascending) {
-          if (f < s.filt_min) { s.filt_min = f; arg_ext[static_cast<std::size_t>(c)] = i; }
-          s.filt_max = std::max(s.filt_max, f);
-        } else {
-          if (f > s.filt_max) { s.filt_max = f; arg_ext[static_cast<std::size_t>(c)] = i; }
-          s.filt_min = std::min(s.filt_min, f);
-        }
+      if (ascending) {
+        if (f < s.filt_min) { s.filt_min = f; arg_ext[static_cast<std::size_t>(c)] = i; }
+        s.filt_max = std::max(s.filt_max, f);
+      } else {
+        if (f > s.filt_max) { s.filt_max = f; arg_ext[static_cast<std::size_t>(c)] = i; }
+        s.filt_min = std::min(s.filt_min, f);
       }
     }
     s.min_x = std::min(s.min_x, x);
@@ -350,8 +390,16 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
       leaf[c].ext_x = static_cast<float>(x);
       leaf[c].ext_y = static_cast<float>(y);
       leaf[c].ext_filtered = ascending ? leaf[c].filt_min : leaf[c].filt_max;
-      leaf[c].ext_base = sample_base(base, width, height, x, y, ext_radius);
+      // Every measurement channel is sampled at the same pixel, so a scale-space
+      // stack reports what the seed looks like at each scale -- the discriminating
+      // signal a later material/air model wants.
+      impl_->leaf_channels.sample_ext(c, x, y, width, height, ext_radius, chan);
     }
+  }
+  // A base manifold with no pixels would otherwise carry +/-FLT_MAX sentinels
+  // into a merge and out to a CSV.
+  for (std::size_t c = 0; c < num_base; ++c) {
+    if (leaf[c].area == 0) impl_->leaf_channels.clear_region(c);
   }
 
   // Initial persistence from cfg (native cancellation).
@@ -368,6 +416,8 @@ int Msc2DPipeline::width() const { return impl_->width; }
 int Msc2DPipeline::height() const { return impl_->height; }
 float Msc2DPipeline::value_range() const { return impl_->value_range; }
 float Msc2DPipeline::current_persistence() const { return impl_->current_persistence; }
+float Msc2DPipeline::base_relevance_floor() const { return impl_->base_relevance_floor; }
+float Msc2DPipeline::base_relevance_ceiling() const { return impl_->base_relevance_ceiling; }
 
 void Msc2DPipeline::select_persistence(float persistence_absolute) {
   impl_->current_persistence = persistence_absolute;
@@ -414,35 +464,68 @@ void Msc2DPipeline::select_persistence(float persistence_absolute) {
     if (b >= 0 && L >= 0) base_to_living.emplace(b, L);   // consistent per base manifold
   }
   lap("base_map", mark);
-  std::unordered_map<int, Msc2DFeatureStat> agg;
-  for (int b = 0; b < static_cast<int>(impl_->leaf_stats.size()); ++b) {
+
+  // Assign each living feature a dense row first, so the geometry vector and the
+  // flat channel table can be filled in lockstep -- slot k of row r is always
+  // channels()[k] of features()[r]. Rows come out ordered by first contributing
+  // base manifold, which also makes the feature order deterministic (it used to
+  // follow unordered_map iteration).
+  const int n_leaves = static_cast<int>(impl_->leaf_stats.size());
+  std::unordered_map<int, int> living_to_row;
+  std::vector<int> row_living;
+  living_to_row.reserve(impl_->leaf_stats.size() * 2);
+  for (int b = 0; b < n_leaves; ++b) {
     if (impl_->leaf_stats[static_cast<std::size_t>(b)].area == 0) continue;
     const auto it = base_to_living.find(b);
     if (it == base_to_living.end()) continue;
-    Msc2DFeatureStat& dst = agg[it->second];
-    dst.feature_id = static_cast<NodeId>(it->second);
-    accumulate(dst, impl_->leaf_stats[static_cast<std::size_t>(b)]);
+    const auto ins = living_to_row.emplace(it->second, static_cast<int>(row_living.size()));
+    if (ins.second) row_living.push_back(it->second);
   }
-  impl_->features.clear();
-  impl_->features.reserve(agg.size());
-  for (auto& [id, s] : agg) {
+
+  const std::size_t n_rows = row_living.size();
+  const std::size_t n_ch = impl_->leaf_channels.channels();
+  impl_->features.assign(n_rows, Msc2DFeatureStat{});
+  impl_->feature_channels.reset(n_rows, n_ch, impl_->stats);
+  for (std::size_t r = 0; r < n_rows; ++r) {
+    impl_->features[r].feature_id = static_cast<NodeId>(row_living[r]);
+  }
+
+  for (int b = 0; b < n_leaves; ++b) {
+    const Msc2DFeatureStat& src = impl_->leaf_stats[static_cast<std::size_t>(b)];
+    if (src.area == 0) continue;
+    const auto it = base_to_living.find(b);
+    if (it == base_to_living.end()) continue;
+    const std::size_t row = static_cast<std::size_t>(living_to_row[it->second]);
+    accumulate(impl_->features[row], src);
+    impl_->feature_channels.merge_region(row, impl_->leaf_channels,
+                                         static_cast<std::size_t>(b));
+  }
+
+  for (std::size_t r = 0; r < n_rows; ++r) {
+    Msc2DFeatureStat& s = impl_->features[r];
+    const int id = row_living[r];
     // A merged feature keeps the SURVIVING extremum, and the living compact id
     // is exactly that surviving extremum's own base-manifold id -- so the seed
-    // is a direct lookup, not an accumulation.
-    if (id >= 0 && id < static_cast<int>(impl_->leaf_stats.size())) {
+    // is a direct lookup, not an accumulation. Every channel's sample at that
+    // seed is carried over as a tuple for the same reason.
+    if (id >= 0 && id < n_leaves) {
       const Msc2DFeatureStat& seed = impl_->leaf_stats[static_cast<std::size_t>(id)];
       s.ext_x = seed.ext_x;
       s.ext_y = seed.ext_y;
-      s.ext_base = seed.ext_base;
       s.ext_filtered = seed.ext_filtered;
+      impl_->feature_channels.copy_ext(r, impl_->leaf_channels, static_cast<std::size_t>(id));
     }
-    impl_->features.push_back(s);
+    s.base_relevance_floor = impl_->base_relevance_floor;
+    s.base_relevance_ceiling = impl_->base_relevance_ceiling;
   }
   lap("rollup", mark);
 }
 
 const std::vector<int>& Msc2DPipeline::labels() const { return impl_->labels; }
 std::vector<Msc2DFeatureStat> Msc2DPipeline::feature_stats() const { return impl_->features; }
+
+const std::vector<ResolvedStatChannel>& Msc2DPipeline::channels() const { return impl_->channels; }
+const ChannelStats& Msc2DPipeline::feature_channels() const { return impl_->feature_channels; }
 
 const StatsSpec& Msc2DPipeline::stats() const { return impl_->stats; }
 

@@ -18,6 +18,7 @@ add_library(msseg_core STATIC
   msseg/segment/registry.cpp
   msseg/io/raw_io.cpp
   msseg/workflow/pipeline.cpp
+  msseg/workflow/stat_channels.cpp
 )
 
 # Headers are included as "msseg/..." -> expose this directory publicly.

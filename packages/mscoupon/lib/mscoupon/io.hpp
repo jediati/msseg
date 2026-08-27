@@ -17,7 +17,7 @@ void write_feature_map_csv(const std::filesystem::path& path, const std::vector<
 // Columns follow `cfg`: only the channels/reductions actually computed are
 // emitted, plus the extremum and any per-slice reductions.
 void write_global_table_csv(const std::filesystem::path& path,
-                            const std::vector<GlobalFeatureStat>& stats,
+                            const GlobalFeatureTable& table,
                             const StatisticsConfig& cfg);
 
 }  // namespace mscoupon
