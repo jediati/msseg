@@ -18,7 +18,7 @@ class ScrollFrame(ttk.Frame):
     scrolled listbox) return "break" before the panel handler fires.
     """
 
-    def __init__(self, parent, width=376, canvas_width=360):
+    def __init__(self, parent, width=376, canvas_width=360, background=None):
         super().__init__(parent, width=width)
         self.canvas = tk.Canvas(self, width=canvas_width, highlightthickness=0,
                                 borderwidth=0, takefocus=0)
@@ -27,7 +27,13 @@ class ScrollFrame(ttk.Frame):
         scroll.pack(side="right", fill="y")
         self.canvas.pack(side="left", fill="both", expand=True)
 
-        self.inner = ttk.Frame(self.canvas)
+        # An explicit background (e.g. the labeler's white lists) needs plain-tk
+        # widgets: ttk frames only recolor through styles.
+        if background is not None:
+            self.canvas.configure(background=background)
+            self.inner = tk.Frame(self.canvas, background=background)
+        else:
+            self.inner = ttk.Frame(self.canvas)
         self._window = self.canvas.create_window((0, 0), window=self.inner,
                                                  anchor="nw")
         self.inner.bind("<Configure>", self._on_content_resize)

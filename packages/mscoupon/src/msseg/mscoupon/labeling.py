@@ -241,15 +241,29 @@ def touched_ids(interaction, labels, np):
     return set(int(v) for v in vals if v >= 0)
 
 
+def touched_sets(interactions, labels, np):
+    """[(interaction, touched region-id set)] in creation (= resolution) order.
+
+    The per-interaction sets are what resolution consumes, and callers that
+    also need the reverse question (which interactions touch region r?) get it
+    from the same single rasterization pass."""
+    return [(it, touched_ids(it, labels, np))
+            for it in sorted(interactions, key=lambda it: it.uid)]
+
+
 def resolve_slice(interactions, labels, np):
     """region_class: uint8 array sized labels.max()+1, 0 = unlabeled.
 
     Interactions apply in creation (uid) order, so a later gesture paints over
     an earlier one on any region both touch."""
+    return resolve_sets(touched_sets(interactions, labels, np), labels, np)
+
+
+def resolve_sets(sets, labels, np):
+    """resolve_slice over already-computed touched_sets output."""
     K = int(labels.max()) + 1 if labels.size else 1
     region_class = np.zeros(max(K, 1), np.uint8)
-    for it in sorted(interactions, key=lambda it: it.uid):
-        ids = touched_ids(it, labels, np)
+    for it, ids in sets:
         if ids:
             region_class[list(ids)] = it.class_id
     return region_class

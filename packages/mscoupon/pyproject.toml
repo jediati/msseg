@@ -18,6 +18,11 @@ dependencies = [
   "matplotlib", "msseg-viz", "large-image[tiff,tifffile]",
 ]
 
+[project.optional-dependencies]
+# The labeler's Train/Classify buttons (random forest); everything else works
+# without it, and the import is lazy with a status-bar hint when missing.
+classify = ["scikit-learn"]
+
 [project.scripts]
 mscoupon = "msseg.mscoupon.analysis:main"
 mscoupon-gui = "msseg.mscoupon.app:main"

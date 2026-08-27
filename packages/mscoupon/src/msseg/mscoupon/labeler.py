@@ -32,6 +32,7 @@ from __future__ import annotations
 import os
 import sys
 import json
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog
 
@@ -40,12 +41,22 @@ from .app import MscouponApp
 from .common import log
 from .widgets import ScrollFrame
 from .labeling import (LabelStore, MAX_CLASSES, TOOLS, class_color_hex,
-                       resolve_slice, class_lut)
+                       resolve_slice, resolve_sets, touched_sets, class_lut)
 
 # How faint the inherited region overlay is drawn under the class layer
 # (0..255); the class colors themselves stay fully opaque in the LUT and are
 # scaled by the shared alpha slider like every overlay.
 _REGION_ALPHA = 90
+# Classifier predictions render between the region layer and the user's own
+# labels, slightly translucent so drawn labels stay distinguishable on top.
+_PRED_ALPHA = 170
+
+# Statistics fields that are POSITIONS, not appearance: where a region sits in
+# the slice says nothing about what material it is, and coordinate features
+# were exactly what dragged k-means across the label boundary. Never fed to
+# the classifier.
+_NON_FEATURE_FIELDS = {"feature_id", "min_x", "max_x", "min_y", "max_y",
+                       "ext_x", "ext_y"}
 
 _TOOL_LABELS = (("squiggle", "squiggle"), ("box", "box"), ("polygon", "lasso"))
 
@@ -141,7 +152,19 @@ class LabelerApp(MscouponApp):
         # Labeler state first: the base __init__ calls the overridden build
         # methods, which read these.
         self.store = LabelStore()
-        self._class_luts = {}      # (si, li) -> (commit, store.rev, lut|None)
+        # (si, li) -> (commit, store.rev, lut|None, {uid: touched id set});
+        # one rasterization pass serves both the class layer and the
+        # which-interactions-touch-this-region hover lookup.
+        self._class_luts = {}
+        self._hover_key = None     # (si, li, region) whose geometry is on screen
+        # Classifier state: model + its feature-column order, and per-slice
+        # predicted region->class arrays keyed by the commit they were made at.
+        self._clf = None
+        self._clf_names = None
+        self._pred = {}            # (si, li) -> (commit, region_class uint8)
+        self.show_pred_var = tk.BooleanVar(master=root, value=False)
+        # Master overlay switch (Tab toggles it): base image only when off.
+        self.show_overlay_var = tk.BooleanVar(master=root, value=True)
         self.active_class_var = tk.IntVar(master=root, value=0)
         self.tool_var = tk.StringVar(master=root, value="squiggle")
         self.show_regions_var = tk.BooleanVar(master=root, value=True)
@@ -214,7 +237,9 @@ class LabelerApp(MscouponApp):
         self._scale(row, from_=0.0, to=1.0, variable=self.vmax_filt_var, orient="horizontal",
                     command=lambda *_: self._refresh_render()).pack(side="left", fill="x", expand=True)
         row = ttk.Frame(live); row.pack(fill="x", padx=4, pady=2)
-        ttk.Label(row, text="Overlay alpha:").pack(side="left")
+        ttk.Checkbutton(row, text="show overlay (Tab)", variable=self.show_overlay_var,
+                        command=self._refresh_render).pack(side="left")
+        ttk.Label(row, text="Overlay alpha:").pack(side="left", padx=(8, 0))
         self._scale(row, from_=0.0, to=1.0, variable=self.alpha_var, orient="horizontal",
                     command=lambda *_: self._refresh_render()).pack(side="left", fill="x", expand=True)
 
@@ -240,6 +265,13 @@ class LabelerApp(MscouponApp):
     # Rendering: the class layer
     # ------------------------------------------------------------------ #
     def _seg_overlays(self, si, li, rec, data, np, min_colors):
+        # A repaint means the slice/segmentation may have changed under any
+        # hover geometry on screen; drop it (the next Motion redraws it).
+        if self.viewer is not None and self._hover_key is not None:
+            self.viewer.canvas.delete("ihover")
+            self._hover_key = None
+        if not self.show_overlay_var.get():
+            return []                # master switch (Tab): base image only
         overlays = super()._seg_overlays(si, li, rec, data, np, min_colors)
         # The inherited region overlay is orientation, not the point: fade it
         # under the class layer (copy first -- _id_lut results may be shared).
@@ -248,30 +280,51 @@ class LabelerApp(MscouponApp):
                 o["lut"] = o["lut"].copy()
                 o["lut"][:, 3] = np.minimum(o["lut"][:, 3], _REGION_ALPHA)
         if rec is not None:
+            # Classifier predictions under the user's own labels: the model's
+            # view of every region, with the drawn ground truth on top.
+            if self.show_pred_var.get():
+                pr = self._pred.get((si, li))
+                if pr is not None and pr[0] == rec.get("commit"):
+                    plut = class_lut(pr[1], np).copy()
+                    plut[:, 3] = (plut[:, 3].astype(np.uint16)
+                                  * _PRED_ALPHA // 255).astype(np.uint8)
+                    overlays.append({"labels": rec["labels"], "lut": plut,
+                                     "visible": True})
             lut = self._class_lut_for(si, li, rec, np)
             if lut is not None:
                 overlays.append({"labels": rec["labels"], "lut": lut,
                                  "visible": True})
         return overlays
 
-    def _class_lut_for(self, si, li, rec, np):
-        """The slice's region->class-color LUT, memoized on (commit, store.rev):
-        a gesture bumps rev (rebuild the LUT only), a Rerun bumps the commit (a
-        fresh labels raster arrives and the interactions re-resolve against it
-        -- which is how annotations survive persistence changes)."""
+    def _labels_cache_for(self, si, li, rec, np):
+        """(commit, rev, lut, {uid: touched ids}) for one slice, memoized on
+        (commit, store.rev): a gesture bumps rev (rebuild only this), a Rerun
+        bumps the commit (a fresh labels raster arrives and the interactions
+        re-resolve against it -- which is how annotations survive persistence
+        changes). The touch map falls out of the same rasterization pass the
+        LUT needs, so the hover lookup costs nothing extra."""
         key = (si, li)
         commit = rec.get("commit")
         cached = self._class_luts.get(key)
         if cached is not None and cached[0] == commit and cached[1] == self.store.rev:
-            return cached[2]
-        lut = None
+            return cached
+        lut, touch = None, {}
         slice_key = self._slice_key(si, li)
         if slice_key is not None:
             its = self.store.for_slice(slice_key)
             if its:
-                lut = class_lut(resolve_slice(its, rec["labels"], np), np)
-        self._class_luts[key] = (commit, self.store.rev, lut)
-        return lut
+                sets = touched_sets(its, rec["labels"], np)
+                touch = {it.uid: ids for it, ids in sets}
+                lut = class_lut(resolve_sets(sets, rec["labels"], np), np)
+        entry = (commit, self.store.rev, lut, touch)
+        self._class_luts[key] = entry
+        return entry
+
+    def _class_lut_for(self, si, li, rec, np):
+        return self._labels_cache_for(si, li, rec, np)[2]
+
+    def _touch_map_for(self, si, li, rec, np):
+        return self._labels_cache_for(si, li, rec, np)[3]
 
     def _slice_key(self, si, li):
         try:
@@ -369,6 +422,7 @@ class LabelerApp(MscouponApp):
         self.root.bind("<Escape>", lambda e: self.active_class_var.set(0))
         self.root.bind("<Control-z>", self._on_undo_key)
         self.root.bind("<Control-y>", self._on_undo_key)
+        self.root.bind("<Tab>", self._on_tab_toggle)
 
     def _typing(self):
         """True while a text-entry widget owns the keyboard focus."""
@@ -385,6 +439,16 @@ class LabelerApp(MscouponApp):
             self._undo()
         else:
             self._redo()
+
+    def _on_tab_toggle(self, _e=None):
+        """Tab flips the master overlay switch. The toplevel binding fires
+        before the "all"-tag focus traversal, so returning "break" consumes
+        the key -- except while typing, where Tab keeps moving focus."""
+        if self._typing():
+            return None
+        self.show_overlay_var.set(not self.show_overlay_var.get())
+        self._refresh_render()
+        return "break"
 
     def _on_class_key(self, e):
         if self._typing():
@@ -425,8 +489,24 @@ class LabelerApp(MscouponApp):
                             value=value).pack(side="left", padx=2)
 
         # Bottom rows pack first (side="bottom") so the classes holder takes
-        # exactly the remaining cavity.
+        # exactly the remaining cavity. The classifier rows are bottommost.
         row = ttk.Frame(panel); row.pack(side="bottom", fill="x", padx=4, pady=(2, 8))
+        ttk.Button(row, text="Train / retrain",
+                   command=self._train_classifier).pack(side="left", fill="x",
+                                                        expand=True, padx=(0, 2))
+        self.classify_btn = ttk.Button(row, text="Classify / reclassify",
+                                       state="disabled", command=self._classify)
+        self.classify_btn.pack(side="left", fill="x", expand=True, padx=2)
+        ttk.Checkbutton(row, text="show", variable=self.show_pred_var,
+                        command=self._refresh_render).pack(side="left", padx=(2, 0))
+        row = ttk.Frame(panel); row.pack(side="bottom", fill="x", padx=4, pady=2)
+        ttk.Button(row, text="Save classifier…",
+                   command=self._save_classifier).pack(side="left", fill="x",
+                                                       expand=True, padx=(0, 2))
+        ttk.Button(row, text="Load classifier…",
+                   command=self._load_classifier).pack(side="left", fill="x",
+                                                       expand=True, padx=(2, 0))
+        row = ttk.Frame(panel); row.pack(side="bottom", fill="x", padx=4, pady=2)
         ttk.Button(row, text="Export as CSV…",
                    command=self._export_csv).pack(fill="x")
         row = ttk.Frame(panel); row.pack(side="bottom", fill="x", padx=4, pady=2)
@@ -480,7 +560,8 @@ class LabelerApp(MscouponApp):
                            indicatoron=False, selectcolor=color,
                            bg="#e8e8e8", activebackground=color,
                            ).pack(side="top", fill="x", padx=4, pady=(2, 4))
-            lst = ScrollFrame(frame, width=240, canvas_width=224)
+            lst = ScrollFrame(frame, width=240, canvas_width=224,
+                              background="white")
             # Small minimum height: the grid's equal weights own the real size.
             lst.canvas.configure(height=48)
             lst.pack(side="top", fill="both", expand=True, padx=2, pady=(0, 2))
@@ -489,16 +570,18 @@ class LabelerApp(MscouponApp):
                     self._build_interaction_row(lst.inner, it)
 
     def _build_interaction_row(self, parent, it):
-        row = ttk.Frame(parent)
+        # Plain-tk widgets so the rows share the list's white background.
+        row = tk.Frame(parent, background="white")
         row.pack(fill="x", padx=6, pady=1)
         where = it.slice_key if it.bound else f"{it.slice_key} (unbound)"
-        lbl = ttk.Label(row, text=f"#{it.uid} {it.tool}  [{where}]",
-                        foreground=("#000" if it.bound else "#888"),
-                        cursor="hand2")
+        lbl = tk.Label(row, text=f"#{it.uid} {it.tool}  [{where}]",
+                       foreground=("#000" if it.bound else "#888"),
+                       background="white", anchor="w", cursor="hand2")
         lbl.pack(side="left", fill="x", expand=True)
-        ttk.Button(row, text="✕", width=2,
-                   command=lambda uid=it.uid: self._delete_interaction(uid)
-                   ).pack(side="right")
+        tk.Button(row, text="✕", width=2, relief="flat", background="white",
+                  activebackground="#ddd",
+                  command=lambda uid=it.uid: self._delete_interaction(uid)
+                  ).pack(side="right")
         # Drag a row onto another class's subpanel to reassign it; a stationary
         # release is a CLICK, which recenters the view on the gesture.
         # Right-click offers move/delete as a menu (drag fallback, faster in
@@ -573,18 +656,16 @@ class LabelerApp(MscouponApp):
         menu.tk_popup(e.x_root, e.y_root)
 
     # -- interaction geometry on the canvas (hover + click-to-center) ---- #
-    def _show_interaction_geometry(self, uid):
-        """Draw the gesture's geometry fully opaque over the slice: the
-        polyline itself, or the outer boundary of a box / lasso. Only when the
-        gesture's slice is the one on screen (clicking the row navigates)."""
-        it = self.store.get(uid)
+    def _draw_interaction_geometry(self, it):
+        """Draw one gesture's geometry fully opaque over the slice: the
+        polyline itself, or the outer boundary of a box / lasso. Does NOT
+        clear first, so several touching gestures can stack."""
         v = self.viewer
         if it is None or v is None or not it.points or not it.bound:
             return
         if self._current() != (it.si, it.li):
             return
         c = v.canvas
-        c.delete("ihover")
         color = class_color_hex(it.class_id)
         scr = [((x - v.view_x) / v.scale, (y - v.view_y) / v.scale)
                for x, y in it.points]
@@ -601,9 +682,50 @@ class LabelerApp(MscouponApp):
             c.create_oval(x - 4, y - 4, x + 4, y + 4, outline=color, width=3,
                           tags=tags)
 
+    def _show_interaction_geometry(self, uid):
+        if self.viewer is None:
+            return
+        self.viewer.canvas.delete("ihover")
+        self._hover_key = None
+        self._draw_interaction_geometry(self.store.get(uid))
+
     def _hide_interaction_geometry(self):
         if self.viewer is not None:
             self.viewer.canvas.delete("ihover")
+        self._hover_key = None
+
+    def _on_hover(self, ix, iy=None):
+        """The inherited readout, plus: hovering a LABELED pixel draws every
+        interaction that touches its region (from the cached touch map -- the
+        same rasterization pass the class LUT already paid for)."""
+        super()._on_hover(ix, iy)
+        v = self.viewer
+        if v is None:
+            return
+        cur = self._current()
+        region = None
+        rec = None
+        if ix is not None and cur is not None:
+            rec = self.engine.record(*cur)
+            if rec is not None and rec.get("labels") is not None:
+                labels = rec["labels"]
+                if 0 <= iy < labels.shape[0] and 0 <= ix < labels.shape[1]:
+                    r = int(labels[iy, ix])
+                    if r >= 0:
+                        region = r
+        key = None if region is None else (cur[0], cur[1], region)
+        if key == self._hover_key:
+            return
+        self._hover_key = key
+        v.canvas.delete("ihover")
+        if key is None:
+            return
+        import numpy as np
+        touch = self._touch_map_for(cur[0], cur[1], rec, np)
+        for it in self.store.for_slice(self._slice_key(*cur)):
+            ids = touch.get(it.uid)
+            if ids and region in ids:
+                self._draw_interaction_geometry(it)
 
     def _on_row_click(self, uid):
         """Center the view on the gesture's centroid at the current zoom,
@@ -659,6 +781,166 @@ class LabelerApp(MscouponApp):
             return
         self._install_store(store)
 
+    # ------------------------------------------------------------------ #
+    # Classifier: train on the labeled regions, predict every region
+    # ------------------------------------------------------------------ #
+    def _iter_stat_slices(self):
+        """(si, li, slice_key, rec, table) for every slice cached at the
+        current commit with a statistics table."""
+        for si, p in enumerate(self.primed):
+            for li in range(len(p["pipes"])):
+                rec = self.engine.record(si, li)
+                key = self._slice_key(si, li)
+                if rec is None or rec.get("labels") is None or key is None:
+                    continue
+                table = rec.get("stats")
+                if getattr(table, "values", None) is None:
+                    continue
+                yield si, li, key, rec, table
+
+    @staticmethod
+    def _feature_matrix(table, names, np):
+        """(n_regions, len(names)) float64, or None if a column is missing."""
+        cols = [table.column(n) for n in names]
+        if any(c is None for c in cols):
+            return None
+        mat = np.stack(cols, axis=1).astype(np.float64)
+        mat[~np.isfinite(mat)] = 0.0
+        return mat
+
+    def _train_classifier(self):
+        """Fit a random forest on the labeled regions' statistics rows.
+
+        Chosen for exactly this data shape: a few hundred labels, tens of
+        features of which only a handful matter (trees select thresholds per
+        feature, so the noise dimensions that dragged k-means across the label
+        boundary are simply never split on), no scaling sensitivity, and
+        millisecond retrains. feature_importances_ names the dimensions that
+        actually matter (logged)."""
+        try:
+            from sklearn.ensemble import RandomForestClassifier
+        except ImportError:
+            self.status_var.set("scikit-learn is not installed - "
+                                "pip install scikit-learn to enable training")
+            return
+        import numpy as np
+        X, y, names = [], [], None
+        for si, li, key, rec, table in self._iter_stat_slices():
+            if names is None:
+                names = [n for n in table.names if n not in _NON_FEATURE_FIELDS]
+            mat = self._feature_matrix(table, names, np)
+            fids = table.column("feature_id")
+            if mat is None or fids is None:
+                continue
+            rc = resolve_slice(self.store.for_slice(key), rec["labels"], np)
+            fid = fids.astype(int)
+            ok = (fid >= 0) & (fid < len(rc))
+            cls = np.zeros(len(fid), int)
+            cls[ok] = rc[fid[ok]]
+            m = cls > 0
+            if m.any():
+                X.append(mat[m])
+                y.append(cls[m])
+        if not X:
+            self.status_var.set("No labeled regions on computed slices - "
+                                "draw some (and Run/Rerun) first.")
+            return
+        X = np.concatenate(X)
+        y = np.concatenate(y)
+        if len(set(y.tolist())) < 2:
+            self.status_var.set("Need labels from at least 2 classes to train.")
+            return
+        use_oob = len(y) >= 20
+        clf = RandomForestClassifier(n_estimators=200, class_weight="balanced",
+                                     oob_score=use_oob, n_jobs=-1, random_state=0)
+        t0 = time.perf_counter()
+        clf.fit(X, y)
+        dt_ms = 1e3 * (time.perf_counter() - t0)
+        self._clf = clf
+        self._clf_names = names
+        self.classify_btn.config(state="normal")
+        top = sorted(zip(names, clf.feature_importances_),
+                     key=lambda t: -t[1])[:8]
+        log("classifier trained: " + "  ".join(f"{n}={v:.3f}" for n, v in top))
+        acc = f", OOB acc {clf.oob_score_:.1%}" if use_oob else ""
+        self.status_var.set(f"Trained on {len(y)} labeled regions in "
+                            f"{dt_ms:.0f} ms{acc} - top: "
+                            + ", ".join(n for n, _v in top[:3]))
+
+    def _classify(self):
+        """Predict a class for EVERY region of every computed slice and show
+        the result as a translucent layer under the drawn labels."""
+        if self._clf is None:
+            self.status_var.set("Train first.")
+            return
+        import numpy as np
+        count = 0
+        t0 = time.perf_counter()
+        for si, li, key, rec, table in self._iter_stat_slices():
+            mat = self._feature_matrix(table, self._clf_names, np)
+            fids = table.column("feature_id")
+            if mat is None or fids is None:
+                continue
+            pred = self._clf.predict(mat).astype(np.uint8)
+            labels = rec["labels"]
+            K = int(labels.max()) + 1 if labels.size else 1
+            region_class = np.zeros(max(K, 1), np.uint8)
+            fid = fids.astype(int)
+            ok = (fid >= 0) & (fid < len(region_class))
+            region_class[fid[ok]] = pred[ok]
+            self._pred[(si, li)] = (rec.get("commit"), region_class)
+            count += 1
+        self.show_pred_var.set(True)
+        self._refresh_render()
+        self.status_var.set(f"Classified {count} slice(s) in "
+                            f"{1e3 * (time.perf_counter() - t0):.0f} ms - "
+                            "predictions shown under your labels")
+
+    # -- classifier persistence (pickle: the sklearn-native format) ------ #
+    def _save_classifier(self):
+        if self._clf is None:
+            self.status_var.set("Train first.")
+            return
+        path = filedialog.asksaveasfilename(title="Save classifier",
+                                            defaultextension=".pkl",
+                                            initialfile="classifier.pkl",
+                                            filetypes=[("Pickle", "*.pkl")])
+        if not path:
+            return
+        self._save_classifier_to(path)
+        self.status_var.set(f"Wrote {path}")
+
+    def _save_classifier_to(self, path):
+        import pickle
+        with open(path, "wb") as f:
+            pickle.dump({"app": "mscoupon-labeler-classifier", "version": 1,
+                         "names": self._clf_names, "model": self._clf}, f)
+
+    def _load_classifier(self):
+        path = filedialog.askopenfilename(title="Load classifier",
+                                          filetypes=[("Pickle", "*.pkl")])
+        if not path:
+            return
+        try:
+            self._load_classifier_from(path)
+        except Exception as exc:     # missing sklearn, wrong file, version skew
+            self.status_var.set(f"Could not load classifier: {exc}")
+            return
+        self.status_var.set(f"Loaded classifier from {path} "
+                            f"({len(self._clf_names)} features)")
+
+    def _load_classifier_from(self, path):
+        import pickle
+        with open(path, "rb") as f:
+            doc = pickle.load(f)
+        if (not isinstance(doc, dict)
+                or doc.get("app") != "mscoupon-labeler-classifier"
+                or "model" not in doc or not doc.get("names")):
+            raise ValueError("not a labeler classifier file")
+        self._clf = doc["model"]
+        self._clf_names = list(doc["names"])
+        self.classify_btn.config(state="normal")
+
     def _export_csv(self):
         """Resolved region -> class table: one row per living MSC region of
         every slice whose labels are cached at the current commit (class 0 =
@@ -682,7 +964,12 @@ class LabelerApp(MscouponApp):
     def _write_labels_csv(self, path):
         import numpy as np
         covered = skipped = 0
-        lines = ["slice,region_id,class"]
+        # Every statistics column the spec produced rides along (the feature
+        # row IS the region's future design vector). The schema is spec-driven
+        # and identical across slices of a run; the first cached table fixes
+        # the column order, later tables are aligned by name.
+        stat_names = None
+        rows = []           # (slice_key, region_id, class, predicted, table, row_idx)
         for si, p in enumerate(self.primed):
             for li in range(len(p["pipes"])):
                 rec = self.engine.record(si, li)
@@ -692,10 +979,39 @@ class LabelerApp(MscouponApp):
                     continue
                 labels = rec["labels"]
                 rc = resolve_slice(self.store.for_slice(key), labels, np)
+                # Classifier predictions ride along when they exist for this
+                # commit; blank otherwise (a prediction of class 0 never
+                # happens -- the model only knows labeled classes).
+                pr = self._pred.get((si, li))
+                pred = pr[1] if pr is not None and pr[0] == rec.get("commit") else None
+                table = rec.get("stats")
+                if getattr(table, "values", None) is None:
+                    table = None
+                row_of = {}
+                if table is not None:
+                    if stat_names is None:
+                        stat_names = [n for n in table.names if n != "feature_id"]
+                    fids = table.column("feature_id")
+                    if fids is not None:
+                        row_of = {int(v): r for r, v in enumerate(fids)}
                 ids = np.unique(labels)
                 for i in ids[ids >= 0]:
-                    lines.append(f"{key},{int(i)},{int(rc[i])}")
+                    p_val = ("" if pred is None or i >= len(pred)
+                             else str(int(pred[i])))
+                    rows.append((key, int(i), int(rc[i]), p_val, table,
+                                 row_of.get(int(i))))
                 covered += 1
+        lines = ["slice,region_id,class,predicted" +
+                 ("," + ",".join(stat_names) if stat_names else "")]
+        for key, rid, cls, p_val, table, r in rows:
+            line = f"{key},{rid},{cls},{p_val}"
+            if stat_names:
+                vals = []
+                for n in stat_names:
+                    col = table.column(n) if (table is not None and r is not None) else None
+                    vals.append("" if col is None else f"{float(col[r]):.10g}")
+                line += "," + ",".join(vals)
+            lines.append(line)
         with open(path, "w", encoding="utf-8", newline="") as f:
             f.write("\n".join(lines) + "\n")
         return covered, skipped
@@ -771,7 +1087,11 @@ def _selftest():
     app.primed = [{"files": files, "base": [zeros], "filtered": [zeros],
                    "pipes": [None], "normalizers": [[]]}]
     app._rebuild_flat_slices()
-    rec = {"commit": app._commit_id, "labels": lab, "stats": None,
+    from .common import FeatureTable
+    table = FeatureTable(["feature_id", "area", "mean_base"],
+                         np.array([[0.0, 64.0, 1.5], [2.0, 80.0, 2.5],
+                                   [5.0, 96.0, 3.5], [9.0, 112.0, 4.5]]))
+    rec = {"commit": app._commit_id, "labels": lab, "stats": table,
            "kept": set(), "cc": None, "n_feat": 4}
     app._slices[(0, 0)] = rec
 
@@ -810,6 +1130,12 @@ def _selftest():
     assert len(ovs) == 2
     assert int(ovs[0]["lut"][:, 3].max()) <= _REGION_ALPHA
     assert int(ovs[1]["lut"][:, 3].max()) == 255
+    # The master overlay switch (Tab) blanks the whole stack.
+    app._on_tab_toggle()
+    assert not app.show_overlay_var.get()
+    assert app._seg_overlays(0, 0, rec2, None, np, min_colors) == []
+    app._on_tab_toggle()
+    assert app.show_overlay_var.get()
 
     # Class-count change clamps orphans; arm state resets when it vanishes.
     app.active_class_var.set(2)
@@ -883,16 +1209,70 @@ def _selftest():
         cx = sum(x for x, _y in it0.points) / len(it0.points)
         w = max(app.viewer.canvas.winfo_width(), 1)
         assert abs(app.viewer.view_x - (cx - (w / 2) * s0)) < 1e-6
+        # Hovering a LABELED pixel draws every gesture touching its region;
+        # a background pixel clears again.
+        app._on_hover(5, 5)                  # inside region 0
+        assert app.viewer.canvas.find_withtag("ihover"), "pixel hover draws gestures"
+        app._on_hover(0, 0)                  # -1 background
+        assert not app.viewer.canvas.find_withtag("ihover")
 
-    # Export as CSV: one row per living region, class 0 = unlabeled.
+    # Export as CSV: one row per living region (class 0 = unlabeled), carrying
+    # every statistics column the spec produced for the region.
     with tempfile.TemporaryDirectory() as td:
         csv_path = os.path.join(td, "labels.csv")
         covered, skipped = app._write_labels_csv(csv_path)
         assert (covered, skipped) == (1, 0)
         with open(csv_path, encoding="utf-8") as f:
             rows = f.read().strip().splitlines()
-        assert rows[0] == "slice,region_id,class" and len(rows) == 5
-        assert all(r.startswith("s0.tiff,") for r in rows[1:])
+        assert rows[0] == "slice,region_id,class,predicted,area,mean_base"
+        assert len(rows) == 5
+        assert rows[1] == "s0.tiff,0,1,,64,1.5"    # predicted blank pre-classify
+        assert rows[4] == "s0.tiff,9,1,,112,4.5"
+
+    # Train + classify (skipped when scikit-learn isn't installed).
+    try:
+        import sklearn  # noqa: F401
+        have_sklearn = True
+    except ImportError:
+        have_sklearn = False
+        print("labeler selftest: scikit-learn not installed - classifier "
+              "checks skipped")
+    if have_sklearn:
+        from msseg.viz import min_colors as _mc
+        app.n_classes_var.set(3)
+        app._on_n_classes_change()
+        app.active_class_var.set(2)
+        app._commit_interaction("squiggle", [(12.0, 12.0), (15.0, 15.0)])  # {9} -> 2
+        app._train_classifier()
+        assert app._clf is not None, "training must produce a model"
+        assert "min_x" not in app._clf_names and "ext_x" not in app._clf_names
+        app._classify()
+        pr = app._pred.get((0, 0))
+        assert pr is not None and pr[0] == app._commit_id
+        assert pr[1].shape == (10,)
+        assert set(int(v) for v in pr[1][[0, 2, 5, 9]]) <= {1, 2}
+        assert app.show_pred_var.get()
+        ovs = app._seg_overlays(0, 0, rec3, None, np, _mc)
+        assert len(ovs) == 3, "regions + prediction layer + drawn labels"
+        assert int(ovs[1]["lut"][:, 3].max()) < 255, "prediction layer is translucent"
+        # Classifier save/load round trip, and predictions in the CSV.
+        with tempfile.TemporaryDirectory() as td:
+            clf_path = os.path.join(td, "classifier.pkl")
+            app._save_classifier_to(clf_path)
+            app._clf = None
+            app._clf_names = None
+            app.classify_btn.config(state="disabled")
+            app._load_classifier_from(clf_path)
+            assert app._clf is not None and app._clf_names == ["area", "mean_base"]
+            assert str(app.classify_btn.cget("state")) == "normal"
+            app._classify()
+            csv2 = os.path.join(td, "labels2.csv")
+            covered2, _sk = app._write_labels_csv(csv2)
+            assert covered2 == 1
+            with open(csv2, encoding="utf-8") as f:
+                rows2 = f.read().strip().splitlines()
+            preds = [r.split(",")[3] for r in rows2[1:]]
+            assert all(v in ("1", "2") for v in preds), "predicted column filled"
 
     # The labeler's session file never collides with the viewer's.
     assert config_io.session_path(app=app.SESSION_APP) != config_io.session_path()
