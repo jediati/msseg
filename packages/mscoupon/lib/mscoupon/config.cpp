@@ -261,6 +261,10 @@ void parse_msc(const nlohmann::json& root, MscConfig& msc) {
   set_if_present(m, "accurate_descending", msc.accurate_descending);
   set_if_present(m, "manifold", msc.manifold);
   set_if_present(m, "requested_parallelism", msc.requested_parallelism);
+  set_if_present(m, "use_gpu_gradient", msc.use_gpu_gradient);
+  if (m.contains("use_gpu_stats") && !m.at("use_gpu_stats").is_null()) {
+    msc.use_gpu_stats = m.at("use_gpu_stats").get<bool>();
+  }
   set_if_present(m, "extremum_sample_radius", msc.extremum_sample_radius);
 }
 

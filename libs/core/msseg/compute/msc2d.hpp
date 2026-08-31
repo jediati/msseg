@@ -131,6 +131,14 @@ class Msc2DPipeline {
   // consult this rather than emitting every member.
   const StatsSpec& stats() const;
 
+  // Free this pipeline's GPU residue (MSCEER's device label context, ~2-3
+  // label images of VRAM) while keeping every host-side result. A stack viewer
+  // holding one primed pipeline per slice calls this on the slices it leaves;
+  // the next select_persistence() on this pipeline lazily re-uploads once and
+  // is GPU-painted again. No-op on CPU builds/pins. build() also calls it on
+  // completion, so priming a long sequence never accumulates contexts.
+  void release_gpu();
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

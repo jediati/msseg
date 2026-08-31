@@ -73,8 +73,33 @@ class LabelStore:
     def __init__(self, n_classes=3):
         self.n_classes = int(n_classes)
         self.interactions = []                   # uid order == creation order
+        self.colors = {}                         # class_id -> "#rrggbb" override
         self.rev = 0
         self._next_uid = 1
+
+    # -- class colors (user-pickable; defaults from CLASS_COLORS) -------- #
+    def color(self, class_id):
+        return self.colors.get(class_id, class_color_hex(class_id))
+
+    def rgba(self, class_id):
+        hexv = self.colors.get(class_id)
+        if hexv is None:
+            return (CLASS_COLORS[class_id]
+                    if 0 <= class_id < MAX_CLASSES else (0, 0, 0, 0))
+        h = str(hexv).lstrip("#")
+        try:
+            return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255)
+        except (ValueError, IndexError):
+            return CLASS_COLORS[class_id % MAX_CLASSES]
+
+    def set_color(self, class_id, hexv):
+        if not (1 <= int(class_id) < MAX_CLASSES):
+            return
+        hexv = str(hexv)
+        if self.colors.get(class_id) == hexv:
+            return
+        self.colors[int(class_id)] = hexv
+        self.rev += 1                    # render LUT caches key on rev
 
     # -- mutations (each bumps rev) ------------------------------------ #
     def add(self, tool, points, class_id, slice_key, si=None, li=None):
@@ -138,7 +163,7 @@ class LabelStore:
             "version": 2,
             "app": "mscoupon-labeler",
             "n_classes": self.n_classes,
-            "classes": [{"id": k, "color": class_color_hex(k)}
+            "classes": [{"id": k, "color": self.color(k)}
                         for k in range(1, self.n_classes)],
             "interactions": [
                 {"uid": it.uid, "slice": it.slice_key, "si": it.si, "li": it.li,
@@ -151,6 +176,9 @@ class LabelStore:
     @classmethod
     def from_json(cls, doc):
         store = cls(n_classes=int(doc.get("n_classes", 3)))
+        for c in doc.get("classes") or []:
+            if isinstance(c, dict) and c.get("id") and c.get("color"):
+                store.colors[int(c["id"])] = str(c["color"])
         for d in doc.get("interactions", []):
             it = Interaction(d["uid"], d["slice"], d.get("si"), d.get("li"),
                              d.get("tool", "squiggle"), d.get("points", []),
@@ -303,9 +331,41 @@ def resolve_sets(sets, labels, np):
     return region_class
 
 
-def class_lut(region_class, np):
+def class_lut(region_class, np, colors=None):
     """(K, 4) uint8 RGBA LUT for the canvas label overlay: region id -> its
     class color. Class-0 rows have alpha 0, so unlabeled regions are invisible
-    (the canvas also treats raster values < 0 as transparent background)."""
-    colors = np.asarray(CLASS_COLORS, np.uint8)
-    return colors[region_class]
+    (the canvas also treats raster values < 0 as transparent background).
+    `colors` overrides the default palette (a (MAX_CLASSES, 4) RGBA table --
+    the labeler passes the store's user-picked colors)."""
+    table = np.asarray(CLASS_COLORS if colors is None else colors, np.uint8)
+    return table[region_class]
+
+
+# A blue -> cyan -> yellow -> red ramp for continuous per-region quantities
+# (class probability, prediction uncertainty). Hand-rolled rather than pulled
+# from matplotlib: this sits on the render path, and keeping it here -- pure
+# numpy, np passed in like everything else in this module -- puts it under
+# tests/test_labeling.py instead of only the Tk selftest.
+_RAMP_STOPS = ((0.00, (49, 54, 149)),
+               (0.33, (69, 180, 190)),
+               (0.66, (254, 224, 100)),
+               (1.00, (165, 15, 21)))
+
+
+def scalar_lut(values, np, alpha=255, mask=None):
+    """(K, 4) uint8 RGBA LUT mapping a per-region scalar in [0, 1] onto the
+    ramp, for the canvas label overlay: `values[i]` colors region id `i`.
+
+    `mask` (a bool array over the same ids) marks the regions that have a
+    value at all; everything else gets alpha 0, so regions the classifier
+    never saw stay invisible instead of rendering as ramp-zero."""
+    v = np.clip(np.asarray(values, np.float32), 0.0, 1.0)
+    stops = np.asarray([s for s, _c in _RAMP_STOPS], np.float32)
+    cols = np.asarray([c for _s, c in _RAMP_STOPS], np.float32)
+    out = np.zeros((len(v), 4), np.uint8)
+    for ch in range(3):
+        out[:, ch] = np.interp(v, stops, cols[:, ch]).round().astype(np.uint8)
+    out[:, 3] = int(max(0, min(255, alpha)))
+    if mask is not None:
+        out[~np.asarray(mask, bool), 3] = 0
+    return out

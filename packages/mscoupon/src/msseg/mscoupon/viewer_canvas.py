@@ -62,6 +62,12 @@ class SliceCanvas(tk.Frame):
         # pan, fit) -- screen-space annotations must be redrawn at the new
         # scale/offset.
         self.on_view_changed = None
+        # Optional callback(event) fired on a right-CLICK -- a Button-3 press
+        # and release with no drag in between. Right-drag still pans (see the
+        # bindings below), so a context menu cannot cost navigation; a viewer
+        # that leaves this None behaves exactly as before.
+        self.on_context = None
+        self._ctx_press = None
         self._hud_mode = None        # None | "busy" (animated) | "stale" (static)
         self._hud_text = ""
         self._hud_job = None
@@ -79,9 +85,9 @@ class SliceCanvas(tk.Frame):
         self.canvas.bind("<ButtonPress-2>", self._pan_start)
         self.canvas.bind("<B2-Motion>", self._pan_move)
         self.canvas.bind("<ButtonRelease-2>", lambda e: setattr(self, "_drag", None))
-        self.canvas.bind("<ButtonPress-3>", self._pan_start)
+        self.canvas.bind("<ButtonPress-3>", self._context_press)
         self.canvas.bind("<B3-Motion>", self._pan_move)
-        self.canvas.bind("<ButtonRelease-3>", lambda e: setattr(self, "_drag", None))
+        self.canvas.bind("<ButtonRelease-3>", self._context_release)
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Leave>", self._on_leave)
 
@@ -176,6 +182,23 @@ class SliceCanvas(tk.Frame):
         if self.tool is not None:
             self.tool.on_release(e)
         self._drag = None
+
+    # A right-press starts a pan optimistically; only a release close enough
+    # to the press counts as a click. Same click-vs-drag threshold idiom the
+    # labeler uses for dragging interaction rows between class panels.
+    _CLICK_SLOP_PX = 5
+
+    def _context_press(self, e):
+        self._ctx_press = (e.x, e.y)
+        self._pan_start(e)
+
+    def _context_release(self, e):
+        press, self._ctx_press = self._ctx_press, None
+        self._drag = None
+        if press is None or self.on_context is None:
+            return
+        if abs(e.x - press[0]) + abs(e.y - press[1]) <= self._CLICK_SLOP_PX:
+            self.on_context(e)
 
     def _pan_start(self, e):
         self._drag = (e.x, e.y, self.view_x, self.view_y)

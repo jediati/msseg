@@ -109,6 +109,16 @@ struct Msc2DParams {
   // Partition/thread count for the discrete gradient and (in "partitioned"
   // mode) the parallel MSC/hierarchy build. 0 => leave the msc_2d_lib default.
   int requested_parallelism = 0;
+  // Compute the base discrete gradient on the GPU (MSCEER's fused CUDA
+  // kernel, bit-identical to the CPU pairing). Requires msc_2d_lib built with
+  // GPU_DGRAD_ENABLED (MSSeg: -DMSSEG_GPU=ON) and a CUDA device; otherwise
+  // MSCEER falls back to the CPU path with a notice.
+  bool use_gpu_gradient = false;
+  // Accumulate the per-region statistics on the GPU (label CSR + segmented
+  // reduces over device-resident diffg channels). Unset => follows
+  // use_gpu_gradient. Requires -DMSSEG_GPU=ON and a CUDA device; falls back to
+  // the CPU loop per call otherwise. Env kill-switch: MSSEG_GPU_STATS=0.
+  std::optional<bool> use_gpu_stats;
   // Per-arc-dimension geometry construction, passed through to the MSC compute.
   // The core does not impose a policy here -- each instance decides (building arc
   // geometry is costly, so it defaults off; turn on the dims a downstream

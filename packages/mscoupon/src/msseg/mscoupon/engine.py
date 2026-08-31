@@ -178,6 +178,16 @@ class ComputeEngine:
                         log(f"  filter[{i}] {f['operation']}({f.get('params', {})}) "
                             f"-> min={cur.min():.4g} max={cur.max():.4g}")
                     filt = np.ascontiguousarray(cur, dtype=np.float32)
+                    if float(filt.max()) == float(filt.min()):
+                        # A constant topology field makes the MSC degenerate
+                        # (one region). Classic cause: an `edges` filter with
+                        # output=mask and thresholds 0/0, which passes every
+                        # pixel. Loud, because the only other trace is
+                        # value_range=0 in the prime log.
+                        log("  WARN: the filtered (topology) field is CONSTANT "
+                            f"(value {filt.max():.4g}) - the MSC will have one "
+                            "region. Check the filter chain (e.g. edges "
+                            "output=mask with thresholds 0/0 masks everything).")
                     # Base channel: the raster statistics and pixel thresholds are
                     # read from. Derived from the raw slice like `filters`, not
                     # chained onto it, matching the C++ pipeline.
@@ -426,6 +436,25 @@ class ComputeEngine:
         return {"commit": params.get("commit", 0), "labels": lab, "stats": table,
                 "kept": kept, "cc": None, "n_feat": n_feat}
 
+    def _release_inactive_gpu(self, si, li):
+        """Keep only the ACTIVE slice's GPU residue resident.
+
+        Each primed pipe that painted on the GPU holds a device label context
+        (~2-3 label images of VRAM); across a long sequence that exceeds the
+        card. Releasing is cheap and lossless -- the pipe's next select lazily
+        re-uploads once. Only called from the single-flight assembly worker."""
+        prev = getattr(self, "_gpu_active", None)
+        self._gpu_active = (si, li)
+        if prev is None or prev == (si, li):
+            return
+        psi, pli = prev
+        try:
+            pipe = self.primed[psi]["pipes"][pli]
+        except (IndexError, KeyError, TypeError):
+            return
+        if pipe is not None and hasattr(pipe, "release_gpu"):
+            pipe.release_gpu()
+
     def _assemble_worker(self, token, si, params):
         """Worker, tiered by params["level"] -- see the app's _needed_level().
 
@@ -449,6 +478,7 @@ class ComputeEngine:
             if level != "global":
                 # --- cheap tiers: the visible slice only --------------------- #
                 rec = self._slice_result(si, li0, params, engine, np, tm)
+                self._release_inactive_gpu(si, li0)
                 if level == "cc":
                     t = time.perf_counter()
                     base = np.asarray(p["base"][li0], dtype=np.float32)
@@ -476,6 +506,11 @@ class ComputeEngine:
             recs, n_feat = [], 0
             for li in range(len(p["pipes"])):
                 rec = self._slice_result(si, li, params, engine, np, tm)
+                # A global pass re-selects every pipe; don't let each one leave
+                # a GPU label context behind (VRAM scales with slice count).
+                pipe_li = p["pipes"][li]
+                if li != li0 and pipe_li is not None and hasattr(pipe_li, "release_gpu"):
+                    pipe_li.release_gpu()
                 recs.append(rec)
                 n_feat += rec["n_feat"]
                 merged_labels.append(rec["labels"])

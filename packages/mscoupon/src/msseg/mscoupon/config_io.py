@@ -33,8 +33,13 @@ FILTER_SCHEMA: Dict[str, List[tuple]] = {
     "structure_eigenvalues": [("smoothing_sigma", "float", 1.0),
                               ("integration_sigma", "float", 2.0),
                               ("component", "choice:largest,middle,smallest", "largest")],
+    # The thresholds are optfloat: BLANK means "no threshold" (diffg's
+    # EdgeOptions are std::optional -- absent skips the hysteresis mask). They
+    # were plain floats defaulting to 0.0 once, which made "unset"
+    # inexpressible: an explicit 0.0 threshold on output=mask passes every
+    # pixel and yields a CONSTANT field (a one-region MSC).
     "edges": [("sigma", "float", 1.0), ("suppress_nonmax", "bool", False),
-              ("low_threshold", "float", 0.0), ("high_threshold", "float", 0.0),
+              ("low_threshold", "optfloat", ""), ("high_threshold", "optfloat", ""),
               ("output", "choice:magnitude,mask", "magnitude")],
     "erode": [("radius", "int", 1)],
     "dilate": [("radius", "int", 1)],
@@ -608,6 +613,14 @@ def filters_from_json(items: Any,
             continue
         card = filter_params_from_json(op, item.get("params"), notes)
         if card is not None:
+            if op == "edges":
+                # Legacy migration: the GUI could not express "no threshold"
+                # and always wrote 0.0. As an explicit mask threshold, 0.0
+                # passes every pixel (constant field), which is never what a
+                # saved 0.0 meant -- read it back as unset.
+                for k in ("low_threshold", "high_threshold"):
+                    if card["params"].get(k) == 0.0:
+                        card["params"][k] = ""
             out.append(card)
     return out
 

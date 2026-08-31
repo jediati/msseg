@@ -87,3 +87,69 @@ def scrolled_listbox(parent, **kw):
     for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):   # Button-4/5 = X11
         lb.bind(seq, lambda e, w=lb: (w.yview_scroll(_wheel_delta(e), "units"), "break")[1])
     return lb
+
+
+class Tooltip:
+    """A delayed hover tooltip for one widget.
+
+    The labeler's class swatches carry two different actions on two mouse
+    buttons; without a tooltip the right-click one is undiscoverable. Kept
+    plain-tk (an override-redirect Toplevel) so it works before any ttk theme
+    is configured, and self-cancelling so a destroyed widget leaves nothing
+    scheduled -- the class panels are torn down and rebuilt constantly."""
+
+    def __init__(self, widget, text, delay_ms=600):
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self._job = None
+        self._tip = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+        widget.bind("<Destroy>", self._hide, add="+")
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        try:
+            self._job = self.widget.after(self.delay_ms, self._show)
+        except tk.TclError:
+            self._job = None
+
+    def _cancel(self):
+        if self._job is not None:
+            try:
+                self.widget.after_cancel(self._job)
+            except tk.TclError:
+                pass
+            self._job = None
+
+    def _show(self):
+        self._job = None
+        if self._tip is not None:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        except tk.TclError:
+            return
+        self._tip = tk.Toplevel(self.widget)
+        self._tip.wm_overrideredirect(True)
+        self._tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self._tip, text=self.text, justify="left",
+                 background="#ffffe0", foreground="#000", relief="solid",
+                 borderwidth=1, padx=4, pady=2).pack()
+
+    def _hide(self, _event=None):
+        self._cancel()
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except tk.TclError:
+                pass
+            self._tip = None
+
+
+def attach_tooltip(widget, text, delay_ms=600):
+    """Attach a hover tooltip; returns it so a caller can keep a reference."""
+    return Tooltip(widget, text, delay_ms)

@@ -71,6 +71,12 @@ struct MscConfig {
   // Discrete-gradient thread count and (in "partitioned" mode) MSC/hierarchy
   // partition count. 0 => leave the msc_2d_lib default (8).
   int requested_parallelism = 0;
+  // Compute the base discrete gradient on the GPU (bit-identical to the CPU
+  // pairing; needs a GPU-enabled build, else MSCEER falls back with a notice).
+  bool use_gpu_gradient = false;
+  // Accumulate per-region statistics on the GPU. Unset => follows
+  // use_gpu_gradient; falls back to the CPU loop when unavailable.
+  std::optional<bool> use_gpu_stats;
   // Window radius for the base-channel sample taken at each feature's seeding
   // extremum (the `ext_base` selection field). 0 => the single critical pixel.
   int extremum_sample_radius = 0;

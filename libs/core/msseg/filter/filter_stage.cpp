@@ -117,6 +117,14 @@ diffg::Image<float> apply_filter(const diffg::Image<float>& input, const FilterP
     const auto result = diffg::edges(view, sigma, edge_opts, exec);
     if (output == "magnitude") return result.gradient_magnitude;
     if (output == "mask" && result.has_mask) return mask_to_float(result.edge_mask, input);
+    if (output == "mask") {
+      // diffg only produces a mask when a threshold is provided; say so
+      // instead of the generic invalid-mode error.
+      throw std::runtime_error(
+          "edges output='mask' needs low_threshold and/or high_threshold "
+          "(none set -> no mask is produced; use output='magnitude' or set a "
+          "threshold).");
+    }
     throw std::runtime_error("Invalid edges output mode: " + output);
   }
 

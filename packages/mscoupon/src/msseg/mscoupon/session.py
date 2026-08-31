@@ -41,7 +41,8 @@ def default_profile(name: str = "default") -> Dict[str, Any]:
         "filters": [],
         "base_filters": [],
         "msc": {"manifold": "ascending", "persistence_percent": 10.0,
-                "accurate": False, "extremum_sample_radius": 0},
+                "accurate": False, "extremum_sample_radius": 0,
+                "use_gpu_gradient": False},
         "statistics": config_io.statistics_to_json(
             [{"kind": "base"}], list(config_io.STAT_REDUCTIONS), True, 0),
         "selection": {"feature_filters": [], "pixel_filters": [],
@@ -77,6 +78,7 @@ def profile_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[str, 
                          or msc.get("accurate_ascending")
                          or msc.get("accurate_descending")),
         "extremum_sample_radius": max(0, _as_int(msc.get("extremum_sample_radius"), 0)),
+        "use_gpu_gradient": bool(msc.get("use_gpu_gradient")),
     }
 
     stats = config_io.statistics_from_json(root.get("statistics"), notes)
@@ -122,6 +124,8 @@ def profile_params_json(profile: Dict[str, Any], cores: int = 1) -> str:
     radius = max(0, _as_int(m.get("extremum_sample_radius"), 0))
     if radius > 0:
         msc["extremum_sample_radius"] = radius
+    if m.get("use_gpu_gradient"):
+        msc["use_gpu_gradient"] = True
     if cores > 1:
         msc["compute_algorithm"] = "partitioned"
         msc["requested_parallelism"] = int(cores)

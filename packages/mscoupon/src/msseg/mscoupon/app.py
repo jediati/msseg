@@ -89,6 +89,7 @@ class MscouponApp:
         self.persist_pct_var = tk.StringVar(value="10")
         self.manifold_var = tk.StringVar(value="ascending")
         self.accurate_var = tk.BooleanVar(value=False)
+        self.gpu_var = tk.BooleanVar(value=False)   # msc.use_gpu_gradient
         self.ext_radius_var = tk.StringVar(value="0")
         self.min_area_var = tk.StringVar(value="")
         self.connectivity_var = tk.IntVar(value=6)
@@ -568,6 +569,8 @@ class MscouponApp:
                         value="descending").pack(side="left", padx=6)
         ttk.Checkbutton(c, text="accurate gradient (slower, more memory)",
                         variable=self.accurate_var).pack(anchor="w", padx=4)
+        ttk.Checkbutton(c, text="GPU gradient (CUDA; bit-identical results)",
+                        variable=self.gpu_var).pack(anchor="w", padx=4)
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="ext sample radius:").pack(side="left")
         ttk.Entry(row, textvariable=self.ext_radius_var, width=8).pack(side="left", padx=4)
@@ -1313,7 +1316,8 @@ class MscouponApp:
             "msc": {"manifold": self.manifold_var.get(),
                     "persistence_percent": pct,
                     "accurate": bool(self.accurate_var.get()),
-                    "extremum_sample_radius": radius},
+                    "extremum_sample_radius": radius,
+                    "use_gpu_gradient": bool(self.gpu_var.get())},
             "statistics": config_io.statistics_to_json(
                 self._stat_channel_cards(), self._stat_reductions(),
                 self.stat_extremum_var.get(), radius),
@@ -1335,6 +1339,7 @@ class MscouponApp:
         if msc.get("manifold"):
             setvar(self.manifold_var, msc["manifold"])
         setvar(self.accurate_var, bool(msc.get("accurate")))
+        setvar(self.gpu_var, bool(msc.get("use_gpu_gradient")))
         setvar(self.ext_radius_var, str(int(msc.get("extremum_sample_radius") or 0)))
         sel = profile.get("selection") or {}
         min_area = sel.get("min_area")
@@ -1547,11 +1552,14 @@ class MscouponApp:
         params = self._params_json()
         subseqs = [dict(s) for s in self.subsequences]
         # Incremental priming: a sequence already primed under the SAME compute
-        # parameters (cores excluded -- parallelism doesn't change results) and
-        # the same files is reused instead of recomputed, so adding a sequence
-        # never re-primes the rest. Any parameter/statistics change misses the
-        # fingerprint and re-primes everything.
-        fingerprint = self._params_json(cores=1)
+        # parameters (cores and the GPU-gradient flag excluded -- neither
+        # changes results, the GPU pairing is bit-identical) and the same files
+        # is reused instead of recomputed, so adding a sequence never re-primes
+        # the rest. Any parameter/statistics change misses the fingerprint and
+        # re-primes everything.
+        fp_doc = json.loads(self._params_json(cores=1))
+        fp_doc.get("msc", {}).pop("use_gpu_gradient", None)
+        fingerprint = json.dumps(fp_doc, sort_keys=True)
         reused = 0
         if fingerprint == getattr(self, "_primed_fingerprint", None) and self.primed:
             by_files = {tuple(p["files"]): p for p in self.primed}

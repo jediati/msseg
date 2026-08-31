@@ -38,16 +38,30 @@ set(DIFFG_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 # so we drive the GInt 3D stack directly from msseg_core instead.
 set(MSC_2D_LIB ON CACHE BOOL "Build MSCEER pure C++ 2D library" FORCE)
 
+# GPU compute path: MSSEG_GPU=ON builds MSCEER's CUDA discrete-gradient library
+# (gpu_dgrad) and links it into msc_2d_lib, enabling msc.use_gpu_gradient at
+# runtime. Requires a CUDA toolkit >= 12.8; with the Ninja generator pass
+# -DCMAKE_CUDA_COMPILER=".../CUDA/v13.0/bin/nvcc.exe" (the PATH nvcc may be
+# older), with the VS generator -T cuda=13.0. OFF by default so pip wheels and
+# CUDA-less machines build unchanged.
+option(MSSEG_GPU "Build the CUDA GPU compute path (MSCEER gpu_dgrad)" OFF)
+if(MSSEG_GPU)
+  set(GPU_DGRAD_ENABLED ON CACHE BOOL "MSCEER GPU discrete gradient" FORCE)
+  # diffg's device-resident filter bank rides the same switch; its stub keeps
+  # CUDA-less consumers link-compatible, so this only changes what diffg_gpu is.
+  set(DIFFG_ENABLE_CUDA ON CACHE BOOL "diffg CUDA filter bank" FORCE)
+endif()
+
 set(TinyTIFF_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(diffg
   GIT_REPOSITORY https://github.com/jediati/diffg.git
-  GIT_TAG bdf5623be9b1563518cdd05ff644f74ed6c5e48a   # + batched multi-filter bank (apply_filter_bank)
+  GIT_TAG 1a06653713cb0c5def3e7f39357c7b7959d9b9e6   # device-resident + JIT GPU filter bank (bit-exact), FilterBankStream
 )
 FetchContent_Declare(msceer
   GIT_REPOSITORY https://github.com/sci-visus/MSCEER.git
-  GIT_TAG c04aab11cb4fd3b46450f1b70650437a8752858f   # + cheap re-thresholding (compact base ids, no per-pixel hash)
+  GIT_TAG ea8443921f7a8999ee3bb151b7abd7982b4b24ee   # cuda-gradient: + LabelCtx2D, region-scale paint API, walk-down remap, releaseGpuResources
 )
 FetchContent_Declare(tinytiff
   GIT_REPOSITORY https://github.com/jkriege2/TinyTIFF.git

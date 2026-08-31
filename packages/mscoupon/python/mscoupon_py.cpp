@@ -79,6 +79,8 @@ msseg::Msc2DParams parse_msc(const nlohmann::json& cfg) {
     msc.accurate_descending = m.value("accurate_descending", msc.accurate_descending);
     msc.manifold = m.value("manifold", msc.manifold);
     msc.requested_parallelism = m.value("requested_parallelism", msc.requested_parallelism);
+    msc.use_gpu_gradient = m.value("use_gpu_gradient", msc.use_gpu_gradient);
+    if (m.contains("use_gpu_stats")) msc.use_gpu_stats = m["use_gpu_stats"].get<bool>();
     msc.extremum_sample_radius = m.value("extremum_sample_radius", msc.extremum_sample_radius);
   }
   msc.stats = parse_stats_spec(cfg);
@@ -555,7 +557,11 @@ PYBIND11_MODULE(mscoupon_py, m) {
       "Primed 2D MSC pipeline: base decomposition + merge tree + statistics, with "
       "cheap persistence re-thresholding. Construct via prime_slice().")
       .def("select_persistence", &msseg::Msc2DPipeline::select_persistence, py::arg("persistence_absolute"),
+           py::call_guard<py::gil_scoped_release>(),
            "Re-threshold to an absolute persistence (remap labels + re-aggregate stats).")
+      .def("release_gpu", &msseg::Msc2DPipeline::release_gpu,
+           "Free this slice's GPU residue (device label context); host results stay, "
+           "the next select re-uploads lazily. Call when the slice stops being active.")
       .def("current_persistence", &msseg::Msc2DPipeline::current_persistence)
       .def("value_range", &msseg::Msc2DPipeline::value_range,
            "Filtered-field value range (max-min), for percent->absolute persistence.")

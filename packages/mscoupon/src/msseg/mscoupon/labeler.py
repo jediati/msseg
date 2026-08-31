@@ -1,7 +1,8 @@
 """mscoupon interactive labeler: annotate MSC regions with classes.
 
 A fork of the viewer (``mscoupon-gui``) for fast class annotation: arm a class
-(button or numeric hotkey), then draw over the slice --
+(left-click its color swatch, or the numeric hotkey; right-click the swatch
+recolors it), then draw over the slice --
 
     squiggle   every living MSC region under the polyline gets the class
     box        every region intersecting the dragged rectangle
@@ -18,6 +19,26 @@ regions for free.
 The class layer renders through the canvas's label-overlay path: one RGBA LUT
 per slice (region id -> class color), rebuilt only when an interaction or the
 segmentation commit changes, gathered over the visible crop at render time.
+The ``regions`` checkbox says whether that layer is drawn; the dropdown beside
+it says how it is *colored* -- the region-id palette, ``P(class k)``, or
+prediction ``uncertainty`` (1 - the top-two probability margin). The scalar
+modes replace the id LUT rather than tinting it, and appear only once Classify
+has filled the probability cache. ``outlines`` paints every on-slice gesture
+at once instead of only what the pointer is over, and a right-CLICK on the
+image plane (a right-DRAG still pans) offers the same move/delete menu the
+class-list rows do.
+
+Train freezes a prediction per region; the confusion matrix under the class
+stack then counts frozen-prediction against live-label, so labeling more moves
+only the true axis -- "old prediction, new value". Clicking a cell highlights
+its regions on the current slice. Early counts are resubstitution (the truth
+IS the training set); the reading that matters is what moves after a Train.
+
+Loading a classifier saved under different ``statistics`` no longer just
+refuses: the v2 pickle carries the statistics it was trained under, and the
+labeler offers to build a profile from them (keeping the active profile's
+filters/MSC/selection) and switch to it -- which drops the primed data, since
+the per-slice feature table is baked at prime time.
 
 Everything else -- sequences, filter chains, statistics, priming, persistence,
 config export, session autosave -- is inherited from the viewer. The exported
@@ -40,9 +61,10 @@ from . import config_io
 from . import session
 from .app import MscouponApp
 from .common import log
-from .widgets import ScrollFrame
-from .labeling import (LabelStore, MAX_CLASSES, TOOLS, class_color_hex,
-                       resolve_slice, resolve_sets, touched_sets, class_lut)
+from .widgets import ScrollFrame, attach_tooltip
+from .labeling import (LabelStore, MAX_CLASSES, TOOLS,
+                       resolve_slice, resolve_sets, touched_sets, class_lut,
+                       scalar_lut)
 
 # How faint the inherited region overlay is drawn under the class layer
 # (0..255); the class colors themselves stay fully opaque in the LUT and are
@@ -51,6 +73,14 @@ _REGION_ALPHA = 90
 # Classifier predictions render between the region layer and the user's own
 # labels, slightly translucent so drawn labels stay distinguishable on top.
 _PRED_ALPHA = 170
+# A scalar regions layer (class probability / uncertainty) IS the point of the
+# view, not orientation under it, so it is drawn much less faintly than the
+# region-id layer it replaces.
+_SCALAR_ALPHA = 150
+
+# Regions coloring modes; the per-class ones are generated ("P(class 2)").
+_MODE_ID = "label id"
+_MODE_UNCERTAINTY = "uncertainty"
 
 # Statistics fields that are POSITIONS, not appearance: where a region sits in
 # the slice says nothing about what material it is, and coordinate features
@@ -145,7 +175,8 @@ class DrawController:
             color = "#ffffff"          # accept box: neutral, dashed
         else:
             cls = self.app.active_class_var.get()
-            color = class_color_hex(cls) if 0 < cls < MAX_CLASSES else "#ffffff"
+            color = (self.app._class_color_hex(cls)
+                     if 0 < cls < MAX_CLASSES else "#ffffff")
         scr = [((x - v.view_x) / v.scale, (y - v.view_y) / v.scale)
                for x, y in self._pts]
         if len(scr) < 2:
@@ -177,6 +208,7 @@ class LabelerApp(MscouponApp):
         # which-interactions-touch-this-region hover lookup.
         self._class_luts = {}
         self._hover_key = None     # (si, li, region) whose geometry is on screen
+        self._cm_cell = None       # selected confusion cell (true, pred)
         self._hover_uid = None     # row-hovered interaction whose geometry shows
         # Classifier state: model + its feature-column order, and per-slice
         # predicted region->class arrays keyed by the commit they were made at.
@@ -184,17 +216,29 @@ class LabelerApp(MscouponApp):
         self._clf_names = None
         self._clf_kind = "dense FC"
         self.model_kind_var = tk.StringVar(master=root, value="dense FC")
+        # Provenance line above the classifier controls: which model is loaded,
+        # how wide its feature vector is, and whether it still agrees with the
+        # active profile (a mismatch blocks Classify, so say so up front).
+        self.model_strip_var = tk.StringVar(master=root, value="no model")
         # Session-level model references: saved/loaded pickles + their feature
         # fingerprint, for the profile-compatibility check.
         self.models = []           # [{"path","fingerprint","kind","statistics"}]
-        self._pred = {}            # (si, li) -> (commit, region_class uint8)
+        # (si, li) -> (commit, region_class uint8, region_proba float32)
+        self._pred = {}
         self.show_pred_var = tk.BooleanVar(master=root, value=False)
         # Master overlay switch (Tab toggles it): base image only when off.
         self.show_overlay_var = tk.BooleanVar(master=root, value=True)
         self.active_class_var = tk.IntVar(master=root, value=0)
+        self._class_swatches = {}       # class_id -> arm/color swatch button
+        self.active_class_var.trace_add("write", self._refresh_class_arm)
         self.tool_var = tk.StringVar(master=root, value="squiggle")
         self.show_regions_var = tk.BooleanVar(master=root, value=True)
+        self.region_mode_var = tk.StringVar(master=root, value=_MODE_ID)
+        # Persistent annotation view: paint every on-slice gesture outline at
+        # once, not just what the pointer is over.
+        self.show_annot_var = tk.BooleanVar(master=root, value=False)
         self.n_classes_var = tk.IntVar(master=root, value=self.store.n_classes)
+        self._class_title_labels = {}   # class_id -> title Label (counts text)
         self._drag_uid = None      # interaction row being dragged between classes
         self._drag_origin = None   # (x_root, y_root) at press: distinguishes click vs drag
         self._drop_panel = None    # class panel currently highlighted as target
@@ -211,6 +255,9 @@ class LabelerApp(MscouponApp):
             self.viewer.tool = DrawController(self)
             # Zoom/pan invalidates screen-space annotation geometry.
             self.viewer.on_view_changed = self._redraw_hover_geometry
+            # Right-CLICK (not right-drag, which still pans) on the image
+            # plane offers the same menu as an interaction row.
+            self.viewer.on_context = self._canvas_menu
         self._bind_hotkeys()
 
     # ------------------------------------------------------------------ #
@@ -231,6 +278,21 @@ class LabelerApp(MscouponApp):
         # "slice" and every inherited path keeps working; the mask is never on.
         ttk.Checkbutton(chan, text="regions", variable=self.show_regions_var,
                         command=self._on_regions_toggle).pack(side="left", padx=(12, 4))
+        # The checkbox says WHETHER the region layer is drawn; the dropdown
+        # says how it is colored. The scalar modes need a probability cache,
+        # so the list is repopulated by Classify and emptied by anything that
+        # invalidates it.
+        self.region_mode_combo = ttk.Combobox(
+            chan, textvariable=self.region_mode_var, values=[_MODE_ID],
+            state="readonly", width=13)
+        self.region_mode_combo.pack(side="left", padx=(0, 4))
+        self.region_mode_combo.bind("<<ComboboxSelected>>",
+                                    lambda e: self._refresh_render())
+        ttk.Separator(chan, orient="vertical").pack(side="left", fill="y",
+                                                    padx=(6, 6))
+        ttk.Checkbutton(chan, text="outlines", variable=self.show_annot_var,
+                        command=self._refresh_annotation_layer
+                        ).pack(side="left")
         self.mask_var = tk.BooleanVar(value=False)
         self.seg_source_var.set("msc" if self.show_regions_var.get() else "none")
 
@@ -238,12 +300,59 @@ class LabelerApp(MscouponApp):
         self.seg_source_var.set("msc" if self.show_regions_var.get() else "none")
         self._on_seg_source_change()
 
+    # -- regions coloring modes ------------------------------------------ #
+    def _region_modes(self):
+        """The coloring modes offered right now: the id LUT always, the scalar
+        ones only once a probability cache exists."""
+        modes = [_MODE_ID]
+        if any(len(v) > 2 for v in self._pred.values()):
+            modes += [f"P(class {k})" for k in range(1, self.store.n_classes)]
+            modes.append(_MODE_UNCERTAINTY)
+        return modes
+
+    def _refresh_region_modes(self):
+        """Repopulate the dropdown, falling back to `label id` when the mode
+        that was selected is no longer available."""
+        combo = getattr(self, "region_mode_combo", None)
+        if combo is None:
+            return
+        modes = self._region_modes()
+        try:
+            combo.config(values=modes)
+        except tk.TclError:
+            return
+        if self.region_mode_var.get() not in modes:
+            self.region_mode_var.set(_MODE_ID)
+
+    def _region_scalar(self, entry, np):
+        """(values, mask) for the selected scalar mode over `entry`'s regions,
+        or None when the mode is `label id` / the entry has no probabilities."""
+        mode = self.region_mode_var.get()
+        if mode == _MODE_ID or len(entry) < 3:
+            return None
+        proba = entry[2]
+        # A region the classifier never scored sums to 0; those stay invisible
+        # rather than rendering as ramp-zero.
+        mask = proba.sum(1) > 0
+        if mode == _MODE_UNCERTAINTY:
+            top = np.sort(proba, axis=1)
+            return 1.0 - (top[:, -1] - top[:, -2]), mask
+        try:
+            k = int(mode[len("P(class "):-1])
+        except ValueError:
+            return None
+        if not (0 <= k < proba.shape[1]):
+            return None
+        return proba[:, k], mask
+
     def _handle_event(self, ev):
         if ev[0] == "primed":
             # The commit bump already invalidates these; dropping them outright
             # also frees the old run's arrays.
             self._class_luts.clear()
             self._pred.clear()
+            self._cm_cell = None
+            self._refresh_region_modes()
         super()._handle_event(ev)
         if ev[0] == "primed":
             self._rebuild_class_panels()      # slice 0 is now on screen
@@ -320,19 +429,36 @@ class LabelerApp(MscouponApp):
         if not self.show_overlay_var.get():
             return []                # master switch (Tab): base image only
         overlays = super()._seg_overlays(si, li, rec, data, np, min_colors)
-        # The inherited region overlay is orientation, not the point: fade it
-        # under the class layer (copy first -- _id_lut results may be shared).
-        for o in overlays:
-            if "lut" in o:
-                o["lut"] = o["lut"].copy()
-                o["lut"][:, 3] = np.minimum(o["lut"][:, 3], _REGION_ALPHA)
+        scalar = None
+        if rec is not None and self.show_regions_var.get():
+            entry = self._pred.get((si, li))
+            if entry is not None and entry[0] == rec.get("commit"):
+                scalar = self._region_scalar(entry, np)
+        if scalar is not None:
+            # A coloring mode REPLACES the id LUT rather than tinting it: the
+            # ids and the scalar are two readings of the same regions, and
+            # stacking them would just muddy both.
+            values, mask = scalar
+            overlays = [o for o in overlays if "lut" not in o]
+            overlays.append({"labels": rec["labels"],
+                             "lut": scalar_lut(values, np, _SCALAR_ALPHA, mask),
+                             "visible": True})
+        else:
+            # The inherited region overlay is orientation, not the point: fade
+            # it under the class layer (copy first -- _id_lut results may be
+            # shared).
+            for o in overlays:
+                if "lut" in o:
+                    o["lut"] = o["lut"].copy()
+                    o["lut"][:, 3] = np.minimum(o["lut"][:, 3], _REGION_ALPHA)
         if rec is not None:
             # Classifier predictions under the user's own labels: the model's
             # view of every region, with the drawn ground truth on top.
             if self.show_pred_var.get():
                 pr = self._pred.get((si, li))
                 if pr is not None and pr[0] == rec.get("commit"):
-                    plut = class_lut(pr[1], np).copy()
+                    plut = class_lut(pr[1], np,
+                                     self._class_colors_rgba(np)).copy()
                     plut[:, 3] = (plut[:, 3].astype(np.uint16)
                                   * _PRED_ALPHA // 255).astype(np.uint8)
                     overlays.append({"labels": rec["labels"], "lut": plut,
@@ -341,10 +467,23 @@ class LabelerApp(MscouponApp):
             if lut is not None:
                 overlays.append({"labels": rec["labels"], "lut": lut,
                                  "visible": True})
+            # A selected confusion cell outranks everything: it is a question
+            # about WHERE those regions are, so it goes on top, opaque.
+            hits = self._confusion_hits()
+            if hits:
+                K = max(int(rec["labels"].max()) + 1 if rec["labels"].size
+                        else 1, 1)
+                hl = np.zeros((K, 4), np.uint8)
+                ids = [r for r in hits if r < K]
+                if ids:
+                    hl[ids] = (255, 255, 255, 255)
+                    overlays.append({"labels": rec["labels"], "lut": hl,
+                                     "visible": True})
         return overlays
 
     def _labels_cache_for(self, si, li, rec, np):
-        """(commit, rev, lut, {uid: touched ids}, per-class region counts) for
+        """(commit, rev, lut, {uid: touched ids}, per-class region counts,
+        region id -> class) for
         one slice, memoized on (commit, store.rev): a gesture bumps rev
         (rebuild only this), a Rerun bumps the commit (a fresh labels raster
         arrives and the interactions re-resolve against it -- which is how
@@ -356,7 +495,7 @@ class LabelerApp(MscouponApp):
         cached = self._class_luts.get(key)
         if cached is not None and cached[0] == commit and cached[1] == self.store.rev:
             return cached
-        lut, touch = None, {}
+        lut, touch, region_class = None, {}, None
         counts = np.zeros(MAX_CLASSES, np.int64)
         slice_key = self._slice_key(si, li)
         if slice_key is not None:
@@ -365,12 +504,24 @@ class LabelerApp(MscouponApp):
                 sets = touched_sets(its, rec["labels"], np)
                 touch = {it.uid: ids for it, ids in sets}
                 region_class = resolve_sets(sets, rec["labels"], np)
-                lut = class_lut(region_class, np)
+                lut = class_lut(region_class, np, self._class_colors_rgba(np))
                 counts = np.bincount(region_class,
                                      minlength=MAX_CLASSES)[:MAX_CLASSES]
-        entry = (commit, self.store.rev, lut, touch, counts)
+        # region_class rides along: the confusion matrix needs per-region truth
+        # on every label edit, and this pass already produced it.
+        entry = (commit, self.store.rev, lut, touch, counts, region_class)
         self._class_luts[key] = entry
         return entry
+
+    def _class_colors_rgba(self, np):
+        """(MAX_CLASSES, 4) RGBA table: the store's user-picked colors over
+        the defaults. A color change bumps store.rev, so every LUT cache
+        keyed on it rebuilds."""
+        return np.asarray([self.store.rgba(k) for k in range(MAX_CLASSES)],
+                          np.uint8)
+
+    def _class_color_hex(self, k):
+        return self.store.color(k)
 
     def _class_lut_for(self, si, li, rec, np):
         return self._labels_cache_for(si, li, rec, np)[2]
@@ -618,6 +769,12 @@ class LabelerApp(MscouponApp):
         self.classify_btn.pack(side="left", fill="x", expand=True, padx=2)
         ttk.Checkbutton(row, text="show", variable=self.show_pred_var,
                         command=self._refresh_render).pack(side="left", padx=(2, 0))
+        # Packed after the Train row, so it lands directly ABOVE it (bottom
+        # packing stacks upward).
+        row = ttk.Frame(panel); row.pack(side="bottom", fill="x", padx=4)
+        self.model_strip = ttk.Label(row, textvariable=self.model_strip_var,
+                                     foreground="#555", anchor="w")
+        self.model_strip.pack(side="left", fill="x", expand=True)
         row = ttk.Frame(panel); row.pack(side="bottom", fill="x", padx=4, pady=2)
         ttk.Button(row, text="Save classifier…",
                    command=self._save_classifier).pack(side="left", fill="x",
@@ -637,12 +794,21 @@ class LabelerApp(MscouponApp):
         ttk.Button(row, text="Load labels…",
                    command=self._load_labels).pack(side="left", fill="x", expand=True, padx=(2, 0))
 
+        # Packed LAST among the bottom rows, so it sits directly under the
+        # class stack, which then takes only the cavity that is left.
+        self.confusion_holder = ttk.LabelFrame(panel, text="true \\ predicted")
+        self.confusion_holder.pack(side="bottom", fill="x", padx=4, pady=(2, 4))
+        self._cm_cells = {}              # (true, pred) -> Label
+        self._cm_counts = {}             # (true, pred) -> int
+        self._rebuild_confusion_grid()
+
         self.classes_holder = ttk.Frame(panel)
         self.classes_holder.pack(side="top", fill="both", expand=True, padx=2, pady=4)
         self.classes_holder.columnconfigure(0, weight=1)
         self._class_panels = {}          # class_id -> LabelFrame (drop targets)
 
         self._rebuild_class_panels()
+        self._refresh_model_strip()
 
     def _on_n_classes_change(self):
         try:
@@ -672,19 +838,33 @@ class LabelerApp(MscouponApp):
             w.destroy()
         self._class_panels = {}
         visible = self._visible_interactions()
+        self._class_title_labels = {}
+        self._class_swatches = {}
         for k in range(1, self.store.n_classes):
-            frame = ttk.LabelFrame(self.classes_holder, text=f"Class {k}")
+            frame = ttk.LabelFrame(self.classes_holder)
             self.classes_holder.rowconfigure(k - 1, weight=1, uniform="cls")
-            frame.grid(row=k - 1, column=0, sticky="nsew", padx=2, pady=3)
+            frame.grid(row=k - 1, column=0, sticky="nsew", padx=2, pady=1)
             self._class_panels[k] = frame
             if k == 1:
                 self._panel_relief = str(frame.cget("relief"))
-            color = class_color_hex(k)
-            tk.Radiobutton(frame, text=f"draw (key {k})",
-                           variable=self.active_class_var, value=k,
-                           indicatoron=False, selectcolor=color,
-                           bg="#e8e8e8", activebackground=color,
-                           ).pack(side="top", fill="x", padx=4, pady=(2, 4))
+            color = self._class_color_hex(k)
+            # Title bar: the counts label plus a color swatch that doubles as
+            # the ARM control -- left-click draws with this class, right-click
+            # recolors it. A full-width "draw (key k)" radiobutton per class
+            # cost more vertical space than the interaction lists themselves.
+            title = ttk.Frame(frame)
+            swatch = tk.Button(title, width=2, bg=color, activebackground=color,
+                               relief="raised", bd=1, cursor="hand2")
+            swatch.bind("<ButtonRelease-1>",
+                        lambda e, k=k: self.active_class_var.set(k))
+            swatch.bind("<Button-3>", lambda e, k=k: self._pick_class_color(k))
+            attach_tooltip(swatch, f"Left-click: draw with class {k} (key {k})\n"
+                                   f"Right-click: change color")
+            swatch.pack(side="left", padx=(0, 4))
+            self._class_swatches[k] = swatch
+            self._class_title_labels[k] = ttk.Label(title, text=f"Class {k}")
+            self._class_title_labels[k].pack(side="left")
+            frame.configure(labelwidget=title)
             lst = ScrollFrame(frame, width=240, canvas_width=224,
                               background="white")
             # Small minimum height: the grid's equal weights own the real size.
@@ -693,8 +873,163 @@ class LabelerApp(MscouponApp):
             for it in visible:
                 if it.class_id == k:
                     self._build_interaction_row(lst.inner, it)
+        # Rows past the last class keep their weight otherwise, so a later
+        # regrow would hand a stale row a share of the height.
+        for k in range(self.store.n_classes - 1, MAX_CLASSES):
+            self.classes_holder.rowconfigure(k, weight=0, uniform="")
         self._update_class_titles()
+        self._refresh_class_arm()
+        # The matrix tracks exactly what the panels do -- class count, class
+        # colors, and the label edit that triggered this -- so it rides the
+        # same rebuild instead of being wired into all ten mutators. It reads
+        # the caches _update_class_titles has just warmed, so it is nearly free
+        # here; refreshing it earlier would pay for the rasterization twice.
+        self._rebuild_confusion_grid()
+        self._refresh_confusion()
+        # Same reasoning: the persistent outlines are exactly the on-slice
+        # interactions the panels list, so they repaint on the same signal.
+        self._refresh_annotation_layer()
         self._refresh_subseq_list()      # keep the tree's annot counts live
+
+    def _refresh_class_arm(self, *_trace):
+        """Ring the armed class's swatch. Driven by a trace on
+        active_class_var, which six paths write (swatch, digit hotkeys,
+        Escape, store install, class-count clamp) -- and the panels are
+        destroyed and rebuilt under it, hence the winfo_exists guard."""
+        active = 0
+        try:
+            active = int(self.active_class_var.get())
+        except (tk.TclError, ValueError):
+            pass
+        for k, w in getattr(self, "_class_swatches", {}).items():
+            try:
+                if not w.winfo_exists():
+                    continue
+                w.configure(relief="sunken" if k == active else "raised",
+                            bd=3 if k == active else 1)
+            except tk.TclError:
+                continue
+
+    # ------------------------------------------------------------------ #
+    # Confusion matrix (frozen predictions vs. live labels)
+    # ------------------------------------------------------------------ #
+    def _rebuild_confusion_grid(self):
+        """Lay out the (n_classes-1)^2 cells plus their colored headers. Only
+        the class COUNT changes the layout, so this runs from the spinbox and
+        the store install, not from every label edit."""
+        holder = getattr(self, "confusion_holder", None)
+        if holder is None:
+            return
+        for w in list(holder.winfo_children()):
+            w.destroy()
+        self._cm_cells = {}
+        n = self.store.n_classes
+        tk.Label(holder, text="t\\p", width=3, background="white",
+                 relief="flat").grid(row=0, column=0, sticky="nsew")
+        for j in range(1, n):
+            tk.Label(holder, text=str(j), width=4, background=self._class_color_hex(j),
+                     relief="flat").grid(row=0, column=j, sticky="nsew")
+        for i in range(1, n):
+            tk.Label(holder, text=str(i), width=3,
+                     background=self._class_color_hex(i),
+                     relief="flat").grid(row=i, column=0, sticky="nsew")
+            for j in range(1, n):
+                cell = tk.Label(holder, text="0", width=4, background="white",
+                                relief="ridge", borderwidth=1, cursor="hand2")
+                cell.grid(row=i, column=j, sticky="nsew", padx=1, pady=1)
+                cell.bind("<Button-1>",
+                          lambda e, i=i, j=j: self._on_confusion_click(i, j))
+                self._cm_cells[(i, j)] = cell
+        for c in range(n):
+            holder.columnconfigure(c, weight=1)
+        if self._cm_cell not in self._cm_cells:
+            self._cm_cell = None         # the class count shrank under it
+
+    def _confusion_counts(self):
+        """{(true, pred): n} over every slice that has BOTH a live prediction
+        cache and drawn labels. Predictions stay frozen until the next
+        Train/Classify, so labeling more moves only the true axis -- which is
+        the point: "old prediction, new value".
+
+        Truth comes from _labels_cache_for, the rasterization the class LUT
+        already paid for, so this adds no pass over the interactions."""
+        import numpy as np
+        counts = {}
+        for (si, li), entry in self._pred.items():
+            rec = self.engine.record(si, li)
+            if rec is None or rec.get("labels") is None:
+                continue
+            if entry[0] != rec.get("commit"):
+                continue
+            truth = self._truth_from_cache(si, li, rec, np)
+            if truth is None:
+                continue
+            pred = entry[1]
+            n = min(len(truth), len(pred))
+            t, p = truth[:n], pred[:n]
+            m = (t >= 1) & (p >= 1)
+            if not m.any():
+                continue
+            pairs, freq = np.unique(np.stack([t[m], p[m]], 1), axis=0,
+                                    return_counts=True)
+            for (ti, pj), c in zip(pairs, freq):
+                key = (int(ti), int(pj))
+                counts[key] = counts.get(key, 0) + int(c)
+        return counts
+
+    def _truth_from_cache(self, si, li, rec, np):
+        """Region id -> user class for one slice, straight out of the memoized
+        rasterization the class LUT already pays for."""
+        return self._labels_cache_for(si, li, rec, np)[5]
+
+    def _refresh_confusion(self):
+        counts = self._confusion_counts()
+        self._cm_counts = counts
+        for (i, j), cell in getattr(self, "_cm_cells", {}).items():
+            try:
+                cell.configure(
+                    text=str(counts.get((i, j), 0)),
+                    background=("#cde8ff" if self._cm_cell == (i, j)
+                                else ("#f0f0f0" if i == j else "white")))
+            except tk.TclError:
+                pass
+
+    def _on_confusion_click(self, i, j):
+        """Highlight the cell's regions on the CURRENT slice (clicking the
+        selected cell again clears it)."""
+        self._cm_cell = None if self._cm_cell == (i, j) else (i, j)
+        self._refresh_confusion()
+        self._refresh_render()
+        if self._cm_cell is None:
+            self.status_var.set("Confusion highlight cleared.")
+            return
+        total = self._cm_counts.get((i, j), 0)
+        self.status_var.set(f"true {i} -> predicted {j}: "
+                            f"{len(self._confusion_hits())} on this slice / "
+                            f"{total} total")
+
+    def _confusion_hits(self):
+        """Region ids on the current slice matching the selected cell."""
+        if self._cm_cell is None:
+            return set()
+        cur = self._current()
+        if cur is None:
+            return set()
+        si, li = cur
+        rec = self.engine.record(si, li)
+        entry = self._pred.get((si, li))
+        if (rec is None or rec.get("labels") is None or entry is None
+                or entry[0] != rec.get("commit")):
+            return set()
+        import numpy as np
+        truth = self._truth_from_cache(si, li, rec, np)
+        if truth is None:
+            return set()
+        i, j = self._cm_cell
+        pred = entry[1]
+        n = min(len(truth), len(pred))
+        hit = (truth[:n] == i) & (pred[:n] == j)
+        return set(int(r) for r in np.nonzero(hit)[0])
 
     def _visible_interactions(self):
         """The interactions listed in the class panels: the CURRENT slice's
@@ -731,26 +1066,52 @@ class LabelerApp(MscouponApp):
 
     def _update_class_titles(self):
         annot, regions = self._class_totals()
-        for k, frame in self._class_panels.items():
+        for k, lbl in getattr(self, "_class_title_labels", {}).items():
             try:
-                frame.configure(text=f"Class {k} — annot: {annot.get(k, 0)} — "
-                                     f"regions: {regions.get(k, 0)}")
+                # Terse: the full "Class k — annot: n — regions: m" overflowed
+                # the 300 px pane. a = annotations (all slices), r = regions.
+                lbl.configure(text=f"{k} · {annot.get(k, 0)}a · "
+                                   f"{regions.get(k, 0)}r")
             except tk.TclError:
                 pass
+
+    def _pick_class_color(self, k):
+        from tkinter import colorchooser
+        hexv = colorchooser.askcolor(color=self._class_color_hex(k),
+                                     title=f"Class {k} color",
+                                     parent=self.root)[1]
+        if not hexv:
+            return
+        self._push_history()             # a color change is undoable
+        self.store.set_color(k, hexv)    # rev bump -> LUT caches rebuild
+        self._rebuild_class_panels()
+        self._refresh_render()
 
     def _build_interaction_row(self, parent, it):
         # Plain-tk widgets so the rows share the list's white background.
         row = tk.Frame(parent, background="white")
-        row.pack(fill="x", padx=6, pady=1)
-        where = it.slice_key if it.bound else f"{it.slice_key} (unbound)"
-        lbl = tk.Label(row, text=f"#{it.uid} {it.tool}  [{where}]",
+        row.pack(fill="x", padx=4, pady=0)
+        # Delete on the LEFT: a narrow pane truncates the label, and a
+        # right-packed ✕ is the first thing to disappear with it.
+        tk.Button(row, text="✕", width=2, relief="flat", background="white",
+                  activebackground="#ddd", padx=0, pady=0,
+                  command=lambda uid=it.uid: self._delete_interaction(uid)
+                  ).pack(side="left")
+        # The rows normally all belong to the current slice, so the key is
+        # noise -- except when it is NOT this slice's (nothing on screen, so
+        # _visible_interactions lists everything) or failed to bind at all.
+        cur = self._current()
+        cur_key = self._slice_key(*cur) if cur is not None else None
+        if not it.bound:
+            where = f"  [{it.slice_key} (unbound)]"
+        elif it.slice_key != cur_key:
+            where = f"  [{it.slice_key}]"
+        else:
+            where = ""
+        lbl = tk.Label(row, text=f"#{it.uid} {it.tool}{where}",
                        foreground=("#000" if it.bound else "#888"),
                        background="white", anchor="w", cursor="hand2")
         lbl.pack(side="left", fill="x", expand=True)
-        tk.Button(row, text="✕", width=2, relief="flat", background="white",
-                  activebackground="#ddd",
-                  command=lambda uid=it.uid: self._delete_interaction(uid)
-                  ).pack(side="right")
         # Drag a row onto another class's subpanel to reassign it; a stationary
         # release is a CLICK, which recenters the view on the gesture.
         # Right-click offers move/delete as a menu (drag fallback, faster in
@@ -811,7 +1172,9 @@ class LabelerApp(MscouponApp):
         if k is not None and it is not None and k != it.class_id:
             self._move_interaction(uid, k)
 
-    def _row_menu(self, e, uid):
+    def _interaction_menu(self, e, uid):
+        """The move/delete menu for one interaction. Single source: the class
+        list rows and the canvas right-click must offer the same thing."""
         it = self.store.get(uid)
         if it is None:
             return
@@ -822,23 +1185,71 @@ class LabelerApp(MscouponApp):
                                  command=lambda k=k: self._move_interaction(uid, k))
         menu.add_separator()
         menu.add_command(label="Delete", command=lambda: self._delete_interaction(uid))
-        menu.tk_popup(e.x_root, e.y_root)
+        try:
+            menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            menu.grab_release()
+
+    def _row_menu(self, e, uid):
+        self._interaction_menu(e, uid)
+
+    def _interaction_at(self, ix, iy):
+        """The uid of the interaction "under" an image pixel: the last-drawn
+        one whose gesture touched that pixel's region -- the same resolution
+        order the class layer paints in, so the menu acts on the gesture the
+        user can actually see there. Falls back to a row-hovered gesture."""
+        cur = self._current()
+        if cur is None or ix is None:
+            return self._hover_uid
+        si, li = cur
+        rec = self.engine.record(si, li)
+        if rec is None or rec.get("labels") is None:
+            return self._hover_uid
+        labels = rec["labels"]
+        if not (0 <= iy < labels.shape[0] and 0 <= ix < labels.shape[1]):
+            return self._hover_uid
+        region = int(labels[iy, ix])
+        if region < 0:
+            return self._hover_uid
+        import numpy as np
+        touch = self._touch_map_for(si, li, rec, np)
+        best = None
+        for it in self.store.for_slice(self._slice_key(si, li)):
+            ids = touch.get(it.uid)
+            if ids and region in ids and (best is None or it.uid > best):
+                best = it.uid
+        return best if best is not None else self._hover_uid
+
+    def _canvas_menu(self, e):
+        """Right-CLICK on the image plane (a right-DRAG still pans): offer the
+        row menu for whatever annotation is under the pointer, and nothing at
+        all when there is none -- an empty popup would just be in the way."""
+        if self.viewer is None:
+            return
+        ix, iy = self.viewer.screen_to_image(e.x, e.y)
+        uid = self._interaction_at(ix, iy)
+        if uid is not None:
+            self._interaction_menu(e, uid)
 
     # -- interaction geometry on the canvas (hover + click-to-center) ---- #
-    def _draw_interaction_geometry(self, it):
+    def _draw_interaction_geometry(self, it, tags=("draw", "ihover")):
         """Draw one gesture's geometry fully opaque over the slice: the
         polyline itself, or the outer boundary of a box / lasso. Does NOT
-        clear first, so several touching gestures can stack."""
+        clear first, so several touching gestures can stack.
+
+        `tags` selects the layer: "ihover" is transient (every repaint of the
+        overlays drops it) while "ipersist" survives, since the persistent
+        annotation view is not tied to where the pointer happens to be."""
         v = self.viewer
         if it is None or v is None or not it.points or not it.bound:
             return
         if self._current() != (it.si, it.li):
             return
         c = v.canvas
-        color = class_color_hex(it.class_id)
+        color = self._class_color_hex(it.class_id)
         scr = [((x - v.view_x) / v.scale, (y - v.view_y) / v.scale)
                for x, y in it.points]
-        tags = ("draw", "ihover")        # "draw" keeps it above re-blits
+        # "draw" (in every tag tuple) keeps the item above each fresh blit.
         if it.tool == "box" and len(scr) >= 2:
             (x0, y0), (x1, y1) = scr[0], scr[-1]
             c.create_rectangle(x0, y0, x1, y1, outline=color, width=3, tags=tags)
@@ -869,9 +1280,23 @@ class LabelerApp(MscouponApp):
         self._hover_key = None
         self._hover_uid = None
 
+    def _refresh_annotation_layer(self):
+        """Repaint the persistent outlines: every ON-SLICE gesture at once,
+        instead of only what the pointer is over. Separate tag from the hover
+        layer, which every overlay repaint drops."""
+        v = self.viewer
+        if v is None:
+            return
+        v.canvas.delete("ipersist")
+        if not self.show_annot_var.get():
+            return
+        for it in self._visible_interactions():
+            self._draw_interaction_geometry(it, tags=("draw", "ipersist"))
+
     def _redraw_hover_geometry(self):
         """Re-project whatever hover geometry is on screen after a zoom/pan
         (the items are drawn in screen coordinates)."""
+        self._refresh_annotation_layer()
         v = self.viewer
         if v is None or (self._hover_uid is None and self._hover_key is None):
             return
@@ -1060,6 +1485,9 @@ class LabelerApp(MscouponApp):
         self._clf_names = names
         self._clf_kind = kind
         self._pred.clear()               # predictions belong to the old model
+        self._cm_cell = None
+        self._refresh_region_modes()
+        self._refresh_confusion()
         self.classify_btn.config(state="normal")
         if hasattr(clf, "feature_importances_"):
             top = sorted(zip(names, clf.feature_importances_),
@@ -1071,6 +1499,7 @@ class LabelerApp(MscouponApp):
         else:                                # dense FC: no per-feature story
             acc = f", train acc {clf.score(X, y):.1%}"
             hint = ""
+        self._refresh_model_strip()
         self.status_var.set(f"Trained {kind} on {len(y)} labeled regions in "
                             f"{dt_ms:.0f} ms{acc}{hint}")
 
@@ -1161,6 +1590,78 @@ class LabelerApp(MscouponApp):
                 f"({context}) - " + "; ".join(parts)
                 + ". Switch profiles or retrain.")
 
+    # -- model provenance ------------------------------------------------ #
+    def _stats_brief(self, stats):
+        """One line for a statistics block's channels, e.g. `base,blur(0.7,1.5)
+        x4` -- the two numbers (channels, reductions) that decide how wide the
+        model's per-feature row is."""
+        try:
+            doc = config_io.statistics_from_json(stats or {})
+        except Exception:
+            return "?"
+        parts = []
+        for c in doc["channels"]:
+            sig = c.get("sigmas") or []
+            parts.append(c["kind"] + (("(" + ",".join(f"{s:g}" for s in sig) + ")")
+                                      if sig else ""))
+        return ",".join(parts) + f" x{len(doc['reductions'])}"
+
+    def _refresh_model_strip(self):
+        """Repaint the provenance line above Train/Classify. The mismatch check
+        is inlined rather than routed through _check_model_compat: this runs on
+        every profile switch and must not log."""
+        var = getattr(self, "model_strip_var", None)
+        if var is None:
+            return
+        if self._clf is None:
+            var.set("no model")
+            return
+        names = list(self._clf_names or [])
+        stats = None
+        if self.models:
+            last = self.models[-1]
+            if list(last.get("fingerprint") or []) == names:
+                stats = last.get("statistics") or None
+        if stats is None and 0 <= self.active_profile_idx < len(self.profiles):
+            stats = self.profiles[self.active_profile_idx].get("statistics")
+        bits = [self._clf_kind, f"{len(names)} feats", self._stats_brief(stats)]
+        expected = self._expected_feature_names()
+        if expected is not None and set(expected) != set(names):
+            bits.append("⚠ profile mismatch")
+        var.set(" · ".join(bits))
+
+    def _switch_profile(self, idx):
+        super()._switch_profile(idx)
+        self._refresh_model_strip()
+
+    def _profile_from_model(self, path, statistics):
+        """Append a profile that keeps the active one's filters/MSC/selection
+        but MEASURES what the model was trained on, and activate it.
+
+        A new profile rather than an edit of the active one: profiles have no
+        undo stack, and _switch_profile already drops the primed data -- which
+        a statistics change needs, since the per-slice feature table is baked
+        at prime time (a selection rerun would not rebuild it)."""
+        self._snapshot_active_profile()
+        base = {}
+        if 0 <= self.active_profile_idx < len(self.profiles):
+            base = json.loads(json.dumps(self.profiles[self.active_profile_idx]))
+        stats = json.loads(json.dumps(statistics))
+        base["statistics"] = stats
+        # profile_from_json takes the radius from msc, not from the statistics
+        # block, so carry the model's across or the round-trip would reset it.
+        base.setdefault("msc", {})["extremum_sample_radius"] = max(
+            0, int(stats.get("extremum_sample_radius") or 0))
+        base["name"] = session.dedupe_profile_name(
+            f"from {os.path.basename(path)}", [p["name"] for p in self.profiles])
+        notes = []
+        # The round-trip re-validates feature_filters against the field
+        # universe the NEW statistics produce, dropping the stale ones.
+        self.profiles.append(session.profile_from_json(base, notes))
+        for msg in notes:
+            log(msg)
+        self._switch_profile(len(self.profiles) - 1)
+
     def _classify(self):
         """Predict a class for EVERY region of every computed slice and show
         the result as a translucent layer under the drawn labels. BLOCKS with
@@ -1185,6 +1686,8 @@ class LabelerApp(MscouponApp):
         finally:
             self._clear_compute_badge()
         self.show_pred_var.set(True)
+        self._refresh_region_modes()
+        self._refresh_confusion()
         self._refresh_render()
         self.status_var.set(f"Classified {count} slice(s) in "
                             f"{1e3 * (time.perf_counter() - t0):.0f} ms - "
@@ -1193,7 +1696,12 @@ class LabelerApp(MscouponApp):
     def _predict_slice(self, si, li, rec, np):
         """The slice's region->class predictions at rec's commit, computing
         and caching them when a model is loaded. Callers gate schema
-        compatibility (this only checks that a model exists)."""
+        compatibility (this only checks that a model exists).
+
+        Caches ``(commit, region_class, region_proba)``: the class
+        probabilities come out of the same forward pass as the hard label
+        (which is their argmax), and the regions coloring modes and any later
+        confidence read need them per region, not per feature row."""
         pr = self._pred.get((si, li))
         if pr is not None and pr[0] == rec.get("commit"):
             return pr[1]
@@ -1206,14 +1714,24 @@ class LabelerApp(MscouponApp):
         fids = table.column("feature_id")
         if mat is None or fids is None:
             return None
-        pred = self._clf.predict(mat).astype(np.uint8)
+        # Column order is the estimator's own classes_, NOT 1..N: both kinds
+        # sit behind a Pipeline and neither promises contiguous class ids.
+        proba = np.asarray(self._clf.predict_proba(mat), np.float32)
+        classes = np.asarray(self._clf.classes_, int)
+        pred = classes[proba.argmax(1)].astype(np.uint8)
         labels = rec["labels"]
-        K = int(labels.max()) + 1 if labels.size else 1
-        region_class = np.zeros(max(K, 1), np.uint8)
+        K = max(int(labels.max()) + 1 if labels.size else 1, 1)
+        region_class = np.zeros(K, np.uint8)
+        # MAX_CLASSES-wide, not n_classes-wide: the class count can change
+        # under a cached slice, and indexing by class id keeps the shape.
+        region_proba = np.zeros((K, MAX_CLASSES), np.float32)
         fid = fids.astype(int)
-        ok = (fid >= 0) & (fid < len(region_class))
+        ok = (fid >= 0) & (fid < K)
         region_class[fid[ok]] = pred[ok]
-        self._pred[(si, li)] = (rec.get("commit"), region_class)
+        keep = (classes >= 0) & (classes < MAX_CLASSES)
+        region_proba[fid[ok][:, None], classes[keep][None, :]] = \
+            proba[ok][:, keep]
+        self._pred[(si, li)] = (rec.get("commit"), region_class, region_proba)
         return region_class
 
     # -- training-set export --------------------------------------------- #
@@ -1363,7 +1881,7 @@ class LabelerApp(MscouponApp):
         if not path:
             return
         try:
-            self._load_classifier_from(path)
+            self._load_classifier_from(path, interactive=True)
         except Exception as exc:     # missing sklearn, wrong file, incompat
             messagebox.showerror("mscoupon labeler", str(exc))
             self.status_var.set(f"Could not load classifier: {exc}")
@@ -1371,7 +1889,9 @@ class LabelerApp(MscouponApp):
         self.status_var.set(f"Loaded {self._clf_kind} from {path} "
                             f"({len(self._clf_names)} features)")
 
-    def _load_classifier_from(self, path):
+    def _load_classifier_from(self, path, interactive=False):
+        """Install a pickled model. `interactive` is opt-in: session restore
+        and the selftest call this headlessly, where a modal would hang."""
         import pickle
         with open(path, "rb") as f:
             doc = pickle.load(f)
@@ -1381,10 +1901,23 @@ class LabelerApp(MscouponApp):
             raise ValueError("not a labeler classifier file")
         # The compatibility gate: a model trained under different statistics
         # is refused OUTRIGHT (per-feature values would silently mean the
-        # wrong thing), before anything is installed.
+        # wrong thing), before anything is installed. Interactively -- and only
+        # for a v2 pickle, which carries the statistics it was trained under --
+        # the user is first offered a profile built from those statistics.
         msg = self._check_model_compat(doc["names"], "load")
+        if msg and interactive and doc.get("statistics"):
+            if not messagebox.askyesno(
+                    "mscoupon labeler",
+                    msg + "\n\nCreate a profile from the model's own statistics "
+                          "and switch to it?"):
+                raise ValueError(msg)
+            self._profile_from_model(path, doc["statistics"])
+            # The new profile can still miss: feature_fields may resolve
+            # differently here than in the build that saved the pickle.
+            msg = self._check_model_compat(doc["names"], "load")
         if msg:
             raise ValueError(msg)
+        self._pred.clear()               # predictions belong to the old model
         self._clf = doc["model"]
         self._clf_names = list(doc["names"])
         self._clf_kind = str(doc.get("kind") or "random forest")
@@ -1392,6 +1925,7 @@ class LabelerApp(MscouponApp):
             self.model_kind_var.set(self._clf_kind)
         self.classify_btn.config(state="normal")
         self._record_model(path, doc.get("statistics") or {})
+        self._refresh_model_strip()
 
     def _export_csv(self):
         """Resolved region -> class table: one row per living MSC region of
@@ -1531,6 +2065,14 @@ def main():
     root.mainloop()
 
 
+class _FakeEvent:
+    """Enough of a Tk event for the canvas's click-vs-drag arithmetic."""
+
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+        self.x_root, self.y_root = x, y
+
+
 def _selftest():
     """Exercise the labeler's wiring headlessly (no engine/render needed);
     the pure geometry/ordering/LUT math is covered by tests/test_labeling.py."""
@@ -1591,12 +2133,42 @@ def _selftest():
     other = app.store.add("squiggle", [(0.0, 0.0)], 1, "data/other.tiff")
     app._rebuild_class_panels()
     assert len(app._visible_interactions()) == 2, "on-slice interactions only"
-    t1 = str(app._class_panels[1].cget("text"))
-    assert "annot: 2" in t1 and "regions: 2" in t1, t1   # box + off-slice; {5,9}
-    t2 = str(app._class_panels[2].cget("text"))
-    assert "annot: 1" in t2 and "regions: 2" in t2, t2   # squiggle; {0,2}
+    t1 = str(app._class_title_labels[1].cget("text"))
+    assert t1 == "1 · 2a · 2r", t1            # box + off-slice; {5,9}
+    t2 = str(app._class_title_labels[2].cget("text"))
+    assert t2 == "2 · 1a · 2r", t2            # squiggle; {0,2}
     app.store.remove(other.uid)
     app._rebuild_class_panels()
+
+    # User-picked class colors: reach the LUT (rev bump rebuilds the cache),
+    # ride the store, and undo like any other edit.
+    app._push_history()
+    app.store.set_color(1, "#123456")
+    app._rebuild_class_panels()
+    assert app._class_color_hex(1) == "#123456"
+    lut_c = app._class_lut_for(0, 0, rec, np)
+    assert tuple(lut_c[5]) == (0x12, 0x34, 0x56, 255), "picked color in the LUT"
+    assert app.store.to_json()["classes"][0]["color"] == "#123456"
+    app._undo()
+    assert app._class_color_hex(1) != "#123456", "color change is undoable"
+
+    # The swatch is the arm control (the per-class "draw" radiobutton is gone),
+    # and the trace rings exactly the armed one.
+    for k, frame in app._class_panels.items():
+        assert not [w for w in frame.winfo_children()
+                    if w.winfo_class() == "Radiobutton"], \
+            f"class {k} still has a draw radiobutton"
+    app._class_swatches[2].event_generate("<ButtonRelease-1>")
+    assert app.active_class_var.get() == 2, "swatch left-click arms the class"
+    armed = [k for k, w in app._class_swatches.items()
+             if str(w.cget("relief")) == "sunken"]
+    assert armed == [2], armed
+    app.active_class_var.set(1)          # the trace, not the swatch, repaints
+    armed = [k for k, w in app._class_swatches.items()
+             if str(w.cget("relief")) == "sunken"]
+    assert armed == [1], armed
+    app._rebuild_class_panels()          # a rebuild restores the ring
+    assert str(app._class_swatches[1].cget("relief")) == "sunken"
 
     # Resolution + LUT: later interaction painted over the earlier one.
     lut = app._class_lut_for(0, 0, rec, np)
@@ -1718,6 +2290,45 @@ def _selftest():
         app._on_hover(0, 0)                  # -1 background
         assert not app.viewer.canvas.find_withtag("ihover")
 
+        # The persistent annotation view: every on-slice gesture at once, on
+        # its own tag so an overlay repaint (which drops "ihover") keeps it.
+        assert not app.viewer.canvas.find_withtag("ipersist")
+        app.show_annot_var.set(True)
+        app._refresh_annotation_layer()
+        n_persist = len(app.viewer.canvas.find_withtag("ipersist"))
+        assert n_persist >= len(app._visible_interactions()) > 0, n_persist
+        from msseg.viz import min_colors as _mc0
+        app._seg_overlays(0, 0, rec, None, np, _mc0)     # drops "ihover" only
+        assert len(app.viewer.canvas.find_withtag("ipersist")) == n_persist
+        app._redraw_hover_geometry()                     # zoom/pan re-projects
+        assert len(app.viewer.canvas.find_withtag("ipersist")) == n_persist
+        app.show_annot_var.set(False)
+        app._refresh_annotation_layer()
+        assert not app.viewer.canvas.find_withtag("ipersist")
+
+        # Right-CLICK on the image plane resolves the annotation under it;
+        # a right-DRAG is a pan, so it must NOT reach the menu.
+        assert app._interaction_at(5, 5) is not None, "region 0 is annotated"
+        assert app._interaction_at(0, 0) is None, "background offers no menu"
+        popped = []
+        app._interaction_menu = lambda e, uid: popped.append(uid)
+        canvas = app.viewer               # the SliceCanvas, not its tk.Canvas
+        canvas.on_context = app._canvas_menu
+        # Pin the view so screen == image: a withdrawn root has a 1x1 canvas,
+        # and _on_row_click just recentred on that.
+        canvas.view_x, canvas.view_y, canvas.scale = 0.0, 0.0, 1.0
+        sx, sy = 5, 5                        # inside region 0
+        want = app._interaction_at(*canvas.screen_to_image(sx, sy))
+        assert want is not None, canvas.screen_to_image(sx, sy)
+        canvas._context_press(_FakeEvent(sx, sy))
+        canvas._context_release(_FakeEvent(sx + 40, sy))     # dragged -> pan
+        assert not popped, "a right-drag pans, it does not open a menu"
+        canvas._context_press(_FakeEvent(sx, sy))
+        canvas._context_release(_FakeEvent(sx + 1, sy))      # a click
+        assert popped == [want], (popped, want)
+        del app._interaction_menu                            # back to the real one
+        assert app.viewer.on_context is not None
+
     # Export as CSV: one row per living region (class 0 = unlabeled), carrying
     # every statistics column the spec produced for the region.
     with tempfile.TemporaryDirectory() as td:
@@ -1767,6 +2378,79 @@ def _selftest():
         ovs = app._seg_overlays(0, 0, rec3, None, np, _mc)
         assert len(ovs) == 3, "regions + prediction layer + drawn labels"
         assert int(ovs[1]["lut"][:, 3].max()) < 255, "prediction layer is translucent"
+
+        # Probabilities ride the same cache; the hard label IS their argmax.
+        assert len(pr) == 3, "_pred caches (commit, region_class, region_proba)"
+        proba = pr[2]
+        assert proba.shape == (10, labeling.MAX_CLASSES)
+        for r in (0, 2, 5, 9):
+            assert abs(float(proba[r].sum()) - 1.0) < 1e-5, r
+            assert int(proba[r].argmax()) == int(pr[1][r]), "hard label = argmax"
+        assert float(proba[1].sum()) == 0.0, "id 1 is not a living region"
+
+        # Regions coloring modes appear only once probabilities exist.
+        app._refresh_region_modes()
+        modes = list(app.region_mode_combo.cget("values"))
+        assert modes[0] == "label id" and "uncertainty" in modes, modes
+        assert "P(class 1)" in modes and "P(class 2)" in modes, modes
+        for mode in ("P(class 1)", "uncertainty"):
+            app.region_mode_var.set(mode)
+            ovs_m = app._seg_overlays(0, 0, rec3, None, np, _mc)
+            # The scalar layer REPLACES the id layer, so the stack is the same
+            # height; it is the bottom one, and only living regions are opaque.
+            assert len(ovs_m) == 3, mode
+            lut_m = ovs_m[0]["lut"]
+            assert lut_m.shape == (10, 4)
+            assert int(lut_m[[0, 2, 5, 9], 3].min()) > 0, mode
+            assert int(lut_m[1, 3]) == 0, "unscored region stays invisible"
+        app.region_mode_var.set("label id")
+        app._pred.clear()
+        app._refresh_region_modes()
+        assert list(app.region_mode_combo.cget("values")) == ("label id",) or \
+            list(app.region_mode_combo.cget("values")) == ["label id"], \
+            "modes collapse when the cache is dropped"
+        app._classify()
+        pr = app._pred.get((0, 0))
+
+        # Confusion matrix: frozen predictions against live labels.
+        app._refresh_confusion()
+        counts = dict(app._cm_counts)
+        truth = app._truth_from_cache(0, 0, rec3, np)
+        expect = {}
+        for r in (0, 2, 5, 9):
+            t, p = int(truth[r]), int(pr[1][r])
+            if t >= 1 and p >= 1:
+                expect[(t, p)] = expect.get((t, p), 0) + 1
+        assert counts == expect, (counts, expect)
+        assert sum(counts.values()) == 4, counts
+        assert str(app._cm_cells[(1, 1)].cget("text")) == \
+            str(counts.get((1, 1), 0))
+        # A new label moves the TRUE axis without re-Classify.
+        moved = next(iter(expect))
+        app.active_class_var.set(3 if app.store.n_classes > 3 else 2)
+        before = dict(app._cm_counts)
+        assert before, before
+        app._commit_interaction("squiggle", [(2.0, 2.0)])     # repaints id 0
+        assert app._cm_counts != before, \
+            "labeling moves the matrix with the predictions frozen"
+        assert sum(app._cm_counts.values()) == sum(before.values()), \
+            "the same regions, redistributed across the true axis"
+        assert app._pred.get((0, 0))[1] is pr[1], "predictions stay frozen"
+        app._undo()
+        assert dict(app._cm_counts) == before, "undo restores the counts"
+
+        # Clicking a cell highlights those regions on the current slice.
+        app._on_confusion_click(*moved)
+        assert app._cm_cell == moved
+        hits = app._confusion_hits()
+        assert hits == {r for r in (0, 2, 5, 9)
+                        if (int(truth[r]), int(pr[1][r])) == moved}, hits
+        ovs_h = app._seg_overlays(0, 0, rec3, None, np, _mc)
+        assert len(ovs_h) == 4, "highlight rides on top"
+        assert set(np.nonzero(ovs_h[-1]["lut"][:, 3])[0].tolist()) == hits
+        app._on_confusion_click(*moved)                       # click again clears
+        assert app._cm_cell is None
+        assert len(app._seg_overlays(0, 0, rec3, None, np, _mc)) == 3
 
         # Dense FC kind: same buttons, scaler inside the pickled pipeline.
         app.model_kind_var.set("dense FC")
@@ -1824,6 +2508,63 @@ def _selftest():
             except ValueError as exc:
                 assert "std_blur_s1.5" in str(exc), exc
             assert app._clf is None, "nothing installed on refusal"
+
+            # Track A: interactively, a v2 pickle's OWN statistics can be
+            # applied as a new profile instead of that flat refusal.
+            def _expected_from_profile():
+                """Stand-in for the real schema call (which needs the compiled
+                extension): derive the field set from the ACTIVE profile's
+                statistics, so applying the model's own really changes it."""
+                doc = config_io.statistics_from_json(
+                    app.profiles[app.active_profile_idx].get("statistics"))
+                out = ["area"]
+                for c in doc["channels"]:
+                    for s in (c.get("sigmas") or [None]):
+                        out.append("mean_" + c["kind"]
+                                   + ("" if s is None else f"_s{s:g}"))
+                return out
+
+            def _reprime():
+                """The engine.reset() inside the profile switch drops the fake
+                primed stack; put it back for the rest of the selftest."""
+                app.primed = [{"files": files, "base": [zeros],
+                               "filtered": [zeros], "pipes": [None],
+                               "normalizers": [[]]}]
+                app._rebuild_flat_slices()
+                rec["commit"] = app._commit_id
+                app._slices[(0, 0)] = rec
+
+            app._expected_feature_names = _expected_from_profile
+            # The pickle was saved under base-only statistics; move the ACTIVE
+            # profile off them so the load really mismatches.
+            app.stat_kind_vars["blur"][0].set(True)
+            app.stat_kind_vars["blur"][1].set("1.5")
+            app._snapshot_active_profile()
+            assert app._check_model_compat(["area", "mean_base"], "t") is not None
+            n_prof = len(app.profiles)
+            with _mock.patch.object(messagebox, "askyesno", return_value=False):
+                try:
+                    app._load_classifier_from(clf_path, interactive=True)
+                    raise AssertionError("declining the offer must still refuse")
+                except ValueError:
+                    pass
+            assert len(app.profiles) == n_prof, "declining creates no profile"
+            assert app._clf is None, "nothing installed when the offer is declined"
+            with _mock.patch.object(messagebox, "askyesno", return_value=True):
+                app._load_classifier_from(clf_path, interactive=True)
+            assert len(app.profiles) == n_prof + 1, "accepting adds a profile"
+            assert app.active_profile_idx == n_prof, "and switches to it"
+            assert app.profiles[-1]["name"] == "from classifier.pkl"
+            assert not app.stat_kind_vars["blur"][0].get(), \
+                "the model's statistics reached the stats panel"
+            assert app._clf is not None and not app._pred, \
+                "model installed, predictions dropped with the old parameters"
+            strip = app.model_strip_var.get()
+            assert "random forest" in strip and "2 feats" in strip, strip
+            assert "mismatch" not in strip, strip
+            _reprime()
+            # Headless (no compiled extension) the offer never fires: the real
+            # gate returns None, so the load succeeds as before.
             app._expected_feature_names = lambda: ["area", "mean_base"]
             app._load_classifier_from(clf_path)
             assert app._clf is not None and app._clf_names == ["area", "mean_base"]
@@ -1891,7 +2632,10 @@ def _selftest():
     print("labeler selftest OK: tiers, gestures, resolution order, LUT cache, "
           "overlay stack, class-count clamp, session round-trip (qualified "
           "keys), export, undo/redo, tap-squiggle, hover geometry, "
-          "click-to-center, CSV, model kinds + compat gate + 'R'")
+          "click-to-center, CSV, model kinds + compat gate + 'R', "
+          "profile-from-model + provenance strip, swatch arming, "
+          "proba cache + coloring modes, confusion matrix + highlight, "
+          "persistent outlines + canvas right-click")
     return 0
 
 

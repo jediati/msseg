@@ -10,7 +10,7 @@ import pytest
 from msseg.mscoupon import labeling
 from msseg.mscoupon.labeling import (LabelStore, Interaction, touched_ids,
                                      resolve_slice, class_lut, line_pixels,
-                                     CLASS_COLORS)
+                                     scalar_lut, CLASS_COLORS)
 
 
 def blocks_raster():
@@ -175,6 +175,29 @@ def test_set_n_classes_clamps_orphans():
         store.set_n_classes(labeling.MAX_CLASSES + 1)
 
 
+def test_custom_class_colors():
+    store = LabelStore(n_classes=3)
+    store.set_color(1, "#00ffee")
+    assert store.color(1) == "#00ffee"
+    assert store.rgba(1) == (0, 255, 238, 255)
+    assert store.color(2) == labeling.class_color_hex(2), "others keep defaults"
+    r0 = store.rev
+    store.set_color(1, "#00ffee")            # no-op: same color
+    assert store.rev == r0
+    doc = store.to_json()
+    assert {"id": 1, "color": "#00ffee"} in doc["classes"]
+    back = LabelStore.from_json(doc)
+    assert back.color(1) == "#00ffee"
+    colors = np.asarray([back.rgba(k) for k in range(labeling.MAX_CLASSES)],
+                        np.uint8)
+    lut = class_lut(np.array([0, 1, 2], np.uint8), np, colors)
+    assert tuple(lut[1]) == (0, 255, 238, 255)
+    assert tuple(lut[2]) == CLASS_COLORS[2]
+    assert store.rgba(1) != CLASS_COLORS[1]
+    store.set_color(1, "junk")               # unusable hex -> default at render
+    assert store.rgba(1) == CLASS_COLORS[1]
+
+
 def test_json_round_trip():
     store = LabelStore(n_classes=4)
     store.add("squiggle", [(1.5, 2.25), (3.0, 4.0)], 1, "s0.tiff", 0, 0)
@@ -232,3 +255,32 @@ def test_rebind_qualified_beats_basename_fallback():
                {"name": "s2", "folder": "tomo", "files": [r"C:\y\a.tiff"]}]
     assert store.rebind(subseqs) == 0
     assert (store.interactions[0].si, store.interactions[0].li) == (1, 0)
+
+
+# --------------------------------------------------------------------------- #
+# scalar_lut: the continuous regions coloring modes (class probability,
+# prediction uncertainty) share one ramp with the id LUT's canvas contract.
+# --------------------------------------------------------------------------- #
+def test_scalar_lut_shape_and_endpoints():
+    lut = scalar_lut([0.0, 0.5, 1.0], np)
+    assert lut.shape == (3, 4) and lut.dtype == np.uint8
+    assert tuple(lut[0][:3]) == (49, 54, 149), "ramp floor"
+    assert tuple(lut[2][:3]) == (165, 15, 21), "ramp ceiling"
+    assert list(lut[:, 3]) == [255, 255, 255], "opaque unless masked"
+
+
+def test_scalar_lut_is_monotone_and_clamps():
+    v = np.linspace(0.0, 1.0, 32)
+    lut = scalar_lut(v, np)
+    # Red rises and blue falls across the ramp: neither is flat, so distinct
+    # probabilities never collide on one color.
+    assert lut[-1, 0] > lut[0, 0] and lut[-1, 2] < lut[0, 2]
+    assert (scalar_lut([-5.0], np)[0] == scalar_lut([0.0], np)[0]).all()
+    assert (scalar_lut([9.0], np)[0] == scalar_lut([1.0], np)[0]).all()
+
+
+def test_scalar_lut_alpha_and_mask():
+    lut = scalar_lut([0.2, 0.8, 0.5], np, alpha=150,
+                     mask=[True, False, True])
+    assert list(lut[:, 3]) == [150, 0, 150], "unscored regions stay invisible"
+    assert list(scalar_lut([0.5], np, alpha=999)[:, 3]) == [255], "alpha clamps"
