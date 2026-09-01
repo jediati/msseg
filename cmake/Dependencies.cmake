@@ -61,7 +61,7 @@ FetchContent_Declare(diffg
 )
 FetchContent_Declare(msceer
   GIT_REPOSITORY https://github.com/sci-visus/MSCEER.git
-  GIT_TAG ea8443921f7a8999ee3bb151b7abd7982b4b24ee   # cuda-gradient: + LabelCtx2D, region-scale paint API, walk-down remap, releaseGpuResources
+  GIT_TAG 598edd24b8958e334330331e2bf02628e7d8a9b9   # cuda-gradient: + merge-forest simplification mode (MSC-free), lazy maxV, Set Dim opt-out
 )
 FetchContent_Declare(tinytiff
   GIT_REPOSITORY https://github.com/jkriege2/TinyTIFF.git

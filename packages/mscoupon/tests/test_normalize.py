@@ -521,6 +521,20 @@ def test_write_session_text_is_atomic_and_best_effort(tmp_path):
 # --------------------------------------------------------------------------- #
 # Statistics schema + the 3D seeding extremum
 # --------------------------------------------------------------------------- #
+def test_statistics_relevance_round_trip():
+    default = config_io.statistics_to_json(
+        [{"kind": "base"}], config_io.STAT_REDUCTIONS)
+    assert "relevance" not in default
+    assert config_io.statistics_from_json(default)["relevance"] is True
+
+    lean = config_io.statistics_to_json(
+        [{"kind": "base"}], config_io.STAT_REDUCTIONS, relevance=False)
+    assert lean["relevance"] is False
+    assert config_io.statistics_from_json(lean)["relevance"] is False
+    assert config_io.statistics_from_json(
+        {"relevance": {"enabled": False}})["relevance"] is False
+
+
 def test_query_fields_drops_feature_id_and_filtered_aggregates():
     names = config_io.query_fields()
     assert "feature_id" not in names, "an id is not a selectable statistic"

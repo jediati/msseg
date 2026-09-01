@@ -257,6 +257,7 @@ void parse_msc(const nlohmann::json& root, MscConfig& msc) {
     msc.persistence_absolute = m.at("persistence").get<float>();
   }
   set_if_present(m, "compute_algorithm", msc.compute_algorithm);
+  set_if_present(m, "simplification", msc.simplification);
   set_if_present(m, "accurate_ascending", msc.accurate_ascending);
   set_if_present(m, "accurate_descending", msc.accurate_descending);
   set_if_present(m, "manifold", msc.manifold);

@@ -29,6 +29,17 @@ def test_default_profile_shape():
     assert p["selection"]["connectivity"] == 6 and p["selection"]["min_area"] is None
 
 
+def test_profile_can_default_relevance_off_and_round_trip():
+    p = default_profile(relevance=False)
+    assert p["statistics"]["relevance"] is False
+    assert profile_from_json(p) == p
+    params = json.loads(profile_params_json(p))
+    assert params["statistics"]["relevance"] is False
+    # Legacy/regular viewer profiles keep the core's relevance-on default.
+    assert "relevance" not in default_profile()["statistics"]
+    assert config_io.statistics_from_json({})["relevance"] is True
+
+
 def test_profile_round_trip_preserves_content():
     p = default_profile("A")
     p["filters"] = config_io.filters_to_json(

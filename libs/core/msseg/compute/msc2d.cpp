@@ -45,6 +45,16 @@ struct HasUseGpuGradient<Options,
                          std::void_t<decltype(std::declval<Options&>().useGpuGradient)>>
     : std::true_type {};
 
+// ComputeOptions::simplification selects the MSC hierarchy or the merge-forest
+// extremum network; detected so an older pin still builds (and warns).
+template <typename Options, typename = void>
+struct HasSimplification : std::false_type {};
+
+template <typename Options>
+struct HasSimplification<Options,
+                         std::void_t<decltype(std::declval<Options&>().simplification)>>
+    : std::true_type {};
+
 // Region-scale facade (baseToLiving/paintLabels), from MSCEER's cuda-gradient
 // branch: lets a re-select work per base REGION (~100k entries) instead of per
 // PIXEL (~10M hash probes), and paint through the persistent GPU label context
@@ -75,6 +85,15 @@ struct HasReleaseGpu<MscType,
 bool region_select_enabled() {
   const char* env = std::getenv("MSSEG_REGION_SELECT");
   return !(env != nullptr && env[0] == '0');
+}
+
+// Which simplification the caller asked for, with MSSEG_SIMPLIFICATION as the
+// runtime kill-switch (mirrors MSSEG_REGION_SELECT / MSSEG_GPU_STATS, so an A/B
+// run can force the MSC without editing a config).
+bool merge_forest_wanted(const Msc2DParams& cfg) {
+  const char* env = std::getenv("MSSEG_SIMPLIFICATION");
+  if (env != nullptr && env[0] != '\0') return std::string(env) == "merge_forest";
+  return cfg.simplification == "merge_forest";
 }
 
 // GPU statistics accumulation: opt-in via msc.use_gpu_stats, defaulting to
@@ -108,6 +127,18 @@ void compute_with_algorithm(MscType& msc, const float* pixels, int rows, int col
                      "msc2d: msc.use_gpu_gradient requested but the linked "
                      "msc_2d_lib predates ComputeOptions::useGpuGradient; "
                      "using the CPU gradient.\n");
+      }
+    }
+    if constexpr (HasSimplification<typename MscType::ComputeOptions>::value) {
+      options.simplification = merge_forest_wanted(cfg)
+                                   ? MscType::Simplification::MergeForest
+                                   : MscType::Simplification::MscHierarchy;
+    } else {
+      if (merge_forest_wanted(cfg)) {
+        std::fprintf(stderr,
+                     "msc2d: msc.simplification='merge_forest' requested but the "
+                     "linked msc_2d_lib predates ComputeOptions::simplification; "
+                     "using the MSC hierarchy.\n");
       }
     }
     if (cfg.compute_algorithm == "partitioned") {

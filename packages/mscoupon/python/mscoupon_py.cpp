@@ -75,6 +75,7 @@ msseg::Msc2DParams parse_msc(const nlohmann::json& cfg) {
     if (m.contains("persistence_absolute")) msc.persistence_absolute = m["persistence_absolute"].get<float>();
     if (m.contains("persistence_percent")) msc.persistence_percent = m["persistence_percent"].get<float>();
     msc.compute_algorithm = m.value("compute_algorithm", msc.compute_algorithm);
+    msc.simplification = m.value("simplification", msc.simplification);
     msc.accurate_ascending = m.value("accurate_ascending", msc.accurate_ascending);
     msc.accurate_descending = m.value("accurate_descending", msc.accurate_descending);
     msc.manifold = m.value("manifold", msc.manifold);

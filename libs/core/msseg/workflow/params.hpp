@@ -103,6 +103,17 @@ struct Msc2DParams {
   std::optional<float> persistence_absolute;
   std::optional<float> persistence_percent = 10.0f;
   std::string compute_algorithm = "serial";  // "serial" | "partitioned"
+  // How the persistence simplification is represented.
+  //   "msc"          -- the Morse-Smale complex + its cancellation hierarchy.
+  //   "merge_forest" -- the extremum network: extrema from the flow-terminal
+  //                     labeling, saddles read off the same maps, and one
+  //                     union-find pass recording a forest that answers every
+  //                     threshold. Much cheaper to build (no MSC, no hierarchy,
+  //                     no partition reconcile) but NOT bit-identical: it
+  //                     measures ~99.7-99.9% pixel agreement with "msc".
+  // Requires an msc_2d_lib new enough to expose ComputeOptions::simplification;
+  // older pins warn and use the MSC. Env kill-switch: MSSEG_SIMPLIFICATION=msc.
+  std::string simplification = "msc";  // "msc" | "merge_forest"
   bool accurate_ascending = true;
   bool accurate_descending = true;
   std::string manifold = "ascending";  // "ascending" | "descending"

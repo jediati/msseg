@@ -35,16 +35,17 @@ PROFILE_FILE_VERSION = 1
 # --------------------------------------------------------------------------- #
 # Compute profiles (JSON/writer-shaped dicts)
 # --------------------------------------------------------------------------- #
-def default_profile(name: str = "default") -> Dict[str, Any]:
+def default_profile(name: str = "default", relevance: bool = True) -> Dict[str, Any]:
     return {
         "name": str(name),
         "filters": [],
         "base_filters": [],
         "msc": {"manifold": "ascending", "persistence_percent": 10.0,
                 "accurate": False, "extremum_sample_radius": 0,
-                "use_gpu_gradient": False},
+                "use_gpu_gradient": False, "simplification": "msc"},
         "statistics": config_io.statistics_to_json(
-            [{"kind": "base"}], list(config_io.STAT_REDUCTIONS), True, 0),
+            [{"kind": "base"}], list(config_io.STAT_REDUCTIONS), True, 0,
+            relevance),
         "selection": {"feature_filters": [], "pixel_filters": [],
                       "connectivity": 6, "min_area": None},
     }
@@ -79,12 +80,13 @@ def profile_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[str, 
                          or msc.get("accurate_descending")),
         "extremum_sample_radius": max(0, _as_int(msc.get("extremum_sample_radius"), 0)),
         "use_gpu_gradient": bool(msc.get("use_gpu_gradient")),
+        "simplification": str(msc.get("simplification") or "msc"),
     }
 
     stats = config_io.statistics_from_json(root.get("statistics"), notes)
     out["statistics"] = config_io.statistics_to_json(
         stats["channels"], stats["reductions"], stats["extremum"],
-        out["msc"]["extremum_sample_radius"])
+        out["msc"]["extremum_sample_radius"], stats["relevance"])
 
     sel = _as_dict(root.get("selection"))
     # Feature filters validate against the schema THIS profile's statistics
@@ -126,6 +128,8 @@ def profile_params_json(profile: Dict[str, Any], cores: int = 1) -> str:
         msc["extremum_sample_radius"] = radius
     if m.get("use_gpu_gradient"):
         msc["use_gpu_gradient"] = True
+    if m.get("simplification"):
+        msc["simplification"] = str(m["simplification"])
     if cores > 1:
         msc["compute_algorithm"] = "partitioned"
         msc["requested_parallelism"] = int(cores)
@@ -324,7 +328,8 @@ def _profile_from_state(state: Dict[str, Any], name: str = "imported") -> Dict[s
         "statistics": config_io.statistics_to_json(
             state.get("stat_channels") or [{"kind": "base"}],
             state.get("stat_reductions") or list(config_io.STAT_REDUCTIONS),
-            bool(state.get("stat_extremum", True)), radius),
+            bool(state.get("stat_extremum", True)), radius,
+            bool(state.get("stat_relevance", True))),
         "selection": {
             "feature_filters": config_io.queries_to_json(state.get("feature_filters") or []),
             "pixel_filters": config_io.pixel_filters_to_json(state.get("pixel_filters") or []),

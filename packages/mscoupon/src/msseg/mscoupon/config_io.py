@@ -284,7 +284,8 @@ def pixel_filters_to_json(rules: Sequence[Dict[str, Any]]) -> List[Dict[str, Any
 def statistics_to_json(channels: Sequence[Dict[str, Any]],
                        reductions: Sequence[str],
                        extremum: bool = True,
-                       extremum_sample_radius: int = 0) -> Dict[str, Any]:
+                       extremum_sample_radius: int = 0,
+                       relevance: bool = True) -> Dict[str, Any]:
     """The `statistics` block for a config.
 
     `channels` mirrors what the CLI parses: a bare string for `base`/`filtered`,
@@ -317,13 +318,17 @@ def statistics_to_json(channels: Sequence[Dict[str, Any]],
     }
     if extremum_sample_radius > 0:
         block["extremum_sample_radius"] = int(extremum_sample_radius)
+    # True is the core/CLI default. Emit only the labeler's lean opt-out so
+    # existing viewer profiles and exported configs retain their old shape.
+    if not relevance:
+        block["relevance"] = False
     return block
 
 
 def statistics_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[str, Any]:
     """Inverse of statistics_to_json, total (never raises) like the rest of the
-    read side. Returns {channels, reductions, extremum, extremum_sample_radius}
-    with `channels` always in the dict form the GUI edits."""
+    read side. Returns {channels, reductions, extremum, extremum_sample_radius,
+    relevance} with `channels` always in the dict form the GUI edits."""
     block = _as_dict(doc)
     raw = block.get("channels")
     channels: List[Dict[str, Any]] = []
@@ -366,11 +371,15 @@ def statistics_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[st
     else:
         reductions = list(STAT_REDUCTIONS)
 
+    raw_relevance = block.get("relevance", True)
+    relevance = (bool(raw_relevance.get("enabled", True))
+                 if isinstance(raw_relevance, dict) else bool(raw_relevance))
     return {
         "channels": channels,
         "reductions": reductions,
         "extremum": bool(block.get("extremum", True)),
         "extremum_sample_radius": _as_int(block.get("extremum_sample_radius"), 0),
+        "relevance": relevance,
     }
 
 
@@ -399,6 +408,7 @@ def build_config(
     stat_channels: Optional[Sequence[Dict[str, Any]]] = None,
     stat_reductions: Optional[Sequence[str]] = None,
     stat_extremum: bool = True,
+    stat_relevance: bool = True,
     folder: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build the AppConfig-shaped dict for one subsequence (an explicit file list).
@@ -461,12 +471,12 @@ def build_config(
     # Measurement channels + reductions. Emitted only when they differ from the
     # default spec (base channel, all reductions, extremum on), so a workflow
     # that never touched the statistics panel exports exactly what it did before.
-    if stat_channels is not None or stat_reductions is not None:
+    if stat_channels is not None or stat_reductions is not None or not stat_relevance:
         channels = list(stat_channels) if stat_channels is not None else [{"kind": "base"}]
         reductions = (list(stat_reductions) if stat_reductions is not None
                       else list(STAT_REDUCTIONS))
         block = statistics_to_json(channels, reductions, stat_extremum,
-                                   int(extremum_sample_radius))
+                                   int(extremum_sample_radius), stat_relevance)
         default = statistics_to_json([{"kind": "base"}], STAT_REDUCTIONS, True, 0)
         if block != default:
             cfg["statistics"] = block
@@ -795,6 +805,7 @@ def config_to_state(cfg: Any, fields: Optional[Sequence[str]] = None,
         "stat_channels": stat_state["channels"],
         "stat_reductions": stat_state["reductions"],
         "stat_extremum": stat_state["extremum"],
+        "stat_relevance": stat_state["relevance"],
     }
 
 

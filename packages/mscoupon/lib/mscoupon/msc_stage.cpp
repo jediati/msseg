@@ -21,6 +21,7 @@ msseg::Msc2DParams to_msc_params(const MscConfig& cfg, const msseg::StatsSpec& s
   params.persistence_absolute = cfg.persistence_absolute;
   params.persistence_percent = cfg.persistence_percent;
   params.compute_algorithm = cfg.compute_algorithm;
+  params.simplification = cfg.simplification;
   params.use_gpu_gradient = cfg.use_gpu_gradient;
   params.use_gpu_stats = cfg.use_gpu_stats;
   params.accurate_ascending = cfg.accurate_ascending;

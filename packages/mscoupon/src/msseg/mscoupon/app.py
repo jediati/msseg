@@ -54,6 +54,10 @@ class MscouponApp:
     # subclasses (the labeler) override it so their sessions never collide.
     SESSION_APP = "mscoupon"
 
+    def _default_profile(self, name="default"):
+        """Factory hook for tools with a different lean statistics default."""
+        return session.default_profile(name)
+
     def __init__(self, root, initial=None, autosave=True):
         self.root = root
         self.root.title("mscoupon viewer")
@@ -66,7 +70,7 @@ class MscouponApp:
         self.active_folder_idx = None            # index into self.folders
         self.all_files = []                      # ACTIVE folder's TIFF paths
         self.subsequences = []                   # [{"name","folder","files":[abs paths]}]
-        self.profiles = [session.default_profile()]
+        self.profiles = [self._default_profile()]
         self.active_profile_idx = 0
         self.filter_cards = [self._new_filter_card()]   # trailing "none" card appended
         # Base-channel chain (typically a single `normalize` stage). Statistics
@@ -90,6 +94,10 @@ class MscouponApp:
         self.manifold_var = tk.StringVar(value="ascending")
         self.accurate_var = tk.BooleanVar(value=False)
         self.gpu_var = tk.BooleanVar(value=False)   # msc.use_gpu_gradient
+        # msc.simplification: "msc" (cancellation hierarchy) | "merge_forest"
+        # (extremum network). No panel control yet -- it round-trips through
+        # profiles so a saved/loaded config keeps whatever it was set to.
+        self.simplification_var = tk.StringVar(value="msc")
         self.ext_radius_var = tk.StringVar(value="0")
         self.min_area_var = tk.StringVar(value="")
         self.connectivity_var = tk.IntVar(value=6)
@@ -1307,8 +1315,11 @@ class MscouponApp:
             pct = 10.0
         radius = self._ext_radius()
         name = "default"
+        relevance = True
         if 0 <= self.active_profile_idx < len(self.profiles):
             name = self.profiles[self.active_profile_idx].get("name", name)
+            relevance = config_io.statistics_from_json(
+                self.profiles[self.active_profile_idx].get("statistics"))["relevance"]
         return {
             "name": name,
             "filters": config_io.filters_to_json(self.filter_cards),
@@ -1317,10 +1328,11 @@ class MscouponApp:
                     "persistence_percent": pct,
                     "accurate": bool(self.accurate_var.get()),
                     "extremum_sample_radius": radius,
-                    "use_gpu_gradient": bool(self.gpu_var.get())},
+                    "use_gpu_gradient": bool(self.gpu_var.get()),
+                    "simplification": self.simplification_var.get()},
             "statistics": config_io.statistics_to_json(
                 self._stat_channel_cards(), self._stat_reductions(),
-                self.stat_extremum_var.get(), radius),
+                self.stat_extremum_var.get(), radius, relevance),
             "selection": {
                 "feature_filters": config_io.queries_to_json(self.query_cards),
                 "pixel_filters": config_io.pixel_filters_to_json(self.pixel_cards),
@@ -1340,6 +1352,7 @@ class MscouponApp:
             setvar(self.manifold_var, msc["manifold"])
         setvar(self.accurate_var, bool(msc.get("accurate")))
         setvar(self.gpu_var, bool(msc.get("use_gpu_gradient")))
+        setvar(self.simplification_var, str(msc.get("simplification") or "msc"))
         setvar(self.ext_radius_var, str(int(msc.get("extremum_sample_radius") or 0)))
         sel = profile.get("selection") or {}
         min_area = sel.get("min_area")
@@ -1444,7 +1457,7 @@ class MscouponApp:
         self._snapshot_active_profile()
         name = session.dedupe_profile_name("profile",
                                            [p["name"] for p in self.profiles])
-        self.profiles.append(session.default_profile(name))
+        self.profiles.append(self._default_profile(name))
         self._switch_profile(len(self.profiles) - 1)
 
     def _profile_duplicate(self):
@@ -1921,6 +1934,14 @@ class MscouponApp:
         self._update_busy()               # clear the spinner if nothing is pending
 
     # -- rendering (reads only cached numpy rasters; never the live pipes) ---- #
+    def _image_window(self, channel):
+        """Window fractions for a displayed channel; tools may unify them."""
+        if channel == "filtered":
+            return self.vmin_filt_var.get(), self.vmax_filt_var.get()
+        if channel in ("", "base"):
+            return self.vmin_var.get(), self.vmax_var.get()
+        return 0.0, 1.0
+
     def _seg_overlays(self, si, li, rec, data, np, min_colors):
         """Build the overlay list for one slice (a subclass hook: the labeler
         appends its class layer here).
@@ -1993,12 +2014,13 @@ class MscouponApp:
 
         first = self.viewer._base is None and self.viewer._source is None
         channel = self.background_var.get()
+        image_window = self._image_window(channel)
         if channel == "filtered":
             self.viewer.set_base(array=filt, path=None)
-            self.viewer.set_window(self.vmin_filt_var.get(), self.vmax_filt_var.get())
+            self.viewer.set_window(*image_window)
         elif channel in ("", "base"):
             self.viewer.set_base(array=base, path=p["files"][li])
-            self.viewer.set_window(self.vmin_var.get(), self.vmax_var.get())
+            self.viewer.set_window(*image_window)
         else:
             # A derived scale-space channel: its range has nothing to do with the
             # base channel's, so the window opens full rather than reusing either
@@ -2009,10 +2031,10 @@ class MscouponApp:
                 # or an extension that cannot build it). Show the base rather than
                 # blanking the canvas.
                 self.viewer.set_base(array=base, path=p["files"][li])
-                self.viewer.set_window(self.vmin_var.get(), self.vmax_var.get())
+                self.viewer.set_window(*image_window)
             else:
                 self.viewer.set_base(array=raster, path=None)
-                self.viewer.set_window(0.0, 1.0)
+                self.viewer.set_window(*image_window)
         self.viewer.set_overlays(overlays)
         self.viewer.set_alpha(self.alpha_var.get())
         if first:
@@ -2159,6 +2181,7 @@ class MscouponApp:
             stat_channels=stats["channels"],
             stat_reductions=stats["reductions"],
             stat_extremum=stats["extremum"],
+            stat_relevance=stats["relevance"],
             folder=folder,
         )
 
