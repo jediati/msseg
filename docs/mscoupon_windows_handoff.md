@@ -8,9 +8,27 @@ A wheel with a compiled extension is locked to one interpreter version
 (`cp311` = CPython 3.11) and one platform (`win_amd64`). If they move to 3.12 or
 3.13, rebuild with that interpreter — nothing else changes.
 
+## Where the wheels live
+
+Published as GitHub Release assets on the (public) `jediati/msseg` repo, so the
+collaborator needs no GitHub account and no manual download:
+
+**<https://github.com/jediati/msseg/releases/tag/mscoupon-win-0.1.0>**
+
+GitHub Packages is not an option — it has no Python/PyPI registry — and
+committing wheels into the tree would bloat it, so Releases is the mechanism.
+
+Cutting a new one (`gh` authenticates over HTTPS; `--target` needs a **full**
+SHA or a branch name, an abbreviated SHA is rejected as
+`target_commitish is invalid`):
+
+```bash
+gh release create <tag> --target $(git rev-parse HEAD) --title "..." --notes-file notes.md dist-ship/*.whl
+```
+
 ## What you send
 
-Two files:
+Two files — or, with the release above, just the install line:
 
 | File | What it is |
 |---|---|
@@ -38,9 +56,22 @@ large-image, scikit-learn) comes from PyPI at install time.
 
 ## Install
 
+Straight from the release, nothing to download by hand (the PEP 508
+`name @ url` form is what lets an extra ride along on a URL — a bare
+`<url>[classify]` does not parse):
+
+```bash
+pip install "msseg-viz @ https://github.com/jediati/msseg/releases/download/mscoupon-win-0.1.0/msseg_viz-0.1.0-py3-none-any.whl" "msseg-mscoupon[classify] @ https://github.com/jediati/msseg/releases/download/mscoupon-win-0.1.0/msseg_mscoupon-0.1.0-cp311-cp311-win_amd64.whl"
+```
+
+Or from local files:
+
 ```bash
 pip install msseg_viz-0.1.0-py3-none-any.whl "msseg_mscoupon-0.1.0-cp311-cp311-win_amd64.whl[classify]"
 ```
+
+Both wheels are version `0.1.0`; a later build that reuses that version needs
+`pip install --force-reinstall` to take effect.
 
 The `[classify]` extra pulls scikit-learn, which powers the labeler's
 Train/Classify buttons. Drop it and everything else still works; the import is
