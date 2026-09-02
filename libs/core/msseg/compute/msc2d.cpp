@@ -80,6 +80,66 @@ struct HasReleaseGpu<MscType,
                      std::void_t<decltype(std::declval<MscType&>().releaseGpuResources())>>
     : std::true_type {};
 
+// livingRegionArcs() (living-region adjacency at the current persistence) is
+// newer still; detected separately so the region-select pins keep building.
+template <typename MscType, typename = void>
+struct HasRegionArcs : std::false_type {};
+
+template <typename MscType>
+struct HasRegionArcs<MscType,
+                     std::void_t<decltype(std::declval<MscType&>().livingRegionArcs(true))>>
+    : std::true_type {};
+
+// Translate MSCEER's living-region arcs into our compact id space. The ids
+// livingRegionArcs() emits are the SAME node-id space baseToLiving() returns
+// (in both the MSC-hierarchy and merge-forest modes), so nid_to_compact is the
+// right bridge -- exactly what select_persistence() does per region. Two
+// enable_if overloads rather than an `if constexpr` in a non-template member,
+// so an older pin without the API still compiles the disabled branch.
+template <typename MscType>
+typename std::enable_if<HasRegionArcs<MscType>::value>::type collect_region_arcs(
+    MscType& msc, bool ascending, const std::unordered_map<int, int>& nid_to_compact,
+    std::vector<Msc2DRegionArc>& out) {
+  out.clear();
+  const auto& arcs = msc.livingRegionArcs(ascending);
+  out.reserve(arcs.size());
+  std::size_t skipped = 0;
+  for (const auto& ra : arcs) {
+    const auto ia = nid_to_compact.find(ra.a);
+    const auto ib = nid_to_compact.find(ra.b);
+    if (ia == nid_to_compact.end() || ib == nid_to_compact.end()) {
+      ++skipped;
+      continue;
+    }
+    int a = ia->second;
+    int b = ib->second;
+    if (a == b) continue;
+    if (a > b) std::swap(a, b);
+    Msc2DRegionArc arc;
+    arc.a = a;
+    arc.b = b;
+    arc.saddle_value = ra.saddleValue;
+    arc.count = ra.count;
+    out.push_back(arc);
+  }
+  if (skipped > 0) {
+    std::fprintf(stderr,
+                 "msc2d: region_arcs skipped %zu of %zu arcs whose endpoints are not base "
+                 "extrema in this labeling.\n",
+                 skipped, arcs.size());
+  }
+  std::sort(out.begin(), out.end(), [](const Msc2DRegionArc& x, const Msc2DRegionArc& y) {
+    return x.a != y.a ? x.a < y.a : x.b < y.b;
+  });
+}
+
+template <typename MscType>
+typename std::enable_if<!HasRegionArcs<MscType>::value>::type collect_region_arcs(
+    MscType& /*msc*/, bool /*ascending*/, const std::unordered_map<int, int>& /*nid_to_compact*/,
+    std::vector<Msc2DRegionArc>& out) {
+  out.clear();
+}
+
 // Runtime kill-switch (MSSEG_REGION_SELECT=0) so the two select paths can be
 // A/B-compared for byte identity on real data.
 bool region_select_enabled() {
@@ -317,6 +377,10 @@ struct Msc2DPipeline::Impl {
   std::vector<int> labels;                       // surviving feature id per pixel
   std::vector<Msc2DFeatureStat> features;        // aggregated per surviving feature
   ChannelStats feature_channels;                 // per-channel aggregates, same order
+  // Living-region adjacency, filled lazily by region_arcs() and invalidated by
+  // every select_persistence() (and by build()).
+  std::vector<Msc2DRegionArc> arcs;
+  bool arcs_valid = false;
 };
 
 namespace {
@@ -775,6 +839,7 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
   // Priming a long sequence must not accumulate one GPU label context per
   // slice; the active slice lazily re-uploads on its first interactive select.
   release_gpu();
+  impl_->arcs_valid = false;
 }
 
 void Msc2DPipeline::release_gpu() {
@@ -792,6 +857,7 @@ float Msc2DPipeline::base_relevance_ceiling() const { return impl_->base_relevan
 
 void Msc2DPipeline::select_persistence(float persistence_absolute) {
   impl_->current_persistence = persistence_absolute;
+  impl_->arcs_valid = false;
   // Phase timing (MSSEG_TIME_MSC=0 opts out). Re-thresholding is the
   // interactive path's dominant cost, so it needs to be attributable.
   const bool time_phases = time_phases_wanted();
@@ -930,6 +996,27 @@ void Msc2DPipeline::select_persistence(float persistence_absolute) {
 }
 
 const std::vector<int>& Msc2DPipeline::labels() const { return impl_->labels; }
+
+const std::vector<Msc2DRegionArc>& Msc2DPipeline::region_arcs() {
+  if (impl_->base_labels.empty()) {
+    // Not built: nothing to be adjacent to.
+    impl_->arcs.clear();
+    impl_->arcs_valid = true;
+    return impl_->arcs;
+  }
+  if (!impl_->arcs_valid) {
+    const bool time_phases = time_phases_wanted();
+    const auto t_start = std::chrono::steady_clock::now();
+    collect_region_arcs(impl_->msc, impl_->ascending, impl_->nid_to_compact, impl_->arcs);
+    impl_->arcs_valid = true;
+    if (time_phases) {
+      const auto now = std::chrono::steady_clock::now();
+      std::fprintf(stderr, "  [msc2d] %-10s %6.1f ms\n", "arcs",
+                   std::chrono::duration<double, std::milli>(now - t_start).count());
+    }
+  }
+  return impl_->arcs;
+}
 std::vector<Msc2DFeatureStat> Msc2DPipeline::feature_stats() const { return impl_->features; }
 
 const std::vector<ResolvedStatChannel>& Msc2DPipeline::channels() const { return impl_->channels; }

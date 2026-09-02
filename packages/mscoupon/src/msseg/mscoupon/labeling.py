@@ -52,9 +52,10 @@ class Interaction:
     """One drawing gesture. ``uid`` is the creation-order id (monotonic,
     unique within a store) and doubles as the resolution order."""
 
-    __slots__ = ("uid", "slice_key", "si", "li", "tool", "points", "class_id")
+    __slots__ = ("uid", "slice_key", "si", "li", "tool", "points", "class_id",
+                 "meta")
 
-    def __init__(self, uid, slice_key, si, li, tool, points, class_id):
+    def __init__(self, uid, slice_key, si, li, tool, points, class_id, meta=None):
         self.uid = int(uid)
         self.slice_key = str(slice_key)          # file basename
         self.si = si                             # session-local hints (or None)
@@ -62,6 +63,12 @@ class Interaction:
         self.tool = str(tool)
         self.points = [(float(x), float(y)) for x, y in points]
         self.class_id = int(class_id)
+        # Optional provenance, JSON-safe values only (a magic fill records the
+        # tool that produced its taps, the seed, threshold and metric). Display
+        # and export read it; resolution never does -- the geometry alone
+        # decides what a gesture paints, so a re-decomposition cannot be
+        # steered by stale metadata.
+        self.meta = dict(meta) if meta else None
 
     @property
     def bound(self):
@@ -106,12 +113,13 @@ class LabelStore:
         self.rev += 1                    # render LUT caches key on rev
 
     # -- mutations (each bumps rev) ------------------------------------ #
-    def add(self, tool, points, class_id, slice_key, si=None, li=None):
+    def add(self, tool, points, class_id, slice_key, si=None, li=None, meta=None):
         if tool not in TOOLS:
             raise ValueError(f"unknown tool {tool!r}")
         if not (1 <= int(class_id) < self.n_classes):
             raise ValueError(f"class {class_id} out of range 1..{self.n_classes - 1}")
-        it = Interaction(self._next_uid, slice_key, si, li, tool, points, class_id)
+        it = Interaction(self._next_uid, slice_key, si, li, tool, points, class_id,
+                         meta=meta)
         self._next_uid += 1
         self.interactions.append(it)
         self.rev += 1
@@ -172,7 +180,10 @@ class LabelStore:
             "interactions": [
                 {"uid": it.uid, "slice": it.slice_key, "si": it.si, "li": it.li,
                  "tool": it.tool, "class": it.class_id,
-                 "points": [[x, y] for x, y in it.points]}
+                 "points": [[x, y] for x, y in it.points],
+                 # "meta" only when present: a file without it is byte-identical
+                 # to what older versions wrote, and older readers ignore it.
+                 **({"meta": it.meta} if it.meta else {})}
                 for it in self.interactions
             ],
         }
@@ -184,9 +195,11 @@ class LabelStore:
             if isinstance(c, dict) and c.get("id") and c.get("color"):
                 store.colors[int(c["id"])] = str(c["color"])
         for d in doc.get("interactions", []):
+            meta = d.get("meta")
             it = Interaction(d["uid"], d["slice"], d.get("si"), d.get("li"),
                              d.get("tool", "squiggle"), d.get("points", []),
-                             d.get("class", 1))
+                             d.get("class", 1),
+                             meta=meta if isinstance(meta, dict) else None)
             # A file written under a larger class count still loads: clamp.
             it.class_id = min(max(it.class_id, 1), store.n_classes - 1)
             store.interactions.append(it)
@@ -248,6 +261,27 @@ def line_pixels(x0, y0, x1, y1, w, h, np):
     return ys[ok], xs[ok]
 
 
+def polygon_mask(pts, w, h, np):
+    """Rasterize the auto-closed polygon `pts` (image coords) over its own
+    bounding box, clipped to the w x h raster: ``(mask, ya, xa)`` with
+    ``mask`` a bool (bh, bw) array whose [0, 0] is raster pixel (ya, xa), or
+    None when the box falls entirely outside the image.
+
+    Bounding-box rasterization is what makes a lasso cheap to re-resolve (and
+    to preview while it is still being drawn): a small lasso on a 3232^2 slice
+    used to allocate and scan the full 10 Mpx mask."""
+    from PIL import Image, ImageDraw
+    xs = [x for x, _y in pts]
+    ys = [y for _x, y in pts]
+    xa, xb = max(int(min(xs)) - 1, 0), min(int(max(xs)) + 2, w)
+    ya, yb = max(int(min(ys)) - 1, 0), min(int(max(ys)) + 2, h)
+    if xa >= xb or ya >= yb:
+        return None
+    im = Image.new("L", (xb - xa, yb - ya), 0)
+    ImageDraw.Draw(im).polygon([(x - xa, y - ya) for x, y in pts], fill=1, outline=1)
+    return np.asarray(im, dtype=bool), ya, xa
+
+
 def touched_ids(interaction, labels, np):
     """The set of region ids the gesture touches on `labels` (background -1
     is never included).
@@ -284,13 +318,14 @@ def touched_ids(interaction, labels, np):
     elif interaction.tool == "polygon":
         if len(pts) < 3:
             return set()
-        from PIL import Image, ImageDraw
-        im = Image.new("L", (w, h), 0)
-        ImageDraw.Draw(im).polygon([(x, y) for x, y in pts], fill=1, outline=1)
-        mask = np.asarray(im, dtype=bool)
+        pm = polygon_mask(pts, w, h, np)
+        if pm is None:
+            return set()
+        mask, ya, xa = pm
         if not mask.any():
             return set()
-        vals = np.unique(labels[mask])
+        sub = labels[ya:ya + mask.shape[0], xa:xa + mask.shape[1]]
+        vals = np.unique(sub[mask])
     else:  # squiggle
         vals = []
         for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
@@ -343,6 +378,39 @@ def class_lut(region_class, np, colors=None):
     the labeler passes the store's user-picked colors)."""
     table = np.asarray(CLASS_COLORS if colors is None else colors, np.uint8)
     return table[region_class]
+
+
+def preview_lut(K, ids, colors, np, lerp=0.35, emphasize=None):
+    """(K, 4) uint8 RGBA LUT for the "will be painted" preview: the regions in
+    `ids` in a brighter (lerped `lerp` of the way toward white), fully opaque
+    version of their class color, everything else transparent.
+
+    `colors` is either ONE RGBA tuple (every id gets the armed class's color)
+    or a mapping id -> RGBA (the accept preview colors each region by its
+    predicted class). An RGBA with alpha 0 (class 0) leaves the row
+    transparent. `emphasize` names one id (the magic-fill seed) that keeps the
+    pure, un-lerped color so the origin of the fill stays visible."""
+    K = max(int(K), 1)
+    lut = np.zeros((K, 4), np.uint8)
+    ids = np.asarray(list(ids), dtype=np.intp)
+    ids = ids[(ids >= 0) & (ids < K)]
+    if len(ids) == 0:
+        return lut
+    if isinstance(colors, dict):
+        rgba = np.asarray([colors.get(int(i), (0, 0, 0, 0)) for i in ids], np.float32)
+    else:
+        rgba = np.broadcast_to(np.asarray(colors, np.float32), (len(ids), 4))
+    lerp = float(min(max(lerp, 0.0), 1.0))
+    rgb = rgba[:, :3] * (1.0 - lerp) + 255.0 * lerp
+    lut[ids, :3] = np.clip(rgb, 0, 255).round().astype(np.uint8)
+    lut[ids, 3] = np.where(rgba[:, 3] > 0, 255, 0).astype(np.uint8)
+    if emphasize is not None and 0 <= int(emphasize) < K:
+        e = int(emphasize)
+        col = (colors.get(e) if isinstance(colors, dict) else colors)
+        if col is not None and col[3] > 0:
+            lut[e, :3] = np.asarray(col[:3], np.uint8)
+            lut[e, 3] = 255
+    return lut
 
 
 # A blue -> cyan -> yellow -> red ramp for continuous per-region quantities

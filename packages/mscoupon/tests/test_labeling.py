@@ -10,7 +10,8 @@ import pytest
 from msseg.mscoupon import labeling
 from msseg.mscoupon.labeling import (LabelStore, Interaction, touched_ids,
                                      resolve_slice, class_lut, line_pixels,
-                                     scalar_lut, CLASS_COLORS)
+                                     scalar_lut, CLASS_COLORS, polygon_mask,
+                                     preview_lut)
 
 
 def blocks_raster():
@@ -284,3 +285,102 @@ def test_scalar_lut_alpha_and_mask():
                      mask=[True, False, True])
     assert list(lut[:, 3]) == [150, 0, 150], "unscored regions stay invisible"
     assert list(scalar_lut([0.5], np, alpha=999)[:, 3]) == [255], "alpha clamps"
+
+
+# --------------------------------------------------------------------------- #
+# polygon_mask (bounding-box rasterization) + preview_lut + meta
+# --------------------------------------------------------------------------- #
+def _full_polygon_ids(pts, labels):
+    """The pre-crop reference: rasterize over the whole image."""
+    from PIL import Image, ImageDraw
+    h, w = labels.shape
+    im = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(im).polygon([(x, y) for x, y in pts], fill=1, outline=1)
+    mask = np.asarray(im, dtype=bool)
+    return set(int(v) for v in np.unique(labels[mask]) if v >= 0)
+
+
+@pytest.mark.parametrize("pts", [
+    [(3.0, 3.0), (16.0, 3.0), (3.0, 16.0)],            # one triangle, 3 blocks
+    [(11.0, 11.0), (17.0, 11.0), (17.0, 17.0)],         # inside block 9 only
+    [(-5.0, -5.0), (25.0, -5.0), (25.0, 25.0), (-5.0, 25.0)],   # runs off the image
+    [(12.0, 12.0), (12.5, 12.4), (12.2, 12.9)],         # sub-pixel sliver
+])
+def test_polygon_mask_crop_matches_full_rasterization(pts):
+    lab = blocks_raster()
+    got = touched_ids(make("polygon", pts), lab, np)
+    assert got == _full_polygon_ids(pts, lab)
+    pm = polygon_mask(pts, lab.shape[1], lab.shape[0], np)
+    assert pm is not None
+    mask, ya, xa = pm
+    assert 0 <= ya and 0 <= xa
+    assert ya + mask.shape[0] <= lab.shape[0] and xa + mask.shape[1] <= lab.shape[1]
+
+
+def test_polygon_mask_outside_image_is_none():
+    assert polygon_mask([(-9.0, -9.0), (-5.0, -9.0), (-5.0, -5.0)], 20, 20, np) is None
+    assert touched_ids(make("polygon", [(-9.0, -9.0), (-5.0, -9.0), (-5.0, -5.0)]),
+                       blocks_raster(), np) == set()
+
+
+def test_preview_lut_single_color_brightened_and_opaque():
+    red = (230, 25, 75, 255)
+    lut = preview_lut(10, {0, 9, 42, -1}, red, np)          # 42 and -1 ignored
+    assert lut.shape == (10, 4)
+    assert set(np.flatnonzero(lut[:, 3] > 0).tolist()) == {0, 9}
+    assert lut[0, 3] == 255 and lut[9, 3] == 255
+    assert (lut[0, :3].astype(int) >= np.array(red[:3])).all()   # lerped to white
+    assert (lut[0, :3].astype(int) > np.array(red[:3])).any()
+    assert lut[2].tolist() == [0, 0, 0, 0]
+
+
+def test_preview_lut_emphasize_keeps_pure_color():
+    red = (230, 25, 75, 255)
+    lut = preview_lut(10, [0, 2], red, np, emphasize=0)
+    assert lut[0].tolist() == [230, 25, 75, 255]
+    assert lut[2, :3].tolist() != [230, 25, 75] and lut[2, 3] == 255
+
+
+def test_preview_lut_per_id_colors_and_class0_transparent():
+    colors = {0: (230, 25, 75, 255), 2: (60, 180, 75, 255), 5: (0, 0, 0, 0)}
+    lut = preview_lut(10, [0, 2, 5, 9], colors, np)
+    assert lut[0, 3] == 255 and lut[2, 3] == 255
+    assert lut[5, 3] == 0, "an RGBA with alpha 0 (class 0) previews nothing"
+    assert lut[9, 3] == 0, "an id with no color previews nothing"
+    assert lut[0, 0] > lut[2, 0]            # red row stays redder than green row
+
+
+def test_preview_lut_empty_and_tiny_K():
+    assert preview_lut(0, [], (1, 2, 3, 255), np).shape == (1, 4)
+    assert preview_lut(5, [], (1, 2, 3, 255), np).sum() == 0
+
+
+def test_meta_round_trips_and_defaults_to_none():
+    store = LabelStore(n_classes=3)
+    it = store.add("taps", [(5.0, 5.0), (12.0, 12.0)], 1, "d/s0.tiff", 0, 0,
+                   meta={"tool": "magic", "seed": [5.0, 5.0], "threshold": 0.5,
+                         "n_regions": 2})
+    plain = store.add("squiggle", [(1.0, 1.0)], 2, "d/s0.tiff", 0, 0)
+    assert it.meta["tool"] == "magic" and plain.meta is None
+    doc = store.to_json()
+    d_meta = [d for d in doc["interactions"] if d["uid"] == it.uid][0]
+    d_plain = [d for d in doc["interactions"] if d["uid"] == plain.uid][0]
+    assert d_meta["meta"]["n_regions"] == 2
+    assert "meta" not in d_plain, "no meta -> byte-identical to the old format"
+    back = LabelStore.from_json(doc)
+    assert back.get(it.uid).meta == it.meta
+    assert back.get(plain.uid).meta is None
+    # A malformed meta (not a dict) is ignored rather than trusted.
+    doc["interactions"][0]["meta"] = "junk"
+    assert LabelStore.from_json(doc).get(it.uid).meta is None
+
+
+def test_meta_does_not_change_resolution():
+    lab = blocks_raster()
+    pts = [(5.0, 5.0), (12.0, 12.0)]
+    with_meta = make("taps", pts, uid=1)
+    with_meta.meta = {"tool": "magic", "seed": [5.0, 5.0]}
+    without = make("taps", pts, uid=2)
+    assert touched_ids(with_meta, lab, np) == touched_ids(without, lab, np) == {0, 9}
+    rc = resolve_slice([with_meta], lab, np)
+    assert rc[0] == 1 and rc[9] == 1 and rc[2] == 0

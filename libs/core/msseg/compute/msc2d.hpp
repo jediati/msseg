@@ -58,6 +58,13 @@ struct Msc2DFeatureStat {
   float ext_filtered = 0.0f;
 };
 
+// One adjacency between two living features at the current persistence, in the
+// compact id space of labels()/feature_id. a < b, one entry per unordered pair,
+// sorted by (a, b). saddle_value is the most extreme saddle joining the pair
+// (lowest for ascending/minima, highest for descending/maxima); count is how
+// many base arcs collapsed onto the pair.
+struct Msc2DRegionArc { int a = -1; int b = -1; float saddle_value = 0.0f; int count = 0; };
+
 // Two-phase 2D pipeline. build() runs the heavy MSC compute once, keeps the MSCEER
 // engine alive, and caches the base (finest) 2-manifold decomposition plus
 // per-base-manifold statistics on both the base image and the filtered field.
@@ -118,6 +125,11 @@ class Msc2DPipeline {
   // Feature id per pixel (row-major) at the current persistence: the living
   // extremum compact id, or -1 where the base was unlabeled.
   const std::vector<int>& labels() const;
+  // Living-region adjacency at the current persistence (which living features
+  // touch which, through a saddle). Empty when the linked msc_2d_lib predates
+  // livingRegionArcs(). Computed lazily on first call after each
+  // select_persistence() and cached until the next one.
+  const std::vector<Msc2DRegionArc>& region_arcs();
   // Per-living-feature geometry + extremum at the current persistence.
   std::vector<Msc2DFeatureStat> feature_stats() const;
   // The resolved measurement channels, in slot order. This is the schema for

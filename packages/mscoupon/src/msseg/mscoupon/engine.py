@@ -405,6 +405,25 @@ class ComputeEngine:
         lab = np.asarray(pipe.labels())
         tm["labels"] += time.perf_counter() - t
 
+        # Living-region adjacency at this persistence (which regions touch
+        # through a saddle, and how deep it is), for the labeler's magic fill.
+        # Cheap -- MSCEER caches it per threshold -- and stored on the record
+        # so it is invalidated with the commit like the labels. None when the
+        # extension predates region_arcs(); the fill then derives pixel
+        # adjacency itself, lazily, on the first press (not here: the global
+        # tier runs this for every slice and would pay it for nothing).
+        t = time.perf_counter()
+        arcs = None
+        if hasattr(pipe, "region_arcs"):
+            try:
+                a, b, s = pipe.region_arcs()
+                if len(a):
+                    arcs = {"a": np.asarray(a, np.int32), "b": np.asarray(b, np.int32),
+                            "saddle": np.asarray(s, np.float32), "source": "msc"}
+            except Exception as exc:          # never let adjacency break a slice
+                log(f"region_arcs unavailable for slice {li}: {exc}")
+        tm["arcs"] = tm.get("arcs", 0.0) + (time.perf_counter() - t)
+
         # Columnar: the field names once, then an (n, f) float64 block. A dict
         # per feature cost a Python string and a dict entry per FIELD per
         # feature on every persistence commit -- with a twelve-channel stack
@@ -434,7 +453,7 @@ class ComputeEngine:
         tm["query"] += time.perf_counter() - t
 
         return {"commit": params.get("commit", 0), "labels": lab, "stats": table,
-                "kept": kept, "cc": None, "n_feat": n_feat}
+                "kept": kept, "cc": None, "n_feat": n_feat, "arcs": arcs}
 
     def _release_inactive_gpu(self, si, li):
         """Keep only the ACTIVE slice's GPU residue resident.

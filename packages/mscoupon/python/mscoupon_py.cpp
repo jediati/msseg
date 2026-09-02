@@ -242,6 +242,31 @@ py::array_t<std::int32_t> pipeline_labels(const msseg::Msc2DPipeline& pipe) {
   return out;
 }
 
+// Living-region adjacency at the current persistence: (a int32[n], b int32[n],
+// saddle float32[n]). Ids are the labels()/feature_id space, a < b, sorted by
+// (a, b). Empty arrays when the linked msc_2d_lib lacks livingRegionArcs().
+py::tuple pipeline_region_arcs(msseg::Msc2DPipeline& pipe) {
+  const std::vector<msseg::Msc2DRegionArc>* arcs = nullptr;
+  {
+    py::gil_scoped_release release;
+    arcs = &pipe.region_arcs();
+  }
+  const auto n = static_cast<py::ssize_t>(arcs->size());
+  py::array_t<std::int32_t> a(n);
+  py::array_t<std::int32_t> b(n);
+  py::array_t<float> saddle(n);
+  auto* pa = static_cast<std::int32_t*>(a.request().ptr);
+  auto* pb = static_cast<std::int32_t*>(b.request().ptr);
+  auto* ps = static_cast<float*>(saddle.request().ptr);
+  for (py::ssize_t i = 0; i < n; ++i) {
+    const msseg::Msc2DRegionArc& arc = (*arcs)[static_cast<std::size_t>(i)];
+    pa[i] = arc.a;
+    pb[i] = arc.b;
+    ps[i] = arc.saddle_value;
+  }
+  return py::make_tuple(std::move(a), std::move(b), std::move(saddle));
+}
+
 // Per-surviving-feature statistics, COLUMNAR: the field names once, then one
 // (n_features, n_fields) float64 array.
 //
@@ -571,6 +596,9 @@ PYBIND11_MODULE(mscoupon_py, m) {
       .def("width", &msseg::Msc2DPipeline::width)
       .def("height", &msseg::Msc2DPipeline::height)
       .def("labels", &pipeline_labels, "Feature id per pixel (int32 h,w) at the current persistence.")
+      .def("region_arcs", &pipeline_region_arcs,
+           "Living-region adjacency at the current persistence: (a, b, saddle) arrays in the "
+           "labels() id space; empty on an old msc_2d_lib.")
       .def("feature_stats", &pipeline_feature_stats,
            "Per-living-feature statistics (list of dicts) at the current persistence.")
       .def("feature_table", &pipeline_feature_table,

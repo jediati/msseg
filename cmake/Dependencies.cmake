@@ -61,7 +61,7 @@ FetchContent_Declare(diffg
 )
 FetchContent_Declare(msceer
   GIT_REPOSITORY https://github.com/sci-visus/MSCEER.git
-  GIT_TAG 598edd24b8958e334330331e2bf02628e7d8a9b9   # cuda-gradient: + merge-forest simplification mode (MSC-free), lazy maxV, Set Dim opt-out
+  GIT_TAG 7cb470381f88d2b3ed5e6d9ac22e2e36e8093a28   # + livingRegionArcs(): living-region adjacency at the current persistence
 )
 FetchContent_Declare(tinytiff
   GIT_REPOSITORY https://github.com/jkriege2/TinyTIFF.git

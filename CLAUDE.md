@@ -167,6 +167,28 @@ morphology `erode/dilate/open/close`) and the feature-query chain
 honored by the CLI; the GUI's on-the-fly 3D assembly
 (`src/msseg/mscoupon/assembly.py`) mirrors the matcher's connectivity.
 
+**mscoupon labeler magic fill + gesture previews** (`mscoupon-labeler`, see
+[docs/mscoupon_labeler.md](docs/mscoupon_labeler.md)): every drawing gesture now
+previews the regions it WILL paint on a transient canvas layer (brightened class
+color, ignores the alpha slider; `SliceCanvas.set_transient`), and a `magic` tool
+grows a similarity flood from the pressed region over the **living-region
+adjacency graph** -- `Msc2DPipeline::region_arcs()` wraps MSCEER's
+`livingRegionArcs()` (pin `7cb4703`; pairs joined by a saddle, with its value,
+in both `msc` and `merge_forest` modes), translated into the compact label-id
+space; older extensions fall back to 4-neighbour pixel adjacency. All
+seed-dependent work happens once per press as a *join ladder*
+(`magic_fill.build_ladder`: metric -> arc weights -> bottleneck/minimax search),
+so a drag tick is a rank on the ladder -- a prefix of the flood's discovery order
+(`growth_order`), NOT a threshold-closed set, because an outlier seed makes its
+gateway neighbour's dissimilarity the bottleneck for most of the slice and a
+threshold then jumps from one region to half of them -- and the threshold reads
+in the data's own units on the HUD. Metrics: z-scored `mean` (default), `bhattacharyya`, saddle
+`barrier`; modes `anchor` (vs the seed) / `chain` (vs the neighbour). The fill
+commits as ONE `taps` interaction with a point per region at its seeding
+extremum plus a `meta` provenance dict, so it re-resolves after a persistence
+change through the unchanged geometric path. Escape abandons any gesture in
+flight.
+
 **mscoupon extremum statistics** (`ext_x`, `ext_y`, `ext_base`, `ext_filtered`):
 the per-slice selection chain can also ask about a region's **seeding critical
 point** — the minimum for ascending manifolds, the maximum for descending — not

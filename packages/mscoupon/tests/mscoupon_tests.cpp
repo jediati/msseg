@@ -594,6 +594,63 @@ void test_msc2d_pipeline_descending() {
   expect(fine >= 1 && coarse <= fine, "descending decomposition is monotone");
 }
 
+void test_msc2d_pipeline_region_arcs() {
+  // Living-region adjacency: every endpoint is a living feature id of the
+  // CURRENT labels(), pairs are normalised a < b and strictly (a, b)-sorted, and
+  // the cache is invalidated by select_persistence() so a coarser threshold
+  // reports arcs in the coarser id set. Whole-graph connectivity is NOT asserted:
+  // boundary minima can make extra regions.
+  const int w = 48, h = 48;
+  const diffg::Image<float> field = make_wells(w, h);
+  msseg::Msc2DParams cfg;
+  cfg.manifold = "ascending";
+  cfg.persistence_absolute = 0.0f;
+  cfg.persistence_percent.reset();
+
+  msseg::Msc2DPipeline pipe;
+  pipe.build(field, field, cfg);
+  pipe.select_persistence(0.0f);
+
+  const auto living_ids = [](const std::vector<int>& labels) {
+    std::unordered_set<int> ids;
+    for (int v : labels)
+      if (v >= 0) ids.insert(v);
+    return ids;
+  };
+  const auto check_arcs = [&](const std::vector<msseg::Msc2DRegionArc>& arcs,
+                              const std::unordered_set<int>& ids) {
+    for (std::size_t i = 0; i < arcs.size(); ++i) {
+      const msseg::Msc2DRegionArc& arc = arcs[i];
+      expect(ids.count(arc.a) == 1 && ids.count(arc.b) == 1,
+             "region arc endpoints are living feature ids of labels()");
+      expect(arc.a < arc.b, "region arc is normalised a < b");
+      expect(arc.count >= 1, "region arc collapsed at least one base arc");
+      if (i > 0) {
+        const msseg::Msc2DRegionArc& prev = arcs[i - 1];
+        expect(prev.a < arc.a || (prev.a == arc.a && prev.b < arc.b),
+               "region arcs are strictly (a, b)-sorted");
+      }
+    }
+  };
+
+  const std::vector<msseg::Msc2DRegionArc>& fine_arcs = pipe.region_arcs();
+  if (fine_arcs.empty()) {
+    std::cout << "region_arcs: skipped (msc_2d_lib without livingRegionArcs)\n";
+    return;
+  }
+  check_arcs(fine_arcs, living_ids(pipe.labels()));
+  const std::size_t n_fine = fine_arcs.size();
+
+  // Cache invalidation: after a coarser select the arcs must be re-collected in
+  // the NEW living id set (a stale cache would name merged-away features).
+  pipe.select_persistence(pipe.value_range());
+  const std::unordered_set<int> coarse_ids = living_ids(pipe.labels());
+  const std::vector<msseg::Msc2DRegionArc>& coarse_arcs = pipe.region_arcs();
+  check_arcs(coarse_arcs, coarse_ids);
+  expect(coarse_arcs.size() <= n_fine, "region arc count is monotone non-increasing in persistence");
+  if (coarse_ids.size() == 1) expect(coarse_arcs.empty(), "a single living region has no arcs");
+}
+
 void test_msc2d_extremum_stats() {
   // The seeding critical point of an ascending 2-manifold is its deepest pixel,
   // so ext_filtered must equal filt_min and ext_base must be the BASE channel
@@ -1621,6 +1678,7 @@ int main() try {
   test_msc2d_pipeline_monotone_and_stats();
   test_msc2d_pipeline_consistency();
   test_msc2d_pipeline_descending();
+  test_msc2d_pipeline_region_arcs();
   test_msc2d_extremum_stats();
   test_msc2d_extremum_sample_radius();
   test_feature_query();

@@ -68,7 +68,13 @@ class SliceCanvas(tk.Frame):
         # that leaves this None behaves exactly as before.
         self.on_context = None
         self._ctx_press = None
-        self._hud_mode = None        # None | "busy" (animated) | "stale" (static)
+        self._hud_mode = None        # None | "busy" (animated) | "stale" | "info" (static)
+        # One transient label+LUT layer above every overlay: the "will be
+        # painted" preview of a gesture in flight. Set/cleared by the drawing
+        # tool, untouched by set_overlays(), so a repaint landing mid-drag
+        # keeps the preview -- and composited at the LUT's own alpha, not the
+        # overlay slider's, because the preview IS the point while it shows.
+        self._transient = None
         self._hud_text = ""
         self._hud_job = None
         self._hud_phase = 0
@@ -133,6 +139,14 @@ class SliceCanvas(tk.Frame):
             else:
                 tagged.append(("rgba", o["rgba"], vis))
         self._overlays = tagged
+
+    def set_transient(self, overlay):
+        """Set (or clear, with None) the transient preview layer: a
+        ``{"labels": HxW int, "lut": (K,4) uint8}`` dict as in set_overlays."""
+        if overlay is None:
+            self._transient = None
+        else:
+            self._transient = ("label", overlay["labels"], overlay["lut"], True)
 
     def set_window(self, vmin, vmax):
         self._vmin, self._vmax = float(vmin), float(vmax)
@@ -236,8 +250,9 @@ class SliceCanvas(tk.Frame):
 
     def set_hud(self, mode, text=""):
         """Show a status badge over the canvas. mode: None (clear), "busy"
-        (animated spinner -- assembly in flight), or "stale" (static warning --
-        the displayed result is out of date)."""
+        (animated spinner -- assembly in flight), "stale" (static warning --
+        the displayed result is out of date), or "info" (static, neutral --
+        a tool's live readout, e.g. the magic-fill threshold)."""
         if mode == self._hud_mode and text == self._hud_text:
             return
         self._hud_mode = mode
@@ -259,6 +274,9 @@ class SliceCanvas(tk.Frame):
             self._hud_phase += 1
             label = f"{frame}  {self._hud_text or 'Recomputing'}…"
             fill, outline = "#1e5a8a", "#8ac0ff"
+        elif self._hud_mode == "info":
+            label = self._hud_text
+            fill, outline = "#2a2a2a", "#cccccc"
         else:  # stale
             label = f"⚠  {self._hud_text or 'Out of date'}"
             fill, outline = "#8a5a1e", "#ffcf8a"
@@ -329,10 +347,14 @@ class SliceCanvas(tk.Frame):
         # Nearest-neighbour source indices for the visible region -> viewport grid
         # (shared by label overlays; O(out_w+out_h) to build).
         ys = xs = None
-        for entry in self._overlays:
+        entries = list(self._overlays)
+        if self._transient is not None:
+            entries.append(self._transient)
+        for entry in entries:
             kind, visible = entry[0], entry[-1]
             if not visible:
                 continue
+            transient = entry is self._transient
             if kind == "rgba":
                 rgba = entry[1]
                 if rgba is None:
@@ -352,7 +374,9 @@ class SliceCanvas(tk.Frame):
                 sub = labels[ys][:, xs]                       # (out_h, out_w) feature ids
                 ov = lut[np.where(sub >= 0, sub, 0)].astype(np.float32)
                 ov[sub < 0] = 0                               # background -> transparent
-            a = (ov[:, :, 3:4] / 255.0) * self._alpha
+            a = ov[:, :, 3:4] / 255.0
+            if not transient:
+                a = a * self._alpha
             rgb = rgb * (1 - a) + ov[:, :, :3] * a
             n_ov += 1
         t_ov = time.perf_counter()

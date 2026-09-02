@@ -53,6 +53,7 @@ from __future__ import annotations
 import os
 import sys
 import json
+import math
 import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -64,7 +65,8 @@ from .common import log
 from .widgets import ScrollFrame, attach_tooltip
 from .labeling import (LabelStore, MAX_CLASSES, TOOLS,
                        resolve_slice, resolve_sets, touched_sets, class_lut,
-                       scalar_lut)
+                       scalar_lut, line_pixels, polygon_mask, preview_lut)
+from . import magic_fill
 
 # How faint the inherited region overlay is drawn under the class layer
 # (0..255); the class colors themselves stay fully opaque in the LUT and are
@@ -94,7 +96,11 @@ _DENSE_TOP_N = {"dense-top-16": 16, "dense-top-32": 32}
 _NON_FEATURE_FIELDS = {"feature_id", "min_x", "max_x", "min_y", "max_y",
                        "ext_x", "ext_y"}
 
-_TOOL_LABELS = (("squiggle", "squiggle"), ("box", "box"), ("polygon", "lasso"))
+_TOOL_LABELS = (("squiggle", "squiggle"), ("box", "box"), ("polygon", "lasso"),
+                ("magic", "magic"))
+# What the tool selector offers (a superset of the STORED tools: "magic" is a
+# way of producing a "taps" interaction, not a gesture type of its own).
+_UI_TOOLS = tuple(v for v, _txt in _TOOL_LABELS)
 
 # Focus-widget classes whose keystrokes must not arm classes (typing "1" into
 # the persistence entry is not a request to arm class 1).
@@ -107,16 +113,28 @@ class DrawController:
     class is armed, collects the gesture in IMAGE coordinates (floats -- so a
     box drawn zoomed-out stays accurate), and draws its own rubber-band as
     canvas items tagged "draw" in screen coordinates, recomputed from the
-    stored image points each move so zooming mid-drag stays consistent."""
+    stored image points each move so zooming mid-drag stays consistent.
+
+    While the slice has a region raster it also previews, on the canvas's
+    transient layer, the regions the gesture WILL paint on release -- the same
+    rasterization the commit performs (incrementally for a squiggle, per move
+    for a box/lasso), in a brightened class color. The "magic" tool is
+    delegated whole (press, drag, release) to a MagicFillController."""
 
     MIN_SCREEN_PX = 3      # squiggle/lasso point spacing (screen px)
     _SHIFT = 0x0001        # Tk event.state modifier bit
+    # Box/lasso previews sample their slab with a stride once it exceeds this
+    # many pixels: a full-image box on 3232^2 then costs ~10 ms per move
+    # instead of ~100. The commit itself is still exact (touched_ids).
+    PREVIEW_BUDGET_PX = 1_000_000
 
     def __init__(self, app):
         self.app = app
         self._pts = None           # image-coord points of the gesture in flight
         self._last_screen = None
         self._accept = False       # SHIFT-box: accept predictions under the box
+        self._pv = None            # "will be painted" preview state, or None
+        self.magic = MagicFillController(app)
 
     def _image_pt(self, e):
         v = self.app.viewer
@@ -128,18 +146,25 @@ class DrawController:
         # SHIFT = the accept tool: a box, regardless of the selected tool or
         # armed class, that turns the predictions under it into real labels.
         self._accept = bool(e.state & self._SHIFT)
+        if not self._accept and self.app.tool_var.get() == "magic":
+            return self.magic.on_press(e)
         if not self._accept and self.app.active_class_var.get() <= 0:
             return False           # no class armed -> pan as in the viewer
         self._pts = [self._image_pt(e)]
         self._last_screen = (e.x, e.y)
+        self._preview_begin()
+        self._preview_update()
         return True
 
     def _tool(self):
         return "box" if self._accept else self.app.tool_var.get()
 
     def on_move(self, e):
+        if self.magic.active:
+            return self.magic.on_move(e)
         if self._pts is None:
             return False
+        changed = True
         if self._tool() == "box":
             # A box is its two corners: the anchor plus the live corner.
             if len(self._pts) > 1:
@@ -151,14 +176,21 @@ class DrawController:
             if abs(e.x - lx) + abs(e.y - ly) >= self.MIN_SCREEN_PX:
                 self._pts.append(self._image_pt(e))
                 self._last_screen = (e.x, e.y)
+            else:
+                changed = False
+        if changed:
+            self._preview_update()
         self._draw_feedback()
         return True
 
     def on_release(self, e):
+        if self.magic.active:
+            return self.magic.on_release(e)
         if self._pts is None:
             return False
         pts, self._pts = self._pts, None
         accept, self._accept = self._accept, False
+        self._preview_end()
         self.app.viewer.canvas.delete("draw")
         if accept:
             if len(pts) >= 2:
@@ -171,6 +203,108 @@ class DrawController:
         if len(pts) >= need:
             self.app._commit_interaction(tool, pts)
         return True
+
+    def cancel(self):
+        """Escape: abandon whatever is in flight (any tool) without committing.
+        Returns True when there was something to abandon."""
+        if self.magic.active:
+            return self.magic.cancel()
+        if self._pts is None:
+            return False
+        self._pts = None
+        self._accept = False
+        self._preview_end()
+        self.app.viewer.canvas.delete("draw")
+        self.app.status_var.set("gesture cancelled")
+        return True
+
+    # -- "will be painted" preview --------------------------------------- #
+    def _preview_begin(self):
+        """Arm the preview for the gesture just started. Nothing to preview
+        (no region raster yet, or an accept box with no live predictions)
+        leaves the tools exactly as they were: rubber band only."""
+        self._pv = None
+        app = self.app
+        cur = app._current()
+        rec = app.engine.record(*cur) if cur is not None else None
+        if rec is None or rec.get("labels") is None:
+            return
+        labels = rec["labels"]
+        pred = None
+        if self._accept:
+            pr = app._pred.get(cur)
+            if pr is None or pr[0] != rec.get("commit"):
+                return             # nothing would be accepted: no preview
+            pred = pr[1]
+        self._pv = {"labels": labels,
+                    "K": int(labels.max()) + 1 if labels.size else 1,
+                    "ids": set(), "shown": None, "pred": pred,
+                    "rgba": app.store.rgba(int(app.active_class_var.get()))}
+        app._begin_preview()
+
+    def _preview_update(self):
+        pv = self._pv
+        if pv is None or not self._pts:
+            return
+        import numpy as np
+        labels = pv["labels"]
+        h, w = labels.shape
+        pts = self._pts
+        tool = self._tool()
+        if tool == "squiggle":
+            # Incremental and exact: only the newest segment is rasterized.
+            (x0, y0), (x1, y1) = (pts[-2], pts[-1]) if len(pts) > 1 else (pts[0], pts[0])
+            ys, xs = line_pixels(x0, y0, x1, y1, w, h, np)
+            if len(ys):
+                pv["ids"].update(int(v) for v in np.unique(labels[ys, xs]) if v >= 0)
+        elif tool == "box":
+            pv["ids"] = self._slab_ids(labels, pts[0], pts[-1], np)
+        elif len(pts) >= 3:                     # polygon
+            ids = set()
+            pm = polygon_mask(pts, w, h, np)
+            if pm is not None:
+                mask, ya, xa = pm
+                sub = labels[ya:ya + mask.shape[0], xa:xa + mask.shape[1]]
+                st = self._stride(mask.size)
+                vals = np.unique(sub[::st, ::st][mask[::st, ::st]])
+                ids = set(int(v) for v in vals if v >= 0)
+            pv["ids"] = ids
+        if pv["ids"] == pv["shown"]:
+            return
+        pv["shown"] = set(pv["ids"])
+        if pv["pred"] is not None:
+            # Accept box: each region in the color of the class it would get.
+            n = self.app.store.n_classes
+            pred = pv["pred"]
+            colors = {i: self.app.store.rgba(int(pred[i])) for i in pv["ids"]
+                      if i < len(pred) and 1 <= int(pred[i]) < n}
+            self.app._preview_regions(labels, pv["K"], list(colors), colors)
+        else:
+            self.app._preview_regions(labels, pv["K"], pv["ids"], pv["rgba"])
+
+    def _preview_end(self):
+        if self._pv is None:
+            return
+        self._pv = None
+        self.app._end_preview()
+
+    @classmethod
+    def _stride(cls, n_px):
+        if n_px <= cls.PREVIEW_BUDGET_PX:
+            return 1
+        return max(1, int(math.ceil(math.sqrt(n_px / cls.PREVIEW_BUDGET_PX))))
+
+    def _slab_ids(self, labels, p0, p1, np):
+        h, w = labels.shape
+        xa, xb = sorted((int(round(p0[0])), int(round(p1[0]))))
+        ya, yb = sorted((int(round(p0[1])), int(round(p1[1]))))
+        xa, xb = max(xa, 0), min(xb, w - 1)
+        ya, yb = max(ya, 0), min(yb, h - 1)
+        if xa > xb or ya > yb:
+            return set()
+        st = self._stride((xb - xa + 1) * (yb - ya + 1))
+        vals = np.unique(labels[ya:yb + 1:st, xa:xb + 1:st])
+        return set(int(v) for v in vals if v >= 0)
 
     def _draw_feedback(self):
         v = self.app.viewer
@@ -199,6 +333,209 @@ class DrawController:
                 # Preview the auto-close edge.
                 c.create_line(scr[-1][0], scr[-1][1], scr[0][0], scr[0][1],
                               fill=color, width=1, dash=(3, 2), tags="draw")
+
+
+class MagicFillController:
+    """The magic-fill tool: press on a region with a class armed, and a flood
+    grows from it over the living-region adjacency graph while a
+    dissimilarity stays under a threshold; drag UP for a higher threshold
+    (more regions), DOWN for a lower one; release paints; Escape abandons.
+
+    Everything seed-dependent is computed once at the press as a join ladder
+    (magic_fill.build_ladder); a drag tick is a rank on that ladder -- a prefix
+    of the flood's discovery order, so every pixel of drag adds or removes ONE
+    connected region even where many tie (an outlier seed) -- and the
+    threshold is always in the data's own units (shown on the canvas HUD). The first threshold is the one last
+    released with the same metric/mode/channels this session, else a natural
+    break in the ladder. The result commits as ONE "taps" interaction with a
+    point per grown region at its seeding extremum, so it re-resolves after a
+    persistence change through the same geometric path as any gesture."""
+
+    def __init__(self, app):
+        self.app = app
+        self._s = None             # session dict while a fill is in flight
+        self._last = {}            # (metric, mode, channels) -> last released t
+
+    @property
+    def active(self):
+        return self._s is not None
+
+    def options(self):
+        app = self.app
+        metric = app.magic_metric_var.get()
+        mode = app.magic_mode_var.get()
+        chans = [c.strip() for c in app.magic_channels_var.get().split(",")
+                 if c.strip()]
+        if metric not in magic_fill.METRICS:
+            metric = "mean"
+        if mode not in magic_fill.MODES:
+            mode = "anchor"
+        return metric, mode, chans or ["base"]
+
+    def on_press(self, e):
+        app = self.app
+        cur = app._current()
+        cls = int(app.active_class_var.get())
+        if cur is None or not (1 <= cls < app.store.n_classes):
+            return False
+        rec = app.engine.record(*cur)
+        if rec is None or rec.get("labels") is None or rec.get("stats") is None:
+            app.status_var.set("Magic fill needs computed regions - Rerun first.")
+            return False
+        import numpy as np
+        v = app.viewer
+        labels = rec["labels"]
+        h, w = labels.shape
+        x, y = v.view_x + e.x * v.scale, v.view_y + e.y * v.scale
+        ix, iy = int(round(x)), int(round(y))
+        if not (0 <= ix < w and 0 <= iy < h):
+            return False
+        seed = int(labels[iy, ix])
+        if seed < 0:
+            return False                     # background: pan as usual
+        arcs = rec.get("arcs")
+        if arcs is None:
+            # Extension without region_arcs(): pixel adjacency, once per
+            # record (commit-keyed, so a Rerun recomputes it).
+            t0 = time.perf_counter()
+            arcs = magic_fill.arcs_from_labels(labels, np)
+            rec["arcs"] = arcs
+            log(f"magic fill: pixel adjacency for slice {cur[1]}: "
+                f"{len(arcs['a'])} pairs ({1e3 * (time.perf_counter() - t0):.0f}ms)")
+        metric, mode, want = self.options()
+        table = rec["stats"]
+        avail = magic_fill.channel_names(table)
+        chans = [c for c in want if c in avail]
+        if not chans:
+            chans = ["base"] if "base" in avail else avail[:1]
+        if metric in magic_fill.EDGE_ONLY_METRICS and arcs.get("saddle") is None:
+            app.status_var.set(f"{metric} needs saddle values (MSC region arcs) "
+                               "- using mean")
+            metric = "mean"
+        try:
+            ladder = magic_fill.build_ladder(table, arcs, seed, metric, mode,
+                                             chans, np)
+        except ValueError as exc:
+            app.status_var.set(f"magic fill: {exc}")
+            return False
+        key = (metric, mode, tuple(chans))
+        last_t = self._last.get(key)
+        k0 = (magic_fill.rank_at(ladder, last_t, np) if last_t is not None
+              else magic_fill.initial_rank(ladder, np))
+        self._s = {"si": cur[0], "li": cur[1], "commit": rec.get("commit"),
+                   "labels": labels,
+                   "K": int(labels.max()) + 1 if labels.size else 1,
+                   "ladder": ladder, "seed": seed, "seed_pt": (x, y),
+                   "press_y": e.y, "k0": k0, "k": None, "t": None, "ids": None,
+                   "rgba": app.store.rgba(cls), "cls": cls, "key": key,
+                   "source": arcs.get("source"),
+                   "hud": (v._hud_mode, v._hud_text)}
+        app._begin_preview()
+        self._preview(k0)
+        return True
+
+    def on_move(self, e):
+        s = self._s
+        if s is None:
+            return False
+        rec = self.app.engine.record(s["si"], s["li"])
+        if rec is None or rec.get("commit") != s["commit"]:
+            self.cancel("magic fill cancelled: regions changed under it")
+            return True
+        k = magic_fill.drag_to_rank(s["k0"], s["press_y"] - e.y,
+                                    s["ladder"].n_reach)
+        if k != s["k"]:
+            self._preview(k)
+        return True
+
+    def _preview(self, k):
+        s = self._s
+        ladder = s["ladder"]
+        import numpy as np
+        t = magic_fill.threshold_for_rank(ladder, k)
+        ids = magic_fill.regions_for_rank(ladder, k)   # a prefix of the flood
+        s["k"], s["t"], s["ids"] = k, t, ids
+        self.app._preview_regions(s["labels"], s["K"], ids, s["rgba"],
+                                  emphasize=s["seed"])
+        n = len(ids)
+        px = ""
+        if ladder.cum_area is not None and n:
+            px = f"  {int(ladder.cum_area[min(n, len(ladder.cum_area)) - 1])} px"
+        self.app.viewer.set_hud(
+            "info", f"magic {ladder.metric}/{ladder.mode}  t={t:.3g}  "
+                    f"{n}/{ladder.n_reach} regions{px}")
+
+    def on_release(self, e):
+        s = self._s
+        if s is None:
+            return False
+        self._s = None
+        self._finish(s)
+        ids = s.get("ids")
+        if ids is None or len(ids) == 0:
+            return True
+        self._last[s["key"]] = float(s["t"])
+        ladder = s["ladder"]
+        meta = {"tool": "magic",
+                "seed": [float(s["seed_pt"][0]), float(s["seed_pt"][1])],
+                "seed_id": int(s["seed"]), "threshold": float(s["t"]),
+                "metric": ladder.metric, "mode": ladder.mode,
+                "channels": list(ladder.channels), "n_regions": int(len(ids)),
+                "arcs": s["source"]}
+        self.app._commit_magic(s["si"], s["li"], s["labels"],
+                               [int(i) for i in ids], s["cls"], meta)
+        return True
+
+    def cancel(self, why="magic fill cancelled"):
+        s = self._s
+        if s is None:
+            return False
+        self._s = None
+        self._finish(s)
+        self.app.status_var.set(why)
+        return True
+
+    def _finish(self, s):
+        v = self.app.viewer
+        self.app._end_preview()
+        if v is not None and v._hud_mode == "info":
+            v.set_hud(*s["hud"])       # give the canvas HUD back to the engine
+
+
+def _extremum_points(labels, ids, table, np):
+    """One image point per region id: its seeding extremum (ext_x/ext_y from
+    the feature table) when that pixel really carries the id, else the
+    region's first pixel in raster order. Both lookups are vectorised -- the
+    fallback is one pass over the raster, not one per region."""
+    h, w = labels.shape
+    pts = {}
+    if table is not None and ids:
+        fid, ex, ey = (table.column("feature_id"), table.column("ext_x"),
+                       table.column("ext_y"))
+        if fid is not None and ex is not None and ey is not None and len(fid):
+            fid = np.asarray(fid, np.intp)
+            K = int(max(int(fid.max()), max(ids))) + 1
+            row_of = np.full(K, -1, np.intp)
+            row_of[fid] = np.arange(len(fid))
+            for i in ids:
+                r = int(row_of[i]) if 0 <= i < K else -1
+                if r < 0:
+                    continue
+                x, y = int(round(float(ex[r]))), int(round(float(ey[r])))
+                if 0 <= x < w and 0 <= y < h and int(labels[y, x]) == i:
+                    pts[i] = (float(x), float(y))
+    missing = [i for i in ids if i not in pts]
+    if missing:
+        flat = labels.ravel()
+        idx = np.flatnonzero(np.isin(flat, np.asarray(missing, labels.dtype)))
+        if len(idx):
+            vals = flat[idx]
+            order = np.argsort(vals, kind="stable")
+            vals, idx = vals[order], idx[order]
+            first = np.r_[True, vals[1:] != vals[:-1]]
+            for val, pos in zip(vals[first].tolist(), idx[first].tolist()):
+                pts[int(val)] = (float(pos % w), float(pos // w))
+    return [pts[i] for i in ids if i in pts]
 
 
 class LabelerApp(MscouponApp):
@@ -241,6 +578,14 @@ class LabelerApp(MscouponApp):
         self._class_swatches = {}       # class_id -> arm/color swatch button
         self.active_class_var.trace_add("write", self._refresh_class_arm)
         self.tool_var = tk.StringVar(master=root, value="squiggle")
+        # Magic-fill options (metric / compare mode / measurement channels);
+        # part of the session's view state.
+        self.magic_metric_var = tk.StringVar(master=root, value="mean")
+        self.magic_mode_var = tk.StringVar(master=root, value="anchor")
+        self.magic_channels_var = tk.StringVar(master=root, value="base")
+        # True while a gesture previews on the canvas: the pointer is busy
+        # drawing, so the hover outlines stay off until it is released.
+        self._hover_suppressed = False
         self.show_regions_var = tk.BooleanVar(master=root, value=True)
         self.region_mode_var = tk.StringVar(master=root, value=_MODE_ID)
         # Persistent annotation view: paint every on-slice gesture outline at
@@ -618,6 +963,57 @@ class LabelerApp(MscouponApp):
         self._refresh_render()
         self.status_var.set(f"#{it.uid} {tool} -> class {cls} ({slice_key})")
 
+    # -- "will be painted" preview (shared by every drawing tool) ---------- #
+    def _begin_preview(self):
+        """A gesture is in flight: park the hover outlines until _end_preview
+        (the pointer is drawing, not asking about regions)."""
+        self._hover_suppressed = True
+        if self.viewer is not None:
+            self.viewer.canvas.delete("ihover")
+        self._hover_key = None
+
+    def _preview_regions(self, labels, K, ids, colors, emphasize=None):
+        """Show `ids` on the canvas's transient layer in a brightened, opaque
+        version of their class color (see labeling.preview_lut)."""
+        v = self.viewer
+        if v is None:
+            return
+        import numpy as np
+        v.set_transient({"labels": labels,
+                         "lut": preview_lut(K, ids, colors, np, emphasize=emphasize)})
+        v._schedule()
+
+    def _end_preview(self):
+        self._hover_suppressed = False
+        v = self.viewer
+        if v is not None:
+            v.set_transient(None)
+            v._schedule()
+
+    def _commit_magic(self, si, li, labels, ids, cls, meta):
+        """Magic-fill release: the grown regions become ONE "taps" interaction
+        with a point per region at its seeding extremum (the pixel most likely
+        to stay inside the region when the decomposition changes), so the fill
+        re-resolves through the same geometric path as every other gesture.
+        The provenance (seed, threshold, metric) rides along as display
+        metadata. One undo step for the whole fill."""
+        slice_key = self._slice_key(si, li)
+        ids = [int(i) for i in ids]
+        if slice_key is None or not ids or not (1 <= int(cls) < self.store.n_classes):
+            return
+        import numpy as np
+        rec = self.engine.record(si, li)
+        table = rec.get("stats") if rec is not None else None
+        pts = _extremum_points(labels, ids, table, np)
+        if not pts:
+            return
+        self._push_history()
+        it = self.store.add("taps", pts, int(cls), slice_key, si, li, meta=meta)
+        self._rebuild_class_panels()
+        self._refresh_render()
+        self.status_var.set(f"#{it.uid} magic -> class {cls}: {len(pts)} region(s) "
+                            f"at t={meta.get('threshold', 0.0):.3g}")
+
     def _accept_predictions(self, pts):
         """SHIFT-box release: turn the classifier's predictions under the box
         into real labels -- one "taps" interaction per predicted class, one
@@ -739,7 +1135,9 @@ class LabelerApp(MscouponApp):
     def _bind_hotkeys(self):
         for k in range(0, MAX_CLASSES):
             self.root.bind(str(k), self._on_class_key)
-        self.root.bind("<Escape>", lambda e: self.active_class_var.set(0))
+        self.root.bind("<Escape>", self._on_escape)
+        self.root.bind("m", self._on_magic_key)
+        self.root.bind("M", self._on_magic_key)
         self.root.bind("<Control-z>", self._on_undo_key)
         self.root.bind("<Control-y>", self._on_undo_key)
         self.root.bind("<Tab>", self._on_tab_toggle)
@@ -748,6 +1146,19 @@ class LabelerApp(MscouponApp):
         self.root.bind("R", self._train_and_classify)
         self.root.bind("c", self._on_classify_key)
         self.root.bind("C", self._on_classify_key)
+
+    def _on_escape(self, _e=None):
+        """Escape abandons a gesture in flight (any tool, preview and all);
+        with nothing in flight it disarms the class, as before."""
+        tool = self.viewer.tool if self.viewer is not None else None
+        if tool is not None and hasattr(tool, "cancel") and tool.cancel():
+            return
+        self.active_class_var.set(0)
+
+    def _on_magic_key(self, _e=None):
+        if self._typing():
+            return
+        self.tool_var.set("magic")
 
     def _typing(self):
         """True while a text-entry widget owns the keyboard focus."""
@@ -820,8 +1231,37 @@ class LabelerApp(MscouponApp):
         row = ttk.Frame(ann); row.pack(side="top", fill="x", padx=4, pady=2)
         ttk.Label(row, text="Tool:").pack(side="left")
         for value, txt in _TOOL_LABELS:
-            ttk.Radiobutton(row, text=txt, variable=self.tool_var,
-                            value=value).pack(side="left", padx=2)
+            rb = ttk.Radiobutton(row, text=txt, variable=self.tool_var,
+                                 value=value)
+            rb.pack(side="left", padx=2)
+            if value == "magic":
+                attach_tooltip(rb, "Magic fill (key M): press on a region, drag UP "
+                                   "to grow over similar neighbours, DOWN to shrink, "
+                                   "release to paint, Escape to abandon.")
+
+        # Magic-fill options: how regions are compared while the fill grows.
+        row = ttk.Frame(ann); row.pack(side="top", fill="x", padx=4, pady=2)
+        self.magic_row = row
+        ttk.Label(row, text="Magic:").pack(side="left")
+        cb = ttk.Combobox(row, textvariable=self.magic_metric_var,
+                          values=list(magic_fill.METRICS), state="readonly",
+                          width=13)
+        cb.pack(side="left", padx=2)
+        attach_tooltip(cb, "mean: |mean difference| over the channels (z-scored)\n"
+                           "bhattacharyya: Gaussian overlap from mean and std\n"
+                           "barrier: saddle height above the seed (MSC arcs only)")
+        cb = ttk.Combobox(row, textvariable=self.magic_mode_var,
+                          values=list(magic_fill.MODES), state="readonly",
+                          width=7)
+        cb.pack(side="left", padx=2)
+        attach_tooltip(cb, "anchor: every region is compared with the SEED\n"
+                           "chain: each region with the neighbour it grows from")
+        ttk.Label(row, text="on").pack(side="left", padx=(4, 0))
+        en = ttk.Entry(row, textvariable=self.magic_channels_var, width=12)
+        en.pack(side="left", padx=2)
+        attach_tooltip(en, "Comma-separated measurement channels as the statistics "
+                           "spec names them (base, blur_s1.5, ...); unknown names "
+                           "are ignored, none valid falls back to base.")
 
         # Packed before the class holder (side="bottom") so it lands directly
         # under the class panels, leaving the holder the cavity between.
@@ -1196,7 +1636,12 @@ class LabelerApp(MscouponApp):
             where = f"  [{it.slice_key}]"
         else:
             where = ""
-        lbl = tk.Label(row, text=f"#{it.uid} {it.tool}{where}",
+        name = it.tool
+        if it.meta and it.meta.get("tool"):
+            name = str(it.meta["tool"])          # e.g. a magic fill's taps
+            if it.meta.get("n_regions") is not None:
+                name += f" ({it.meta['n_regions']})"
+        lbl = tk.Label(row, text=f"#{it.uid} {name}{where}",
                        foreground=("#000" if it.bound else "#888"),
                        background="white", anchor="w", cursor="hand2")
         lbl.pack(side="left", fill="x", expand=True)
@@ -1345,6 +1790,12 @@ class LabelerApp(MscouponApp):
             for x, y in scr:
                 c.create_oval(x - 4, y - 4, x + 4, y + 4, outline=color,
                               width=3, tags=tags)
+            seed = (it.meta or {}).get("seed")
+            if seed and len(seed) == 2:  # a magic fill: mark where it started
+                sx = (float(seed[0]) - v.view_x) / v.scale
+                sy = (float(seed[1]) - v.view_y) / v.scale
+                c.create_oval(sx - 9, sy - 9, sx + 9, sy + 9, outline=color,
+                              width=2, dash=(3, 2), tags=tags)
         elif len(scr) >= 2:
             pts = scr + [scr[0]] if it.tool == "polygon" else scr
             flat = [coord for pt in pts for coord in pt]
@@ -1438,6 +1889,8 @@ class LabelerApp(MscouponApp):
                             f"x={ix} y={iy}  |  base={float(base[iy, ix]):.4g} "
                             f"filtered={float(filt[iy, ix]):.4g}  |  "
                             f"class probabilities: {probabilities}")
+        if self._hover_suppressed:
+            return                        # a gesture is previewing: no outlines
         key = None if region is None else (cur[0], cur[1], region)
         if key == self._hover_key:
             return
@@ -2200,6 +2653,9 @@ class LabelerApp(MscouponApp):
     def _view_state(self):
         d = super()._view_state()
         d["tool"] = self.tool_var.get()
+        d["magic"] = {"metric": self.magic_metric_var.get(),
+                      "mode": self.magic_mode_var.get(),
+                      "channels": self.magic_channels_var.get()}
         return d
 
     def _session_doc(self):
@@ -2233,8 +2689,16 @@ class LabelerApp(MscouponApp):
                     notes.append(f"model not reloaded: {exc}")
                 break
         view = sdoc.get("view") or {}
-        if view.get("tool") in TOOLS:
+        if view.get("tool") in _UI_TOOLS:
             self.tool_var.set(view["tool"])
+        magic = view.get("magic")
+        if isinstance(magic, dict):
+            if magic.get("metric") in magic_fill.METRICS:
+                self.magic_metric_var.set(magic["metric"])
+            if magic.get("mode") in magic_fill.MODES:
+                self.magic_mode_var.set(magic["mode"])
+            if isinstance(magic.get("channels"), str) and magic["channels"].strip():
+                self.magic_channels_var.set(magic["channels"])
         # Keep the regions toggle in sync with whatever seg_source restored to.
         self.show_regions_var.set(self.seg_source_var.get() == "msc")
         return notes
@@ -2262,11 +2726,13 @@ def main():
 
 
 class _FakeEvent:
-    """Enough of a Tk event for the canvas's click-vs-drag arithmetic."""
+    """Enough of a Tk event for the canvas's click-vs-drag arithmetic and
+    the drawing tool's modifier check."""
 
-    def __init__(self, x, y):
+    def __init__(self, x, y, state=0):
         self.x, self.y = x, y
         self.x_root, self.y_root = x, y
+        self.state = state
 
 
 def _selftest():
@@ -2987,6 +3453,121 @@ def _selftest():
                 if rc_user[r] > 0:
                     assert mask[px] == rc_user[r]
 
+    # -- Drawing-tool state machine: gesture previews + magic fill ----------- #
+    # Fresh one-slice fixture at the current commit (earlier sections swapped
+    # the record). No engine: adjacency comes from the pixel fallback and the
+    # table has mean_base only (so the extremum points fall back to the first
+    # pixel of each region).
+    rec_m = {"commit": app._commit_id, "labels": lab, "stats": table,
+             "kept": set(), "cc": None, "n_feat": 4}
+    app._slices[(0, 0)] = rec_m
+    app._pred = {}
+    v = app.viewer
+    v.view_x, v.view_y, v.scale = 0.0, 0.0, 1.0
+    ctrl = v.tool
+    assert isinstance(ctrl, DrawController)
+    n_before = len(app.store.interactions)
+
+    def lit():
+        return set(np.flatnonzero(v._transient[2][:, 3] > 0).tolist())
+
+    # Squiggle: incremental, exact -- from region 0 into region 2.
+    app.tool_var.set("squiggle"); app.active_class_var.set(1)
+    assert ctrl.on_press(_FakeEvent(5, 5))
+    assert v._transient is not None and app._hover_suppressed
+    assert lit() == {0}, lit()
+    assert ctrl.on_move(_FakeEvent(15, 5))
+    assert lit() == {0, 2}, lit()
+    assert ctrl.on_release(_FakeEvent(15, 5))
+    assert v._transient is None and not app._hover_suppressed
+    assert len(app.store.interactions) == n_before + 1
+    assert app.store.interactions[-1].tool == "squiggle"
+
+    # Box across all four blocks, then Escape: nothing committed, class kept.
+    app.tool_var.set("box")
+    assert ctrl.on_press(_FakeEvent(3, 3))
+    assert ctrl.on_move(_FakeEvent(16, 16))
+    assert lit() == {0, 2, 5, 9}, lit()
+    app._on_escape()
+    assert v._transient is None and ctrl._pts is None
+    assert len(app.store.interactions) == n_before + 1, "Escape commits nothing"
+    assert app.active_class_var.get() == 1, "Escape mid-gesture keeps the class"
+    app._on_escape()
+    assert app.active_class_var.get() == 0, "Escape with nothing in flight disarms"
+
+    # SHIFT-accept box: the preview shows what WOULD be accepted, each region
+    # in its predicted class color; unpredicted regions stay dark.
+    app.active_class_var.set(1)
+    k_hi = app.store.n_classes - 1
+    pred_rc = np.zeros(10, np.uint8); pred_rc[0] = 1; pred_rc[9] = k_hi
+    app._pred[(0, 0)] = (app._commit_id, pred_rc,
+                         np.zeros((10, MAX_CLASSES), np.float32))
+    assert ctrl.on_press(_FakeEvent(3, 3, state=0x0001))
+    assert ctrl.on_move(_FakeEvent(16, 16, state=0x0001))
+    assert lit() == {0, 9}, lit()
+    pure = np.asarray(app.store.rgba(k_hi)[:3], np.int32)
+    shown = v._transient[2][9, :3].astype(np.int32)
+    assert (shown >= pure).all() and v._transient[2][9, 3] == 255, (shown, pure)
+    app._on_escape()
+    app._pred = {}
+
+    # Magic fill: seed region 0, mean/anchor on base. The ladder is
+    # d = [0, 1, 2, 3] / std(mean_base), so a long drag up sweeps all four
+    # regions and a drag down leaves the seed alone.
+    app.tool_var.set("magic"); app.active_class_var.set(1)
+    assert app.magic_metric_var.get() == "mean"
+    assert ctrl.on_press(_FakeEvent(5, 5))
+    assert ctrl.magic.active and v._transient is not None
+    assert rec_m.get("arcs") is not None and rec_m["arcs"]["source"] == "pixels"
+    assert set(zip(rec_m["arcs"]["a"].tolist(), rec_m["arcs"]["b"].tolist())) == \
+        {(0, 2), (0, 5), (2, 9), (5, 9)}
+    assert v._hud_mode == "info" and "magic" in v._hud_text
+    assert lit() == {0}, lit()
+    assert ctrl.on_move(_FakeEvent(5, 5 - 400))
+    assert lit() == {0, 2, 5, 9}, lit()
+    assert ctrl.on_move(_FakeEvent(5, 5 + 400))
+    assert lit() == {0}, lit()
+    assert ctrl.on_move(_FakeEvent(5, 5 - 400))
+    assert ctrl.on_release(_FakeEvent(5, 5 - 400))
+    assert v._transient is None and v._hud_mode is None and not ctrl.magic.active
+    it_m = app.store.interactions[-1]
+    assert it_m.tool == "taps" and it_m.meta and it_m.meta["tool"] == "magic"
+    assert it_m.meta["n_regions"] == 4 and it_m.meta["seed_id"] == 0
+    assert len(it_m.points) == 4
+    rc_m = labeling.resolve_slice([it_m], lab, np)
+    assert all(rc_m[r] == 1 for r in (0, 2, 5, 9))
+    # Provenance in the session doc; the options ride the view state; undo
+    # removes the whole fill in one step.
+    app._rebuild_class_panels()
+    doc_m = app._session_doc()
+    assert doc_m["view"]["magic"]["metric"] == "mean"
+    assert any(d.get("meta", {}).get("tool") == "magic"
+               for d in doc_m["annotations"]["interactions"])
+    n_now = len(app.store.interactions)
+    app._undo()
+    assert len(app.store.interactions) == n_now - 1
+    assert not any(it.meta for it in app.store.interactions)
+    # A second press starts from the threshold last released (all four).
+    app.active_class_var.set(1)
+    assert ctrl.on_press(_FakeEvent(5, 5))
+    assert lit() == {0, 2, 5, 9}, lit()
+    assert ctrl.magic.cancel()
+    assert v._transient is None
+    # Escape mid-fill abandons it and keeps the class armed; a press on the
+    # background is refused (falls through to the pan).
+    assert ctrl.on_press(_FakeEvent(12, 12))
+    app._on_escape()
+    assert not ctrl.magic.active and app.active_class_var.get() == 1
+    assert not ctrl.on_press(_FakeEvent(0, 0))
+    # The chain mode and bhattacharyya need std_ columns: a table without
+    # them reports instead of raising out of the press.
+    app.magic_metric_var.set("bhattacharyya")
+    assert not ctrl.on_press(_FakeEvent(5, 5))
+    assert "std_base" in app.status_var.get(), app.status_var.get()
+    app.magic_metric_var.set("mean")
+    app.active_class_var.set(0)
+    app.tool_var.set("squiggle")
+
     # A re-prime (engine "done") bumps the commit, so every commit-keyed cache
     # (per-slice records, class LUTs, predictions) self-invalidates -- the
     # "stale overlays after adding a folder and re-running" regression.
@@ -3005,7 +3586,8 @@ def _selftest():
           "click-to-center, CSV, model kinds + compat gate + 'R', "
           "profile-from-model + provenance strip, swatch arming, "
           "proba cache + coloring modes, confusion matrix + highlight, "
-          "persistent outlines + canvas right-click")
+          "persistent outlines + canvas right-click, gesture previews, "
+          "magic fill")
     return 0
 
 
