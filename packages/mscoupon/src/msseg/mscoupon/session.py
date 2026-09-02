@@ -42,7 +42,7 @@ def default_profile(name: str = "default", relevance: bool = True) -> Dict[str, 
         "base_filters": [],
         "msc": {"manifold": "ascending", "persistence_percent": 10.0,
                 "accurate": False, "extremum_sample_radius": 0,
-                "use_gpu_gradient": False, "simplification": "msc"},
+                "use_gpu_gradient": False, "simplification": "merge_forest"},
         "statistics": config_io.statistics_to_json(
             [{"kind": "base"}], list(config_io.STAT_REDUCTIONS), True, 0,
             relevance),
@@ -80,7 +80,7 @@ def profile_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[str, 
                          or msc.get("accurate_descending")),
         "extremum_sample_radius": max(0, _as_int(msc.get("extremum_sample_radius"), 0)),
         "use_gpu_gradient": bool(msc.get("use_gpu_gradient")),
-        "simplification": str(msc.get("simplification") or "msc"),
+        "simplification": str(msc.get("simplification") or "merge_forest"),
     }
 
     stats = config_io.statistics_from_json(root.get("statistics"), notes)
@@ -216,7 +216,7 @@ def build_session_doc(*, app: str,
                       active_profile: str,
                       run: Dict[str, Any],
                       view: Dict[str, Any],
-                      labels: Optional[Dict[str, Any]] = None,
+                      annotations: Optional[Dict[str, Any]] = None,
                       models: Optional[Sequence[Dict[str, Any]]] = None) -> Dict[str, Any]:
     doc: Dict[str, Any] = {
         "app": str(app),
@@ -232,11 +232,20 @@ def build_session_doc(*, app: str,
         "run": dict(run),
         "view": dict(view),
     }
-    if labels is not None:
-        doc["labels"] = labels
+    if annotations is not None:
+        doc["annotations"] = annotations
     if models is not None:
         doc["models"] = [dict(m) for m in models]
     return doc
+
+
+def _first_dict(*candidates: Any) -> Optional[Dict[str, Any]]:
+    """The first candidate that is actually a dict, else None -- for reading a
+    key that has been renamed, newest spelling first."""
+    for c in candidates:
+        if isinstance(c, dict):
+            return c
+    return None
 
 
 def is_session_doc(doc: Any) -> bool:
@@ -305,7 +314,10 @@ def session_doc_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[s
         "run": {"cores_per_slice": _as_int(run.get("cores_per_slice"), 0) or None,
                 "concurrent_slices": _as_int(run.get("concurrent_slices"), 0) or None},
         "view": _as_dict(root.get("view")),
-        "labels": root.get("labels") if isinstance(root.get("labels"), dict) else None,
+        # "labels" is what sessions written before the rename call this, and it
+        # is the ONLY thing that key ever meant here (the raw gesture geometry);
+        # elsewhere in the tree "labels" is the MSC label raster.
+        "annotations": _first_dict(root.get("annotations"), root.get("labels")),
         "models": models,
     }
 
@@ -407,6 +419,6 @@ def legacy_docs_to_session(docs: Sequence[Tuple[str, Any]],
                 "concurrent_slices": state.get("concurrent_slices")},
         "view": view,
     }
-    if isinstance(gui0.get("labels"), dict):
-        doc["labels"] = gui0["labels"]
+    if isinstance(gui0.get("labels"), dict):     # v1 spelling, on the way in
+        doc["annotations"] = gui0["labels"]
     return session_doc_from_json(doc, notes)

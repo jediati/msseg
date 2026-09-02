@@ -87,6 +87,14 @@ bool region_select_enabled() {
   return !(env != nullptr && env[0] == '0');
 }
 
+// Phase timing, on by default with MSSEG_TIME_MSC=0 as the opt-out (mirrors
+// MSSEG_REGION_SELECT). The interactive path's cost has to be attributable
+// without re-launching, and the lines are a handful per slice.
+bool time_phases_wanted() {
+  const char* env = std::getenv("MSSEG_TIME_MSC");
+  return !(env != nullptr && env[0] == '0');
+}
+
 // Which simplification the caller asked for, with MSSEG_SIMPLIFICATION as the
 // runtime kill-switch (mirrors MSSEG_REGION_SELECT / MSSEG_GPU_STATS, so an A/B
 // run can force the MSC without editing a config).
@@ -338,7 +346,7 @@ bool try_gpu_accumulate(ImplT& impl, const diffg::Image<float>& base,
   const std::size_t num_base = impl.leaf_stats.size();
   if (num_base == 0) return false;
 
-  const bool time_phases = std::getenv("MSSEG_TIME_MSC") != nullptr;
+  const bool time_phases = time_phases_wanted();
   auto mark = std::chrono::steady_clock::now();
   auto lap = [&](const char* what) {
     if (!time_phases) return;
@@ -784,9 +792,9 @@ float Msc2DPipeline::base_relevance_ceiling() const { return impl_->base_relevan
 
 void Msc2DPipeline::select_persistence(float persistence_absolute) {
   impl_->current_persistence = persistence_absolute;
-  // Phase timing, opt-in via MSSEG_TIME_MSC=1. Re-thresholding is the
+  // Phase timing (MSSEG_TIME_MSC=0 opts out). Re-thresholding is the
   // interactive path's dominant cost, so it needs to be attributable.
-  const bool time_phases = std::getenv("MSSEG_TIME_MSC") != nullptr;
+  const bool time_phases = time_phases_wanted();
   const auto t_start = std::chrono::steady_clock::now();
   auto lap = [&](const char* what, std::chrono::steady_clock::time_point& from) {
     if (!time_phases) return;

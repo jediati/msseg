@@ -111,9 +111,13 @@ struct Msc2DParams {
   //                     threshold. Much cheaper to build (no MSC, no hierarchy,
   //                     no partition reconcile) but NOT bit-identical: it
   //                     measures ~99.7-99.9% pixel agreement with "msc".
+  // Defaults to "merge_forest": the interactive labeler is the primary consumer
+  // and the disagreement is confined to a few giant basins, not to the small
+  // features a selection chain asks about. Set "msc" (or MSSEG_SIMPLIFICATION=msc)
+  // when bit-fidelity to the MSC matters.
   // Requires an msc_2d_lib new enough to expose ComputeOptions::simplification;
   // older pins warn and use the MSC. Env kill-switch: MSSEG_SIMPLIFICATION=msc.
-  std::string simplification = "msc";  // "msc" | "merge_forest"
+  std::string simplification = "merge_forest";  // "msc" | "merge_forest"
   bool accurate_ascending = true;
   bool accurate_descending = true;
   std::string manifold = "ascending";  // "ascending" | "descending"

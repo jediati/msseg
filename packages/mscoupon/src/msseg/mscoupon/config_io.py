@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
@@ -868,6 +869,28 @@ def serialize_session(doc: Dict[str, Any]) -> str:
     """`sort_keys` so key ordering can never make an unchanged session look
     changed -- the auto-save compares this text against the last one written."""
     return json.dumps(doc, indent=2, sort_keys=True)
+
+
+def rotate_session_backups(path: str, keep: int = 3) -> None:
+    """Roll `path` back one generation: .1 -> .2 -> ... -> .<keep>, then copy
+    the live file to .1. Never raises, and never removes the live file.
+
+    Auto-save is the only writer that runs without the user asking for it, so
+    it is the one that needs an undo: a bad automatic write then costs the last
+    `keep` states rather than everything. The copy (rather than a move) for the
+    newest generation keeps `path` readable even if the write that follows
+    fails."""
+    if keep < 1 or not os.path.isfile(path):
+        return
+    root, ext = os.path.splitext(path)
+    try:
+        for i in range(keep, 1, -1):
+            src = f"{root}.{i - 1}{ext}"
+            if os.path.isfile(src):
+                os.replace(src, f"{root}.{i}{ext}")
+        shutil.copy2(path, f"{root}.1{ext}")
+    except OSError:
+        return          # a full or read-only directory must not stop the save
 
 
 def write_session_text(text: str, path: str) -> bool:

@@ -11,7 +11,11 @@ background, ids SPARSE -- a subset of the compact base ids), and everything is
 sized ``labels.max()+1``, the established LUT pattern.
 
 Persistence: ``LabelStore.to_json()`` <-> ``from_json()`` round-trips the raw
-geometry (labels.json). The file basename is the authoritative slice identity
+geometry (annotations.json -- labels.json before the rename; the document
+itself is unchanged, so old files still load). Note the two senses of "label"
+that rename separated: the ANNOTATIONS here are gestures, while ``labels`` in
+the compute path is the MSC label raster this module rasterizes them onto.
+The file basename is the authoritative slice identity
 so a session survives folder moves; ``(si, li)`` are session-local hints,
 recomputed by ``rebind()``.
 """

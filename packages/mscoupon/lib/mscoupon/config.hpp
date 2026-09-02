@@ -67,7 +67,7 @@ struct MscConfig {
   std::string compute_algorithm = "serial";
   // "msc" (the cancellation hierarchy) | "merge_forest" (the extremum network).
   // See msseg::Msc2DParams::simplification.
-  std::string simplification = "msc";
+  std::string simplification = "merge_forest";
   bool accurate_ascending = true;
   bool accurate_descending = true;
   std::string manifold = "ascending";

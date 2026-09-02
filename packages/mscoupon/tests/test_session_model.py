@@ -141,7 +141,7 @@ def _sample_doc():
         active_profile="P",
         run={"cores_per_slice": 4, "concurrent_slices": 1},
         view={"alpha": 0.5},
-        labels={"version": 2, "n_classes": 3, "interactions": []},
+        annotations={"version": 2, "n_classes": 3, "interactions": []},
         models=[{"path": r"C:\m\clf.pkl", "fingerprint": ["area"],
                  "kind": "random forest", "statistics": {}}])
 
@@ -154,8 +154,25 @@ def test_session_doc_round_trip():
     assert back["sequences"][0]["files"] == ["a.tif", "b.tif"]   # basenames in doc
     assert back["active_profile"] == "P"
     assert back["run"] == {"cores_per_slice": 4, "concurrent_slices": 1}
-    assert back["labels"]["n_classes"] == 3
+    assert back["annotations"]["n_classes"] == 3
     assert back["models"][0]["fingerprint"] == ["area"]
+
+
+def test_session_doc_reads_pre_rename_labels_key():
+    """The gesture geometry was stored under "labels" before it was renamed to
+    "annotations" (in this tree "labels" otherwise means the MSC label raster).
+    Sessions written then must still restore."""
+    doc = _sample_doc()
+    doc["labels"] = doc.pop("annotations")
+    back = session_doc_from_json(doc)
+    assert back["annotations"]["n_classes"] == 3
+    # The new spelling wins when a document somehow carries both.
+    doc["annotations"] = {"version": 2, "n_classes": 4, "interactions": []}
+    assert session_doc_from_json(doc)["annotations"]["n_classes"] == 4
+    # Neither present -> None, not a crash.
+    bare = _sample_doc()
+    bare.pop("annotations")
+    assert session_doc_from_json(bare)["annotations"] is None
 
 
 def test_session_doc_reader_is_total():
@@ -211,7 +228,8 @@ def test_legacy_session_import():
     assert p["selection"]["connectivity"] == 18 and p["selection"]["min_area"] == 9
     assert doc["run"] == {"cores_per_slice": 4, "concurrent_slices": 2}
     assert doc["view"]["persist_live"] == "15" and doc["view"]["alpha"] == 0.7
-    assert doc["labels"]["n_classes"] == 2
+    assert doc["annotations"]["n_classes"] == 2, (
+        "a v1 doc's 'labels' is read as annotations")
 
 
 def test_legacy_multi_config_import():

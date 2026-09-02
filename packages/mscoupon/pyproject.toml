@@ -32,6 +32,21 @@ mscoupon-labeler = "msseg.mscoupon.labeler:main"
 # src-layout: ship msseg/mscoupon/ (namespace package, no msseg/__init__.py).
 # The compiled mscoupon_py extension is installed alongside by CMake below.
 wheel.packages = ["src/msseg"]
+# Keep dev artifacts out of the distribution. These filter the *source* copy
+# only (scikit-build-core passes sdist.exclude as the package walk's
+# src_exclude), so the CMake-installed extension is untouched -- wheel.exclude
+# would also match it, since that one is applied to the CMake output as well.
+sdist.exclude = [
+  # In-place builds of the extension for whatever interpreter the dev happens
+  # to run land beside the sources; the wheel's copy comes from CMake install.
+  "**/*.pyd",
+  "**/__pycache__",
+  # Measurement outputs committed next to the measure_*/plot_* scripts that
+  # produced them; they are CLI arguments in those docstrings, not package data.
+  "**/mscoupon/*.csv",
+  "**/mscoupon/*.png",
+  "**/mscoupon/*.ps1",
+]
 cmake.version = ">=3.21"
 # Only install our pybind module into the wheel (keeps FetchContent deps' own
 # install() output out).

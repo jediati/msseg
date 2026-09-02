@@ -42,7 +42,7 @@ the per-slice feature table is baked at prime time.
 
 Everything else -- sequences, filter chains, statistics, priming, persistence,
 config export, session autosave -- is inherited from the viewer. The exported
-folder additionally receives ``labels.json`` (the raw interactions), and the
+folder additionally receives ``annotations.json`` (the raw gestures), and the
 session autosaves under its own file (``mscoupon-labeler``), never the
 viewer's.
 
@@ -798,7 +798,17 @@ class LabelerApp(MscouponApp):
         self.paned.add(self.label_pane, weight=0)
         panel = self.label_pane
 
-        row = ttk.Frame(panel); row.pack(side="top", fill="x", padx=4, pady=(6, 2))
+        # Two titled halves: what the user DRAWS, and what the model does
+        # with it. The classifier half is fixed-height and packs FIRST
+        # (side="bottom"), so the annotation half takes every remaining pixel
+        # for the class stack -- the one thing here that wants more room.
+        ml = ttk.LabelFrame(panel, text="ML Region Classifier")
+        ml.pack(side="bottom", fill="x", padx=4, pady=(2, 4))
+        ann = ttk.LabelFrame(panel, text="Annotation")
+        ann.pack(side="top", fill="both", expand=True, padx=4, pady=(4, 2))
+
+        # -- Annotation ---------------------------------------------------- #
+        row = ttk.Frame(ann); row.pack(side="top", fill="x", padx=4, pady=(4, 2))
         ttk.Label(row, text="Classes:").pack(side="left")
         self.n_classes_spin = ttk.Spinbox(row, from_=2, to=MAX_CLASSES,
                                           textvariable=self.n_classes_var,
@@ -807,15 +817,32 @@ class LabelerApp(MscouponApp):
         self.n_classes_spin.pack(side="left", padx=4)
         ttk.Label(row, text="(class 0 = no label)").pack(side="left", padx=4)
 
-        row = ttk.Frame(panel); row.pack(side="top", fill="x", padx=4, pady=2)
+        row = ttk.Frame(ann); row.pack(side="top", fill="x", padx=4, pady=2)
         ttk.Label(row, text="Tool:").pack(side="left")
         for value, txt in _TOOL_LABELS:
             ttk.Radiobutton(row, text=txt, variable=self.tool_var,
                             value=value).pack(side="left", padx=2)
 
-        # Bottom rows pack first (side="bottom") so the classes holder takes
-        # exactly the remaining cavity. The classifier rows are bottommost.
-        row = ttk.Frame(panel); row.pack(side="bottom", fill="x", padx=4, pady=(2, 8))
+        # Packed before the class holder (side="bottom") so it lands directly
+        # under the class panels, leaving the holder the cavity between.
+        row = ttk.Frame(ann); row.pack(side="bottom", fill="x", padx=4, pady=(2, 4))
+        ttk.Button(row, text="Save annotations…",
+                   command=self._save_annotations).pack(side="left", fill="x",
+                                                   expand=True, padx=(0, 2))
+        ttk.Button(row, text="Load annotations…",
+                   command=self._load_annotations).pack(side="left", fill="x",
+                                                   expand=True, padx=(2, 0))
+
+        self.classes_holder = ttk.Frame(ann)
+        self.classes_holder.pack(side="top", fill="both", expand=True,
+                                 padx=2, pady=4)
+        self.classes_holder.columnconfigure(0, weight=1)
+        self._class_panels = {}          # class_id -> LabelFrame (drop targets)
+
+        # -- ML Region Classifier ------------------------------------------ #
+        # Fixed height, so these read top-to-bottom in code order: pick a model
+        # and train it, see what it did, then export the result or save it.
+        row = ttk.Frame(ml); row.pack(side="top", fill="x", padx=4, pady=(4, 2))
         ttk.Combobox(row, textvariable=self.model_kind_var, state="readonly",
                      values=_MODEL_KINDS, width=14
                      ).pack(side="left", padx=(0, 2))
@@ -825,43 +852,35 @@ class LabelerApp(MscouponApp):
         self.classify_btn = ttk.Button(row, text="Classify (C)",
                                        state="disabled", command=self._classify)
         self.classify_btn.pack(side="left", fill="x", expand=True, padx=2)
-        # Packed after the Train row, so it lands directly ABOVE it (bottom
-        # packing stacks upward).
-        row = ttk.Frame(panel); row.pack(side="bottom", fill="x", padx=4)
+
+        row = ttk.Frame(ml); row.pack(side="top", fill="x", padx=4)
         self.model_strip = ttk.Label(row, textvariable=self.model_strip_var,
                                      foreground="#555", anchor="w")
         self.model_strip.pack(side="left", fill="x", expand=True)
-        row = ttk.Frame(panel); row.pack(side="bottom", fill="x", padx=4, pady=2)
+
+        self.confusion_holder = ttk.LabelFrame(ml, text="true \\ predicted")
+        self.confusion_holder.pack(side="top", fill="x", padx=4, pady=(2, 4))
+        self._cm_cells = {}              # scope -> {(true, pred): Label}
+        self._cm_counts = {}             # scope -> {(true, pred): int}
+        self._rebuild_confusion_grid()
+
+        # Shortened from "Make image training set" / "Export as CSV" so both
+        # fit on one 300 px row.
+        row = ttk.Frame(ml); row.pack(side="top", fill="x", padx=4, pady=2)
+        ttk.Button(row, text="Image training set…",
+                   command=self._make_training_set).pack(side="left", fill="x",
+                                                         expand=True, padx=(0, 2))
+        ttk.Button(row, text="Export CSV…",
+                   command=self._export_csv).pack(side="left", fill="x",
+                                                  expand=True, padx=(2, 0))
+
+        row = ttk.Frame(ml); row.pack(side="top", fill="x", padx=4, pady=(2, 4))
         ttk.Button(row, text="Save classifier…",
                    command=self._save_classifier).pack(side="left", fill="x",
                                                        expand=True, padx=(0, 2))
         ttk.Button(row, text="Load classifier…",
                    command=self._load_classifier).pack(side="left", fill="x",
                                                        expand=True, padx=(2, 0))
-        row = ttk.Frame(panel); row.pack(side="bottom", fill="x", padx=4, pady=2)
-        ttk.Button(row, text="Export as CSV…",
-                   command=self._export_csv).pack(fill="x")
-        row = ttk.Frame(panel); row.pack(side="bottom", fill="x", padx=4, pady=2)
-        ttk.Button(row, text="Make image training set…",
-                   command=self._make_training_set).pack(fill="x")
-        row = ttk.Frame(panel); row.pack(side="bottom", fill="x", padx=4, pady=2)
-        ttk.Button(row, text="Save labels…",
-                   command=self._save_labels).pack(side="left", fill="x", expand=True, padx=(0, 2))
-        ttk.Button(row, text="Load labels…",
-                   command=self._load_labels).pack(side="left", fill="x", expand=True, padx=(2, 0))
-
-        # Packed LAST among the bottom rows, so it sits directly under the
-        # class stack, which then takes only the cavity that is left.
-        self.confusion_holder = ttk.LabelFrame(panel, text="true \\ predicted")
-        self.confusion_holder.pack(side="bottom", fill="x", padx=4, pady=(2, 4))
-        self._cm_cells = {}              # scope -> {(true, pred): Label}
-        self._cm_counts = {}             # scope -> {(true, pred): int}
-        self._rebuild_confusion_grid()
-
-        self.classes_holder = ttk.Frame(panel)
-        self.classes_holder.pack(side="top", fill="both", expand=True, padx=2, pady=4)
-        self.classes_holder.columnconfigure(0, weight=1)
-        self._class_panels = {}          # class_id -> LabelFrame (drop targets)
 
         self._rebuild_class_panels()
         self._refresh_model_strip()
@@ -1457,12 +1476,17 @@ class LabelerApp(MscouponApp):
         self._show_interaction_geometry(uid)  # redraw at the new view
 
     # ------------------------------------------------------------------ #
-    # Persistence: labels.json + session
+    # Persistence: annotations.json + session
+    #
+    # The document is the raw gesture geometry (tool, points, class, slice) --
+    # annotations, not the MSC label raster that `rec["labels"]` means
+    # everywhere else. It was called labels.json before that ambiguity bit;
+    # the CONTENT is unchanged, so an old labels.json still loads here.
     # ------------------------------------------------------------------ #
-    def _save_labels(self):
-        path = filedialog.asksaveasfilename(title="Save labels.json",
+    def _save_annotations(self):
+        path = filedialog.asksaveasfilename(title="Save annotations.json",
                                             defaultextension=".json",
-                                            initialfile="labels.json",
+                                            initialfile="annotations.json",
                                             filetypes=[("JSON", "*.json")])
         if not path:
             return
@@ -1470,8 +1494,8 @@ class LabelerApp(MscouponApp):
             json.dump(self.store.to_json(), f, indent=2)
         self.status_var.set(f"Wrote {path}")
 
-    def _load_labels(self):
-        path = filedialog.askopenfilename(title="Load labels.json",
+    def _load_annotations(self):
+        path = filedialog.askopenfilename(title="Load annotations.json",
                                           filetypes=[("JSON", "*.json")])
         if not path:
             return
@@ -1482,7 +1506,7 @@ class LabelerApp(MscouponApp):
         try:
             store = LabelStore.from_json(doc)
         except Exception as exc:
-            self.status_var.set(f"Not a labels.json: {exc}")
+            self.status_var.set(f"Not an annotations.json: {exc}")
             return
         self._install_store(store)
 
@@ -2180,7 +2204,7 @@ class LabelerApp(MscouponApp):
 
     def _session_doc(self):
         doc = super()._session_doc()
-        doc["labels"] = self.store.to_json()   # rides the inherited 4s autosave
+        doc["annotations"] = self.store.to_json()   # rides the 4s autosave
         doc["models"] = [dict(m) for m in self.models]
         return doc
 
@@ -2190,9 +2214,10 @@ class LabelerApp(MscouponApp):
         sdoc = session.session_doc_from_json(doc)
         # The store installs AFTER sequences exist, so rebind sees them (and
         # migrates legacy bare-basename keys against the qualified identity).
-        if sdoc.get("labels"):
+        if sdoc.get("annotations"):
             try:
-                self._install_store(LabelStore.from_json(sdoc["labels"]))
+                self._install_store(
+                    LabelStore.from_json(sdoc["annotations"]))
             except Exception as exc:
                 notes.append(f"labels not restored: {exc}")
         else:
@@ -2216,7 +2241,7 @@ class LabelerApp(MscouponApp):
 
     def _write_configs(self, out_dir):
         paths = super()._write_configs(out_dir)
-        path = os.path.join(out_dir, "labels.json")
+        path = os.path.join(out_dir, "annotations.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.store.to_json(), f, indent=2)
         paths.append(path)
@@ -2422,8 +2447,9 @@ def _selftest():
 
     # Session round-trip: the store rides the v2 session doc.
     sdoc = app._session_doc()
-    assert sdoc["labels"]["n_classes"] == 2
-    assert len(sdoc["labels"]["interactions"]) == 2
+    assert "labels" not in sdoc, "the gesture geometry is 'annotations' now"
+    assert sdoc["annotations"]["n_classes"] == 2
+    assert len(sdoc["annotations"]["interactions"]) == 2
     assert sdoc["sequences"][0]["folder"] == "data"
     app.store = LabelStore()             # clobber
     app._apply_session_doc(sdoc, "test")
@@ -2431,10 +2457,19 @@ def _selftest():
     assert all(it.bound for it in app.store.interactions), \
         "rebind by folder-qualified key"
 
-    # Export writes labels.json alongside the config(s).
+    # ...and a session written BEFORE the rename still restores: the key moved,
+    # the document under it did not.
+    legacy = {k: v for k, v in sdoc.items() if k != "annotations"}
+    legacy["labels"] = sdoc["annotations"]
+    app.store = LabelStore()
+    app._apply_session_doc(legacy, "legacy key")
+    assert len(app.store.interactions) == 2, \
+        "a pre-rename session's 'labels' key still loads"
+
+    # Export writes annotations.json alongside the config(s).
     with tempfile.TemporaryDirectory() as td:
         paths = app._write_configs(td)
-        assert os.path.basename(paths[-1]) == "labels.json"
+        assert os.path.basename(paths[-1]) == "annotations.json"
         with open(paths[-1], encoding="utf-8") as f:
             doc = json.load(f)
         assert doc["version"] == 2 and len(doc["interactions"]) == 2

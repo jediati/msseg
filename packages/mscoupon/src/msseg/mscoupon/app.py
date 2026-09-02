@@ -169,6 +169,12 @@ class MscouponApp:
         # real app and must not touch the user's saved session.
         self._autosave_last = ""         # last session text actually written
         self._autosave_after = None      # pending root.after id
+        # Auto-save OWNS the saved session only once this instance has opened
+        # it (Restore last / Load session…) or explicitly written one (Save
+        # session…). A freshly launched app is empty, and the timer below fires
+        # 4 s later: without this gate that empty state is serialized straight
+        # over the real session, before the user can even reach "Restore last".
+        self._session_owned = False
         if autosave:
             try:
                 self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -2351,6 +2357,11 @@ class MscouponApp:
         except Exception as exc:            # a stale render must not eat the load
             log(f"redraw after load failed: {exc}")
 
+        # This instance now HOLDS a session, so auto-save may continue it.
+        # Until a document has been opened (or one explicitly saved), writing
+        # would replace a session nobody in this window has seen.
+        self._session_owned = True
+
         for msg in notes:
             log(msg)
         summary = f"Loaded {source}: {len(self.subsequences)} sequence(s), " \
@@ -2420,6 +2431,9 @@ class MscouponApp:
             return
         blob = config_io.serialize_session(self._session_doc())
         if config_io.write_session_text(blob, path):
+            # Writing a session on purpose is the other way to take ownership:
+            # auto-save continuing from here can no longer surprise anyone.
+            self._session_owned = True
             self.status_var.set(f"Wrote {path}")
         else:
             self.status_var.set(f"Could not write {path}")
@@ -2460,10 +2474,18 @@ class MscouponApp:
         UI thread owns (subsequences, the card lists, the Tk vars) and never
         primed/_slices/_assembly, which the workers write.
         """
+        if not self._session_owned:
+            # Say so rather than failing silently: "auto-save" is checked, and
+            # a user building a session from scratch has to know it is not
+            # being written yet.
+            self.autosave_label.config(text="auto-save held — load or save a session")
+            return
         blob = config_io.serialize_session(self._session_doc())
         if blob == self._autosave_last:
             return
-        if config_io.write_session_text(blob, config_io.session_path(app=self.SESSION_APP)):
+        path = config_io.session_path(app=self.SESSION_APP)
+        config_io.rotate_session_backups(path)
+        if config_io.write_session_text(blob, path):
             self._autosave_last = blob
             self.autosave_label.config(text=f"saved {time.strftime('%H:%M:%S')}")
         else:
@@ -2736,6 +2758,53 @@ def _selftest():
         app._apply_session_docs([(os.path.join(d, "gone.json"), None)], "missing")
         assert app.subsequences == [], "a failed load changes nothing"
         assert isinstance(config_io.session_path(), str) and config_io.session_path()
+
+        # --- auto-save ownership gate ------------------------------------ #
+        # A freshly launched app is EMPTY and its timer fires 4 s later; without
+        # this gate that empty state lands on top of a real saved session
+        # before the user can reach "Restore last".
+        fresh_root = tk.Tk(); fresh_root.withdraw()
+        fresh = MscouponApp(fresh_root, autosave=False)
+        assert fresh._session_owned is False, "a new window owns nothing"
+        sess = os.path.join(d, "owned_session.json")
+        config_io.write_session_text(config_io.serialize_session(doc), sess)
+        keep = open(sess, encoding="utf-8").read()
+        _real_path = config_io.session_path
+        config_io.session_path = lambda app=None, name=None: sess
+        try:
+            fresh._autosave_now()            # the empty app must NOT write
+            assert open(sess, encoding="utf-8").read() == keep, \
+                "auto-save must not overwrite a session this window never opened"
+            assert "held" in str(fresh.autosave_label.cget("text")), \
+                fresh.autosave_label.cget("text")
+            # Opening one takes ownership; auto-save then continues it.
+            fresh._apply_session_docs([(sess, doc)], "test")
+            assert fresh._session_owned is True
+            fresh._clear_subsequences()
+            fresh._autosave_now()
+            assert open(sess, encoding="utf-8").read() != keep, \
+                "auto-save writes once the session is owned"
+            # ...and the previous generation survives as .1.
+            root_, ext_ = os.path.splitext(sess)
+            assert open(f"{root_}.1{ext_}", encoding="utf-8").read() == keep, \
+                "the overwritten session is recoverable"
+        finally:
+            config_io.session_path = _real_path
+            fresh_root.destroy()
+
+        # Rotation is depth-3 and never removes the live file.
+        rot = os.path.join(d, "rot.json")
+        root_, ext_ = os.path.splitext(rot)
+        for gen in ("a", "b", "c", "d"):
+            config_io.write_session_text(gen, rot)
+            config_io.rotate_session_backups(rot)
+        assert open(rot, encoding="utf-8").read() == "d", "live file kept"
+        assert open(f"{root_}.1{ext_}", encoding="utf-8").read() == "d"
+        assert open(f"{root_}.2{ext_}", encoding="utf-8").read() == "c"
+        assert open(f"{root_}.3{ext_}", encoding="utf-8").read() == "b"
+        assert not os.path.exists(f"{root_}.4{ext_}"), "depth is capped at 3"
+        config_io.rotate_session_backups(os.path.join(d, "nope.json"))   # no file
+
         # Restore the real session for everything below.
         app._apply_session_docs([(os.path.join(d, "last_session.json"), doc)], "test")
         assert len(app.subsequences) == 2
