@@ -88,18 +88,67 @@ _MODE_UNCERTAINTY = "uncertainty"
 # adding one cannot leave a trained model that the UI does not recognize.
 _MODEL_KINDS = ("random forest", "dense FC", "dense-top-16", "dense-top-32")
 _DENSE_TOP_N = {"dense-top-16": 16, "dense-top-32": 32}
+# The architectures behind the kinds. Module constants rather than literals
+# inside _make_model so the Model tab's readout is formatted from the same
+# values the estimator is built with and cannot drift from them.
+_FOREST_TREES = 200
+_OOB_MIN_SAMPLES = 20          # forest OOB score needs a few samples per tree
+_MLP_HIDDEN = (64, 32)
+_MLP_MAX_ITER = 1000
+
+
+def _model_description(kind):
+    """One-paragraph, read-only description of what `_make_model(kind)` builds."""
+    if kind == "dense FC":
+        return (f"StandardScaler -> MLPClassifier(hidden layers {_MLP_HIDDEN}, "
+                f"max_iter {_MLP_MAX_ITER}, random_state 0). The scaler lives "
+                "inside the pipeline, so the pickle predicts exactly as trained.")
+    if kind in _DENSE_TOP_N:
+        return (f"SelectFromModel(RandomForest, {_FOREST_TREES} trees, balanced) "
+                f"keeps the top {_DENSE_TOP_N[kind]} features by importance "
+                "(fewer if the profile has fewer) -> StandardScaler -> "
+                f"MLPClassifier(hidden layers {_MLP_HIDDEN}, max_iter "
+                f"{_MLP_MAX_ITER}, random_state 0).")
+    return (f"RandomForestClassifier: {_FOREST_TREES} trees, class_weight "
+            f"balanced, OOB score once >= {_OOB_MIN_SAMPLES} labeled regions, "
+            "n_jobs -1, random_state 0.")
+
+
+# The center notebook's tabs, in order. Named (not indexed) in the session
+# view state so a reordered tab list still restores.
+_CENTER_TABS = ("Processing", "View", "Model")
 
 # Statistics fields that are POSITIONS, not appearance: where a region sits in
 # the slice says nothing about what material it is, and coordinate features
 # were exactly what dragged k-means across the label boundary. Never fed to
 # the classifier.
-_NON_FEATURE_FIELDS = {"feature_id", "min_x", "max_x", "min_y", "max_y",
-                       "ext_x", "ext_y"}
+_NON_FEATURE_FIELDS = set(magic_fill.POSITIONAL_FIELDS)   # one list, shared with cosine
 
 _TOOL_LABELS = (("squiggle", "squiggle"), ("box", "box"), ("polygon", "lasso"),
-                ("magic", "magic"))
-# What the tool selector offers (a superset of the STORED tools: "magic" is a
-# way of producing a "taps" interaction, not a gesture type of its own).
+                ("magic", "magic"), ("blobber", "blobber"))
+# What the tool selector offers (a superset of the STORED tools: "magic" and
+# "blobber" are ways of producing "taps" interactions, not gesture types).
+# Blobber ring-class choices: the class after the active one, or a fixed id.
+_RING_CHOICES = ("next",) + tuple(str(k) for k in range(1, MAX_CLASSES))
+# Magic-fill flood options: the per-hop cost multiplier (1 = pure bottleneck;
+# clamped to [1, 2] because the cost is w * g^hops and hop depths reach the
+# hundreds on a 3232^2 slice) and the drag sensitivity in screen px / region.
+_DEFAULT_HOP_GAIN = 1.1
+_HOP_GAIN_RANGE = (1.0, 2.0)
+_DEFAULT_DRAG_PX = 4.0
+_DRAG_PX_RANGE = (1.0, 64.0)
+
+
+def _bounded_float(text, default, lo, hi):
+    """float(text) clamped to [lo, hi], or `default` when it is not a number
+    -- an option entry mid-edit must never raise out of a press."""
+    try:
+        v = float(str(text).strip())
+    except (TypeError, ValueError):
+        return default
+    if v != v:                       # NaN
+        return default
+    return min(max(v, lo), hi)
 _UI_TOOLS = tuple(v for v, _txt in _TOOL_LABELS)
 
 # Focus-widget classes whose keystrokes must not arm classes (typing "1" into
@@ -143,11 +192,16 @@ class DrawController:
     def on_press(self, e):
         if self.app._current() is None:
             return False           # nothing on screen to label
+        # Drawing takes the keyboard back: with a combobox or entry still
+        # focused (the Magic row, say) every hotkey -- Ctrl-Z above all --
+        # would be swallowed as "typing" after the gesture.
+        self.app._unfocus_entries()
         # SHIFT = the accept tool: a box, regardless of the selected tool or
         # armed class, that turns the predictions under it into real labels.
         self._accept = bool(e.state & self._SHIFT)
-        if not self._accept and self.app.tool_var.get() == "magic":
-            return self.magic.on_press(e)
+        tool = self.app.tool_var.get()
+        if not self._accept and tool in ("magic", "blobber"):
+            return self.magic.on_press(e, ring=(tool == "blobber"))
         if not self._accept and self.app.active_class_var.get() <= 0:
             return False           # no class armed -> pan as in the viewer
         self._pts = [self._image_pt(e)]
@@ -349,12 +403,39 @@ class MagicFillController:
     released with the same metric/mode/channels this session, else a natural
     break in the ladder. The result commits as ONE "taps" interaction with a
     point per grown region at its seeding extremum, so it re-resolves after a
-    persistence change through the same geometric path as any gesture."""
+    persistence change through the same geometric path as any gesture.
+
+    The "blobber" is the same fill with a RING: the regions immediately
+    adjacent to the core (magic_fill.ring_for_rank) preview and commit in a
+    second class -- the one after the active class by default (wrapping past
+    the last), or a fixed id from the options row. Click on a void with class
+    2 armed and the void is class 2 with its bounding regions in class 3;
+    the drag grows the core and the ring follows. Committed as two taps
+    interactions, ring first so the core wins if a re-decomposition ever
+    merges a ring point's region into a core point's."""
 
     def __init__(self, app):
         self.app = app
         self._s = None             # session dict while a fill is in flight
         self._last = {}            # (metric, mode, channels) -> last released t
+
+    def ring_class(self, cls):
+        """The blobber's ring class for active class `cls`: the options row's
+        explicit id when it is a real class other than `cls`, else the next
+        class after `cls` (wrapping past the last). None when no other class
+        exists (a two-class store has only class 1)."""
+        n = self.app.store.n_classes
+        want = self.app.blob_ring_var.get()
+        if want != "next":
+            try:
+                k = int(want)
+            except ValueError:
+                k = -1
+            if 1 <= k < n and k != cls:
+                return k
+        for k in list(range(cls + 1, n)) + list(range(1, cls)):
+            return k
+        return None
 
     @property
     def active(self):
@@ -372,12 +453,27 @@ class MagicFillController:
             mode = "anchor"
         return metric, mode, chans or ["base"]
 
-    def on_press(self, e):
+    def hop_gain(self):
+        return _bounded_float(self.app.magic_gain_var.get(), _DEFAULT_HOP_GAIN,
+                              *_HOP_GAIN_RANGE)
+
+    def drag_px(self):
+        return _bounded_float(self.app.magic_drag_var.get(), _DEFAULT_DRAG_PX,
+                              *_DRAG_PX_RANGE)
+
+    def on_press(self, e, ring=False):
         app = self.app
         cur = app._current()
         cls = int(app.active_class_var.get())
         if cur is None or not (1 <= cls < app.store.n_classes):
             return False
+        ring_cls = None
+        if ring:
+            ring_cls = self.ring_class(cls)
+            if ring_cls is None:
+                app.status_var.set("Blobber needs a second class for the ring "
+                                   "(Classes >= 3).")
+                return False
         rec = app.engine.record(*cur)
         if rec is None or rec.get("labels") is None or rec.get("stats") is None:
             app.status_var.set("Magic fill needs computed regions - Rerun first.")
@@ -412,13 +508,30 @@ class MagicFillController:
             app.status_var.set(f"{metric} needs saddle values (MSC region arcs) "
                                "- using mean")
             metric = "mean"
+        extra = None
+        if metric in magic_fill.EXTRA_METRICS:
+            # Class probabilities come from the classifier, not the table, and
+            # only count at the commit they were made for. No silent fallback:
+            # painting with `mean` under a row that says `proba` would mislead
+            # while tuning, so the press is refused like one on background.
+            pr = app._pred.get((cur[0], cur[1]))
+            if pr is None or pr[0] != rec.get("commit"):
+                app.status_var.set(f"{metric} needs predictions at this commit "
+                                   "- Classify first")
+                return False
+            extra = {"proba": pr[2]}
+        gain = self.hop_gain()
+        if _bounded_float(app.magic_gain_var.get(), None, *_HOP_GAIN_RANGE) is None:
+            app.status_var.set(f"hop\u00d7 is not a number - using {gain:g}")
         try:
             ladder = magic_fill.build_ladder(table, arcs, seed, metric, mode,
-                                             chans, np)
+                                             chans, np, hop_gain=gain, extra=extra)
         except ValueError as exc:
             app.status_var.set(f"magic fill: {exc}")
             return False
-        key = (metric, mode, tuple(chans))
+        key = (metric, mode,
+               tuple(chans) if metric in magic_fill.CHANNEL_METRICS else (),
+               round(gain, 6))
         last_t = self._last.get(key)
         k0 = (magic_fill.rank_at(ladder, last_t, np) if last_t is not None
               else magic_fill.initial_rank(ladder, np))
@@ -429,6 +542,11 @@ class MagicFillController:
                    "press_y": e.y, "k0": k0, "k": None, "t": None, "ids": None,
                    "rgba": app.store.rgba(cls), "cls": cls, "key": key,
                    "source": arcs.get("source"),
+                   "tool": "blobber" if ring else "magic",
+                   "drag_px": self.drag_px(),
+                   "ring_cls": ring_cls,
+                   "ring_rgba": app.store.rgba(ring_cls) if ring_cls else None,
+                   "ring": None,
                    "hud": (v._hud_mode, v._hud_text)}
         app._begin_preview()
         self._preview(k0)
@@ -442,8 +560,10 @@ class MagicFillController:
         if rec is None or rec.get("commit") != s["commit"]:
             self.cancel("magic fill cancelled: regions changed under it")
             return True
+        drag = s["drag_px"]
         k = magic_fill.drag_to_rank(s["k0"], s["press_y"] - e.y,
-                                    s["ladder"].n_reach)
+                                    s["ladder"].n_reach,
+                                    px_per_step=drag, accel_px=3.0 * drag)
         if k != s["k"]:
             self._preview(k)
         return True
@@ -455,15 +575,28 @@ class MagicFillController:
         t = magic_fill.threshold_for_rank(ladder, k)
         ids = magic_fill.regions_for_rank(ladder, k)   # a prefix of the flood
         s["k"], s["t"], s["ids"] = k, t, ids
-        self.app._preview_regions(s["labels"], s["K"], ids, s["rgba"],
-                                  emphasize=s["seed"])
         n = len(ids)
         px = ""
         if ladder.cum_area is not None and n:
             px = f"  {int(ladder.cum_area[min(n, len(ladder.cum_area)) - 1])} px"
+        gtxt = f" g{ladder.hop_gain:g}" if ladder.hop_gain != 1.0 else ""
+        if s["ring_cls"] is None:
+            self.app._preview_regions(s["labels"], s["K"], ids, s["rgba"],
+                                      emphasize=s["seed"])
+            self.app.viewer.set_hud(
+                "info", f"magic {ladder.metric}/{ladder.mode}{gtxt}  t={t:.3g}  "
+                        f"{n}/{ladder.n_reach} regions{px}")
+            return
+        ring = magic_fill.ring_for_rank(ladder, k, np)
+        s["ring"] = ring
+        colors = {int(i): s["rgba"] for i in ids}
+        colors.update({int(i): s["ring_rgba"] for i in ring})
+        self.app._preview_regions(s["labels"], s["K"], list(colors), colors,
+                                  emphasize=s["seed"])
         self.app.viewer.set_hud(
-            "info", f"magic {ladder.metric}/{ladder.mode}  t={t:.3g}  "
-                    f"{n}/{ladder.n_reach} regions{px}")
+            "info", f"blob {ladder.metric}/{ladder.mode}{gtxt}  t={t:.3g}  "
+                    f"{n} core (class {s['cls']}) + {len(ring)} ring "
+                    f"(class {s['ring_cls']}){px}")
 
     def on_release(self, e):
         s = self._s
@@ -476,14 +609,24 @@ class MagicFillController:
             return True
         self._last[s["key"]] = float(s["t"])
         ladder = s["ladder"]
-        meta = {"tool": "magic",
+        meta = {"tool": s["tool"],
                 "seed": [float(s["seed_pt"][0]), float(s["seed_pt"][1])],
                 "seed_id": int(s["seed"]), "threshold": float(s["t"]),
                 "metric": ladder.metric, "mode": ladder.mode,
-                "channels": list(ladder.channels), "n_regions": int(len(ids)),
-                "arcs": s["source"]}
-        self.app._commit_magic(s["si"], s["li"], s["labels"],
-                               [int(i) for i in ids], s["cls"], meta)
+                "channels": list(ladder.channels), "arcs": s["source"],
+                "hop_gain": float(ladder.hop_gain)}
+        parts = []
+        ring = s.get("ring")
+        if s["ring_cls"] is not None and ring is not None and len(ring):
+            # Ring first: a later uid paints over an earlier one, so the core
+            # wins should a re-decomposition merge a ring point into it.
+            parts.append(([int(i) for i in ring], s["ring_cls"],
+                          dict(meta, part="ring", n_regions=int(len(ring)))))
+        core_meta = dict(meta, n_regions=int(len(ids)))
+        if s["ring_cls"] is not None:
+            core_meta["part"] = "core"
+        parts.append(([int(i) for i in ids], s["cls"], core_meta))
+        self.app._commit_blob(s["si"], s["li"], s["labels"], parts)
         return True
 
     def cancel(self, why="magic fill cancelled"):
@@ -583,6 +726,9 @@ class LabelerApp(MscouponApp):
         self.magic_metric_var = tk.StringVar(master=root, value="mean")
         self.magic_mode_var = tk.StringVar(master=root, value="anchor")
         self.magic_channels_var = tk.StringVar(master=root, value="base")
+        self.blob_ring_var = tk.StringVar(master=root, value="next")
+        self.magic_gain_var = tk.StringVar(master=root, value=f"{_DEFAULT_HOP_GAIN:g}")
+        self.magic_drag_var = tk.StringVar(master=root, value=f"{_DEFAULT_DRAG_PX:g}")
         # True while a gesture previews on the canvas: the pointer is busy
         # drawing, so the hover outlines stay off until it is released.
         self._hover_suppressed = False
@@ -602,6 +748,10 @@ class LabelerApp(MscouponApp):
         # reuses the load path, so history can never drift from reality.
         self._undo_stack = []
         self._redo_stack = []
+        # Set while the first render of a run happened on an unmapped View tab:
+        # the base fits the image only on that first render, and an unmapped
+        # canvas is 1x1, so the fit is redone when the tab shows.
+        self._fit_pending = False
         super().__init__(root, initial=initial, autosave=autosave)
         root.title("mscoupon labeler")
         self._build_label_panel()
@@ -613,6 +763,130 @@ class LabelerApp(MscouponApp):
             # plane offers the same menu as an interaction row.
             self.viewer.on_context = self._canvas_menu
         self._bind_hotkeys()
+
+    # ------------------------------------------------------------------ #
+    # Center notebook: Processing | View | Model
+    # ------------------------------------------------------------------ #
+    # The labeler's window is three panes -- data navigation and processing
+    # SELECTION on the left, annotation management and the classifier on the
+    # right -- with a tabbed center: the compute profile is EDITED on the
+    # Processing tab, the slice is viewed and drawn on the View tab (the
+    # inherited `self.right`, so every viewer-area builder packs into it
+    # unchanged), and the model is designed on the Model tab. The notebook
+    # hides whatever tab is not active.
+    def _build_center(self):
+        self.center = ttk.Notebook(self.paned, width=900)
+        self.paned.add(self.center, weight=1)
+        self.processing_tab = ttk.Frame(self.center)
+        self.right = ttk.Frame(self.center)          # the View tab
+        self.model_tab = ttk.Frame(self.center)
+        self._center_tabs = {"Processing": self.processing_tab,
+                             "View": self.right,
+                             "Model": self.model_tab}
+        for name in _CENTER_TABS:
+            self.center.add(self._center_tabs[name], text=name)
+
+        # Processing: the profile management rows on top (anchored, not
+        # filled -- the base rows pack fill="x" and would stretch across the
+        # whole tab), then the four parameter sections in two columns inside
+        # one scrolling frame, because filter cards grow the chains downward.
+        self.profile_tools = ttk.Frame(self.processing_tab)
+        self.profile_tools.pack(side="top", anchor="w", padx=6, pady=(4, 0))
+        self.proc_scroll = ScrollFrame(self.processing_tab, width=900,
+                                       canvas_width=880)
+        self.proc_scroll.pack(side="top", fill="both", expand=True)
+        body = self.proc_scroll.inner
+        body.columnconfigure(0, weight=1, uniform="cols")
+        body.columnconfigure(1, weight=1, uniform="cols")
+        self.proc_col_a = ttk.Frame(body)
+        self.proc_col_a.grid(row=0, column=0, sticky="nsew")
+        self.proc_col_b = ttk.Frame(body)
+        self.proc_col_b.grid(row=0, column=1, sticky="nsew")
+
+        self._build_model_tab(self.model_tab)
+        self.center.select(self.right)
+        # Bound AFTER the initial select: <<NotebookTabChanged>> fires
+        # synchronously on select(), and the viewer does not exist yet.
+        self.center.bind("<<NotebookTabChanged>>", self._on_center_tab_changed)
+
+    def _profile_tools_parent(self, section):
+        return self.profile_tools
+
+    def _processing_parent(self, section):
+        if section in ("filters", "base"):
+            return self.proc_col_a
+        return self.proc_col_b
+
+    def _build_model_tab(self, parent):
+        """Model design. For now: which estimator kind Train builds, and a
+        read-only description of its architecture (formatted from the same
+        constants _make_model uses)."""
+        box = ttk.LabelFrame(parent, text="Region classifier")
+        box.pack(side="top", fill="x", padx=6, pady=4)
+        row = ttk.Frame(box); row.pack(fill="x", padx=4, pady=(4, 2))
+        ttk.Label(row, text="Kind:").pack(side="left")
+        self.model_kind_combo = ttk.Combobox(row, textvariable=self.model_kind_var,
+                                             state="readonly", values=_MODEL_KINDS,
+                                             width=14)
+        self.model_kind_combo.pack(side="left", padx=4)
+        self.model_kind_combo.bind("<<ComboboxSelected>>", self._unfocus_entries)
+        self.model_arch_var = tk.StringVar(master=self.root, value="")
+        self.model_arch_label = ttk.Label(box, textvariable=self.model_arch_var,
+                                          justify="left", wraplength=700,
+                                          foreground="#333")
+        self.model_arch_label.pack(anchor="w", padx=6, pady=(0, 6))
+        # A trace rather than the combobox event: Load classifier… sets the
+        # kind programmatically and the readout must follow that too.
+        self.model_kind_var.trace_add("write", lambda *_: self._refresh_model_readout())
+        self._refresh_model_readout()
+
+    def _refresh_model_readout(self):
+        var = getattr(self, "model_arch_var", None)
+        if var is not None:
+            var.set(_model_description(self.model_kind_var.get()))
+
+    def _center_tab_name(self):
+        """Name of the selected center tab ("View" when unsure)."""
+        try:
+            selected = self.center.select()
+        except tk.TclError:
+            return "View"
+        for name, frame in self._center_tabs.items():
+            if str(frame) == str(selected):
+                return name
+        return "View"
+
+    def _on_center_tab_changed(self, _e=None):
+        """The View tab came back: repaint, and redo the one-time fit if the
+        first render of this run happened while the canvas was unmapped."""
+        if self._center_tab_name() != "View" or self.viewer is None:
+            return
+
+        def repaint():
+            if self.viewer is None:
+                return
+            self._refresh_render()
+            if self._fit_pending:
+                self._fit_pending = False
+                self.viewer.fit()
+
+        try:
+            self.root.after_idle(repaint)
+        except tk.TclError:
+            pass
+
+    def _refresh_render(self):
+        viewer = self.viewer
+        first = (viewer is not None and viewer._base is None
+                 and viewer._source is None)
+        super()._refresh_render()
+        if first and viewer is not None and viewer._base is not None:
+            try:
+                mapped = bool(viewer.canvas.winfo_viewable())
+            except tk.TclError:
+                mapped = True
+            if not mapped:
+                self._fit_pending = True
 
     # ------------------------------------------------------------------ #
     # Right-side overrides (viewer area is inherited unchanged)
@@ -991,28 +1265,45 @@ class LabelerApp(MscouponApp):
             v._schedule()
 
     def _commit_magic(self, si, li, labels, ids, cls, meta):
-        """Magic-fill release: the grown regions become ONE "taps" interaction
-        with a point per region at its seeding extremum (the pixel most likely
-        to stay inside the region when the decomposition changes), so the fill
-        re-resolves through the same geometric path as every other gesture.
-        The provenance (seed, threshold, metric) rides along as display
-        metadata. One undo step for the whole fill."""
+        """Magic-fill release: one part, see _commit_blob."""
+        self._commit_blob(si, li, labels, [(ids, cls, meta)])
+
+    def _commit_blob(self, si, li, labels, parts):
+        """Magic-fill / blobber release: each `(ids, cls, meta)` part becomes
+        ONE "taps" interaction with a point per region at its seeding extremum
+        (the pixel most likely to stay inside the region when the
+        decomposition changes), so the fill re-resolves through the same
+        geometric path as every other gesture. Parts are added in order (a
+        later uid paints over an earlier one), the provenance rides along as
+        display metadata, and the whole release is one undo step."""
         slice_key = self._slice_key(si, li)
-        ids = [int(i) for i in ids]
-        if slice_key is None or not ids or not (1 <= int(cls) < self.store.n_classes):
+        if slice_key is None:
             return
         import numpy as np
         rec = self.engine.record(si, li)
         table = rec.get("stats") if rec is not None else None
-        pts = _extremum_points(labels, ids, table, np)
-        if not pts:
+        added = []
+        for ids, cls, meta in parts:
+            ids = [int(i) for i in ids]
+            if not ids or not (1 <= int(cls) < self.store.n_classes):
+                continue
+            pts = _extremum_points(labels, ids, table, np)
+            if not pts:
+                continue
+            if not added:
+                self._push_history()
+            added.append(self.store.add("taps", pts, int(cls), slice_key, si, li,
+                                        meta=meta))
+        if not added:
             return
-        self._push_history()
-        it = self.store.add("taps", pts, int(cls), slice_key, si, li, meta=meta)
         self._rebuild_class_panels()
         self._refresh_render()
-        self.status_var.set(f"#{it.uid} magic -> class {cls}: {len(pts)} region(s) "
-                            f"at t={meta.get('threshold', 0.0):.3g}")
+        what = " + ".join(f"#{it.uid} {(it.meta or {}).get('part', 'fill')} "
+                          f"-> class {it.class_id} ({len(it.points)})"
+                          for it in added)
+        tool = (added[-1].meta or {}).get("tool", "magic")
+        t = (added[-1].meta or {}).get("threshold", 0.0)
+        self.status_var.set(f"{tool}: {what} at t={t:.3g}")
 
     def _accept_predictions(self, pts):
         """SHIFT-box release: turn the classifier's predictions under the box
@@ -1138,6 +1429,8 @@ class LabelerApp(MscouponApp):
         self.root.bind("<Escape>", self._on_escape)
         self.root.bind("m", self._on_magic_key)
         self.root.bind("M", self._on_magic_key)
+        self.root.bind("b", self._on_blob_key)
+        self.root.bind("B", self._on_blob_key)
         self.root.bind("<Control-z>", self._on_undo_key)
         self.root.bind("<Control-y>", self._on_undo_key)
         self.root.bind("<Tab>", self._on_tab_toggle)
@@ -1155,10 +1448,26 @@ class LabelerApp(MscouponApp):
             return
         self.active_class_var.set(0)
 
+    def _unfocus_entries(self, _e=None):
+        """Give the keyboard back to the window. The hotkeys are ignored while
+        an entry/combobox has focus (typing "1" into a field must not arm a
+        class), and Tk leaves focus on a combobox after a selection -- so the
+        option widgets hand it back on selection/Return, and a canvas press
+        does too."""
+        try:
+            self.root.focus_set()
+        except tk.TclError:
+            pass
+
     def _on_magic_key(self, _e=None):
         if self._typing():
             return
         self.tool_var.set("magic")
+
+    def _on_blob_key(self, _e=None):
+        if self._typing():
+            return
+        self.tool_var.set("blobber")
 
     def _typing(self):
         """True while a text-entry widget owns the keyboard focus."""
@@ -1238,6 +1547,10 @@ class LabelerApp(MscouponApp):
                 attach_tooltip(rb, "Magic fill (key M): press on a region, drag UP "
                                    "to grow over similar neighbours, DOWN to shrink, "
                                    "release to paint, Escape to abandon.")
+            elif value == "blobber":
+                attach_tooltip(rb, "Blobber (key B): a magic fill in the active "
+                                   "class plus its immediately adjacent regions in "
+                                   "the ring class (see 'ring' in the Magic row).")
 
         # Magic-fill options: how regions are compared while the fill grows.
         row = ttk.Frame(ann); row.pack(side="top", fill="x", padx=4, pady=2)
@@ -1247,21 +1560,57 @@ class LabelerApp(MscouponApp):
                           values=list(magic_fill.METRICS), state="readonly",
                           width=13)
         cb.pack(side="left", padx=2)
+        cb.bind("<<ComboboxSelected>>", self._unfocus_entries)
         attach_tooltip(cb, "mean: |mean difference| over the channels (z-scored)\n"
                            "bhattacharyya: Gaussian overlap from mean and std\n"
+                           "cosine: 1 - cosine over EVERY statistic column "
+                           "(z-scored, positions excluded; ignores 'on')\n"
+                           "proba: total variation between the classifier's class "
+                           "probabilities (Classify first; ignores 'on')\n"
                            "barrier: saddle height above the seed (MSC arcs only)")
         cb = ttk.Combobox(row, textvariable=self.magic_mode_var,
                           values=list(magic_fill.MODES), state="readonly",
                           width=7)
         cb.pack(side="left", padx=2)
+        cb.bind("<<ComboboxSelected>>", self._unfocus_entries)
         attach_tooltip(cb, "anchor: every region is compared with the SEED\n"
                            "chain: each region with the neighbour it grows from")
         ttk.Label(row, text="on").pack(side="left", padx=(4, 0))
         en = ttk.Entry(row, textvariable=self.magic_channels_var, width=12)
         en.pack(side="left", padx=2)
+        en.bind("<Return>", self._unfocus_entries)
         attach_tooltip(en, "Comma-separated measurement channels as the statistics "
                            "spec names them (base, blur_s1.5, ...); unknown names "
-                           "are ignored, none valid falls back to base.")
+                           "are ignored, none valid falls back to base. Used by "
+                           "mean and bhattacharyya only. Enter to leave the field.")
+        ttk.Label(row, text="ring").pack(side="left", padx=(6, 0))
+        cb = ttk.Combobox(row, textvariable=self.blob_ring_var,
+                          values=list(_RING_CHOICES), state="readonly", width=5)
+        cb.pack(side="left", padx=2)
+        cb.bind("<<ComboboxSelected>>", self._unfocus_entries)
+        attach_tooltip(cb, "Blobber ring class: 'next' = the class after the active "
+                           "one (wrapping), or a fixed class id.")
+
+        # Flood feel: the per-hop gain and the drag sensitivity.
+        row = ttk.Frame(ann); row.pack(side="top", fill="x", padx=4, pady=2)
+        self.magic_row2 = row
+        ttk.Label(row, text="hop\u00d7").pack(side="left")
+        en = ttk.Entry(row, textvariable=self.magic_gain_var, width=5)
+        en.pack(side="left", padx=2)
+        en.bind("<Return>", self._unfocus_entries)
+        attach_tooltip(en, "Per-hop cost multiplier, 1..2. 1 = pure bottleneck: a "
+                           "region joins when every hop on its best path is under t. "
+                           "Above 1 the cost also grows with graph distance from the "
+                           "seed, so nearby regions win over equally similar far "
+                           "ones (t then reads in inflated units).")
+        ttk.Label(row, text="drag").pack(side="left", padx=(8, 0))
+        en = ttk.Entry(row, textvariable=self.magic_drag_var, width=4)
+        en.pack(side="left", padx=2)
+        en.bind("<Return>", self._unfocus_entries)
+        ttk.Label(row, text="px/region").pack(side="left")
+        attach_tooltip(en, "Drag sensitivity: screen pixels of vertical drag per "
+                           "region near the start of the drag (1..64); longer drags "
+                           "accelerate.")
 
         # Packed before the class holder (side="bottom") so it lands directly
         # under the class panels, leaving the holder the cavity between.
@@ -1282,13 +1631,12 @@ class LabelerApp(MscouponApp):
         # -- ML Region Classifier ------------------------------------------ #
         # Fixed height, so these read top-to-bottom in code order: pick a model
         # and train it, see what it did, then export the result or save it.
+        # The model KIND is chosen on the Model tab; this panel trains,
+        # applies and exports whatever kind is selected there.
         row = ttk.Frame(ml); row.pack(side="top", fill="x", padx=4, pady=(4, 2))
-        ttk.Combobox(row, textvariable=self.model_kind_var, state="readonly",
-                     values=_MODEL_KINDS, width=14
-                     ).pack(side="left", padx=(0, 2))
         ttk.Button(row, text="Train (R)",
                    command=self._train_classifier).pack(side="left", fill="x",
-                                                        expand=True, padx=2)
+                                                        expand=True, padx=(0, 2))
         self.classify_btn = ttk.Button(row, text="Classify (C)",
                                        state="disabled", command=self._classify)
         self.classify_btn.pack(side="left", fill="x", expand=True, padx=2)
@@ -1639,6 +1987,8 @@ class LabelerApp(MscouponApp):
         name = it.tool
         if it.meta and it.meta.get("tool"):
             name = str(it.meta["tool"])          # e.g. a magic fill's taps
+            if it.meta.get("part"):
+                name += f" {it.meta['part']}"    # blobber: core / ring
             if it.meta.get("n_regions") is not None:
                 name += f" ({it.meta['n_regions']})"
         lbl = tk.Label(row, text=f"#{it.uid} {name}{where}",
@@ -2126,7 +2476,7 @@ class LabelerApp(MscouponApp):
             from sklearn.neural_network import MLPClassifier
             return make_pipeline(
                 StandardScaler(),
-                MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=1000,
+                MLPClassifier(hidden_layer_sizes=_MLP_HIDDEN, max_iter=_MLP_MAX_ITER,
                               random_state=0))
         if kind in _DENSE_TOP_N:
             if n_features is None or n_features < 1:
@@ -2142,18 +2492,18 @@ class LabelerApp(MscouponApp):
             from sklearn.neural_network import MLPClassifier
             top_n = min(_DENSE_TOP_N[kind], n_features)
             forest = RandomForestClassifier(
-                n_estimators=200, class_weight="balanced", n_jobs=-1,
+                n_estimators=_FOREST_TREES, class_weight="balanced", n_jobs=-1,
                 random_state=0)
             return Pipeline([
                 ("select", SelectFromModel(forest, threshold=-np.inf,
                                            max_features=top_n)),
                 ("scale", StandardScaler()),
-                ("dense", MLPClassifier(hidden_layer_sizes=(64, 32),
-                                        max_iter=1000, random_state=0)),
+                ("dense", MLPClassifier(hidden_layer_sizes=_MLP_HIDDEN,
+                                        max_iter=_MLP_MAX_ITER, random_state=0)),
             ])
         from sklearn.ensemble import RandomForestClassifier
-        return RandomForestClassifier(n_estimators=200, class_weight="balanced",
-                                      oob_score=n_samples >= 20, n_jobs=-1,
+        return RandomForestClassifier(n_estimators=_FOREST_TREES, class_weight="balanced",
+                                      oob_score=n_samples >= _OOB_MIN_SAMPLES, n_jobs=-1,
                                       random_state=0)
 
     def _train_and_classify(self, _e=None):
@@ -2655,8 +3005,36 @@ class LabelerApp(MscouponApp):
         d["tool"] = self.tool_var.get()
         d["magic"] = {"metric": self.magic_metric_var.get(),
                       "mode": self.magic_mode_var.get(),
-                      "channels": self.magic_channels_var.get()}
+                      "channels": self.magic_channels_var.get(),
+                      "ring": self.blob_ring_var.get(),
+                      # Parsed floats, not the raw entry text: what the fill
+                      # actually used, re-rendered with :g on restore.
+                      "hop_gain": _bounded_float(self.magic_gain_var.get(),
+                                                 _DEFAULT_HOP_GAIN, *_HOP_GAIN_RANGE),
+                      "drag_px": _bounded_float(self.magic_drag_var.get(),
+                                                _DEFAULT_DRAG_PX, *_DRAG_PX_RANGE)}
+        d["center_tab"] = self._center_tab_name()
         return d
+
+    def _apply_magic_view(self, magic):
+        """Restore the Magic rows from a session view dict, field by field --
+        an unknown or malformed value leaves that setting as it is."""
+        if not isinstance(magic, dict):
+            return
+        if magic.get("metric") in magic_fill.METRICS:
+            self.magic_metric_var.set(magic["metric"])
+        if magic.get("mode") in magic_fill.MODES:
+            self.magic_mode_var.set(magic["mode"])
+        if isinstance(magic.get("channels"), str) and magic["channels"].strip():
+            self.magic_channels_var.set(magic["channels"])
+        if str(magic.get("ring")) in _RING_CHOICES:
+            self.blob_ring_var.set(str(magic["ring"]))
+        for key, var, (lo, hi) in (("hop_gain", self.magic_gain_var, _HOP_GAIN_RANGE),
+                                   ("drag_px", self.magic_drag_var, _DRAG_PX_RANGE)):
+            val = magic.get(key)
+            if (isinstance(val, (int, float)) and not isinstance(val, bool)
+                    and lo <= val <= hi):
+                var.set(f"{float(val):g}")
 
     def _session_doc(self):
         doc = super()._session_doc()
@@ -2691,16 +3069,16 @@ class LabelerApp(MscouponApp):
         view = sdoc.get("view") or {}
         if view.get("tool") in _UI_TOOLS:
             self.tool_var.set(view["tool"])
-        magic = view.get("magic")
-        if isinstance(magic, dict):
-            if magic.get("metric") in magic_fill.METRICS:
-                self.magic_metric_var.set(magic["metric"])
-            if magic.get("mode") in magic_fill.MODES:
-                self.magic_mode_var.set(magic["mode"])
-            if isinstance(magic.get("channels"), str) and magic["channels"].strip():
-                self.magic_channels_var.set(magic["channels"])
+        self._apply_magic_view(view.get("magic"))
         # Keep the regions toggle in sync with whatever seg_source restored to.
         self.show_regions_var.set(self.seg_source_var.get() == "msc")
+        # The center tab, by name; an unknown or missing value leaves it alone.
+        tab = self._center_tabs.get(view.get("center_tab"))
+        if tab is not None:
+            try:
+                self.center.select(tab)
+            except tk.TclError:
+                pass
         return notes
 
     def _write_configs(self, out_dir):
@@ -2752,6 +3130,54 @@ def _selftest():
     assert not stats0["relevance"], "new labeler profiles default relevance off"
     assert app.rerun_btn.cget("text") == "update region simplification"
     assert app.show_pred_var.get(), "classification rendering is on by default"
+
+    # Window layout: a tabbed center. The left pane keeps the profile PICKER,
+    # the session and Run; the profile is EDITED on the Processing tab (two
+    # columns); the View tab is `app.right`; the model kind lives on the Model
+    # tab and is gone from the classifier panel.
+    def _under(w, ancestor):
+        while w is not None:
+            if w is ancestor:
+                return True
+            w = getattr(w, "master", None)
+        return False
+
+    tabs = [str(app.center.tab(t, "text")) for t in app.center.tabs()]
+    assert tabs == list(_CENTER_TABS) == ["Processing", "View", "Model"], tabs
+    assert app.center.nametowidget(app.center.select()) is app.right, \
+        "the View tab is selected at start"
+    assert app._center_tab_name() == "View"
+    for w in (app.filters_frame, app.base_frame, app.msc_frame, app.stats_frame,
+              app.profile_load_btn):
+        assert _under(w, app.processing_tab), w
+    assert app.filters_frame.master is app.base_frame.master is app.proc_col_a
+    assert app.msc_frame.master is app.stats_frame.master is app.proc_col_b
+    assert _under(app.profile_combo, app.left) and _under(app.run_btn, app.left)
+    assert not _under(app.profile_load_btn, app.left), "profile tools moved"
+    assert _under(app.model_kind_combo, app.model_tab)
+    assert not _under(app.model_kind_combo, app.label_pane)
+    ml_rows = [c for row in app.confusion_holder.master.winfo_children()
+               for c in row.winfo_children()]
+    assert not any(isinstance(c, ttk.Combobox) for c in ml_rows), \
+        "no kind combobox left in the classifier panel"
+    # The notebook never binds plain Tab, so the overlay hotkey still fires
+    # (and still consumes the key) from every tab.
+    assert "<Key-Tab>" not in app.center.bind_class("TNotebook")
+    assert app._on_tab_toggle() == "break"
+    assert not app.show_overlay_var.get()
+    app._on_tab_toggle()
+    assert app.show_overlay_var.get()
+    # The architecture readout follows the kind, formatted from the constants
+    # _make_model builds with.
+    for kind in _MODEL_KINDS:
+        app.model_kind_var.set(kind)
+        assert app.model_arch_var.get() == _model_description(kind), kind
+    assert str(_FOREST_TREES) in _model_description("random forest")
+    assert str(_MLP_HIDDEN) in _model_description("dense FC")
+    assert str(_DENSE_TOP_N["dense-top-16"]) in _model_description("dense-top-16")
+    app.model_kind_var.set("dense FC")
+
+    # `app.right` IS the View tab, so the scan below reads unchanged.
     right_rows = list(app.right.winfo_children())
     assert not any(isinstance(w, ttk.LabelFrame)
                    and str(w.cget("text")) == "Live parameters"
@@ -2911,14 +3337,20 @@ def _selftest():
     assert all(it.class_id == 1 for it in app.store.interactions)
     assert app.active_class_var.get() == 0
 
-    # Session round-trip: the store rides the v2 session doc.
+    # Session round-trip: the store rides the v2 session doc, and so does
+    # the selected center tab (by name).
+    app.center.select(app.model_tab)
     sdoc = app._session_doc()
+    assert sdoc["view"]["center_tab"] == "Model"
+    app.center.select(app.right)
     assert "labels" not in sdoc, "the gesture geometry is 'annotations' now"
     assert sdoc["annotations"]["n_classes"] == 2
     assert len(sdoc["annotations"]["interactions"]) == 2
     assert sdoc["sequences"][0]["folder"] == "data"
     app.store = LabelStore()             # clobber
     app._apply_session_doc(sdoc, "test")
+    assert app._center_tab_name() == "Model", "the center tab restores by name"
+    app.center.select(app.right)
     assert len(app.store.interactions) == 2
     assert all(it.bound for it in app.store.interactions), \
         "rebind by folder-qualified key"
@@ -2927,8 +3359,10 @@ def _selftest():
     # the document under it did not.
     legacy = {k: v for k, v in sdoc.items() if k != "annotations"}
     legacy["labels"] = sdoc["annotations"]
+    legacy["view"] = dict(sdoc["view"], center_tab="bogus")   # unknown -> untouched
     app.store = LabelStore()
     app._apply_session_doc(legacy, "legacy key")
+    assert app._center_tab_name() == "View", "an unknown tab name is ignored"
     assert len(app.store.interactions) == 2, \
         "a pre-rename session's 'labels' key still loads"
 
@@ -3565,6 +3999,117 @@ def _selftest():
     assert not ctrl.on_press(_FakeEvent(5, 5))
     assert "std_base" in app.status_var.get(), app.status_var.get()
     app.magic_metric_var.set("mean")
+
+    # Blobber: the magic core in the active class, its immediate neighbours
+    # in the ring class ("next" -> class 2 for class 1). The last released
+    # threshold (all four) is remembered, so drag DOWN to the seed alone.
+    if app.store.n_classes < 3:
+        app.store.set_n_classes(3); app.n_classes_var.set(3)
+    app.tool_var.set("blobber"); app.active_class_var.set(1)
+    assert ctrl.magic.ring_class(1) == 2
+    app.blob_ring_var.set("1")                 # same as the active class -> next
+    assert ctrl.magic.ring_class(1) == 2
+    app.blob_ring_var.set(str(app.store.n_classes - 1))
+    assert ctrl.magic.ring_class(1) == app.store.n_classes - 1
+    app.blob_ring_var.set("next")
+    assert ctrl.on_press(_FakeEvent(5, 5))
+    assert ctrl.magic.active and "ring" in v._hud_text
+    assert ctrl.on_move(_FakeEvent(5, 5 + 400))
+    assert lit() == {0, 2, 5}, lit()           # core {0}, ring = its neighbours
+    lut = v._transient[2]
+    assert lut[0].tolist() == list(app.store.rgba(1)), "seed keeps the pure core color"
+    c1 = np.asarray(app.store.rgba(1)[:3], int); c2 = np.asarray(app.store.rgba(2)[:3], int)
+    for r in (2, 5):
+        d1 = np.abs(lut[r, :3].astype(int) - c1).sum()
+        d2 = np.abs(lut[r, :3].astype(int) - c2).sum()
+        assert d2 < d1, "ring regions preview in the ring class color"
+    n0 = len(app.store.interactions)
+    assert ctrl.on_release(_FakeEvent(5, 5 + 400))
+    assert len(app.store.interactions) == n0 + 2, "ring + core, two interactions"
+    ring_it, core_it = app.store.interactions[-2], app.store.interactions[-1]
+    assert ring_it.class_id == 2 and ring_it.meta["part"] == "ring" \
+        and ring_it.meta["tool"] == "blobber" and len(ring_it.points) == 2
+    assert core_it.class_id == 1 and core_it.meta["part"] == "core" \
+        and len(core_it.points) == 1
+    rc_b = labeling.resolve_slice([ring_it, core_it], lab, np)
+    assert rc_b[0] == 1 and rc_b[2] == 2 and rc_b[5] == 2 and rc_b[9] == 0
+    app._rebuild_class_panels()
+    assert app._session_doc()["view"]["magic"]["ring"] == "next"
+    app._undo()
+    assert len(app.store.interactions) == n0, "one undo step removes ring + core"
+    # Grown to everything: no ring left, only the core commits.
+    assert ctrl.on_press(_FakeEvent(5, 5))
+    assert ctrl.on_move(_FakeEvent(5, 5 - 400))
+    assert lit() == {0, 2, 5, 9}, lit()
+    assert ctrl.on_release(_FakeEvent(5, 5 - 400))
+    assert len(app.store.interactions) == n0 + 1
+    assert app.store.interactions[-1].meta["part"] == "core"
+    app._undo()
+
+    # Hop gain + drag entries: lenient parsing, clamped, session round-trip
+    # as floats, restored with validation; the gain reaches the ladder, the
+    # HUD, the provenance and the last-threshold key.
+    app.tool_var.set("magic")
+    app.magic_gain_var.set("abc"); assert ctrl.magic.hop_gain() == _DEFAULT_HOP_GAIN
+    app.magic_gain_var.set("0.5"); assert ctrl.magic.hop_gain() == 1.0
+    app.magic_gain_var.set("9");   assert ctrl.magic.hop_gain() == 2.0
+    app.magic_drag_var.set("x");   assert ctrl.magic.drag_px() == _DEFAULT_DRAG_PX
+    app.magic_gain_var.set("1.5"); app.magic_drag_var.set("8")
+    vs = app._session_doc()["view"]["magic"]
+    assert vs["hop_gain"] == 1.5 and vs["drag_px"] == 8.0
+    n0 = len(app.store.interactions)
+    assert ctrl.on_press(_FakeEvent(5, 5))
+    assert "g1.5" in v._hud_text, v._hud_text
+    assert ctrl.magic._s["ladder"].hop_gain == 1.5
+    assert ctrl.magic._s["drag_px"] == 8.0
+    assert ctrl.on_move(_FakeEvent(5, 5 - 400))
+    assert ctrl.on_release(_FakeEvent(5, 5 - 400))
+    assert len(app.store.interactions) == n0 + 1
+    assert app.store.interactions[-1].meta["hop_gain"] == 1.5
+    assert any(k[3] == 1.5 for k in ctrl.magic._last), list(ctrl.magic._last)
+    app._undo()
+    app._apply_magic_view({"hop_gain": 1.25, "drag_px": 6, "metric": "cosine",
+                           "mode": "chain"})
+    assert app.magic_gain_var.get() == "1.25" and app.magic_drag_var.get() == "6"
+    assert app.magic_metric_var.get() == "cosine" and app.magic_mode_var.get() == "chain"
+    app._apply_magic_view({"hop_gain": "abc", "drag_px": 0.5, "metric": "nope"})
+    assert app.magic_gain_var.get() == "1.25" and app.magic_drag_var.get() == "6"
+    assert app.magic_metric_var.get() == "cosine"
+    # cosine runs on the whole row (here area + mean_base) without channels.
+    app.magic_gain_var.set("1")
+    assert ctrl.on_press(_FakeEvent(5, 5))
+    assert ctrl.magic._s["ladder"].metric == "cosine"
+    assert ctrl.magic.cancel()
+    app.magic_mode_var.set("anchor")
+
+    # proba: refused without predictions or with stale ones; with a fake
+    # prediction the seed's class joins first, unscored regions last.
+    app.magic_metric_var.set("proba")
+    app._pred = {}
+    assert not ctrl.on_press(_FakeEvent(5, 5))
+    assert "Classify first" in app.status_var.get(), app.status_var.get()
+    proba = np.zeros((10, MAX_CLASSES), np.float32)
+    proba[0, 1] = 1.0; proba[2, 1] = 1.0; proba[5, 2] = 1.0      # 9 unscored
+    rc_p = np.zeros(10, np.uint8)
+    app._pred[(0, 0)] = (app._commit_id + 1, rc_p, proba)          # stale
+    assert not ctrl.on_press(_FakeEvent(5, 5))
+    app._pred[(0, 0)] = (app._commit_id, rc_p, proba)
+    assert ctrl.on_press(_FakeEvent(5, 5))
+    lad_p = ctrl.magic._s["ladder"]
+    assert lad_p.ids[lad_p.order].tolist() == [0, 2, 5, 9], lad_p.ids[lad_p.order].tolist()
+    assert np.allclose(lad_p.join, [0.0, 0.0, 1.0, 1.0]), lad_p.join
+    assert ctrl.magic.cancel()
+    app._pred = {}
+    app.magic_metric_var.set("mean")
+    app.magic_gain_var.set(f"{_DEFAULT_HOP_GAIN:g}")
+    app.magic_drag_var.set(f"{_DEFAULT_DRAG_PX:g}")
+    app.tool_var.set("blobber")
+    # Two-class store: no ring class exists, the press is refused.
+    saved_n = app.store.n_classes
+    app.store.set_n_classes(2); app.n_classes_var.set(2)
+    assert not ctrl.on_press(_FakeEvent(5, 5))
+    assert "second class" in app.status_var.get()
+    app.store.set_n_classes(saved_n); app.n_classes_var.set(saved_n)
     app.active_class_var.set(0)
     app.tool_var.set("squiggle")
 
@@ -3587,7 +4132,8 @@ def _selftest():
           "profile-from-model + provenance strip, swatch arming, "
           "proba cache + coloring modes, confusion matrix + highlight, "
           "persistent outlines + canvas right-click, gesture previews, "
-          "magic fill")
+          "magic fill, blobber, hop gain + drag + cosine/proba metrics, "
+          "center notebook + model tab")
     return 0
 
 

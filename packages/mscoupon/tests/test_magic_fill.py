@@ -129,7 +129,7 @@ def test_barrier_weights_need_saddles():
 def test_unknown_metric_or_mode_raise():
     t = blocks_table()
     with pytest.raises(ValueError):
-        mf.node_dissimilarity(t, 0, "cosine", ["base"], np)
+        mf.node_dissimilarity(t, 0, "manhattan", ["base"], np)
     with pytest.raises(ValueError):
         mf.edge_weights(t, np.array([0]), np.array([1]), 0, "mean", "sideways",
                         ["base"], np)
@@ -369,3 +369,196 @@ def test_growth_order_degenerate_inputs():
     assert len(order) == 0
     order, join = mf.growth_order(3, [], [], [], 1, np)
     assert order.tolist() == [1, 0, 2] and join[1] == 0.0 and np.isinf(join[0])
+
+# --------------------------------------------------------------------------- #
+# ring (blobber)
+# --------------------------------------------------------------------------- #
+def test_ring_for_rank_on_blocks():
+    t = blocks_table()
+    arcs = mf.arcs_from_labels(blocks_raster(), np)
+    lad = mf.build_ladder(t, arcs, 0, "mean", "anchor", ["base"], np)
+    assert lad.ids[lad.order].tolist() == [0, 2, 5, 9]
+    assert sorted(mf.ring_for_rank(lad, 1, np).tolist()) == [2, 5]
+    assert sorted(mf.ring_for_rank(lad, 2, np).tolist()) == [5, 9]
+    assert sorted(mf.ring_for_rank(lad, 3, np).tolist()) == [9]
+    assert mf.ring_for_rank(lad, 4, np).tolist() == []
+    assert sorted(mf.ring_for_rank(lad, 0, np).tolist()) == [2, 5]     # clamps to 1
+    # Ring and core never overlap, and together they are the closed neighbourhood.
+    for k in range(1, 5):
+        core = set(mf.regions_for_rank(lad, k).tolist())
+        ring = set(mf.ring_for_rank(lad, k, np).tolist())
+        assert not (core & ring)
+
+
+def test_ring_for_rank_without_arcs_is_empty():
+    t = blocks_table()
+    arcs = {"a": np.zeros(0, np.int32), "b": np.zeros(0, np.int32), "saddle": None}
+    lad = mf.build_ladder(t, arcs, 0, "mean", "anchor", ["base"], np)
+    assert lad.n_reach == 1
+    assert mf.ring_for_rank(lad, 1, np).tolist() == []
+
+
+# --------------------------------------------------------------------------- #
+# hop gain
+# --------------------------------------------------------------------------- #
+def test_hop_gain_inflates_per_hop_and_one_is_bottleneck():
+    ia = np.array([0, 1]); ib = np.array([1, 2]); w = np.ones(2)
+    _o, join = mf.growth_order(3, ia, ib, w, 0, np, hop_gain=1.5)
+    assert np.allclose(join, [0.0, 1.5, 2.25])            # w * g^hops
+    _o, join = mf.growth_order(3, np.array([0, 1, 0]), np.array([1, 2, 2]),
+                               np.ones(3), 0, np, hop_gain=1.5)
+    assert np.allclose(join, [0.0, 1.5, 1.5])             # the direct arc wins
+    _o, join1 = mf.growth_order(3, ia, ib, w, 0, np, hop_gain=1.0)
+    assert join1.tolist() == mf.bottleneck_join(3, ia, ib, w, 0, np,
+                                                use_scipy=False).tolist()
+    with pytest.raises(ValueError, match="hop_gain"):
+        mf.growth_order(3, ia, ib, w, 0, np, hop_gain=0.9)
+
+
+@pytest.mark.parametrize("gain", [1.0, 1.3])
+def test_hop_gain_random_graph_prefixes_connected(gain):
+    rng = np.random.default_rng(5)
+    n, m = 40, 120
+    ia = rng.integers(0, n, m); ib = rng.integers(0, n, m)
+    keep = ia != ib
+    ia, ib = ia[keep], ib[keep]
+    w = rng.random(len(ia))
+    order, join = mf.growth_order(n, ia, ib, w, 0, np, hop_gain=gain)
+    ref = mf.bottleneck_join(n, ia, ib, w, 0, np, use_scipy=False)
+    fin = np.isfinite(ref)
+    if gain == 1.0:
+        assert np.allclose(join[fin], ref[fin])
+    else:
+        assert (join[fin] >= ref[fin] - 1e-12).all()      # never cheaper than the bottleneck
+    assert np.isinf(join[~fin]).all()
+    reach = int(fin.sum())
+    assert np.all(np.diff(join[order[:reach]]) >= 0)
+    arcs = {"a": ia.astype(np.int32), "b": ib.astype(np.int32)}
+    for k in range(1, reach + 1):
+        assert _connected(order[:k], arcs)
+
+
+def test_build_ladder_hop_gain_on_blocks():
+    t = blocks_table()
+    arcs = mf.arcs_from_labels(blocks_raster(), np)
+    lad = mf.build_ladder(t, arcs, 0, "mean", "anchor", ["base"], np, hop_gain=1.1)
+    sd = np.std([1.5, 2.5, 3.5, 4.5])
+    # 2 and 5 are one hop (d*1.1); 9 is two hops, and its own last-hop weight
+    # dominates the gained first hop: max(d2*1.1, d9)*1.1 = 3*1.1 (the closed
+    # form max_i w_i * g^(hops after i) with the last arc winning).
+    assert np.allclose(lad.join, np.array([0.0, 1.1, 2.2, 3.3]) / sd)
+    # A chain where the FIRST hop dominates shows the compounding instead.
+    chain = FeatureTable(["feature_id", "area", "mean_base"],
+                         np.array([[0, 1, 0.0], [1, 1, 10.0], [2, 1, 10.5]]))
+    arcs2 = {"a": np.array([0, 1], np.int32), "b": np.array([1, 2], np.int32), "saddle": None}
+    lad2 = mf.build_ladder(chain, arcs2, 0, "mean", "anchor", ["base"], np, hop_gain=1.5)
+    d = mf.node_dissimilarity(chain, 0, "mean", ["base"], np)
+    # 0-1 costs d1*g; 1-2 carries weight d2 but the gained first hop d1*g is
+    # larger, so it compounds: (d1*g)*g.
+    assert d[1] * 1.5 > d[2]
+    assert np.allclose(lad2.join, [0.0, d[1] * 1.5, d[1] * 1.5 * 1.5])
+    assert lad.hop_gain == 1.1
+    assert lad.ids[lad.order].tolist() == [0, 2, 5, 9]
+
+
+# --------------------------------------------------------------------------- #
+# row vectors: cosine + proba
+# --------------------------------------------------------------------------- #
+def _wide_table():
+    return FeatureTable(["feature_id", "area", "mean_base", "std_base", "min_x", "ext_y"],
+                        np.array([[0, 64, 1.5, 0.1, 3, 5],
+                                  [2, 80, 2.5, 0.1, 999, 7],
+                                  [5, 96, 3.5, 0.5, -400, 11],
+                                  [9, 112, 4.5, 0.2, 12, 15]], np.float64))
+
+
+def test_row_vectors_shapes_and_positional_exclusion():
+    t = _wide_table()
+    X, kind = mf.row_vectors(t, "mean", ["base"], np)
+    assert X.shape == (4, 1) and kind == "euclidean"
+    X, kind = mf.row_vectors(t, "bhattacharyya", ["base"], np)
+    assert X.shape == (4, 2) and kind == "bhattacharyya"
+    X, kind = mf.row_vectors(t, "cosine", [], np)
+    assert X.shape == (4, 3) and kind == "cosine"          # area, mean_base, std_base
+    P = np.zeros((10, 5)); P[0, 1] = 1
+    X, kind = mf.row_vectors(t, "proba", [], np, extra={"proba": P})
+    assert X.shape == (4, 5) and kind == "tv"
+    with pytest.raises(ValueError, match="proba"):
+        mf.row_vectors(t, "proba", [], np)
+    with pytest.raises(ValueError, match="barrier"):
+        mf.row_vectors(t, "barrier", [], np)
+
+
+def test_mean_metric_unchanged_by_refactor():
+    t = blocks_table()
+    d = mf.node_dissimilarity(t, 1, "mean", ["base"], np)
+    sd = np.std([1.5, 2.5, 3.5, 4.5])
+    assert np.allclose(d, [1, 0, 1, 2] / sd)
+    ia, ib = np.array([0, 2]), np.array([3, 1])
+    assert np.allclose(mf.edge_dissimilarity(t, ia, ib, "mean", ["base"], np),
+                       [3 / sd, 1 / sd])
+
+
+def test_cosine_identities():
+    X = np.array([[1.0, 1.0], [1.0, 1.0], [-1.0, -1.0], [1.0, 0.0], [0.0, 1.0], [0.0, 0.0]])
+    assert mf.pairwise(X, 0, np.array([1]), "cosine", np)[0] == pytest.approx(0.0)
+    assert mf.pairwise(X, 0, np.array([2]), "cosine", np)[0] == pytest.approx(2.0)
+    assert mf.pairwise(X, 3, np.array([4]), "cosine", np)[0] == pytest.approx(1.0)
+    assert mf.pairwise(X, 0, np.array([5]), "cosine", np)[0] == 1.0     # zero row
+    assert mf.pairwise(X, 5, np.array([5]), "cosine", np)[0] == 1.0
+
+
+def test_cosine_ignores_positions_and_zscores_columns():
+    t = _wide_table()
+    d_wide = mf.node_dissimilarity(t, 0, "cosine", [], np)
+    narrow = FeatureTable(["feature_id", "area", "mean_base", "std_base"],
+                          t.values[:, :4].copy())
+    d_narrow = mf.node_dissimilarity(narrow, 0, "cosine", [], np)
+    assert np.allclose(d_wide, d_narrow)                   # min_x / ext_y never counted
+    assert d_wide[0] == pytest.approx(0.0)
+    # Scaling one column by 1e6 changes nothing after z-scoring.
+    scaled = FeatureTable(narrow.names, narrow.values * np.array([1, 1e6, 1, 1]))
+    assert np.allclose(mf.node_dissimilarity(scaled, 0, "cosine", [], np), d_narrow)
+
+
+def test_proba_tv_and_hellinger():
+    X = np.array([[1, 0, 0], [1, 0, 0], [0, 1, 0], [.5, .5, 0], [0, 0, 0]], np.float64)
+    J = np.arange(5)
+    tv = mf.pairwise(X, 0, J, "tv", np)
+    assert np.allclose(tv, [0.0, 0.0, 1.0, 0.5, 1.0])      # last: unscored
+    he = mf.pairwise(X, 0, J, "hellinger", np)
+    assert he[0] == pytest.approx(0.0) and he[2] == pytest.approx(1.0) and he[4] == 1.0
+    assert he[3] == pytest.approx(np.sqrt(0.5 * ((1 - np.sqrt(0.5)) ** 2 + 0.5)))
+    assert mf.pairwise(X, 4, np.array([4]), "tv", np)[0] == 1.0
+
+
+def test_proba_gathers_by_label_id_and_drives_the_ladder():
+    t = blocks_table()                                     # ids 0, 2, 5, 9
+    P = np.zeros((6, 4))                                   # ids 0..5 only: 9 unscored
+    P[0, 1] = 1.0; P[2, 1] = 1.0; P[5, 2] = 1.0
+    X, _k = mf.row_vectors(t, "proba", [], np, extra={"proba": P})
+    assert X[3].sum() == 0.0                               # id 9 beyond P -> unscored
+    arcs = mf.arcs_from_labels(blocks_raster(), np)
+    lad = mf.build_ladder(t, arcs, 0, "proba", "anchor", [], np, extra={"proba": P})
+    assert np.allclose(lad.join, [0.0, 0.0, 1.0, 1.0])
+    assert lad.ids[lad.order].tolist() == [0, 2, 5, 9]
+    hel = mf.build_ladder(t, arcs, 0, "proba", "anchor", [], np,
+                          extra={"proba": P, "dist": "hellinger"})
+    assert np.allclose(hel.join, [0.0, 0.0, 1.0, 1.0])
+    with pytest.raises(ValueError, match="Classify first"):
+        mf.build_ladder(t, arcs, 0, "proba", "anchor", [], np)
+
+
+def test_edge_matches_pairwise_for_cosine_and_proba():
+    t = _wide_table()
+    ia, ib = np.array([0, 1, 2]), np.array([1, 3, 3])
+    X, kind = mf.row_vectors(t, "cosine", [], np)
+    assert np.allclose(mf.edge_dissimilarity(t, ia, ib, "cosine", [], np),
+                       mf.pairwise(X, ia, ib, kind, np))
+    P = np.random.default_rng(1).random((10, 3)); P /= P.sum(1, keepdims=True)
+    X, kind = mf.row_vectors(t, "proba", [], np, extra={"proba": P})
+    assert np.allclose(mf.edge_dissimilarity(t, ia, ib, "proba", [], np, extra={"proba": P}),
+                       mf.pairwise(X, ia, ib, kind, np))
+    w = mf.edge_weights(t, ia, ib, 0, "proba", "anchor", [], np, extra={"proba": P})
+    d = mf.node_dissimilarity(t, 0, "proba", [], np, extra={"proba": P})
+    assert np.allclose(w, np.maximum(d[ia], d[ib]))

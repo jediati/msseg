@@ -14,6 +14,26 @@ PYTHONPATH="packages/mscoupon/src;packages/msseg-viz/src" python -c "from msseg.
 PYTHONPATH=packages/mscoupon/src pytest packages/mscoupon/tests/test_labeling.py packages/mscoupon/tests/test_magic_fill.py
 ```
 
+## Layout
+
+Three panes. The **left** pane is data navigation and processing *selection*:
+the compute-profile dropdown, the session (folders, files, the sequence tree)
+and Run. The **right** pane is annotation management (classes, tools, the
+Magic rows, the per-class interaction lists, Save/Load annotations) and the
+classifier (Train/Classify, the model strip, the confusion matrix, exports,
+Save/Load classifier). The **center** is a notebook whose inactive tabs are
+hidden:
+
+| tab | holds |
+|---|---|
+| **Processing** | the profile tools (New/Dup/Rename/Delete, Save/Load profile) and the profile being edited, in two columns: filter chain + base channel, MSC parameters + statistics channels |
+| **View** (default) | the slice canvas, hover readout, slice navigation, image/overlay/alpha controls and the persistence entry |
+| **Model** | the classifier kind and a read-only description of its architecture |
+
+The selected tab rides the session as `view.center_tab` and is restored by
+name. The hotkeys are window-wide, so `Tab` still toggles the overlay from any
+tab. The viewer (`mscoupon-gui`) keeps its two-pane layout.
+
 ## Annotations are gestures, not region ids
 
 An annotation (`labeling.Interaction`) is one gesture in **image coordinates**
@@ -38,9 +58,11 @@ today only the magic fill writes it. Resolution never reads it, so a stale
 | box | drag a rectangle | every region overlapping it |
 | lasso | drag a closed polygon | every region under the filled polygon |
 | magic | press, drag up/down, release | a similarity flood from the pressed region |
+| blobber | as magic | the flood in the active class **and** its bounding regions in the ring class |
 | *SHIFT + drag* | a box, any tool | **accepts** the classifier's predictions under it as `taps` |
 
-Hotkeys: `1..4` arm a class, `0`/Escape disarm, `M` selects magic, `Tab`
+Hotkeys: `1..4` arm a class, `0`/Escape disarm, `M` selects magic, `B` the
+blobber, `Tab`
 toggles the overlays, `Ctrl-Z`/`Ctrl-Y` undo/redo, `R` train + classify,
 `C` classify. Middle/right drag always pans; a right-click opens the
 annotation menu for the region under it.
@@ -73,6 +95,8 @@ Release paints; Escape abandons.
 |---|---|---|
 | `mean` (default) | \|Δmean\| over the chosen channels, each z-scored by that column's spread on the slice | `mean_<channel>` |
 | `bhattacharyya` | Gaussian overlap from mean and std per channel | `mean_`, `std_` |
+| `cosine` | `1 − cos` between the regions' whole statistics rows: every column except ids and positions, each z-scored over the slice. Ignores the channel list. | any statistics |
+| `proba` | total variation (half the L1) between the classifier's class-probability vectors; a region the model never scored is at distance 1, so it joins last. Ignores the channel list. The press is refused until the slice has been classified at the current commit. | a Classify |
 | `barrier` | saddle height above the seed's extremum: the persistence-style flood anchored at a point | MSC region arcs (`ext_filtered`) |
 
 | mode | compares |
@@ -88,16 +112,23 @@ into one weight per arc and runs a **priority flood** from the seed
 (`growth_order`: a bottleneck/minimax Dijkstra whose ties are broken by the
 most seed-like frontier region), giving every region the threshold at which
 it joins — the **join ladder** — *and* the order in which the flood admits
-them. A drag tick is a rank on that order, i.e. a prefix of it
-(`drag_to_rank`: linear near the start so single regions are reachable,
-quadratic further out so a long drag sweeps a thousand-region ladder), so
-every pixel of drag adds or removes one connected region. The prefix, not a
+them. The flood takes a **hop gain** `g` (the `hop×` entry, default 1.1,
+range 1..2): the cost of a path is its bottleneck inflated by `g` per hop,
+`max_i w_i · g^(hops after i)`, so an equally similar region far from the seed
+costs more than a neighbour and the ladder is no longer flat across a
+homogeneous plateau — the reason a few pixels of drag used to sweep half a
+slice. `g = 1` is the pure bottleneck; the HUD shows `g1.1` and its `t` then
+reads in inflated units. A drag tick is a rank on that order, i.e. a prefix of
+it (`drag_to_rank`: linear near the start so single regions are reachable —
+the `drag` entry sets the screen pixels per region, default 4 — quadratic
+further out so a long drag sweeps a thousand-region ladder), so every pixel of
+drag adds or removes one connected region. The prefix, not a
 threshold-closed set, is deliberate: a bright outlier seed makes its first
 neighbour's dissimilarity the bottleneck for most of the slice, so hundreds
 of regions share one join value and a plain threshold jumps from one region
 to half the slice at that rung; the HUD's `t` is the join value of the last
 region admitted. The first threshold is the
-one last released with the same metric/mode/channels in this session, else a
+one last released with the same metric/mode/channels/hop gain in this session, else a
 natural break in the ladder (`initial_rank`: the largest relative gap within
 its first 5 %).
 
@@ -114,12 +145,28 @@ unreachable; the HUD's `k/n` shows how many are.
 *What is stored.* The release commits **one `taps` interaction with a point
 per grown region at its seeding extremum** (`ext_x/ext_y`, falling back to the
 region's first pixel), plus `meta = {tool: "magic", seed, seed_id, threshold,
-metric, mode, channels, n_regions, arcs}`. So the fill re-resolves after a
+metric, mode, channels, hop_gain, n_regions, arcs}`. So the fill re-resolves after a
 persistence change like every other gesture: on a coarser decomposition
 several points collapse into one region; on a finer one only the sub-regions
 containing a stored point stay painted. The annotation row reads
 `#12 magic (37)` and hovering it shows the taps plus a dashed ring at the seed.
 One undo step removes the whole fill.
+
+### Blobber
+
+The blobber is the magic fill plus a **ring**: the regions immediately
+adjacent to the core (`magic_fill.ring_for_rank`, the arc graph's neighbours
+of the prefix that are not in it) preview and commit in a second class. Click
+on a void with class 2 armed and the void is class 2 with the material
+bounding it in class 3; the drag grows the core and the ring follows it, and
+once the core has taken every reachable region the ring is empty. The ring
+class is the **`ring`** option in the Magic row: `next` (default) is the class
+after the active one, wrapping past the last, or pick a fixed id; an id equal
+to the active class falls back to `next`, and a two-class store (only class
+1) refuses the press with a status line. The release commits two `taps`
+interactions, `blobber ring (n)` first and `blobber core (n)` second, so on a
+re-decomposition that merges a ring point's region into a core point's the
+core wins; one undo step removes both.
 
 ## Classifier and exports
 

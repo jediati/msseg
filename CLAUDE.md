@@ -177,17 +177,36 @@ adjacency graph** -- `Msc2DPipeline::region_arcs()` wraps MSCEER's
 in both `msc` and `merge_forest` modes), translated into the compact label-id
 space; older extensions fall back to 4-neighbour pixel adjacency. All
 seed-dependent work happens once per press as a *join ladder*
-(`magic_fill.build_ladder`: metric -> arc weights -> bottleneck/minimax search),
+(`magic_fill.build_ladder`: metric -> row vectors -> arc weights -> priority flood
+with a geometric hop gain, `hop×` default 1.1, g=1 being the pure bottleneck),
 so a drag tick is a rank on the ladder -- a prefix of the flood's discovery order
 (`growth_order`), NOT a threshold-closed set, because an outlier seed makes its
 gateway neighbour's dissimilarity the bottleneck for most of the slice and a
 threshold then jumps from one region to half of them -- and the threshold reads
 in the data's own units on the HUD. Metrics: z-scored `mean` (default), `bhattacharyya`, saddle
-`barrier`; modes `anchor` (vs the seed) / `chain` (vs the neighbour). The fill
+`barrier`, `cosine` (the whole statistics row minus positions, z-scored) and
+`proba` (total variation between classifier class probabilities; the press is
+refused until the slice is classified); modes `anchor` (vs the seed) / `chain`
+(vs the neighbour); the `drag` entry sets screen px per region. The fill
 commits as ONE `taps` interaction with a point per region at its seeding
 extremum plus a `meta` provenance dict, so it re-resolves after a persistence
-change through the unchanged geometric path. Escape abandons any gesture in
-flight.
+change through the unchanged geometric path. The **blobber** (key B) is the same
+fill plus a ring -- the core's immediate neighbours (`ring_for_rank`) in a second
+class (`next` after the active one, or a fixed id) -- committed as two taps
+interactions, ring first so the core wins on a merge. Escape abandons any
+gesture in flight.
+
+**mscoupon labeler layout** (three panes, tabbed center): the left pane is data
+navigation + processing *selection* (profile dropdown, session, Run); the right
+pane is annotation management + the classifier; the center is a `ttk.Notebook`
+-- **Processing** (profile tools + the edited profile in two columns),
+**View** (the canvas and its controls; `self.right` *is* this tab, so every
+viewer-area builder packs into it unchanged) and **Model** (kind + architecture
+readout formatted from the `_make_model` constants). `MscouponApp` grew three
+layout hooks (`_build_center`, `_profile_tools_parent`, `_processing_parent`)
+whose defaults reproduce the viewer's tree exactly; the labeler overrides them
+rather than forking `_build_left`. The selected tab is `view.center_tab` in the
+session.
 
 **mscoupon extremum statistics** (`ext_x`, `ext_y`, `ext_base`, `ext_filtered`):
 the per-slice selection chain can also ask about a region's **seeding critical

@@ -151,9 +151,10 @@ class MscouponApp:
         self.left_pane = ScrollFrame(self.paned, width=376, canvas_width=360)
         self.left = self.left_pane.inner
 
-        self.right = ttk.Frame(self.paned, width=900)
         self.paned.add(self.left_pane, weight=0)
-        self.paned.add(self.right, weight=1)
+        # The center pane is a hook: the viewer wants one frame (`self.right`),
+        # the labeler a tabbed notebook whose View tab IS `self.right`.
+        self._build_center()
         self._build_left()
         self._build_right()
 
@@ -308,8 +309,9 @@ class MscouponApp:
         are measure-only: the topology field is still `filters`, and the seeding
         extremum is still located on it.
         """
-        c = ttk.LabelFrame(self.left, text="5. Statistics channels")
+        c = ttk.LabelFrame(self._processing_parent("stats"), text="5. Statistics channels")
         c.pack(fill="x", padx=6, pady=4)
+        self.stats_frame = c
 
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
         ttk.Checkbutton(row, text="base", variable=self.stat_base_var,
@@ -492,6 +494,28 @@ class MscouponApp:
                     pass
 
     # ------------------------------------------------------------------ #
+    # Layout hooks
+    # ------------------------------------------------------------------ #
+    # Three template methods decide WHERE the shared sections land, so a
+    # subclass can re-lay the window without forking the builders. The
+    # defaults reproduce the viewer's tree exactly: one center frame, and
+    # every section in the scrolling left panel.
+    def _build_center(self):
+        """Create the center pane (`self.right`) and add it to the paned window."""
+        self.right = ttk.Frame(self.paned, width=900)
+        self.paned.add(self.right, weight=1)
+
+    def _profile_tools_parent(self, section):
+        """Parent for the profile New/Dup/Rename/Delete and Save/Load rows;
+        `section` is the compute-profile LabelFrame that holds the picker."""
+        return section
+
+    def _processing_parent(self, section):
+        """Parent for one of the parameter sections: "filters", "base",
+        "msc" or "stats"."""
+        return self.left
+
+    # ------------------------------------------------------------------ #
     # Left panel
     # ------------------------------------------------------------------ #
     def _build_left(self):
@@ -504,12 +528,15 @@ class MscouponApp:
                                           state="readonly", width=22)
         self.profile_combo.pack(side="left", fill="x", expand=True)
         self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_selected)
-        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
+        # The management rows go wherever the profile is EDITED (the labeler
+        # moves them next to the parameter sections); the picker stays here.
+        tools = self._profile_tools_parent(c)
+        row = ttk.Frame(tools); row.pack(fill="x", padx=4, pady=2)
         ttk.Button(row, text="New", command=self._profile_new, width=5).pack(side="left")
         ttk.Button(row, text="Dup", command=self._profile_duplicate, width=5).pack(side="left", padx=2)
         ttk.Button(row, text="Rename…", command=self._profile_rename, width=8).pack(side="left", padx=2)
         ttk.Button(row, text="Delete", command=self._profile_delete, width=6).pack(side="left", padx=2)
-        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
+        row = ttk.Frame(tools); row.pack(fill="x", padx=4, pady=2)
         ttk.Button(row, text="Save profile…",
                    command=self._save_profile).pack(side="left", fill="x", expand=True, padx=(0, 2))
         self.profile_load_btn = ttk.Button(row, text="Load profile…",
@@ -555,12 +582,14 @@ class MscouponApp:
         ttk.Button(row, text="Clear all", command=self._clear_subsequences).pack(side="left", padx=4)
 
         # 2. Filter chain
-        self.filters_frame = ttk.LabelFrame(self.left, text="2. Filter chain (topology field)")
+        self.filters_frame = ttk.LabelFrame(self._processing_parent("filters"),
+                                            text="2. Filter chain (topology field)")
         self.filters_frame.pack(fill="x", padx=6, pady=4)
         self._rebuild_filter_cards()
 
         # 3. Base channel: 2-point normalization
-        self.base_frame = ttk.LabelFrame(self.left, text="3. Base channel (2-point normalization)")
+        self.base_frame = ttk.LabelFrame(self._processing_parent("base"),
+                                         text="3. Base channel (2-point normalization)")
         self.base_frame.pack(fill="x", padx=6, pady=4)
         ttk.Label(self.base_frame, wraplength=330, justify="left",
                   text="Add a 'normalize' stage to put region statistics and pixel "
@@ -571,8 +600,9 @@ class MscouponApp:
         self._rebuild_filter_cards("base")
 
         # 4. MSC params
-        c = ttk.LabelFrame(self.left, text="4. MSC parameters")
+        c = ttk.LabelFrame(self._processing_parent("msc"), text="4. MSC parameters")
         c.pack(fill="x", padx=6, pady=4)
+        self.msc_frame = c
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="Max persistence %:").pack(side="left")
         ttk.Entry(row, textvariable=self.persist_pct_var, width=8).pack(side="left", padx=4)

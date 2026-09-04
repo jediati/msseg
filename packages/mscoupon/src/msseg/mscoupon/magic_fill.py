@@ -28,9 +28,22 @@ arc saddles:
                  column's spread over the slice (so channels with different
                  units add up sensibly).
   bhattacharyya  per-channel Gaussian overlap from mean and std, summed.
+  cosine         1 - cos between the regions' whole statistics rows: every
+                 column except ids/positions (POSITIONAL_FIELDS), each
+                 z-scored over the slice. Ignores the channel list.
+  proba          total variation (half the L1) between the classifier's
+                 class-probability vectors, handed in as extra["proba"]
+                 (indexed by label id); a region the model never scored is
+                 at distance 1 from everything, so it joins last.
   barrier        |saddle - seed extremum value|: purely topological, the
                  persistence-style flood anchored at a point. Needs saddles,
                  so it is unavailable on the pixel fallback.
+
+The flood also takes a geometric HOP GAIN g >= 1: the accumulated cost of a
+path is the bottleneck inflated by g per hop, C(v_k) = max_i w_i * g^(k-i+1),
+so with g > 1 a region far from the seed costs more than an equally similar
+neighbour and the ladder is no longer flat across a homogeneous plateau. g = 1
+is the pure bottleneck; the HUD threshold then reads in the inflated units.
 
   anchor mode    every candidate is compared with the SEED (no drift).
   chain mode     each arc compares its two endpoints (follows gradients).
@@ -44,11 +57,22 @@ from __future__ import annotations
 import heapq
 import math
 
-METRICS = ("mean", "bhattacharyya", "barrier")
+METRICS = ("mean", "bhattacharyya", "cosine", "proba", "barrier")
 MODES = ("anchor", "chain")
 
 # Metrics that need the saddle value per arc (unavailable on pixel adjacency).
 EDGE_ONLY_METRICS = ("barrier",)
+# Metrics that read the channel list (the others use the whole row / extra).
+CHANNEL_METRICS = ("mean", "bhattacharyya")
+# Metrics that need a per-region array the table does not carry: metric -> the
+# key build_ladder expects in `extra`.
+EXTRA_METRICS = {"proba": "proba"}
+# Statistics columns that say WHERE a region is, not what it looks like --
+# never part of the cosine row (the labeler's classifier excludes the same).
+POSITIONAL_FIELDS = frozenset({"feature_id", "min_x", "max_x", "min_y", "max_y",
+                               "ext_x", "ext_y"})
+# Distance between probability vectors: "tv" (total variation) or "hellinger".
+PROBA_DIST = "tv"
 
 
 # --------------------------------------------------------------------------- #
@@ -126,60 +150,103 @@ def _std_floor(sd, m, np):
     return np.maximum(sd, floor)
 
 
-def node_dissimilarity(table, seed_row, metric, channels, np):
-    """d(seed, r) for every row r (anchor mode). float64[n_rows], 0 at the seed."""
+def row_vectors(table, metric, channels, np, extra=None):
+    """One vector per table row for `metric`, plus the distance kind that
+    compares them: ``(X float64[n_rows, d], kind)``. Every region metric goes
+    through here so node (seed vs all) and arc (a vs b) dissimilarities are
+    the same function applied to different index pairs."""
     if metric == "mean":
-        acc = None
-        for c in channels:
-            m = _column(table, f"mean_{c}", np)
-            z = (m - m[seed_row]) / _spread(m, np)
-            acc = z * z if acc is None else acc + z * z
-        if acc is None:
+        cols = [_column(table, f"mean_{c}", np) for c in channels]
+        if not cols:
             raise ValueError("no channels selected")
-        return np.sqrt(acc)
+        X = np.stack([(c - c.mean()) / _spread(c, np) for c in cols], axis=1)
+        return X, "euclidean"
     if metric == "bhattacharyya":
-        acc = None
-        for c in channels:
-            m = _column(table, f"mean_{c}", np)
-            sd = _std_floor(_column(table, f"std_{c}", np), m, np)
-            v1, v2 = sd[seed_row] ** 2, sd ** 2
-            bc = (0.25 * np.log(0.25 * (v1 / v2 + v2 / v1 + 2.0))
-                  + 0.25 * (m - m[seed_row]) ** 2 / (v1 + v2))
-            acc = bc if acc is None else acc + bc
-        if acc is None:
+        means = [_column(table, f"mean_{c}", np) for c in channels]
+        if not means:
             raise ValueError("no channels selected")
-        return acc
+        stds = [_std_floor(_column(table, f"std_{c}", np), m, np)
+                for c, m in zip(channels, means)]
+        X = np.concatenate([np.stack(means, axis=1), np.stack(stds, axis=1)], axis=1)
+        return X, "bhattacharyya"
+    if metric == "cosine":
+        names = [n for n in table.names if n not in POSITIONAL_FIELDS]
+        if not names:
+            raise ValueError("no statistics columns for cosine")
+        cols = []
+        for n in names:
+            c = _column(table, n, np).copy()
+            c[~np.isfinite(c)] = 0.0
+            cols.append((c - c.mean()) / _spread(c, np))
+        return np.stack(cols, axis=1), "cosine"
+    if metric == "proba":
+        P = None if extra is None else extra.get("proba")
+        if P is None:
+            raise ValueError("'proba' needs class probabilities (extra['proba']) "
+                             "- Classify first")
+        P = np.asarray(P, dtype=np.float64)
+        if P.ndim != 2:
+            raise ValueError("proba must be an (n_ids, n_classes) array")
+        ids = np.asarray(_column(table, "feature_id", np), dtype=np.intp)
+        X = np.zeros((len(ids), P.shape[1]), dtype=np.float64)
+        ok = (ids >= 0) & (ids < len(P))
+        X[ok] = P[ids[ok]]                      # ids outside P stay unscored
+        return X, str((extra or {}).get("dist") or PROBA_DIST)
     if metric in EDGE_ONLY_METRICS:
         raise ValueError(f"{metric!r} is an arc metric, not a region metric")
     raise ValueError(f"unknown metric {metric!r}")
 
 
-def edge_dissimilarity(table, ia, ib, metric, channels, np):
+def pairwise(X, I, J, kind, np):
+    """dist(X[I], X[J]) elementwise for index arrays I and J (either may be a
+    scalar, broadcasting against the other): float64."""
+    A = X[np.asarray(I, dtype=np.intp)]
+    B = X[np.asarray(J, dtype=np.intp)]
+    if kind == "euclidean":
+        return np.sqrt(((A - B) ** 2).sum(axis=-1))
+    if kind == "bhattacharyya":
+        k = X.shape[1] // 2
+        m1, s1 = A[..., :k], A[..., k:]
+        m2, s2 = B[..., :k], B[..., k:]
+        v1, v2 = s1 ** 2, s2 ** 2
+        bc = (0.25 * np.log(0.25 * (v1 / v2 + v2 / v1 + 2.0))
+              + 0.25 * (m1 - m2) ** 2 / (v1 + v2))
+        return bc.sum(axis=-1)
+    if kind == "cosine":
+        na = np.sqrt((A * A).sum(axis=-1))
+        nb = np.sqrt((B * B).sum(axis=-1))
+        dot = (A * B).sum(axis=-1)
+        denom = na * nb
+        ok = (na > 1e-12) & (nb > 1e-12)
+        safe = np.where(ok, denom, 1.0)              # no divide-by-zero warning
+        out = np.where(ok, 1.0 - dot / safe, 1.0)    # a zero vector: distance 1
+        return np.clip(np.asarray(out, dtype=np.float64), 0.0, 2.0)
+    if kind in ("tv", "hellinger"):
+        if kind == "tv":
+            d = 0.5 * np.abs(A - B).sum(axis=-1)
+        else:
+            d = np.sqrt(0.5 * ((np.sqrt(np.maximum(A, 0.0))
+                                - np.sqrt(np.maximum(B, 0.0))) ** 2).sum(axis=-1))
+        unscored = (A.sum(axis=-1) <= 0.0) | (B.sum(axis=-1) <= 0.0)
+        d = np.asarray(d, dtype=np.float64)
+        if np.ndim(d):
+            d[unscored] = 1.0
+        elif unscored:
+            d = np.float64(1.0)
+        return d
+    raise ValueError(f"unknown distance {kind!r}")
+
+
+def node_dissimilarity(table, seed_row, metric, channels, np, extra=None):
+    """d(seed, r) for every row r (anchor mode). float64[n_rows], 0 at the seed."""
+    X, kind = row_vectors(table, metric, channels, np, extra)
+    return pairwise(X, seed_row, np.arange(len(X)), kind, np)
+
+
+def edge_dissimilarity(table, ia, ib, metric, channels, np, extra=None):
     """d(a, b) per arc (chain mode). float64[n_arcs]."""
-    if metric == "mean":
-        acc = None
-        for c in channels:
-            m = _column(table, f"mean_{c}", np)
-            z = (m[ia] - m[ib]) / _spread(m, np)
-            acc = z * z if acc is None else acc + z * z
-        if acc is None:
-            raise ValueError("no channels selected")
-        return np.sqrt(acc)
-    if metric == "bhattacharyya":
-        acc = None
-        for c in channels:
-            m = _column(table, f"mean_{c}", np)
-            sd = _std_floor(_column(table, f"std_{c}", np), m, np)
-            v1, v2 = sd[ia] ** 2, sd[ib] ** 2
-            bc = (0.25 * np.log(0.25 * (v1 / v2 + v2 / v1 + 2.0))
-                  + 0.25 * (m[ia] - m[ib]) ** 2 / (v1 + v2))
-            acc = bc if acc is None else acc + bc
-        if acc is None:
-            raise ValueError("no channels selected")
-        return acc
-    if metric in EDGE_ONLY_METRICS:
-        raise ValueError(f"{metric!r} needs saddle values; use barrier_weights")
-    raise ValueError(f"unknown metric {metric!r}")
+    X, kind = row_vectors(table, metric, channels, np, extra)
+    return pairwise(X, ia, ib, kind, np)
 
 
 def barrier_weights(saddle, seed_ext_value, np):
@@ -189,7 +256,7 @@ def barrier_weights(saddle, seed_ext_value, np):
 
 
 def edge_weights(table, ia, ib, seed_row, metric, mode, channels, np,
-                 saddle=None, seed_ext_value=None):
+                 saddle=None, seed_ext_value=None, extra=None):
     """One weight per arc, whatever the metric/mode: the bottleneck search
     below only ever sees arcs."""
     if metric in EDGE_ONLY_METRICS:
@@ -199,10 +266,10 @@ def edge_weights(table, ia, ib, seed_row, metric, mode, channels, np,
             raise ValueError(f"{metric!r} needs the seed's extremum value (ext_filtered)")
         return barrier_weights(saddle, seed_ext_value, np)
     if mode == "anchor":
-        d = node_dissimilarity(table, seed_row, metric, channels, np)
+        d = node_dissimilarity(table, seed_row, metric, channels, np, extra)
         return np.maximum(d[ia], d[ib])
     if mode == "chain":
-        return edge_dissimilarity(table, ia, ib, metric, channels, np)
+        return edge_dissimilarity(table, ia, ib, metric, channels, np, extra)
     raise ValueError(f"unknown mode {mode!r}")
 
 
@@ -215,7 +282,10 @@ def bottleneck_join(n_nodes, ia, ib, w, seed, np, use_scipy=None):
     0 at the seed). Arcs are undirected.
 
     The minimax path lives on the minimum spanning tree, so with scipy this is
-    one MST plus a tree walk; without it, a heap-based minimax Dijkstra."""
+    one MST plus a tree walk; without it, a heap-based minimax Dijkstra.
+    This is the hop_gain = 1 reference (and test) API: build_ladder uses
+    growth_order, which also yields the flood order and takes the gain (a
+    path-length term the MST cannot express)."""
     n = int(n_nodes)
     join = np.full(max(n, 1), np.inf, dtype=np.float64)
     if n == 0:
@@ -287,18 +357,26 @@ def _csr(n, ia, ib, w, np):
     return dst.tolist(), ww.tolist(), indptr.tolist()
 
 
-def growth_order(n_nodes, ia, ib, w, seed, np, node_key=None):
+def growth_order(n_nodes, ia, ib, w, seed, np, node_key=None, hop_gain=1.0):
     """Priority flood from the seed: ``(order, join)``.
 
-    `join` is the bottleneck cost of bottleneck_join(); `order` lists the
-    reachable nodes in the order the flood admits them -- non-decreasing join,
-    ties broken by a secondary key: ``node_key[v]`` when given (anchor mode:
-    the region's own dissimilarity to the seed), else the weight of the arc
-    the node is entered through (chain / barrier). Every prefix of `order` is
-    connected to the seed, which is what makes a rank on it a usable drag
-    axis when many regions tie (see the module docstring). Unreached nodes
-    follow in index order with join inf."""
+    `join` is the bottleneck cost of bottleneck_join() inflated by `hop_gain`
+    per hop -- along seed=v0..vk, ``C(vk) = max_i w_i * g**(k-i+1)`` -- so
+    g = 1 is the bottleneck exactly and g > 1 makes distance from the seed
+    cost something. The label-setting search only needs the extension
+    ``f(c, w) = max(c, w) * g`` to be >= c and monotone in c, which holds for
+    g >= 1 and w >= 0 (g < 1 raises). `order` lists the reachable nodes in
+    the order the flood admits them -- non-decreasing join, ties broken by a
+    secondary key: ``node_key[v]`` when given (anchor mode: the region's own
+    dissimilarity to the seed), else the weight of the arc the node is entered
+    through (chain / barrier). Every prefix of `order` is connected to the
+    seed (each popped node was pushed by a popped neighbour), which is what
+    makes a rank on it a usable drag axis when many regions tie (see the
+    module docstring). Unreached nodes follow in index order with join inf."""
     n = int(n_nodes)
+    g = float(hop_gain)
+    if not g >= 1.0:
+        raise ValueError(f"hop_gain must be >= 1, got {hop_gain!r}")
     join = np.full(max(n, 1), np.inf, dtype=np.float64)
     if n == 0:
         return np.zeros(0, dtype=np.intp), join
@@ -326,7 +404,7 @@ def growth_order(n_nodes, ia, ib, w, seed, np, node_key=None):
             if done[v]:
                 continue
             wk = ww[k]
-            p1 = c1 if c1 > wk else wk
+            p1 = (c1 if c1 > wk else wk) * g
             p2 = nk[v] if nk is not None else wk
             if p1 < b1[v] or (p1 == b1[v] and p2 < b2[v]):
                 b1[v] = p1
@@ -374,11 +452,16 @@ class Ladder:
     drag never goes past it."""
 
     __slots__ = ("ids", "join", "order", "sorted_join", "cum_area", "n_reach",
-                 "seed_id", "seed_row", "metric", "mode", "channels")
+                 "seed_id", "seed_row", "metric", "mode", "channels", "ia", "ib",
+                 "hop_gain")
 
     def __init__(self, ids, join, order, sorted_join, cum_area, n_reach,
-                 seed_id, seed_row, metric, mode, channels):
+                 seed_id, seed_row, metric, mode, channels, ia=None, ib=None,
+                 hop_gain=1.0):
         self.ids = ids
+        self.hop_gain = float(hop_gain)
+        self.ia = ia                   # the arc graph in ROW space (ring queries)
+        self.ib = ib
         self.join = join
         self.order = order
         self.sorted_join = sorted_join
@@ -391,12 +474,18 @@ class Ladder:
         self.channels = tuple(channels)
 
 
-def build_ladder(table, arcs, seed_id, metric, mode, channels, np):
-    """Join ladder for `seed_id` (a label id present in `table`)."""
+def build_ladder(table, arcs, seed_id, metric, mode, channels, np,
+                 hop_gain=1.0, extra=None):
+    """Join ladder for `seed_id` (a label id present in `table`). `extra`
+    carries what the table does not (``{"proba": (K, C)}`` for the proba
+    metric); `hop_gain` is the flood's per-hop multiplier (>= 1)."""
     if metric not in METRICS:
         raise ValueError(f"unknown metric {metric!r}")
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}")
+    need = EXTRA_METRICS.get(metric)
+    if need is not None and (extra is None or extra.get(need) is None):
+        raise ValueError(f"{metric!r} needs {need} (extra[{need!r}]) - Classify first")
     fid = table.column("feature_id")
     if fid is None:
         raise ValueError("feature table has no feature_id column")
@@ -421,19 +510,21 @@ def build_ladder(table, arcs, seed_id, metric, mode, channels, np):
     if metric not in EDGE_ONLY_METRICS and mode == "anchor":
         # Anchor mode: the region's own dissimilarity is both the arc weight
         # ingredient and the tie-breaker (most seed-like first).
-        node_key = node_dissimilarity(table, seed_row, metric, channels, np)
+        node_key = node_dissimilarity(table, seed_row, metric, channels, np, extra)
         w = np.maximum(node_key[ia], node_key[ib])
     else:
         w = edge_weights(table, ia, ib, seed_row, metric, mode, channels, np,
-                         saddle=saddle, seed_ext_value=seed_ext)
-    order, join = growth_order(len(ids), ia, ib, w, seed_row, np, node_key=node_key)
+                         saddle=saddle, seed_ext_value=seed_ext, extra=extra)
+    order, join = growth_order(len(ids), ia, ib, w, seed_row, np,
+                               node_key=node_key, hop_gain=hop_gain)
     sorted_join = join[order]
     n_reach = int(np.count_nonzero(np.isfinite(join)))
     area = table.column("area")
     cum_area = (np.cumsum(np.asarray(area, dtype=np.int64)[order])
                 if area is not None else None)
     return Ladder(ids, join, order, sorted_join, cum_area, n_reach,
-                  seed_id, seed_row, metric, mode, channels)
+                  seed_id, seed_row, metric, mode, channels, ia=ia, ib=ib,
+                  hop_gain=hop_gain)
 
 
 def regions_for_rank(ladder, k):
@@ -442,6 +533,24 @@ def regions_for_rank(ladder, k):
     n = ladder.n_reach
     k = min(max(int(k), 1), max(n, 1))
     return ladder.ids[ladder.order[:k]]
+
+
+def ring_for_rank(ladder, k, np):
+    """Label ids of the regions ADJACENT to the first k in flood order and not
+    among them -- the blobber's ring: what a fill of rank k is bounded by.
+    Empty once the fill has taken every reachable region."""
+    n_rows = len(ladder.ids)
+    if n_rows == 0 or ladder.ia is None or len(ladder.ia) == 0:
+        return ladder.ids[:0]
+    n = ladder.n_reach
+    k = min(max(int(k), 1), max(n, 1))
+    inside = np.zeros(n_rows, dtype=bool)
+    inside[ladder.order[:k]] = True
+    ia, ib = ladder.ia, ladder.ib
+    ring = np.zeros(n_rows, dtype=bool)
+    ring[ia[inside[ib] & ~inside[ia]]] = True
+    ring[ib[inside[ia] & ~inside[ib]]] = True
+    return ladder.ids[ring]
 
 
 def regions_at(ladder, t, np):
