@@ -206,7 +206,18 @@ readout formatted from the `_make_model` constants). `MscouponApp` grew three
 layout hooks (`_build_center`, `_profile_tools_parent`, `_processing_parent`)
 whose defaults reproduce the viewer's tree exactly; the labeler overrides them
 rather than forking `_build_left`. The selected tab is `view.center_tab` in the
-session.
+session. Two more hooks (`_build_left_shell`, `_left_section_parent`,
+`_session_group`) let the labeler drop the left scroll frame for a vertical
+`ttk.PanedWindow` over the session's three lists with Run packed first at the
+bottom. **Previews compute channels**: `_preview_channel` runs the base chain /
+filter chain / `stat_channel_images` on the raw preview array (memoised per
+path, channel and params), so the Image dropdown shows any derived field
+before a Run; an unprimed sequence-tree row previews like a file-list click.
+Two link-labels -- heading the Run section and the classifier section
+respectively -- show the active workflow rendered by
+`session.profile_summary` (two lines: `topo field: base→b(1.5)→e(0.7)→msc(asc, 10%)`
+and `stats: base→norm(gmm)→12ch×4`, polled every 0.7 s from the panel) and the active model -- each a
+click away from its tab.
 
 **mscoupon extremum statistics** (`ext_x`, `ext_y`, `ext_base`, `ext_filtered`):
 the per-slice selection chain can also ask about a region's **seeding critical

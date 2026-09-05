@@ -49,6 +49,80 @@ from . import session
 # --------------------------------------------------------------------------- #
 # Application
 # --------------------------------------------------------------------------- #
+# Byte budget for channels computed on previews (a 3232^2 float32 raster is
+# ~42 MB): the base chain (a GMM normalize is ~5 s) and a wide blur (~3.5 s at
+# sigma 64) must survive a few channel switches.
+_PREVIEW_CHAN_BUDGET = 640 * 1024 * 1024
+
+
+class _RasterCache:
+    """LRU of numpy rasters under a byte budget. Evicting by count was the
+    wrong unit: a stack of derived channels is a handful of ~40 MB planes,
+    and clearing the lot on the fifth entry re-ran a 5 s normalize."""
+
+    def __init__(self, budget):
+        from collections import OrderedDict
+        self.budget = int(budget)
+        self._d = OrderedDict()
+        self.nbytes = 0
+
+    def get(self, key):
+        hit = self._d.get(key)
+        if hit is not None:
+            self._d.move_to_end(key)
+        return hit
+
+    def put(self, key, raster):
+        old = self._d.pop(key, None)
+        if old is not None:
+            self.nbytes -= int(old.nbytes)
+        self._d[key] = raster
+        self.nbytes += int(raster.nbytes)
+        while self.nbytes > self.budget and len(self._d) > 1:
+            _k, v = self._d.popitem(last=False)
+            self.nbytes -= int(v.nbytes)
+
+    def clear(self):
+        self._d.clear()
+        self.nbytes = 0
+
+    def __len__(self):
+        return len(self._d)
+
+
+def single_channel_params(params_json, name):
+    """`params_json` with its statistics block cut down to the ONE derived
+    channel `name` (its kind at its sigma, keeping the card's other keys such
+    as hessian's sort_by_absolute_value), or None when `name` is not a
+    derived channel of the spec.
+
+    stat_channel_images builds every channel a spec names; asking for one
+    plane out of a twelve-channel spec used to pay for all twelve -- and a
+    blur at sigma 64 is ~3.5 s at 3232^2 on its own. Each channel's response
+    is independent of the others, so a one-channel spec yields the same
+    raster."""
+    try:
+        card = next(c for c in config_io.stat_channels(params_json)
+                    if c.get("name") == name)
+    except StopIteration:
+        return None
+    kind = card.get("kind")
+    if kind in ("base", "filtered") or not kind:
+        return None
+    doc = json.loads(params_json)
+    stats = dict(doc.get("statistics") or {})
+    keep = {}
+    for c in stats.get("channels") or []:
+        if isinstance(c, dict) and c.get("kind") == kind:
+            keep = {k: v for k, v in c.items() if k != "sigmas"}
+            break
+    keep["kind"] = kind
+    keep["sigmas"] = [float(card.get("sigma", 0.0))]
+    stats["channels"] = [keep]
+    doc["statistics"] = stats
+    return json.dumps(doc)
+
+
 class MscouponApp:
     # The per-app session-file identity (config_io.session_path(app=...));
     # subclasses (the labeler) override it so their sessions never collide.
@@ -134,6 +208,10 @@ class MscouponApp:
         self._preview_after = None
         self._preview_path = None
         self._preview_cache = {}                          # path -> float32 array (LRU)
+        # Channels computed ON a preview (base chain / topology chain / derived
+        # scale-space responses), keyed by (path, channel, params): the Image
+        # dropdown works before any Run, through the same chains a run applies.
+        self._preview_chan_cache = _RasterCache(_PREVIEW_CHAN_BUDGET)
         self.autosave_var = tk.BooleanVar(value=bool(autosave))
 
         # --- layout ------------------------------------------------------ #
@@ -148,8 +226,7 @@ class MscouponApp:
         # filter/query cards are added, so it scrolls: a canvas carries the real
         # panel and `self.left` IS that inner frame, which leaves _build_left()
         # and every section below it untouched.
-        self.left_pane = ScrollFrame(self.paned, width=376, canvas_width=360)
-        self.left = self.left_pane.inner
+        self._build_left_shell()
 
         self.paned.add(self.left_pane, weight=0)
         # The center pane is a hook: the viewer wants one frame (`self.right`),
@@ -157,6 +234,9 @@ class MscouponApp:
         self._build_center()
         self._build_left()
         self._build_right()
+        # Offer the profile's channels from the start: a preview (no Run) can
+        # show any of them.
+        self._refresh_channel_picker()
 
         ttk.Label(root, textvariable=self.status_var, relief="sunken", anchor="w").pack(
             side="bottom", fill="x")
@@ -286,6 +366,7 @@ class MscouponApp:
     def _build_toolbar(self, parent):
         bar = ttk.Frame(parent)
         bar.pack(side="top", fill="x")
+        self.toolbar = bar
         self.save_session_btn = ttk.Button(bar, text="Save session…",
                                            command=self._save_session_as)
         self.save_session_btn.pack(side="left", padx=(6, 2), pady=3)
@@ -436,23 +517,31 @@ class MscouponApp:
             return p["base"][li]
         if not hasattr(engine, "stat_channel_images"):
             return p["base"][li]
+        # One-channel spec: the bank builds every channel it is asked for,
+        # and only this plane is wanted.
+        params = single_channel_params(self._params_json(), name)
+        if params is None:
+            return p["base"][li]
+        t0 = time.perf_counter()
         try:
             names, imgs = engine.stat_channel_images(
                 np.asarray(p["base"][li], dtype=np.float32),
-                np.asarray(p["filtered"][li], dtype=np.float32),
-                self._params_json())
+                np.asarray(p["filtered"][li], dtype=np.float32), params)
         except Exception as exc:
             log(f"channel '{name}' unavailable: {exc}")
             return p["base"][li]
         names = list(names)
+        log(f"channel {name} for slice {si}:{li}: "
+            f"{1e3 * (time.perf_counter() - t0):.0f}ms ({len(names)} plane(s))")
         if name not in names:
             return p["base"][li]
-        # Keep only the requested plane; holding all C would defeat the point.
-        raster = np.array(imgs[names.index(name)], copy=True)
         if len(self._chan_cache) > 8:
             self._chan_cache.clear()
-        self._chan_cache[key] = raster
-        return raster
+        # A kind can yield several planes per sigma (hessian: largest +
+        # smallest); keep them all, they came for free.
+        for k, n in enumerate(names):
+            self._chan_cache[(si, li, n)] = np.array(imgs[k], copy=True)
+        return self._chan_cache[key]
 
     def _refresh_stat_summary(self):
         """Show the resolved channel count and field count -- the two numbers that
@@ -500,6 +589,29 @@ class MscouponApp:
     # subclass can re-lay the window without forking the builders. The
     # defaults reproduce the viewer's tree exactly: one center frame, and
     # every section in the scrolling left panel.
+    def _build_left_shell(self):
+        """Create the left pane (`self.left_pane`, added to the paned window by
+        the caller) and the frame the sections pack into (`self.left`).
+
+        The viewer's six sections outgrow the window as soon as a few filter /
+        query cards are added, so its panel scrolls: a canvas carries the real
+        panel and `self.left` IS that inner frame."""
+        self.left_pane = ScrollFrame(self.paned, width=376, canvas_width=360)
+        self.left = self.left_pane.inner
+
+    def _left_section_parent(self, section):
+        """Parent for a left-panel section: "profile", "session" or "run"."""
+        return self.left
+
+    def _session_group(self, name, section):
+        """Container for one group of the Session section -- "folders",
+        "files" or "sequences" -- inside the section's LabelFrame. A plain
+        frame here; the labeler makes them the panes of a vertical paned
+        window so the lists can be resized against each other."""
+        f = ttk.Frame(section)
+        f.pack(fill="x")
+        return f
+
     def _build_center(self):
         """Create the center pane (`self.right`) and add it to the paned window."""
         self.right = ttk.Frame(self.paned, width=900)
@@ -520,8 +632,9 @@ class MscouponApp:
     # ------------------------------------------------------------------ #
     def _build_left(self):
         # 0. Compute profile: the named parameter set the panel below edits.
-        c = ttk.LabelFrame(self.left, text="0. Compute profile")
+        c = ttk.LabelFrame(self._left_section_parent("profile"), text="0. Compute profile")
         c.pack(fill="x", padx=6, pady=4)
+        self.profile_frame = c
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
         self.profile_var = tk.StringVar(value=self.profiles[0]["name"])
         self.profile_combo = ttk.Combobox(row, textvariable=self.profile_var,
@@ -545,23 +658,31 @@ class MscouponApp:
         self._refresh_profile_combo()
 
         # 1. Session: data folders and the sequences made from them.
-        c = ttk.LabelFrame(self.left, text="1. Session")
+        c = ttk.LabelFrame(self._left_section_parent("session"), text="1. Session")
         c.pack(fill="x", padx=6, pady=4)
-        ttk.Label(c, text="Folders:").pack(anchor="w", padx=4)
-        self.folder_list = self._scrolled_listbox(c, height=4, exportselection=False)
+        self.session_frame = c
+        # Three groups (folders / files / sequences); each one's buttons are
+        # named so a subclass can re-pack them against a resizable list.
+        g = self._session_group("folders", c)
+        ttk.Label(g, text="Folders:").pack(anchor="w", padx=4)
+        self.folder_list = self._scrolled_listbox(g, height=4, exportselection=False)
         self.folder_list.bind("<<ListboxSelect>>", self._on_folder_selected)
-        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
+        row = ttk.Frame(g); row.pack(fill="x", padx=4, pady=2)
+        self.folder_btn_row = row
         ttk.Button(row, text="Add folder…", command=self._add_folder).pack(side="left")
         ttk.Button(row, text="Remove", command=self._remove_folder).pack(side="left", padx=4)
         # Production folders hold thousands of files -> scrollable list.
         # Clicking / dragging over the list previews the image on the right.
-        self.file_list = self._scrolled_listbox(c, selectmode="extended", height=10,
+        g = self._session_group("files", c)
+        self.file_list = self._scrolled_listbox(g, selectmode="extended", height=10,
                                                 exportselection=False)
         self._bind_preview()
-        ttk.Button(c, text="Make sequence from selection",
-                   command=self._make_subsequence).pack(fill="x", padx=4, pady=2)
-        ttk.Label(c, text="Sequences:").pack(anchor="w", padx=4)
-        holder = ttk.Frame(c); holder.pack(fill="x", padx=4, pady=2)
+        self.make_seq_btn = ttk.Button(g, text="Make sequence from selection",
+                                       command=self._make_subsequence)
+        self.make_seq_btn.pack(fill="x", padx=4, pady=2)
+        g = self._session_group("sequences", c)
+        ttk.Label(g, text="Sequences:").pack(anchor="w", padx=4)
+        holder = ttk.Frame(g); holder.pack(fill="x", padx=4, pady=2)
         self.subseq_list = ttk.Treeview(holder, columns=("msc", "annot"),
                                         height=7, selectmode="extended")
         self.subseq_list.heading("#0", text="sequence / image")
@@ -577,7 +698,8 @@ class MscouponApp:
         self.subseq_list.pack(side="left", fill="both", expand=True)
         # Clicking a TIFF row under a sequence navigates the viewer to it.
         self.subseq_list.bind("<<TreeviewSelect>>", self._on_seq_tree_select)
-        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
+        row = ttk.Frame(g); row.pack(fill="x", padx=4, pady=2)
+        self.seq_btn_row = row
         ttk.Button(row, text="Remove", command=self._remove_subsequence).pack(side="left")
         ttk.Button(row, text="Clear all", command=self._clear_subsequences).pack(side="left", padx=4)
 
@@ -627,8 +749,9 @@ class MscouponApp:
         self._build_statistics_panel()
 
         # 6. Run
-        c = ttk.LabelFrame(self.left, text="6. Run")
+        c = ttk.LabelFrame(self._left_section_parent("run"), text="6. Run")
         c.pack(fill="x", padx=6, pady=4)
+        self.run_frame = c
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="Cores/slice:").pack(side="left")
         ttk.Entry(row, textvariable=self.cores_per_slice_var, width=5).pack(side="left", padx=(2, 10))
@@ -916,9 +1039,19 @@ class MscouponApp:
         left, li = sel[0].split(":")
         try:
             si, li = int(left[1:]), int(li)
+        except ValueError:
+            return
+        try:
             idx = self.flat_slices.index((si, li))
         except ValueError:
-            return                        # not primed yet -> nothing to show
+            # Not primed (yet): preview the slice as a click in the file list
+            # would -- a sequence is browsable before any Run.
+            try:
+                path = self.subsequences[si]["files"][li]
+            except (IndexError, KeyError, TypeError):
+                return
+            self._preview_file(path)
+            return
         if idx != int(round(float(self.slice_var.get()))):
             self._goto_slice(idx)
 
@@ -981,7 +1114,12 @@ class MscouponApp:
         self._preview_after = None
         if self.viewer is None or not (0 <= idx < len(self.all_files)):
             return
-        path = self.all_files[idx]
+        self._preview_file(self.all_files[idx])
+
+    def _preview_file(self, path):
+        """Show one TIFF without priming: the Image dropdown's channel of it."""
+        if self.viewer is None:
+            return
         arr = self._preview_cache.get(path)
         if arr is None:
             try:
@@ -1010,24 +1148,136 @@ class MscouponApp:
             # Re-insert for LRU recency.
             self._preview_cache[path] = self._preview_cache.pop(path)
         first = self.viewer._base is None and self.viewer._source is None
-        self.viewer.set_base(array=arr, path=path)
         self._preview_path = path
+        self._render_preview(first)
+
+    def _render_preview(self, first=False):
+        """Paint the active preview in the Image dropdown's channel."""
+        path = self._preview_path
+        arr = self._preview_cache.get(path)
+        if arr is None:
+            # Path-only (pyramidal) preview: no array to compute channels on.
+            self.viewer.set_window(self.vmin_var.get(), self.vmax_var.get())
+            self.viewer.fit() if first else self.viewer.render()
+            return
+        channel = self.background_var.get()
+        raster = self._preview_channel(arr, path, channel)
+        # The path doubles as the pyramidal source only for the raw base.
+        self.viewer.set_base(array=raster, path=path if raster is arr else None)
         self.viewer.set_overlays([])
         self.viewer.set_window(self.vmin_var.get(), self.vmax_var.get())
         if first:
             self.viewer.fit()
         else:
             self.viewer.render()
-        self.status_var.set(f"preview: {os.path.basename(path)}")
+        # Replaces any "computing …" line _preview_channel left behind.
+        shown = "" if raster is arr else f"  [{channel}]"
+        self.status_var.set(f"preview: {os.path.basename(path)}{shown}")
+
+    def _preview_channel(self, arr, path, channel):
+        """The named channel of a preview slice, computed on the spot.
+
+        "base" is the raw slice through the base chain (the raw array itself
+        when that chain is empty), "filtered" is the topology chain's output,
+        and a derived name is the scale-space response the statistics spec
+        defines -- each through the SAME calls a run makes (engine.filter_slice
+        / _apply_base_chain / stat_channel_images), so what is previewed is
+        what priming will measure. Any failure (no extension, unknown name)
+        falls back to the raw slice.
+
+        Memoised per path under a byte budget, and each entry is keyed on
+        exactly the parameters that produce it: the base chain on
+        `base_filters`, the filtered field on `filters`, a derived channel on
+        its own one-channel spec. Keying everything on the whole params JSON
+        made a sigma edit re-run the base chain's GMM (~5 s at 3232^2), and
+        computing the spec's whole bank for one plane charged every other
+        channel's sigma to each switch. Every step is timed to the log."""
+        params = self._params_json()
+        try:
+            import numpy as np
+            from msseg import mscoupon as engine
+        except Exception:
+            return arr
+        doc = json.loads(params)
+        base_filters = doc.get("base_filters") or []
+        filters = doc.get("filters") or []
+        stem = os.path.basename(path)
+        cache = self._preview_chan_cache
+        try:
+            if channel in ("", "base"):
+                if not base_filters:
+                    return arr
+                key = (path, "base", json.dumps(base_filters, sort_keys=True))
+                hit = cache.get(key)
+                if hit is not None:
+                    return hit
+                self.status_var.set(f"preview: applying the base chain to {stem}…")
+                self.root.update_idletasks()
+                t0 = time.perf_counter()
+                raster, _ = self.engine._apply_base_chain(arr, base_filters, engine, log)
+                log(f"preview base chain on {stem}: "
+                    f"{1e3 * (time.perf_counter() - t0):.0f}ms")
+                cache.put(key, raster)
+                return raster
+            if channel == "filtered":
+                if not filters:
+                    return arr
+                key = (path, "filtered", json.dumps(filters, sort_keys=True))
+                hit = cache.get(key)
+                if hit is not None:
+                    return hit
+                self.status_var.set(f"preview: applying the filter chain to {stem}…")
+                self.root.update_idletasks()
+                t0 = time.perf_counter()
+                cur = arr
+                for f in filters:
+                    cur = engine.filter_slice(cur, json.dumps({"filter": f}))
+                raster = np.ascontiguousarray(cur, dtype=np.float32)
+                log(f"preview filter chain on {stem}: "
+                    f"{1e3 * (time.perf_counter() - t0):.0f}ms")
+                cache.put(key, raster)
+                return raster
+            if not hasattr(engine, "stat_channel_images"):
+                return arr
+            single = single_channel_params(params, channel)
+            if single is None:
+                return arr
+            # The derived channel depends on the base chain too (it is
+            # measured on the base raster), so that rides in the key.
+            spec_key = json.dumps({"base": base_filters,
+                                   "stat": json.loads(single).get("statistics")},
+                                  sort_keys=True)
+            key = (path, channel, spec_key)
+            hit = cache.get(key)
+            if hit is not None:
+                return hit
+            base = self._preview_channel(arr, path, "base")
+            filt = self._preview_channel(arr, path, "filtered")
+            self.status_var.set(f"preview: computing {channel} on {stem}…")
+            self.root.update_idletasks()
+            t0 = time.perf_counter()
+            names, imgs = engine.stat_channel_images(
+                np.asarray(base, dtype=np.float32),
+                np.asarray(filt, dtype=np.float32), single)
+            names = list(names)
+            log(f"preview channel {channel} on {stem}: "
+                f"{1e3 * (time.perf_counter() - t0):.0f}ms ({len(names)} plane(s))")
+            if channel not in names:
+                return arr
+            for k, n in enumerate(names):          # hessian: two planes per sigma
+                cache.put((path, n, spec_key), np.array(imgs[k], copy=True))
+            return cache.get(key)
+        except Exception as exc:
+            log(f"preview channel '{channel}' unavailable: {exc}")
+            return arr
 
     def _repreview_if_active(self):
-        """Re-apply the base window to an active preview. The window sliders
-        call _refresh_render, which early-returns while nothing is primed --
-        this keeps them live for previews too."""
+        """Repaint an active preview. The window sliders, the Image dropdown
+        and the parameter panels all call _refresh_render, which early-returns
+        while nothing is primed -- this keeps them live for previews too."""
         if (self.viewer is not None and self._preview_path is not None
                 and not self.primed):
-            self.viewer.set_window(self.vmin_var.get(), self.vmax_var.get())
-            self.viewer.render()
+            self._render_preview()
 
     # ------------------------------------------------------------------ #
     # Right panel
@@ -2606,6 +2856,14 @@ def _selftest():
     assert len(app.subseq_list.get_children("q0")) == 3
     assert app.subseq_list.item("q0:0", "text") == "asdf_0011.tiff"
     assert tuple(app.subseq_list.item("q0:0", "values")) == ("", "")
+    # Selecting a TIFF row of a sequence that is not primed previews it (the
+    # file does not exist, so this exercises the path-only fallback).
+    app._preview_path = None
+    app.subseq_list.selection_set("q1:1")
+    app._on_seq_tree_select()
+    if app.viewer is not None:
+        assert app._preview_path == app.subsequences[1]["files"][1]
+    app.subseq_list.selection_remove("q1:1")
 
     # Preview plumbing (pure parts): a click schedules a debounced load; a
     # missing file falls back without raising and still records the preview.
@@ -2624,6 +2882,70 @@ def _selftest():
     assert app.filter_cards[0]["operation"] == "blur"
     assert app.filter_cards[-1]["operation"] == "none"
     app.filter_cards[0]["params"]["sigma"] = 2.0
+
+    # Channels on a PREVIEW (nothing primed): the topology chain and the
+    # derived channels are computed on the spot from the raw array through
+    # the run's own calls, memoised per (path, channel, params), and an
+    # unknown name falls back to the raw slice.
+    try:
+        import numpy as np
+        from msseg import mscoupon as _ext   # noqa: F401
+        have_ext = True
+    except Exception:
+        have_ext = False
+    if have_ext and app.viewer is not None:
+        raw = np.random.default_rng(0).random((32, 32), dtype=np.float32)
+        fake = os.path.join(data_dir, "fake.tiff")
+        app._preview_cache[fake] = raw
+        app._preview_path = fake
+        assert app._preview_channel(raw, fake, "base") is raw, "empty base chain -> raw"
+        filt = app._preview_channel(raw, fake, "filtered")
+        assert filt.shape == raw.shape and not np.array_equal(filt, raw), "blur applied"
+        assert app._preview_channel(raw, fake, "filtered") is filt, "memoised"
+        app.stat_kind_vars["edges"][0].set(True)
+        app._on_stat_spec_change()
+        derived = [n for n in app._stat_channel_names() if n.startswith("edges_")]
+        assert derived, app._stat_channel_names()
+        assert derived[0] in app.background_combo.cget("values"), "picker offers it before a Run"
+        e = app._preview_channel(raw, fake, derived[0])
+        assert e.shape == raw.shape and e is not raw
+        assert app._preview_channel(raw, fake, derived[0]) is e, "memoised"
+        assert app._preview_channel(raw, fake, "no_such_channel") is raw
+        # A derived request is cut down to a one-channel spec (the bank would
+        # otherwise build every channel of the profile for one plane), and
+        # the memo keys are the parameters that PRODUCE each raster: editing
+        # another kind's sigmas must not invalidate the filtered field.
+        one = json.loads(single_channel_params(app._params_json(), derived[0]))
+        assert one["statistics"]["channels"] == [{"kind": "edges", "sigmas": [0.7]}], one
+        assert single_channel_params(app._params_json(), "base") is None
+        assert single_channel_params(app._params_json(), "nope") is None
+        app.stat_kind_vars["blur"][0].set(True)
+        app.stat_kind_vars["blur"][1].set("2, 4")
+        app._on_stat_spec_change()
+        assert app._preview_channel(raw, fake, "filtered") is filt, "unaffected by the spec"
+        assert app._preview_channel(raw, fake, derived[0]) is e, "unaffected by another kind"
+        h = json.loads(single_channel_params(
+            app._params_json(), "blur_s4"))
+        assert h["statistics"]["channels"] == [{"kind": "blur", "sigmas": [4.0]}], h
+        app.stat_kind_vars["blur"][0].set(False)
+        app._on_stat_spec_change()
+        # The cache is byte-budgeted, not counted: the most recent entries
+        # survive and the total stays under budget.
+        small = _RasterCache(3 * raw.nbytes)
+        for i in range(5):
+            small.put(("k", i), raw.copy())
+        assert len(small) == 3 and small.nbytes <= 3 * raw.nbytes
+        assert small.get(("k", 4)) is not None and small.get(("k", 0)) is None
+        app.background_var.set(derived[0])
+        app._refresh_render()                  # the dropdown's path, unprimed
+        assert app.viewer._base is not None and app.viewer._base.shape == raw.shape
+        assert np.array_equal(app.viewer._base, e), "the preview shows the derived channel"
+        app.background_var.set("base")
+        app.stat_kind_vars["edges"][0].set(False)
+        app._on_stat_spec_change()
+        app._preview_cache.pop(fake, None)
+        app._preview_chan_cache.clear()
+        app._preview_path = None
 
     # Base channel: a normalize stage, on its own independent chain.
     app._on_filter_op_change(0, "normalize", "base")
@@ -2977,7 +3299,7 @@ def _selftest():
         assert app.filter_cards[0]["operation"] == "blur", "v1 filters imported"
         assert float(app.alpha_var.get()) == 0.25
         assert app.persist_live_var.get() == "5"
-    print("selftest OK: session (folders/sequences/preview), filters, base chain, "
+    print("selftest OK: session (folders/sequences/preview + preview channels), filters, base chain, "
           "stat channels, assembly tiers, per-slice selection, pixel trim, "
           "profiles + switch + file round-trip, session v2 round-trip, legacy import")
     root.destroy()

@@ -42,6 +42,8 @@ parameters that produced it have just been replaced; click *Run* again.
 1. **Sequences** — browse a folder; ctrl-select contiguous runs and
    *Make subsequence from selection*. Each subsequence is processed as its own 3D
    stack (e.g. `asdf_0011..0013` + `asdf_0025..0026` → two subsequences).
+   Clicking a TIFF in the file list, or a TIFF row of a sequence that is not
+   primed, **previews** it on the right without a Run.
 2. **Filter chain** — pick a filter type to populate its parameter widgets; a
    trailing "none" card lets you append more (chain e.g. morphology → edges).
    Types: `blur, derivative, laplacian, zero_crossings, hessian_eigenvalues,
@@ -61,6 +63,11 @@ parameters that produced it have just been replaced; click *Run* again.
   `max_edges_s0.7` can be looked at on the raster it is thresholding. A derived
   channel is computed for the displayed slice on demand and memoised — holding
   a twelve-channel stack for every primed slice would dominate memory.
+  The dropdown also works on a **preview** (nothing primed yet): `filtered` runs
+  the filter chain on the raw slice, `base` runs the base chain, and a derived
+  name computes that scale-space response — through the same calls priming
+  makes, so what is previewed is what a Run will measure. Results are memoised
+  per slice, channel and parameter set, and recomputed when a parameter changes.
 - **Slice slider (top)** — a single slider linearized over *all* subsequences'
   slices (shown when > 1 TIFF); crossing a boundary switches the active stack.
 - **Persistence %** — live re-threshold via native cancellation (cheap; no MSC
@@ -212,6 +219,13 @@ log. Two streams, both intentionally verbose:
     count after priming.
   - GUI (on a persistence/query change): persistence %, 2D features total + size-
     gated, 3D feature count, and how many pass the feature-query chain.
+  - GUI (preview channels): one timed line per computation -- `preview base
+    chain on X: 4975ms`, `preview channel blur_s64 on X: 3417ms (1 plane(s))` --
+    so a slow Image-dropdown switch names its cost. A derived channel is built
+    from a one-channel spec (not the profile's whole bank), and the base chain,
+    the filtered field and each channel are memoised on exactly the parameters
+    that produce them, under a byte budget; a GMM normalize is ~5 s and a blur
+    at sigma 64 ~3.5 s on 3232², each paid once per slice.
   - CLI: a startup config summary, then one line per slice
     (`image[min,max] filtered[min,max] regions=N kept=M`).
 

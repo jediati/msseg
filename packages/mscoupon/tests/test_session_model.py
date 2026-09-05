@@ -247,3 +247,27 @@ def test_legacy_unreadable_docs():
     notes = []
     doc = legacy_docs_to_session([("bad.json", None)], notes)
     assert doc["sequences"] == [] and notes
+
+
+def test_profile_summary_compact_chain():
+    p = default_profile()
+    assert session.profile_summary(p) == ("topo field: base→msc(asc, 10%, mf)\n"
+                                          "stats: base→1ch×4")
+    p["filters"] = [{"operation": "blur", "params": {"sigma": 1.5}},
+                    {"operation": "none", "params": {}},
+                    {"operation": "edges", "params": {"sigma": 0.7, "output": "mask"}}]
+    p["base_filters"] = [{"operation": "normalize", "params": {"method": "gmm"}}]
+    p["msc"].update({"manifold": "descending", "simplification": "msc",
+                     "persistence_percent": 2.5})
+    p["statistics"] = config_io.statistics_to_json(
+        [{"kind": "base"}, {"kind": "hessian", "sigmas": [1.0, 2.0]}],
+        ["mean", "max"], True, 0, False)
+    assert session.profile_summary(p) == ("topo field: base→b(1.5)→e(0.7)→msc(dsc, 2.5%)\n"
+                                          "stats: base→norm(gmm)→5ch×2")
+    assert session.msc_code({}) == "msc(asc, 10%)"
+    assert session.stats_width(p["statistics"]) == "5ch×2"
+    assert session.stage_code({"operation": "erode", "params": {"radius": 2}}) == "ero(2)"
+    assert session.stage_code({"operation": "blur", "params": {}}) == "b"
+    assert session.stage_code({"operation": "none"}) == ""
+    assert session.chain_text([]) == "base"
+    assert session.profile_summary({}).startswith("topo field: base→msc(asc, 10%)\nstats: base→")

@@ -17,8 +17,13 @@ PYTHONPATH=packages/mscoupon/src pytest packages/mscoupon/tests/test_labeling.py
 ## Layout
 
 Three panes. The **left** pane is data navigation and processing *selection*:
-the compute-profile dropdown, the session (folders, files, the sequence tree)
-and Run. The **right** pane is annotation management (classes, tools, the
+the compute-profile dropdown, the session (folders, files, the sequence tree,
+which divide the height through draggable sashes) and Run, pinned to the
+bottom so it is always visible. Clicking a TIFF in the file list or an
+unprimed row of a sequence previews it; the Image dropdown then computes the
+chosen channel (filter chain, base chain, or a derived scale-space response)
+on that preview, so a profile can be judged before any Run. The **right**
+pane is annotation management (classes, tools, the
 Magic rows, the per-class interaction lists, Save/Load annotations) and the
 classifier (Train/Classify, the model strip, the confusion matrix, exports,
 Save/Load classifier). The **center** is a notebook whose inactive tabs are
@@ -30,8 +35,16 @@ hidden:
 | **View** (default) | the slice canvas, hover readout, slice navigation, image/overlay/alpha controls and the persistence entry |
 | **Model** | the classifier kind and a read-only description of its architecture |
 
-The selected tab rides the session as `view.center_tab` and is restored by
-name. The hotkeys are window-wide, so `Tab` still toggles the overlay from any
+Two link-labels say what is in effect: the Run section is headed by the
+**selected workflow** as two compact chains --
+`topo field: base→b(1.5)→e(0.7)→msc(asc, 10%)` (the field the MSC runs on,
+then manifold and persistence, `mf` for merge forest) and
+`stats: base→norm(gmm)→12ch×4` (the base chain the statistics are measured
+on, then channels × reductions); hover for the code table -- and the classifier
+section, above Train/Classify, by the **active model** (the kind Train will
+build, or the trained model and its feature count); clicking either opens its
+tab. The selected tab rides the session as
+`view.center_tab` and is restored by name. The hotkeys are window-wide, so `Tab` still toggles the overlay from any
 tab. The viewer (`mscoupon-gui`) keeps its two-pane layout.
 
 ## Annotations are gestures, not region ids

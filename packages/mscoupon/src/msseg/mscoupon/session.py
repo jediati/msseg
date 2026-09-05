@@ -422,3 +422,99 @@ def legacy_docs_to_session(docs: Sequence[Tuple[str, Any]],
     if isinstance(gui0.get("labels"), dict):     # v1 spelling, on the way in
         doc["annotations"] = gui0["labels"]
     return session_doc_from_json(doc, notes)
+
+
+# --------------------------------------------------------------------------- #
+# Compact workflow text, two lines: `topo field: base→b(1.5)→e(0.7)→msc(asc, 10%)`
+# and `stats: base→norm(gmm)→12ch×4`
+# --------------------------------------------------------------------------- #
+# One short code per filter operation and the parameter that names the stage.
+# The point is a one-line reminder of WHICH workflow is active, legible in a
+# toolbar; the full card lives on the Processing tab.
+OP_CODES = {
+    "blur": "b", "derivative": "d", "laplacian": "lap", "zero_crossings": "zc",
+    "hessian_eigenvalues": "hess", "structure_eigenvalues": "struct",
+    "edges": "e", "erode": "ero", "dilate": "dil", "open": "open",
+    "close": "close", "label_components": "cc", "normalize": "norm",
+}
+# The parameter shown in parentheses; "sigma" unless the operation has none.
+HEADLINE_PARAM = {
+    "structure_eigenvalues": "smoothing_sigma", "erode": "radius",
+    "dilate": "radius", "open": "radius", "close": "radius",
+    "label_components": "threshold", "normalize": "method",
+}
+
+
+def _fmt_param(v: Any) -> str:
+    if isinstance(v, bool):
+        return str(v).lower()
+    if isinstance(v, (int, float)):
+        return f"{float(v):g}"
+    return str(v)
+
+
+def stage_code(stage: Dict[str, Any]) -> str:
+    """`b(1.5)` for a blur at sigma 1.5, `norm(gmm)`, `ero(2)`; "" for none."""
+    op = str(stage.get("operation") or "none")
+    if op == "none":
+        return ""
+    if op == "__msc__":
+        return op
+    code = OP_CODES.get(op, op)
+    params = stage.get("params") or {}
+    v = params.get(HEADLINE_PARAM.get(op, "sigma"))
+    if v is None or v == "":
+        return code
+    return f"{code}({_fmt_param(v)})"
+
+
+def chain_text(stages: Sequence[Dict[str, Any]], start: str = "base",
+               arrow: str = "→") -> str:
+    """`base→b(1.5)→e(0.7)`; `start` alone when the chain is empty."""
+    codes = [c for c in (stage_code(s) for s in stages or []) if c]
+    return arrow.join([start] + codes)
+
+
+def msc_code(msc: Dict[str, Any]) -> str:
+    """`msc(asc, 10%)`, with a trailing `mf` for the merge-forest simplifier."""
+    manifold = "dsc" if str(msc.get("manifold", "ascending")).startswith("desc") else "asc"
+    try:
+        pct = f"{float(msc.get('persistence_percent', 10.0)):g}%"
+    except (TypeError, ValueError):
+        pct = "?%"
+    args = [manifold, pct]
+    if str(msc.get("simplification") or "msc") == "merge_forest":
+        args.append("mf")
+    return f"msc({', '.join(args)})"
+
+
+def stats_width(statistics: Any) -> str:
+    """`12ch×4`: how many channels a feature is measured on times the
+    reductions -- the width of every per-feature row."""
+    stats = config_io.statistics_from_json(statistics or {})
+    n_ch = 0
+    for c in stats["channels"]:
+        sig = c.get("sigmas") or []
+        n_ch += max(1, len(sig)) * (2 if c.get("kind") == "hessian" else 1)
+    return f"{n_ch}ch×{len(stats['reductions'])}"
+
+
+def profile_summary(profile: Dict[str, Any]) -> str:
+    """Two lines for a profile, one per pipeline:
+
+        topo field: base→b(1.5)→e(0.7)→msc(asc, 10%)
+        stats: base→norm(gmm)→12ch×4
+
+    The first is the field the MSC runs on and the MSC setting; the second
+    the channel statistics are measured on (the base chain) and the width of
+    the resulting row."""
+    topo = chain_text(list(profile.get("filters") or [])
+                      + [{"operation": "__msc__"}])
+    topo = topo.replace("→__msc__", "→" + msc_code(profile.get("msc") or {}))
+    stats_stages = list(profile.get("base_filters") or [])
+    try:
+        width = stats_width(profile.get("statistics"))
+    except Exception:
+        width = "?ch"
+    stats = chain_text(stats_stages) + "→" + width
+    return f"topo field: {topo}\nstats: {stats}"

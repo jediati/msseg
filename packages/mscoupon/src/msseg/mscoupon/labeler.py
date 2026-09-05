@@ -117,6 +117,10 @@ def _model_description(kind):
 # The center notebook's tabs, in order. Named (not indexed) in the session
 # view state so a reordered tab list still restores.
 _CENTER_TABS = ("Processing", "View", "Model")
+# Toolbar hint labels (workflow / model): link-blue, and how often the
+# workflow text is re-snapshotted from the panel.
+_HINT_COLOR = "#1a4fa0"
+_HINT_POLL_MS = 700
 
 # Statistics fields that are POSITIONS, not appearance: where a region sits in
 # the slice says nothing about what material it is, and coordinate features
@@ -752,6 +756,9 @@ class LabelerApp(MscouponApp):
         # the base fits the image only on that first render, and an unmapped
         # canvas is 1x1, so the fit is redone when the tab shows.
         self._fit_pending = False
+        self.workflow_hint_var = tk.StringVar(master=root, value="")
+        self.model_hint_var = tk.StringVar(master=root, value="")
+        self._hint_after = None
         super().__init__(root, initial=initial, autosave=autosave)
         root.title("mscoupon labeler")
         self._build_label_panel()
@@ -763,6 +770,7 @@ class LabelerApp(MscouponApp):
             # plane offers the same menu as an interaction row.
             self.viewer.on_context = self._canvas_menu
         self._bind_hotkeys()
+        self._hint_tick()          # first paint + the poll
 
     # ------------------------------------------------------------------ #
     # Center notebook: Processing | View | Model
@@ -812,10 +820,132 @@ class LabelerApp(MscouponApp):
     def _profile_tools_parent(self, section):
         return self.profile_tools
 
+    # -- left pane: picker on top, resizable session lists, Run pinned ----- #
+    # The labeler's left pane holds only three sections, so it needs no
+    # scrolling; instead the session's three lists divide the height through
+    # a vertical paned window, and Run is packed FIRST at the bottom so it
+    # keeps its space whatever the window height.
+    def _build_left_shell(self):
+        self.left_pane = ttk.Frame(self.paned, width=376)
+        self.left_bottom = ttk.Frame(self.left_pane)
+        self.left_bottom.pack(side="bottom", fill="x")
+        self.left = ttk.Frame(self.left_pane)
+        self.left.pack(side="top", fill="both", expand=True)
+        self.session_paned = None
+        self._session_groups = {}
+
+    def _left_section_parent(self, section):
+        return self.left_bottom if section == "run" else self.left
+
+    _SESSION_GROUP_WEIGHTS = {"folders": 1, "files": 3, "sequences": 3}
+
+    def _session_group(self, name, section):
+        if self.session_paned is None:
+            self.session_paned = ttk.PanedWindow(section, orient="vertical")
+            self.session_paned.pack(fill="both", expand=True, padx=2, pady=2)
+        f = ttk.Frame(self.session_paned)
+        self.session_paned.add(f, weight=self._SESSION_GROUP_WEIGHTS.get(name, 1))
+        self._session_groups[name] = f
+        return f
+
+    def _build_left(self):
+        super()._build_left()
+        # The section and its lists grow with their panes, and each group's
+        # buttons are packed at the bottom AHEAD of the list in pack order,
+        # so a pane dragged short clips list rows rather than the buttons.
+        self.session_frame.pack_configure(fill="both", expand=True)
+        for lb in (self.folder_list, self.file_list):
+            lb.master.pack_configure(fill="both", expand=True)
+        self.subseq_list.master.pack_configure(fill="both", expand=True)
+        self.folder_btn_row.pack_configure(side="bottom", before=self.folder_list.master)
+        self.make_seq_btn.pack_configure(side="bottom", before=self.file_list.master)
+        self.seq_btn_row.pack_configure(side="bottom", before=self.subseq_list.master)
+        self._build_workflow_hint()
+
     def _processing_parent(self, section):
         if section in ("filters", "base"):
             return self.proc_col_a
         return self.proc_col_b
+
+    # -- hints: the selected workflow and the active model ----------------- #
+    # With the profile edited on one tab and the model on another, the panels
+    # that USE them need a reminder: the workflow (as a compact chain,
+    # session.profile_summary) sits in the Run box above the run settings,
+    # the model above Train/Classify. Both are link-styled; a click opens
+    # the tab that edits it.
+    def _hint_label(self, parent, var, tab, tip):
+        label = ttk.Label(parent, textvariable=var, foreground=_HINT_COLOR,
+                          cursor="hand2", wraplength=330, justify="left")
+        label.bind("<Button-1>", lambda e: self._show_center_tab(tab))
+        attach_tooltip(label, tip)
+        return label
+
+    def _build_workflow_hint(self):
+        """Into the Run section, above the cores / concurrent-slices row."""
+        first = self.run_frame.winfo_children()[0]
+        self.workflow_hint = self._hint_label(
+            self.run_frame, self.workflow_hint_var, "Processing",
+            "The active compute profile. Line 1: the topology field the MSC "
+            "runs on and the MSC setting (manifold, persistence; mf = merge "
+            "forest). Line 2: the base chain the statistics are measured on "
+            "and channels × reductions. Click to open the Processing tab.\n"
+            "Codes: " + ", ".join(f"{v}={k}" for k, v in session.OP_CODES.items()))
+        self.workflow_hint.pack(fill="x", padx=6, pady=(4, 2), before=first)
+
+    def _build_model_hint(self, ml):
+        """Into the classifier section; packed first, so above Train/Classify."""
+        self.model_hint = self._hint_label(
+            ml, self.model_hint_var, "Model",
+            "The classifier: the kind Train builds until a model exists, then "
+            "the trained/loaded model and its feature count. Click to open "
+            "the Model tab.")
+        self.model_hint.pack(side="top", fill="x", padx=6, pady=(4, 0))
+
+    def _show_center_tab(self, name):
+        tab = getattr(self, "_center_tabs", {}).get(name)
+        if tab is None:
+            return
+        try:
+            self.center.select(tab)
+        except tk.TclError:
+            pass
+
+    def _workflow_hint_text(self):
+        try:
+            profile = self._profile_from_ui()
+        except Exception:
+            return "workflow: ?"
+        return session.profile_summary(profile)
+
+    def _model_hint_text(self):
+        if self._clf is None:
+            return f"model: {self.model_kind_var.get()} · not trained"
+        names = list(self._clf_names or [])
+        bits = [self._clf_kind, f"{len(names)} feats"]
+        expected = self._expected_feature_names()
+        if expected is not None and set(expected) != set(names):
+            bits.append("⚠ profile mismatch")
+        return "model: " + " · ".join(bits)
+
+    def _refresh_hints(self):
+        """Repaint both hints; a var is only written when its text changed."""
+        wv = getattr(self, "workflow_hint_var", None)
+        if wv is None or not hasattr(self, "filter_cards"):
+            return
+        for var, text in ((wv, self._workflow_hint_text()),
+                          (self.model_hint_var, self._model_hint_text())):
+            if var.get() != text:
+                var.set(text)
+
+    def _hint_tick(self):
+        """Poll rather than trace: the profile is edited through dozens of
+        widgets (cards are rebuilt constantly), and the snapshot is cheap."""
+        self._hint_after = None
+        try:
+            self._refresh_hints()
+            self._hint_after = self.root.after(_HINT_POLL_MS, self._hint_tick)
+        except tk.TclError:
+            pass
 
     def _build_model_tab(self, parent):
         """Model design. For now: which estimator kind Train builds, and a
@@ -1632,7 +1762,9 @@ class LabelerApp(MscouponApp):
         # Fixed height, so these read top-to-bottom in code order: pick a model
         # and train it, see what it did, then export the result or save it.
         # The model KIND is chosen on the Model tab; this panel trains,
-        # applies and exports whatever kind is selected there.
+        # applies and exports whatever kind is selected there. The hint above
+        # the buttons says which kind / model that is and links to the tab.
+        self._build_model_hint(ml)
         row = ttk.Frame(ml); row.pack(side="top", fill="x", padx=4, pady=(4, 2))
         ttk.Button(row, text="Train (R)",
                    command=self._train_classifier).pack(side="left", fill="x",
@@ -2620,6 +2752,7 @@ class LabelerApp(MscouponApp):
         if expected is not None and set(expected) != set(names):
             bits.append("⚠ profile mismatch")
         var.set(" · ".join(bits))
+        self._refresh_hints()
 
     def _switch_profile(self, idx):
         super()._switch_profile(idx)
@@ -3152,8 +3285,25 @@ def _selftest():
         assert _under(w, app.processing_tab), w
     assert app.filters_frame.master is app.base_frame.master is app.proc_col_a
     assert app.msc_frame.master is app.stats_frame.master is app.proc_col_b
-    assert _under(app.profile_combo, app.left) and _under(app.run_btn, app.left)
+    assert _under(app.profile_combo, app.left) and _under(app.run_btn, app.left_pane)
     assert not _under(app.profile_load_btn, app.left), "profile tools moved"
+    # Left pane: Run pinned at the bottom (packed first, side=bottom), the
+    # session's three lists as the panes of a vertical paned window.
+    assert _under(app.run_frame, app.left_bottom) and not _under(app.run_btn, app.left)
+    assert app.left_bottom.pack_info()["side"] == "bottom"
+    assert app.left_pane.pack_slaves()[0] is app.left_bottom, "Run claims its space first"
+    assert len(app.session_paned.panes()) == 3
+    assert [str(app._session_groups[n]) for n in ("folders", "files", "sequences")] == \
+        [str(p) for p in app.session_paned.panes()]
+    assert _under(app.folder_list, app._session_groups["folders"])
+    assert _under(app.file_list, app._session_groups["files"])
+    assert _under(app.subseq_list, app._session_groups["sequences"])
+    for btn, lst in ((app.folder_btn_row, app.folder_list), (app.make_seq_btn, app.file_list),
+                     (app.seq_btn_row, app.subseq_list)):
+        slaves = lst.master.master.pack_slaves()
+        assert btn.pack_info()["side"] == "bottom"
+        assert slaves.index(btn) < slaves.index(lst.master), "buttons packed before the list"
+        assert lst.master.pack_info()["expand"] in (1, "1", True)
     assert _under(app.model_kind_combo, app.model_tab)
     assert not _under(app.model_kind_combo, app.label_pane)
     ml_rows = [c for row in app.confusion_holder.master.winfo_children()
@@ -3176,6 +3326,42 @@ def _selftest():
     assert str(_MLP_HIDDEN) in _model_description("dense FC")
     assert str(_DENSE_TOP_N["dense-top-16"]) in _model_description("dense-top-16")
     app.model_kind_var.set("dense FC")
+
+    # Toolbar hints: the selected workflow as a compact chain and the active
+    # model, each a click away from its tab.
+    app._refresh_hints()
+    assert app.workflow_hint_var.get().splitlines() == \
+        ["topo field: base→msc(asc, 10%)", "stats: base→1ch×4"], app.workflow_hint_var.get()
+    assert app.model_hint_var.get() == "model: dense FC · not trained"
+    app._on_filter_op_change(0, "blur"); app.filter_cards[0]["params"]["sigma"] = 1.5
+    app._on_filter_op_change(1, "edges"); app.filter_cards[1]["params"]["sigma"] = 0.7
+    app._refresh_hints()
+    assert "base→b(1.5)→e(0.7)" in app.workflow_hint_var.get(), app.workflow_hint_var.get()
+    app.filter_cards = [app._new_filter_card()]
+    app._rebuild_filter_cards()
+    app._refresh_hints()
+    assert app.workflow_hint_var.get().splitlines()[0] == "topo field: base→msc(asc, 10%)"
+    app._show_center_tab("Processing")
+    assert app._center_tab_name() == "Processing"
+    app._show_center_tab("Model")
+    assert app._center_tab_name() == "Model"
+    app._show_center_tab("nope")
+    assert app._center_tab_name() == "Model", "an unknown name is ignored"
+    app.center.select(app.right)
+    app._clf, app._clf_names, app._clf_kind = object(), ["a", "b"], "random forest"
+    assert app._model_hint_text().startswith("model: random forest · 2 feats")
+    app._clf = None
+    app._refresh_hints()
+    assert app.model_hint_var.get() == "model: dense FC · not trained"
+    # Placement: the workflow hint heads the Run section; the model hint
+    # heads the classifier section, above Train/Classify.
+    assert app.workflow_hint.master is app.run_frame
+    assert app.run_frame.pack_slaves()[0] is app.workflow_hint
+    ml = app.confusion_holder.master
+    assert app.model_hint.master is ml and ml.pack_slaves()[0] is app.model_hint
+    train_row = ml.pack_slaves()[1]
+    assert any(isinstance(w, ttk.Button) and str(w.cget("text")).startswith("Train")
+               for w in train_row.winfo_children()), "Train/Classify right under the hint"
 
     # `app.right` IS the View tab, so the scan below reads unchanged.
     right_rows = list(app.right.winfo_children())
@@ -4133,7 +4319,7 @@ def _selftest():
           "proba cache + coloring modes, confusion matrix + highlight, "
           "persistent outlines + canvas right-click, gesture previews, "
           "magic fill, blobber, hop gain + drag + cosine/proba metrics, "
-          "center notebook + model tab")
+          "center notebook + model tab, toolbar hints")
     return 0
 
 
