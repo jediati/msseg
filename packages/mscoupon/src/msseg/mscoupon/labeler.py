@@ -55,6 +55,8 @@ import sys
 import json
 import math
 import time
+import queue
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -67,6 +69,7 @@ from .labeling import (LabelStore, MAX_CLASSES, TOOLS,
                        resolve_slice, resolve_sets, touched_sets, class_lut,
                        scalar_lut, line_pixels, polygon_mask, preview_lut)
 from . import magic_fill
+from . import model_search
 
 # How faint the inherited region overlay is drawn under the class layer
 # (0..255); the class colors themselves stay fully opaque in the LUT and are
@@ -86,19 +89,59 @@ _MODE_UNCERTAINTY = "uncertainty"
 
 # Classifier kinds are shared by the dropdown, factory, and pickle loader so
 # adding one cannot leave a trained model that the UI does not recognize.
-_MODEL_KINDS = ("random forest", "dense FC", "dense-top-16", "dense-top-32")
+_TUNED_KIND = "dense (tuned)"
+_MODEL_KINDS = ("random forest", "dense FC", "dense-top-16", "dense-top-32", _TUNED_KIND)
 _DENSE_TOP_N = {"dense-top-16": 16, "dense-top-32": 32}
 # The architectures behind the kinds. Module constants rather than literals
 # inside _make_model so the Model tab's readout is formatted from the same
 # values the estimator is built with and cannot drift from them.
 _FOREST_TREES = 200
 _OOB_MIN_SAMPLES = 20          # forest OOB score needs a few samples per tree
-_MLP_HIDDEN = (64, 32)
-_MLP_MAX_ITER = 1000
+# ...and shared with model_search, whose search starts from exactly this net.
+_MLP_HIDDEN = model_search.BASELINE_HIDDEN
+_MLP_MAX_ITER = model_search.DEFAULT_MAX_ITER
+# "Optimize network" defaults (the Model tab edits them; they ride the session
+# view) and how often the Tk thread drains the worker's progress queue.
+# An overnight-sized default: a trial is a 5-fold CV of one candidate, ~5-10 s
+# with the search budget (SEARCH_MAX_ITER / SEARCH_PATIENCE), so 300 trials is
+# under an hour and the 8 h limit is the real stop for a larger label set.
+_SEARCH_TRIALS = 300
+_SEARCH_TIMEOUT_MIN = 480                # the entry is in MINUTES
+_SEARCH_TIMEOUT_S = _SEARCH_TIMEOUT_MIN * 60
+_SEARCH_TRIALS_RANGE = (1, 100000)
+_SEARCH_TIMEOUT_RANGE = (0, 7 * 86400)  # seconds; 0 = no time limit
+_SEARCH_PUMP_MS = 150
+# Trials per rung of the size sweep: enough for alpha / lr / batch / early
+# stopping (and the feature mask) to settle at a fixed architecture.
+_SWEEP_TRIALS = 20
+_SWEEP_TRIALS_RANGE = (1, 10000)
 
 
-def _model_description(kind):
-    """One-paragraph, read-only description of what `_make_model(kind)` builds."""
+def _hms(seconds):
+    """`47s`, `12m 05s`, `3h 07m` for the search progress line."""
+    s = max(0, int(round(seconds)))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60:02d}s"
+    return f"{s // 3600}h {(s % 3600) // 60:02d}m"
+
+
+def _model_description(kind, spec=None, n_features=None):
+    """One-paragraph, read-only description of what `_make_model(kind)` builds.
+    For the tuned kind that is the search winner `spec` (over `n_features`
+    columns), or what Train falls back to while no search has run."""
+    if kind == _TUNED_KIND:
+        if spec is None:
+            return ("No search yet: Train builds the dense FC baseline "
+                    f"(FeatureSubset(all) -> StandardScaler -> MLPClassifier(hidden "
+                    f"layers {_MLP_HIDDEN}, max_iter {_MLP_MAX_ITER})) with balanced "
+                    "sample weights. Optimize network (O) searches depth, layer widths, "
+                    "L2 alpha, learning rate, batch size, early stopping and a "
+                    "per-channel feature subset by leave-slices-out cross-validation "
+                    "(Optuna when installed, else random), then installs the winner. "
+                    f"Backend: {model_search.backend_label('auto')}.")
+        return spec.describe(n_features)
     if kind == "dense FC":
         return (f"StandardScaler -> MLPClassifier(hidden layers {_MLP_HIDDEN}, "
                 f"max_iter {_MLP_MAX_ITER}, random_state 0). The scaler lives "
@@ -708,6 +751,30 @@ class LabelerApp(MscouponApp):
         self._clf_names = None
         self._clf_kind = "dense FC"
         self.model_kind_var = tk.StringVar(master=root, value="dense FC")
+        # "dense (tuned)": the spec the CURRENT model was built from (rides its
+        # pickle), the last search's winner (what Train rebuilds; survives a
+        # kind switch), and the in-flight search's worker state.
+        self._clf_spec = None
+        self._search_spec = None
+        self._search = None            # {"queue","stop","thread","names","n","t0"}
+        self.search_trials_var = tk.StringVar(master=root, value=str(_SEARCH_TRIALS))
+        self.search_timeout_var = tk.StringVar(master=root, value=str(_SEARCH_TIMEOUT_MIN))
+        # Where a finished search saves its winner so a restart (or the
+        # morning after an overnight run) finds it: the session reloads the
+        # most recent recorded model. The selftest points this at a temp dir.
+        self._models_dir = os.path.join(config_io.app_data_dir(self.SESSION_APP), "models")
+        self.search_seed_var = tk.StringVar(master=root, value="0")
+        self.search_features_var = tk.BooleanVar(master=root, value=True)
+        self.search_backend_var = tk.StringVar(master=root, value="auto")
+        self.search_progress_var = tk.StringVar(master=root, value="")
+        # Size sweep (how small can the network be): the ladder, the trials
+        # spent per rung, and the last result (rows shown in the Model tab).
+        self.sweep_sizes_var = tk.StringVar(
+            master=root, value=", ".join(model_search.size_text(h)
+                                         for h in model_search.DEFAULT_SIZE_LADDER))
+        self.sweep_trials_var = tk.StringVar(master=root, value=str(_SWEEP_TRIALS))
+        self.sweep_summary_var = tk.StringVar(master=root, value="")
+        self._sweep = None                   # last model_search.SweepResult
         # Provenance line above the classifier controls: which model is loaded,
         # how wide its feature vector is, and whether it still agrees with the
         # active profile (a mismatch blocks Classify, so say so up front).
@@ -922,6 +989,8 @@ class LabelerApp(MscouponApp):
             return f"model: {self.model_kind_var.get()} · not trained"
         names = list(self._clf_names or [])
         bits = [self._clf_kind, f"{len(names)} feats"]
+        if self._clf_spec is not None:
+            bits[1] = self._clf_spec.brief(len(names))
         expected = self._expected_feature_names()
         if expected is not None and set(expected) != set(names):
             bits.append("⚠ profile mismatch")
@@ -970,10 +1039,192 @@ class LabelerApp(MscouponApp):
         self.model_kind_var.trace_add("write", lambda *_: self._refresh_model_readout())
         self._refresh_model_readout()
 
+        # -- Optimize network: the search over the dense FC space ------------ #
+        srch = ttk.LabelFrame(parent, text="Optimize network (dense FC search)")
+        srch.pack(side="top", fill="x", padx=6, pady=4)
+        row = ttk.Frame(srch); row.pack(fill="x", padx=4, pady=(4, 2))
+        for label, var, width, tip in (
+                ("Trials:", self.search_trials_var, 6,
+                 "How many architectures to score. Trial 1 is always the "
+                 "un-tuned dense FC baseline, so the winner never loses to it."),
+                ("Time limit (min):", self.search_timeout_var, 6,
+                 "Stop after this many minutes (the current trial finishes); "
+                 "0 = no limit. The best so far is installed, saved under the "
+                 "session's models folder and classified either way -- leave "
+                 "it running overnight."),
+                ("Seed:", self.search_seed_var, 4,
+                 "Seeds the sampler, the folds and the networks: the same "
+                 "labels and seed reproduce the same winner.")):
+            ttk.Label(row, text=label).pack(side="left")
+            ent = ttk.Entry(row, textvariable=var, width=width)
+            ent.pack(side="left", padx=(2, 8))
+            attach_tooltip(ent, tip)
+        ttk.Label(row, text="Backend:").pack(side="left")
+        self.search_backend_combo = ttk.Combobox(
+            row, textvariable=self.search_backend_var, state="readonly",
+            values=model_search.BACKENDS, width=7)
+        self.search_backend_combo.pack(side="left", padx=(2, 8))
+        self.search_backend_combo.bind("<<ComboboxSelected>>", self._unfocus_entries)
+        attach_tooltip(self.search_backend_combo,
+                       "torch: the GPU MLP (every fold of a trial trains as one "
+                       "stacked batch; adds dropout to the search); sklearn: "
+                       "MLPClassifier on the CPU; auto: torch when installed. "
+                       f"Now: {model_search.backend_label('auto')}.")
+        chk = ttk.Checkbutton(row, text="search feature subset",
+                              variable=self.search_features_var)
+        chk.pack(side="left", padx=(0, 8))
+        attach_tooltip(chk, "Also search which measurement CHANNELS the network "
+                            "sees (all reductions of a channel together); off = "
+                            "every non-positional field.")
+        row = ttk.Frame(srch); row.pack(fill="x", padx=4, pady=2)
+        self.optimize_btn = ttk.Button(row, text="Optimize network (O)",
+                                       command=self._optimize_network)
+        self.optimize_btn.pack(side="left", padx=(0, 4))
+        attach_tooltip(self.optimize_btn,
+                       "Cross-validate candidate dense networks -- depth, widths, "
+                       "L2 alpha, learning rate, batch size, early stopping, "
+                       "feature subset -- leaving whole slices out, then install "
+                       "the winner as the 'dense (tuned)' model, save it and "
+                       "classify. Runs in the background; labeling stays live.\n"
+                       f"Each trial trains at most {model_search.SEARCH_MAX_ITER} "
+                       f"epochs (patience {model_search.SEARCH_PATIENCE}); mini-"
+                       f"batches under {model_search.TORCH_MIN_BATCH} rows train on "
+                       "sklearn's CPU MLP, full/large batches on torch; the winner "
+                       f"is refit with the full {_MLP_MAX_ITER}-epoch budget.")
+        self.cancel_search_btn = ttk.Button(row, text="Cancel", state="disabled",
+                                            command=self._cancel_search)
+        self.cancel_search_btn.pack(side="left")
+        ttk.Label(srch, textvariable=self.search_progress_var, justify="left",
+                  wraplength=700, foreground="#333").pack(anchor="w", padx=6,
+                                                          pady=(0, 6))
+        self._build_sweep_panel(parent)
+
+    def _build_sweep_panel(self, parent):
+        """The lower half of the Model tab: the size sweep's controls and its
+        report -- one row per rung, the best settings the search found for
+        that architecture, and how far its held-out loss sits from the best
+        rung's. A selected rung can be installed as the model."""
+        sw = ttk.LabelFrame(parent, text="Size sweep: how small can the network be?")
+        sw.pack(side="top", fill="both", expand=True, padx=6, pady=4)
+        row = ttk.Frame(sw); row.pack(fill="x", padx=4, pady=(4, 2))
+        ttk.Label(row, text="Sizes:").pack(side="left")
+        ent = ttk.Entry(row, textvariable=self.sweep_sizes_var, width=36)
+        ent.pack(side="left", padx=(2, 8))
+        attach_tooltip(ent, "The ladder of architectures to score, largest first: "
+                            "layers joined by '-', rungs by ',' (64-32, 32-16, 16-8, 8-4, 4). "
+                            "Each rung is searched with its size FIXED and alpha, learning "
+                            "rate, batch, early stopping, dropout and the feature subset "
+                            "free, so a small net is judged at its own best settings.")
+        ttk.Label(row, text="Trials/size:").pack(side="left")
+        ent = ttk.Entry(row, textvariable=self.sweep_trials_var, width=5)
+        ent.pack(side="left", padx=(2, 8))
+        attach_tooltip(ent, "Search trials spent on each rung (trial 1 is the rung at "
+                            "the baseline settings). The Optimize time limit caps the "
+                            "whole sweep.")
+        self.sweep_btn = ttk.Button(row, text="Sweep sizes", command=self._sweep_network)
+        self.sweep_btn.pack(side="left", padx=(0, 4))
+        attach_tooltip(self.sweep_btn, "Run one fixed-size search per rung (background; "
+                                       "Cancel above stops it), install the best rung, "
+                                       "save it and classify. The report fills in as "
+                                       "rungs complete.")
+        self.sweep_install_btn = ttk.Button(row, text="Install selected size",
+                                            state="disabled",
+                                            command=self._sweep_install_selected)
+        self.sweep_install_btn.pack(side="left")
+        attach_tooltip(self.sweep_install_btn,
+                       "Make the selected rung the model (its refit estimator, saved "
+                       "like an Optimize winner) and classify -- the way to take the "
+                       "smallest network that still holds.")
+        ttk.Label(sw, textvariable=self.sweep_summary_var, justify="left",
+                  wraplength=700, foreground="#333").pack(anchor="w", padx=6, pady=(0, 2))
+        holder = ttk.Frame(sw); holder.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        cols = ("size", "params", "logloss", "bacc", "delta", "trials", "settings")
+        self.sweep_tree = ttk.Treeview(holder, columns=cols, show="headings",
+                                       height=6, selectmode="browse")
+        for cid, text, width, anchor in (("size", "size", 70, "w"),
+                                         ("params", "params", 70, "e"),
+                                         ("logloss", "CV log-loss", 80, "e"),
+                                         ("bacc", "bal. acc", 70, "e"),
+                                         ("delta", "vs best", 70, "e"),
+                                         ("trials", "trials", 50, "e"),
+                                         ("settings", "best settings", 380, "w")):
+            self.sweep_tree.heading(cid, text=text)
+            self.sweep_tree.column(cid, width=width, anchor=anchor,
+                                   stretch=(cid == "settings"))
+        self.sweep_tree.tag_configure("bad", foreground="#a00000")
+        self.sweep_tree.tag_configure("pick", background="#e6f2e6")
+        sb = ttk.Scrollbar(holder, orient="vertical", command=self.sweep_tree.yview)
+        self.sweep_tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.sweep_tree.pack(side="left", fill="both", expand=True)
+        self.sweep_tree.bind("<<TreeviewSelect>>", lambda e: self._refresh_sweep_buttons())
+
+    def _sweep_settings(self):
+        """``(sizes, trials_per_size)`` from the panel; raises ValueError with
+        a readable reason."""
+        sizes = model_search.parse_sizes(self.sweep_sizes_var.get())
+        try:
+            trials = int(float(str(self.sweep_trials_var.get()).strip()))
+        except (ValueError, TypeError):
+            trials = _SWEEP_TRIALS
+        lo, hi = _SWEEP_TRIALS_RANGE
+        return sizes, max(lo, min(hi, trials))
+
+    def _refresh_sweep_report(self, rows=None, stopped=False):
+        """Repaint the table from `rows` (SweepRows so far); the summary and
+        the "vs best" column are relative to the best rung present."""
+        tree = getattr(self, "sweep_tree", None)
+        if tree is None:
+            return
+        try:
+            tree.delete(*tree.get_children())
+        except tk.TclError:
+            return
+        rows = list(rows or [])
+        if not rows:
+            self.sweep_summary_var.set("")
+            self._refresh_sweep_buttons()
+            return
+        n_total = len(self._sweep.names) if self._sweep is not None else None
+        partial = model_search.SweepResult(rows=rows, names=list(self._sweep.names)
+                                           if self._sweep is not None else [],
+                                           n_classes=0, elapsed_s=0.0, stopped=stopped)
+        pick = partial.smallest_within()
+        for i, r in enumerate(rows):
+            rel = partial.relative_loss(i)
+            tags = []
+            if rel > model_search.SWEEP_TOLERANCE:
+                tags.append("bad")
+            if i == pick:
+                tags.append("pick")
+            tree.insert("", "end", iid=str(i), tags=tuple(tags), values=(
+                r.size, f"{r.n_params:,}", f"{r.cv_score:.3f}", f"{r.cv_bacc:.1%}",
+                "best" if rel <= 0 else f"+{rel:.0%}", str(r.n_trials),
+                r.spec.settings_text(n_total)))
+        self.sweep_summary_var.set(partial.summary())
+        self._refresh_sweep_buttons()
+
+    def _refresh_sweep_buttons(self):
+        btn = getattr(self, "sweep_install_btn", None)
+        if btn is None:
+            return
+        ok = (self._sweep is not None and self._search is None
+              and bool(self.sweep_tree.selection()))
+        btn.config(state="normal" if ok else "disabled")
+
     def _refresh_model_readout(self):
         var = getattr(self, "model_arch_var", None)
         if var is not None:
-            var.set(_model_description(self.model_kind_var.get()))
+            var.set(self._model_description_now(self.model_kind_var.get()))
+
+    def _model_description_now(self, kind):
+        """`_model_description` for the app's state: the tuned kind renders the
+        last search's winner over the trained model's column count."""
+        if kind != _TUNED_KIND:
+            return _model_description(kind)
+        spec = self._search_spec
+        n = len(self._clf_names) if (spec is not None and self._clf_names) else None
+        return _model_description(kind, spec, n)
 
     def _center_tab_name(self):
         """Name of the selected center tab ("View" when unsure)."""
@@ -1569,6 +1820,9 @@ class LabelerApp(MscouponApp):
         self.root.bind("R", self._train_and_classify)
         self.root.bind("c", self._on_classify_key)
         self.root.bind("C", self._on_classify_key)
+        # 'O': optimize the dense network (search + install + classify).
+        self.root.bind("o", self._on_optimize_key)
+        self.root.bind("O", self._on_optimize_key)
 
     def _on_escape(self, _e=None):
         """Escape abandons a gesture in flight (any tool, preview and all);
@@ -2515,64 +2769,35 @@ class LabelerApp(MscouponApp):
         feature_importances_ naming the dimensions that matter (logged).
         "dense FC" is a small MLP behind an in-pipeline StandardScaler for
         when the boundary is not axis-aligned. The dense-top-N variants first
-        fit a balanced forest and retain its N most important dimensions."""
-        try:
-            import sklearn  # noqa: F401
-        except ImportError:
-            self.status_var.set("scikit-learn is not installed - "
-                                "pip install scikit-learn to enable training")
+        fit a balanced forest and retain its N most important dimensions.
+        "dense (tuned)" rebuilds the last Optimize winner (or the baseline
+        while there is none) with balanced sample weights."""
+        got = self._training_set()
+        if got is None:
             return
-        import numpy as np
-        slices = self._all_stat_slices("Preparing training")
-        if slices is None:
-            return
-        X, y, names = [], [], None
-        for si, li, key, rec, table in slices:
-            if names is None:
-                names = [n for n in table.names if n not in _NON_FEATURE_FIELDS]
-            mat = self._feature_matrix(table, names, np)
-            fids = table.column("feature_id")
-            if mat is None or fids is None:
-                self.status_var.set(
-                    f"Training stopped: incomplete statistics on slice {si}:{li}.")
-                return
-            rc = resolve_slice(self.store.for_slice(key), rec["labels"], np)
-            fid = fids.astype(int)
-            ok = (fid >= 0) & (fid < len(rc))
-            cls = np.zeros(len(fid), int)
-            cls[ok] = rc[fid[ok]]
-            m = cls > 0
-            if m.any():
-                X.append(mat[m])
-                y.append(cls[m])
-        if not X:
-            self.status_var.set("No labeled regions on computed slices - "
-                                "draw some (and Run/Rerun) first.")
-            return
-        X = np.concatenate(X)
-        y = np.concatenate(y)
-        if len(set(y.tolist())) < 2:
-            self.status_var.set("Need labels from at least 2 classes to train.")
-            return
+        X, y, _groups, names = got
         kind = self.model_kind_var.get()
-        clf = self._make_model(kind, len(y), len(names))
+        spec = self._search_spec if kind == _TUNED_KIND else None
+        build_spec = spec
+        if kind == _TUNED_KIND and spec is None:     # baseline on the picked backend
+            build_spec = model_search.ModelSpec(max_iter=_MLP_MAX_ITER,
+                                                backend=self._search_settings()[4])
+        clf = self._make_model(kind, len(y), len(names), names=names, spec=build_spec)
         self._compute_badge("Training")
         t0 = time.perf_counter()
         try:
-            clf.fit(X, y)
+            if kind == _TUNED_KIND:
+                model_search.fit_estimator(clf, X, y)
+            else:
+                clf.fit(X, y)
         finally:
             self._clear_compute_badge()
         dt_ms = 1e3 * (time.perf_counter() - t0)
-        self._clf = clf
-        self._clf_names = names
-        self._clf_kind = kind
-        self._pred.clear()               # predictions belong to the old model
-        if not preserve_view:
-            self._cm_cell = None
-            self._refresh_region_modes()
-        self._refresh_confusion()
-        self.classify_btn.config(state="normal")
-        if kind in _DENSE_TOP_N:
+        self._install_model(clf, names, kind, spec, preserve_view)
+        if kind == _TUNED_KIND:
+            acc = f", train acc {clf.score(X, y):.1%}"
+            hint = "" if spec is None else " - " + spec.brief(len(names))
+        elif kind in _DENSE_TOP_N:
             selector = clf.named_steps["select"]
             selected = [(names[i], float(v)) for i, v in
                         enumerate(selector.estimator_.feature_importances_)
@@ -2597,8 +2822,74 @@ class LabelerApp(MscouponApp):
         self.status_var.set(f"Trained {kind} on {len(y)} labeled regions in "
                             f"{dt_ms:.0f} ms{acc}{hint}")
 
+    def _training_set(self):
+        """``(X, y, groups, names)`` over every labeled region of every primed
+        slice -- `groups` is each row's slice index, for leave-slices-out CV --
+        or None with the reason in the status bar."""
+        try:
+            import sklearn  # noqa: F401
+        except ImportError:
+            self.status_var.set("scikit-learn is not installed - "
+                                "pip install scikit-learn to enable training")
+            return None
+        import numpy as np
+        slices = self._all_stat_slices("Preparing training")
+        if slices is None:
+            return None
+        X, y, g, names = [], [], [], None
+        for si, li, key, rec, table in slices:
+            if names is None:
+                names = [n for n in table.names if n not in _NON_FEATURE_FIELDS]
+            mat = self._feature_matrix(table, names, np)
+            fids = table.column("feature_id")
+            if mat is None or fids is None:
+                self.status_var.set(
+                    f"Training stopped: incomplete statistics on slice {si}:{li}.")
+                return None
+            rc = resolve_slice(self.store.for_slice(key), rec["labels"], np)
+            fid = fids.astype(int)
+            ok = (fid >= 0) & (fid < len(rc))
+            cls = np.zeros(len(fid), int)
+            cls[ok] = rc[fid[ok]]
+            m = cls > 0
+            if m.any():
+                X.append(mat[m])
+                y.append(cls[m])
+                g.append(np.full(int(m.sum()), si, int))
+        if not X:
+            self.status_var.set("No labeled regions on computed slices - "
+                                "draw some (and Run/Rerun) first.")
+            return None
+        X = np.concatenate(X)
+        y = np.concatenate(y)
+        g = np.concatenate(g)
+        if len(set(y.tolist())) < 2:
+            self.status_var.set("Need labels from at least 2 classes to train.")
+            return None
+        return X, y, g, names
+
+    def _install_model(self, clf, names, kind, spec=None, preserve_view=False):
+        """Make `clf` the current model (Train and Optimize share this tail)."""
+        self._clf = clf
+        self._clf_names = names
+        self._clf_kind = kind
+        self._clf_spec = spec
+        self._pred.clear()               # predictions belong to the old model
+        if not preserve_view:
+            self._cm_cell = None
+            self._refresh_region_modes()
+        self._refresh_confusion()
+        self.classify_btn.config(state="normal")
+
     @staticmethod
-    def _make_model(kind, n_samples, n_features=None):
+    def _make_model(kind, n_samples, n_features=None, names=None, spec=None):
+        if kind == _TUNED_KIND:
+            # The search winner (or the baseline before any search), built by
+            # model_search so the estimator and its description share a spec.
+            if not names:
+                raise ValueError("dense (tuned) needs the feature names")
+            spec = spec or model_search.ModelSpec(max_iter=_MLP_MAX_ITER)
+            return model_search.build_estimator(spec, list(names))
         if kind == "dense FC":
             # The scaler lives INSIDE the pipeline: an MLP needs standardized
             # inputs, and keeping it in the estimator means the pickle /
@@ -2652,6 +2943,426 @@ class LabelerApp(MscouponApp):
             if not self._pred:            # classification failed after training
                 self._cm_cell = None
                 self._refresh_region_modes()
+
+    def _on_optimize_key(self, _e=None):
+        """'O': search the dense network, install + classify the winner."""
+        if self._typing():
+            return
+        self._optimize_network()
+
+    # -- Optimize network ------------------------------------------------ #
+    def _search_settings(self):
+        """``(n_trials, timeout_s, seed, feature_search, backend)`` from the
+        Model tab, each clamped to its range / choices (a malformed entry
+        reads as the default)."""
+        def _int(var, default, lo, hi):
+            try:
+                v = int(float(str(var.get()).strip()))
+            except (ValueError, TypeError):
+                v = default
+            return max(lo, min(hi, v))
+        backend = self.search_backend_var.get()
+        if backend not in model_search.BACKENDS:
+            backend = "auto"
+        # The time limit is entered in minutes and kept in seconds.
+        try:
+            minutes = float(str(self.search_timeout_var.get()).strip())
+            timeout_s = int(round(minutes * 60.0))
+        except (ValueError, TypeError):
+            timeout_s = _SEARCH_TIMEOUT_S
+        lo, hi = _SEARCH_TIMEOUT_RANGE
+        timeout_s = max(lo, min(hi, timeout_s))
+        return (_int(self.search_trials_var, _SEARCH_TRIALS, *_SEARCH_TRIALS_RANGE),
+                timeout_s,
+                _int(self.search_seed_var, 0, 0, 2**31 - 1),
+                bool(self.search_features_var.get()), backend)
+
+    def _sweep_settings_trials(self):
+        try:
+            return self._sweep_settings()[1]
+        except ValueError:
+            return _SWEEP_TRIALS
+
+    def _apply_search_view(self, d):
+        """Restore the search settings from a session view dict, field by
+        field; a missing or malformed value leaves that setting alone."""
+        if not isinstance(d, dict):
+            return
+        for key, var in (("trials", self.search_trials_var),
+                         ("seed", self.search_seed_var)):
+            v = d.get(key)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                var.set(str(int(v)))
+        v = d.get("timeout_s")
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            self.search_timeout_var.set(f"{float(v) / 60.0:g}")     # entry in minutes
+        if isinstance(d.get("feature_search"), bool):
+            self.search_features_var.set(d["feature_search"])
+        if d.get("backend") in model_search.BACKENDS:
+            self.search_backend_var.set(d["backend"])
+        sizes = d.get("sweep_sizes")
+        if isinstance(sizes, str) and sizes.strip():
+            try:
+                model_search.parse_sizes(sizes)
+                self.sweep_sizes_var.set(sizes)
+            except ValueError:
+                pass
+        v = d.get("sweep_trials")
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            self.sweep_trials_var.set(str(int(v)))
+
+    def _feature_schema_now(self):
+        try:
+            return config_io.feature_schema(self._params_json())
+        except Exception:
+            return None
+
+    def _optimize_network(self, sync=False):
+        """Search the dense FC space by leave-slices-out cross-validation and
+        install the winner as the "dense (tuned)" model, then classify.
+
+        The labeled rows are gathered on the Tk thread (they touch the engine
+        and the label store); the search itself runs on a worker thread and
+        reports through a queue that `_search_pump` drains, so labeling stays
+        live and Cancel keeps the best so far. `sync` runs the worker inline
+        (the selftest)."""
+        if self._search is not None:
+            self.status_var.set("A search is already running - Cancel it first.")
+            return
+        got = self._training_set()
+        if got is None:
+            return
+        X, y, groups, names = got
+        n_trials, timeout_s, seed, feat, backend = self._search_settings()
+        try:
+            model_search.make_cv(y, groups, seed=seed)
+        except ValueError as exc:
+            self.status_var.set(f"Cannot optimize: {exc}.")
+            return
+        schema = self._feature_schema_now()
+        searcher = "optuna" if model_search.have_optuna() else "random"
+        q = queue.Queue()
+        stop = threading.Event()
+        space = model_search.SearchSpace(feature_search=feat)
+
+        def progress(done, total, best):
+            q.put(("progress", done, total, best))
+
+        def work():
+            try:
+                res = model_search.run_search(
+                    X, y, groups, names, schema, n_trials=n_trials,
+                    timeout_s=timeout_s or None, seed=seed,
+                    max_iter=model_search.SEARCH_MAX_ITER,
+                    patience=model_search.SEARCH_PATIENCE,
+                    refit_max_iter=_MLP_MAX_ITER,
+                    space=space, progress_cb=progress, stop_event=stop,
+                    searcher=searcher, backend=backend)
+                q.put(("done", res))
+            except Exception as exc:            # reported, never raised off-thread
+                q.put(("error", f"{type(exc).__name__}: {exc}"))
+
+        n_slices = len(set(groups.tolist()))
+        self._search = {"queue": q, "stop": stop, "thread": None, "names": names,
+                        "n": int(len(y)), "t0": time.perf_counter()}
+        self.model_kind_var.set(_TUNED_KIND)
+        self._set_search_buttons(running=True)
+        self.search_progress_var.set(
+            f"{searcher}: scoring the baseline ({len(y)} labeled regions on "
+            f"{n_slices} slice{'s' if n_slices != 1 else ''}, {len(names)} features)…")
+        self._compute_badge("Optimizing")
+        log(f"optimize: {searcher}, {model_search.backend_label(backend)}, {n_trials} "
+            f"trials, {timeout_s or 'no'} s limit, seed {seed}, feature subset "
+            f"{'on' if feat else 'off'}; {len(y)} rows, {n_slices} slices, "
+            f"{len(names)} features; trial budget {model_search.SEARCH_MAX_ITER} epochs "
+            f"/ patience {model_search.SEARCH_PATIENCE}, batches < "
+            f"{model_search.TORCH_MIN_BATCH} on sklearn"
+            + ("" if searcher == "optuna" else
+               " (pip install optuna for the TPE searcher)"))
+        if sync:
+            work()
+            self._search_pump()
+            return
+        t = threading.Thread(target=work, name="mscoupon-optimize", daemon=True)
+        self._search["thread"] = t
+        t.start()
+        self.root.after(_SEARCH_PUMP_MS, self._search_pump)
+
+    def _search_pump(self):
+        st = self._search
+        if st is None:
+            return
+        finished = False
+        try:
+            while not finished:
+                ev = st["queue"].get_nowait()
+                if ev[0] == "progress":
+                    _, done, total, best = ev
+                    text = f"trial {done}/{total}"
+                    elapsed = time.perf_counter() - st["t0"]
+                    if done > 0 and elapsed > 1.0:
+                        text += (f" · {_hms(elapsed)} elapsed, ~{_hms(elapsed / done)}"
+                                 f"/trial, ~{_hms(elapsed / done * max(0, total - done))} left")
+                    if best is not None and best.cv_score is not None:
+                        text += (f" · best: log-loss {best.cv_score:.3f}, balanced acc "
+                                 f"{best.cv_bacc:.1%} · {best.layers_text()} · "
+                                 f"{best.features_text(len(st['names']))}")
+                    self.search_progress_var.set(text)
+                    self._compute_badge(f"Optimizing {done}/{total}")
+                elif ev[0] == "done":
+                    self._finish_search(ev[1])
+                    finished = True
+                elif ev[0] == "sweep_progress":
+                    self._on_sweep_progress(*ev[1:])
+                elif ev[0] == "sweep_done":
+                    self._finish_sweep(ev[1])
+                    finished = True
+                else:
+                    self.search_progress_var.set(f"failed: {ev[1]}")
+                    self.status_var.set(f"Optimize failed: {ev[1]}")
+                    log(f"optimize failed: {ev[1]}")
+                    finished = True
+        except queue.Empty:
+            pass
+        thread = st.get("thread")
+        if not finished and thread is not None and not thread.is_alive() \
+                and st["queue"].empty():
+            self.search_progress_var.set("failed: the search thread ended silently")
+            self.status_var.set("Optimize failed: the search thread ended silently")
+            finished = True
+        if finished:
+            self._search = None
+            self._set_search_buttons(running=False)
+            self._clear_compute_badge()
+            self._refresh_sweep_buttons()
+            return
+        self.root.after(_SEARCH_PUMP_MS, self._search_pump)
+
+    def _finish_search(self, res):
+        st = self._search
+        names = st["names"]
+        spec = res.spec
+        self._search_spec = spec
+        self._install_model(res.estimator, names, _TUNED_KIND, spec, preserve_view=True)
+        self._refresh_model_readout()
+        gain = ""
+        if spec.baseline_score is not None:
+            gain = f" (baseline {spec.baseline_score:.3f} / {spec.baseline_bacc:.1%})"
+        summary = (f"{spec.searcher}: {res.n_trials} trials in {res.elapsed_s:.0f} s"
+                   f"{' (stopped early)' if res.stopped else ''} · best: log-loss "
+                   f"{spec.cv_score:.3f}, balanced acc {spec.cv_bacc:.1%}{gain} · "
+                   f"{spec.layers_text()} · {spec.features_text(len(names))}")
+        self.search_progress_var.set(summary)
+        log("optimize: " + summary + " -- " + spec.describe(len(names)))
+        if res.importances:
+            log("optimize: top features (permutation, log-loss): "
+                + "  ".join(f"{n}={v:.3f}" for n, v in res.importances[:8]))
+        self._refresh_model_strip()
+        saved = self._autosave_tuned_model()
+        if saved:
+            self.search_progress_var.set(summary + f" · saved {saved}")
+        # Classify first: it writes its own status line, and the summary
+        # (with where the winner was saved) is the one that should stay.
+        self._classify()
+        self.status_var.set(f"Optimized network on {st['n']} labeled regions - {summary}"
+                            + (f" - saved {saved}" if saved else ""))
+
+    def _autosave_tuned_model(self):
+        """Pickle the search winner under the session's models folder and
+        record it, so the result of a run nobody watched survives: the
+        session reloads its most recent recorded model on restore. Returns
+        the path, or None (with a log line) when the write failed."""
+        folder = self._models_dir
+        if not folder or self._clf is None:
+            return None
+        try:
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, time.strftime("tuned_%Y%m%d_%H%M%S.pkl"))
+            self._save_classifier_to(path)
+        except Exception as exc:
+            log(f"optimize: could not save the winner: {exc}")
+            return None
+        log(f"optimize: winner saved to {path}")
+        return path
+
+    # -- Size sweep ------------------------------------------------------ #
+    def _sweep_network(self, sync=False):
+        """Score a ladder of architectures, each at its own best settings
+        (one fixed-size search per rung), report them, install the best rung
+        and classify. Same worker/pump/Cancel as Optimize."""
+        if self._search is not None:
+            self.status_var.set("A search is already running - Cancel it first.")
+            return
+        try:
+            sizes, per_size = self._sweep_settings()
+        except ValueError as exc:
+            self.status_var.set(str(exc))
+            return
+        got = self._training_set()
+        if got is None:
+            return
+        X, y, groups, names = got
+        _n_trials, timeout_s, seed, feat, backend = self._search_settings()
+        try:
+            model_search.make_cv(y, groups, seed=seed)
+        except ValueError as exc:
+            self.status_var.set(f"Cannot sweep: {exc}.")
+            return
+        schema = self._feature_schema_now()
+        searcher = "optuna" if model_search.have_optuna() else "random"
+        q = queue.Queue()
+        stop = threading.Event()
+        space = model_search.SearchSpace(feature_search=feat)
+
+        def progress(k, n, hidden, done, total, row):
+            q.put(("sweep_progress", k, n, hidden, done, total, row))
+
+        def work():
+            try:
+                res = model_search.run_size_sweep(
+                    X, y, groups, names, schema, sizes=sizes, trials_per_size=per_size,
+                    timeout_s=timeout_s or None, seed=seed,
+                    max_iter=model_search.SEARCH_MAX_ITER,
+                    patience=model_search.SEARCH_PATIENCE, refit_max_iter=_MLP_MAX_ITER,
+                    space=space, progress_cb=progress, stop_event=stop,
+                    searcher=searcher, backend=backend)
+                q.put(("sweep_done", res))
+            except Exception as exc:            # reported, never raised off-thread
+                q.put(("error", f"{type(exc).__name__}: {exc}"))
+
+        self._sweep = None
+        self._sweep_rows = []
+        self._refresh_sweep_report([])
+        self._search = {"queue": q, "stop": stop, "thread": None, "names": names,
+                        "n": int(len(y)), "t0": time.perf_counter(), "kind": "sweep",
+                        "sizes": sizes, "per_size": per_size}
+        self.model_kind_var.set(_TUNED_KIND)
+        self._set_search_buttons(running=True)
+        self.search_progress_var.set(
+            f"size sweep: {len(sizes)} rung(s) x {per_size} trials on {len(y)} labeled "
+            f"regions, {len(names)} features…")
+        self._compute_badge("Sweeping sizes")
+        log(f"size sweep: {[model_search.size_text(h) for h in sizes]}, {per_size} "
+            f"trials/rung, {searcher}, {model_search.backend_label(backend)}, "
+            f"{timeout_s or 'no'} s limit, seed {seed}; {len(y)} rows, {len(names)} features")
+        if sync:
+            work()
+            self._search_pump()
+            return
+        t = threading.Thread(target=work, name="mscoupon-size-sweep", daemon=True)
+        self._search["thread"] = t
+        t.start()
+        self.root.after(_SEARCH_PUMP_MS, self._search_pump)
+
+    def _on_sweep_progress(self, k, n, hidden, done, total, row):
+        st = self._search
+        size = model_search.size_text(hidden)
+        if row is not None:
+            self._sweep_rows.append(row)
+            self._sweep = model_search.SweepResult(
+                rows=list(self._sweep_rows), names=list(st["names"]), n_classes=0,
+                elapsed_s=time.perf_counter() - st["t0"])
+            self._refresh_sweep_report(self._sweep_rows)
+            log(f"size sweep: {size}: log-loss {row.cv_score:.3f}, bal. acc "
+                f"{row.cv_bacc:.1%}, {row.n_params:,} params, {row.n_trials} trials, "
+                f"{row.elapsed_s:.0f} s -- {row.spec.settings_text(len(st['names']))}")
+        elapsed = time.perf_counter() - st["t0"]
+        text = f"size {k + 1}/{n} ({size}): trial {done}/{total}"
+        rungs_done = len(self._sweep_rows)
+        if rungs_done and elapsed > 1.0:
+            per_rung = elapsed / rungs_done
+            text += (f" · {_hms(elapsed)} elapsed, ~{_hms(per_rung)}/rung, "
+                     f"~{_hms(per_rung * max(0, n - rungs_done))} left")
+        if self._sweep_rows:
+            b = self._sweep_rows[min(range(len(self._sweep_rows)),
+                                     key=lambda i: self._sweep_rows[i].cv_score)]
+            text += f" · best so far {b.size} (log-loss {b.cv_score:.3f})"
+        self.search_progress_var.set(text)
+        self._compute_badge(f"Sweeping {k + 1}/{n} · {done}/{total}")
+
+    def _finish_sweep(self, res):
+        st = self._search
+        self._sweep = res
+        self._sweep_rows = list(res.rows)
+        self._refresh_sweep_report(res.rows, stopped=res.stopped)
+        lines = res.report_lines()
+        log("size sweep report:\n  " + "\n  ".join(lines))
+        # Install the best rung (the Optimize convention); a smaller rung is
+        # one click away in the table.
+        best = res.rows[res.best_index()]
+        self._install_sweep_row(best, announce=False)
+        saved = self._autosave_tuned_model()
+        report_path = self._save_sweep_report(res, saved)
+        summary = (f"{len(res.rows)} rung(s) in {_hms(res.elapsed_s)}"
+                   f"{' (stopped early)' if res.stopped else ''} · {res.summary()}")
+        self.search_progress_var.set(summary + (f" · saved {saved}" if saved else ""))
+        self._classify()
+        self.status_var.set(f"Size sweep on {st['n']} labeled regions - {summary}"
+                            + (f" - report {report_path}" if report_path else ""))
+
+    def _install_sweep_row(self, row, announce=True):
+        names = list(self._search["names"] if self._search is not None
+                     else (self._sweep.names if self._sweep is not None else []))
+        self._search_spec = row.spec
+        self._install_model(row.estimator, names, _TUNED_KIND, row.spec, preserve_view=True)
+        self._refresh_model_readout()
+        self._refresh_model_strip()
+        if announce:
+            self.status_var.set(f"Installed {row.size} ({row.n_params:,} params, CV log-loss "
+                                f"{row.cv_score:.3f}, bal. acc {row.cv_bacc:.1%})")
+
+    def _sweep_install_selected(self):
+        """Make the selected rung the model, save it and classify."""
+        if self._sweep is None or self._search is not None:
+            return
+        sel = self.sweep_tree.selection()
+        if not sel:
+            return
+        try:
+            row = self._sweep.rows[int(sel[0])]
+        except (ValueError, IndexError):
+            return
+        self._install_sweep_row(row)
+        saved = self._autosave_tuned_model()
+        status = self.status_var.get()
+        self._classify()
+        self.status_var.set(status + (f" - saved {saved}" if saved else ""))
+
+    def _save_sweep_report(self, res, model_path=None):
+        """Write the sweep (rows, specs, the text table) as JSON beside the
+        saved models, so the numbers outlive the session. Returns the path
+        or None."""
+        folder = self._models_dir
+        if not folder:
+            return None
+        try:
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, time.strftime("sweep_%Y%m%d_%H%M%S.json"))
+            doc = res.to_dict()
+            doc["installed_model"] = model_path
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(doc, f, indent=2)
+        except Exception as exc:
+            log(f"size sweep: could not save the report: {exc}")
+            return None
+        log(f"size sweep: report saved to {path}")
+        return path
+
+    def _cancel_search(self):
+        st = self._search
+        if st is None:
+            return
+        st["stop"].set()
+        self.search_progress_var.set("stopping after the current trial…")
+        self.cancel_search_btn.config(state="disabled")
+
+    def _set_search_buttons(self, running):
+        for name, state in (("optimize_btn", "disabled" if running else "normal"),
+                            ("sweep_btn", "disabled" if running else "normal"),
+                            ("cancel_search_btn", "normal" if running else "disabled")):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.config(state=state)
 
     def _on_classify_key(self, _e=None):
         """'C': classify/reclassify with the current model."""
@@ -2748,6 +3459,8 @@ class LabelerApp(MscouponApp):
         if stats is None and 0 <= self.active_profile_idx < len(self.profiles):
             stats = self.profiles[self.active_profile_idx].get("statistics")
         bits = [self._clf_kind, f"{len(names)} feats", self._stats_brief(stats)]
+        if self._clf_spec is not None:
+            bits[1] = self._clf_spec.brief(len(names))
         expected = self._expected_feature_names()
         if expected is not None and set(expected) != set(names):
             bits.append("⚠ profile mismatch")
@@ -2985,16 +3698,18 @@ class LabelerApp(MscouponApp):
         self.status_var.set(f"Wrote {path}")
 
     def _save_classifier_to(self, path):
-        """Pickle v2: model + feature names + kind + the statistics block it
-        was trained under (the fingerprint the session records). v1 pickles
-        (no kind/statistics) still load."""
+        """Pickle v3: model + feature names + kind + the statistics block it
+        was trained under (the fingerprint the session records) + the tuned
+        spec (None for the other kinds). v1 (no kind/statistics) and v2 (no
+        spec) pickles still load."""
         import pickle
         self._snapshot_active_profile()
         stats = dict(self.profiles[self.active_profile_idx].get("statistics") or {})
+        spec = None if self._clf_spec is None else self._clf_spec.to_dict()
         with open(path, "wb") as f:
-            pickle.dump({"app": "mscoupon-labeler-classifier", "version": 2,
+            pickle.dump({"app": "mscoupon-labeler-classifier", "version": 3,
                          "kind": self._clf_kind, "names": self._clf_names,
-                         "model": self._clf, "statistics": stats}, f)
+                         "model": self._clf, "statistics": stats, "spec": spec}, f)
         self._record_model(path, stats)
 
     def _record_model(self, path, statistics):
@@ -3002,7 +3717,8 @@ class LabelerApp(MscouponApp):
         entry = {"path": os.path.abspath(path),
                  "fingerprint": list(self._clf_names or []),
                  "kind": self._clf_kind,
-                 "statistics": dict(statistics or {})}
+                 "statistics": dict(statistics or {}),
+                 "spec": None if self._clf_spec is None else self._clf_spec.to_dict()}
         self.models = [m for m in self.models if m.get("path") != entry["path"]]
         self.models.append(entry)
 
@@ -3052,8 +3768,14 @@ class LabelerApp(MscouponApp):
         self._clf = doc["model"]
         self._clf_names = list(doc["names"])
         self._clf_kind = str(doc.get("kind") or "random forest")
+        spec = doc.get("spec")
+        self._clf_spec = (model_search.ModelSpec.from_dict(spec)
+                          if isinstance(spec, dict) else None)
+        if self._clf_spec is not None:
+            self._search_spec = self._clf_spec   # Train rebuilds what was loaded
         if self._clf_kind in _MODEL_KINDS:
             self.model_kind_var.set(self._clf_kind)
+        self._refresh_model_readout()
         self.classify_btn.config(state="normal")
         self._record_model(path, doc.get("statistics") or {})
         self._refresh_model_strip()
@@ -3147,6 +3869,11 @@ class LabelerApp(MscouponApp):
                       "drag_px": _bounded_float(self.magic_drag_var.get(),
                                                 _DEFAULT_DRAG_PX, *_DRAG_PX_RANGE)}
         d["center_tab"] = self._center_tab_name()
+        trials, timeout_s, seed, feat, backend = self._search_settings()
+        d["model_search"] = {"trials": trials, "timeout_s": timeout_s, "seed": seed,
+                             "feature_search": feat, "backend": backend,
+                             "sweep_sizes": self.sweep_sizes_var.get(),
+                             "sweep_trials": self._sweep_settings_trials()}
         return d
 
     def _apply_magic_view(self, magic):
@@ -3203,6 +3930,7 @@ class LabelerApp(MscouponApp):
         if view.get("tool") in _UI_TOOLS:
             self.tool_var.set(view["tool"])
         self._apply_magic_view(view.get("magic"))
+        self._apply_search_view(view.get("model_search"))
         # Keep the regions toggle in sync with whatever seg_source restored to.
         self.show_regions_var.set(self.seg_source_var.get() == "msc")
         # The center tab, by name; an unknown or missing value leaves it alone.
@@ -3905,6 +4633,167 @@ def _selftest():
                 app._classify()
                 assert np.array_equal(app._pred[(0, 0)][1], before_load), \
                     "loaded dense-top model must preserve predictions"
+        # "dense (tuned)": Train with no search yet builds the baseline behind a
+        # FeatureSubset; Optimize (run inline here) installs the search winner,
+        # whose spec rides the pickle and the session model record.
+        assert _TUNED_KIND in _MODEL_KINDS
+        assert _under(app.optimize_btn, app.model_tab)
+        assert str(app.cancel_search_btn.cget("state")) == "disabled"
+        app.model_kind_var.set(_TUNED_KIND)
+        assert "No search yet" in app.model_arch_var.get()
+        app._train_classifier()
+        assert app._clf_kind == _TUNED_KIND and app._clf_spec is None
+        assert app._clf.named_steps["dense"].hidden_layer_sizes == _MLP_HIDDEN
+        assert app._clf_names == ["area", "mean_base"], "full fingerprint kept"
+        app._classify()
+        assert app._pred, "tuned baseline classifies"
+        # Unscorable labels (one class) refuse with a reason, not a traceback.
+        original_training_set = app._training_set
+        app._training_set = lambda: (np.zeros((6, 2)), np.ones(6, int),
+                                     np.arange(6), ["area", "mean_base"])
+        app._optimize_network(sync=True)
+        assert app._search is None and "Cannot optimize" in app.status_var.get()
+        # A synthetic labeled set -- six slices, three classes -- runs the
+        # search to completion inline, grouped by slice.
+        rng = np.random.RandomState(0)
+        Xs = rng.normal(size=(90, 2))
+        ys = rng.randint(1, 4, size=90)
+        gs = rng.randint(0, 6, size=90)
+        Xs[:, 1] += 2.0 * ys
+        app._training_set = lambda: (Xs, ys, gs, ["area", "mean_base"])
+        app.search_trials_var.set("3")
+        app.search_timeout_var.set("60")            # minutes
+        models_td = tempfile.mkdtemp()
+        app._models_dir = models_td                 # never the user's folder
+        app._optimize_network(sync=True)
+        assert app._search is None, "the pump drains a sync search to completion"
+        # The winner is pickled + recorded on finish, so a restore finds it.
+        saved = [f for f in os.listdir(models_td) if f.startswith("tuned_")]
+        assert len(saved) == 1, saved
+        assert app.models[-1]["path"] == os.path.join(models_td, saved[0])
+        assert app.models[-1]["kind"] == _TUNED_KIND
+        assert "saved" in app.status_var.get()
+        assert app._clf_spec.max_iter == _MLP_MAX_ITER, "refit with the full budget"
+        assert str(app.optimize_btn.cget("state")) == "normal"
+        assert app._clf_kind == _TUNED_KIND and app._clf_spec is not None
+        spec = app._clf_spec
+        assert spec.n_trials == 3 and spec.cv_kind == "slices" and spec.n_groups == 6
+        assert spec.cv_score is not None and spec.cv_score <= spec.baseline_score
+        assert app._search_spec is spec
+        assert app.model_arch_var.get() == _model_description(_TUNED_KIND, spec, 2)
+        assert "CV bacc" in app.model_hint_var.get(), app.model_hint_var.get()
+        assert "CV bacc" in app.model_strip_var.get(), app.model_strip_var.get()
+        assert app._pred, "the winner is classified immediately"
+        assert "trials" in app.search_progress_var.get()
+        # Train on the tuned kind rebuilds the same spec on the current labels.
+        app._pred.clear()
+        app._train_classifier()
+        assert app._clf_spec == spec and app._clf_kind == _TUNED_KIND
+        # The spec rides the pickle (v3) and the session's model record.
+        with tempfile.TemporaryDirectory() as td:
+            tuned_path = os.path.join(td, "tuned.pkl")
+            app._save_classifier_to(tuned_path)
+            assert app.models[-1]["kind"] == _TUNED_KIND
+            assert app.models[-1]["spec"]["hidden"] == list(spec.hidden)
+            sdoc_t = session.session_doc_from_json(app._session_doc())
+            assert sdoc_t["models"][-1]["spec"]["hidden"] == list(spec.hidden)
+            app._clf = None
+            app._clf_spec = None
+            app._search_spec = None
+            app.model_kind_var.set("dense FC")
+            app._load_classifier_from(tuned_path)
+            assert app._clf_kind == _TUNED_KIND
+            assert app._clf_spec == spec and app._search_spec == spec
+            assert app.model_kind_var.get() == _TUNED_KIND
+            assert app.model_arch_var.get() == _model_description(_TUNED_KIND, spec, 2)
+        # The search settings ride the session view, clamped on the way in.
+        assert app._view_state()["model_search"] == \
+            {"trials": 3, "timeout_s": 3600, "seed": 0, "feature_search": True,
+             "backend": "auto",
+             "sweep_sizes": "64-32, 32-16, 16-8, 8-4, 4", "sweep_trials": _SWEEP_TRIALS}, \
+            "the entry is minutes, the session seconds"
+        app._apply_search_view({"trials": 12, "timeout_s": 5, "seed": 7,
+                                "feature_search": False, "backend": "sklearn", "junk": 1})
+        assert app._search_settings() == (12, 5, 7, False, "sklearn")
+        app.search_timeout_var.set("0.5")
+        assert app._search_settings()[1] == 30, "fractional minutes"
+        app.search_timeout_var.set("junk")
+        assert app._search_settings()[1] == _SEARCH_TIMEOUT_S, "malformed = default"
+        # Size sweep: one fixed-size search per rung, a report row per rung,
+        # the best rung installed + saved, any rung installable from the table.
+        app.search_timeout_var.set("60")
+        assert _under(app.sweep_tree, app.model_tab) and _under(app.sweep_btn, app.model_tab)
+        assert model_search.parse_sizes(" 64-32, 16x8;4 ") == [(64, 32), (16, 8), (4,)]
+        assert model_search.n_params((4,), 2, 3) == (2 + 1) * 4 + (4 + 1) * 3
+        app.sweep_sizes_var.set("8-4, 4")
+        app.sweep_trials_var.set("2")
+        assert app._sweep_settings() == ([(8, 4), (4,)], 2)
+        app.sweep_sizes_var.set("8-4, banana")
+        app._sweep_network(sync=True)
+        assert app._search is None and "cannot read" in app.status_var.get()
+        app.sweep_sizes_var.set("8-4, 4")
+        n_models_before = len([f for f in os.listdir(models_td) if f.startswith("tuned_")])
+        app._sweep_network(sync=True)
+        assert app._search is None and app._sweep is not None
+        res = app._sweep
+        assert [r.size for r in res.rows] == ["8-4", "4"] and all(r.n_trials == 2 for r in res.rows)
+        assert all(r.spec.hidden == r.hidden and r.spec.baseline_hidden == r.hidden
+                   for r in res.rows), "each rung searched at its own fixed size"
+        assert all(r.spec.max_iter == _MLP_MAX_ITER for r in res.rows)
+        assert len(app.sweep_tree.get_children()) == 2
+        assert app.sweep_tree.item("0", "values")[0] == "8-4"
+        assert app.sweep_summary_var.get().startswith("best: ")
+        assert "rung" in app.search_progress_var.get()
+        best = res.rows[res.best_index()]
+        assert app._clf_spec == best.spec and app._clf_kind == _TUNED_KIND
+        assert app._clf is best.estimator and app._pred, "best rung installed + classified"
+        assert len([f for f in os.listdir(models_td) if f.startswith("tuned_")]) == n_models_before + 1
+        assert len([f for f in os.listdir(models_td) if f.startswith("sweep_")]) == 1
+        lines = res.report_lines()
+        assert lines[0].startswith("size") and len(lines) == 2 + len(res.rows)
+        assert res.to_dict()["rows"][0]["hidden"] == [8, 4]
+        # Install the OTHER rung from the table.
+        other = 1 - res.best_index()
+        app.sweep_tree.selection_set(str(other))
+        app._refresh_sweep_buttons()
+        assert str(app.sweep_install_btn.cget("state")) == "normal"
+        app._sweep_install_selected()
+        assert app._clf is res.rows[other].estimator and app._clf_spec == res.rows[other].spec
+        assert app._search_spec == res.rows[other].spec
+        assert "Installed " + res.rows[other].size in app.status_var.get()
+        assert app.model_arch_var.get() == _model_description(_TUNED_KIND, res.rows[other].spec, 2)
+        # The sweep settings ride the session view and are validated on the way in.
+        app._apply_search_view({"sweep_sizes": "nope!", "sweep_trials": 7})
+        assert app.sweep_sizes_var.get() == "8-4, 4" and app._sweep_settings()[1] == 7
+        app._apply_search_view({"sweep_sizes": "16-8, 4"})
+        assert app.sweep_sizes_var.get() == "16-8, 4"
+        app.sweep_sizes_var.set(", ".join(model_search.size_text(h)
+                                          for h in model_search.DEFAULT_SIZE_LADDER))
+        app.sweep_trials_var.set(str(_SWEEP_TRIALS))
+        app._sweep = None
+        app._refresh_sweep_report([])
+        app._apply_search_view({"backend": "nonsense"})
+        assert app._search_settings()[4] == "sklearn", "unknown backend ignored"
+        # A forced sklearn backend builds sklearn's MLP even when torch exists;
+        # the spec records the resolved backend and the readout names it.
+        app.search_trials_var.set("2")
+        app._optimize_network(sync=True)
+        assert app._search is None and app._clf_spec.backend == "sklearn"
+        assert type(app._clf.named_steps["dense"]).__name__ == "MLPClassifier"
+        assert "sklearn (cpu)" in app.model_arch_var.get()
+        app.search_backend_var.set("auto")
+        app.search_trials_var.set("abc")
+        assert app._search_settings()[0] == _SEARCH_TRIALS, "malformed = default"
+        app.search_trials_var.set(str(_SEARCH_TRIALS))
+        app.search_timeout_var.set(str(_SEARCH_TIMEOUT_MIN))
+        import shutil
+        shutil.rmtree(models_td, ignore_errors=True)
+        app._models_dir = None
+        app.search_seed_var.set("0")
+        app.search_features_var.set(True)
+        app.search_backend_var.set("auto")
+        app._training_set = original_training_set
+        app._search_spec = None
         app.model_kind_var.set("random forest")
 
         # 'R' = train + immediate reclassify in one call, without resetting
@@ -4319,7 +5208,7 @@ def _selftest():
           "proba cache + coloring modes, confusion matrix + highlight, "
           "persistent outlines + canvas right-click, gesture previews, "
           "magic fill, blobber, hop gain + drag + cosine/proba metrics, "
-          "center notebook + model tab, toolbar hints")
+          "center notebook + model tab, toolbar hints, optimize network, size sweep")
     return 0
 
 

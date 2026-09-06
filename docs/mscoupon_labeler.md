@@ -33,7 +33,7 @@ hidden:
 |---|---|
 | **Processing** | the profile tools (New/Dup/Rename/Delete, Save/Load profile) and the profile being edited, in two columns: filter chain + base channel, MSC parameters + statistics channels |
 | **View** (default) | the slice canvas, hover readout, slice navigation, image/overlay/alpha controls and the persistence entry |
-| **Model** | the classifier kind and a read-only description of its architecture |
+| **Model** | the classifier kind, a read-only description of its architecture, the **Optimize network** search (trials, time limit, seed, feature-subset toggle, progress line) and, in the lower half, the **Size sweep** report |
 
 Two link-labels say what is in effect: the Run section is headed by the
 **selected workflow** as two compact chains --
@@ -188,3 +188,94 @@ Unchanged by the above: Train/Classify on the per-region statistics table
 export (one row per living region, class 0 kept as negatives), and the
 image training set (`train/` raw TIFFs + `labels/` per-pixel class masks,
 annotations winning over predictions).
+
+## Optimize network (the `dense (tuned)` kind)
+
+The plain `dense FC` kind is one fixed network, `StandardScaler ->
+MLPClassifier((64, 32))`, fit on every labeled region with no held-out score.
+**Optimize network** (the button on the Model tab, or `O`) searches the dense
+space instead and installs the winner as the `dense (tuned)` model:
+
+* **What is searched** (`model_search.py`, headless): depth (1-4 layers) and
+  each layer's width (8-256), L2 `alpha`, learning rate, batch size, early
+  stopping, and -- with *search feature subset* on -- which measurement
+  **channels** the network sees (all reductions of a channel stand or fall
+  together, so twelve channels are twelve booleans, not sixty). The pipeline
+  still consumes the full profile schema: the subset is a `FeatureSubset` step
+  *inside* the estimator, so the feature fingerprint, the profile-compatibility
+  gate and the pickle/predict paths are those of every other kind.
+* **How a candidate is scored**: mean held-out **log-loss** (balanced accuracy
+  alongside) under cross-validation that **leaves whole slices out** whenever
+  three or more slices carry labels (`StratifiedGroupKFold` by slice index;
+  plain stratified folds below that, folds capped by the rarest class). Regions
+  on one slice share the scan's intensity drift, so a split that mixes them
+  reports how well the net memorised the slice, not how it transfers. Log-loss
+  rather than accuracy because the class probabilities are what the magic-fill
+  `proba` metric and the uncertainty coloring consume. Every fit uses balanced
+  sample weights.
+* **The searcher**: Optuna's TPE sampler with median pruning when `optuna` is
+  installed (`pip install msseg-mscoupon[optimize]`), otherwise a seeded random
+  search over the same space (the log says which). Trial 1 is always the
+  un-tuned baseline, so the winner never loses to what Train would have built,
+  and the readout states the gain over it.
+* **Controls**: trials (default 300), a time limit in **minutes** (default
+  480 = an overnight run; 0 = none; the session keeps it as `timeout_s`), the
+  seed (sampler, folds and networks: same labels + seed = same winner), and the
+  feature-subset toggle; they ride the session as `view.model_search`. The
+  search runs on a worker thread -- labeling stays live, the canvas HUD shows
+  `Optimizing k/n`, the progress line shows the best so far plus elapsed time,
+  the per-trial average and the time left -- and **Cancel** stops after the
+  current trial, keeping the best. When it finishes the winner is installed,
+  **saved** as `models/tuned_<timestamp>.pkl` under the labeler's session
+  folder (`%APPDATA%\mscoupon-labeler` on Windows) and recorded on the
+  session, then classified -- so an unattended run is remembered: the session
+  reloads its most recent recorded model on restore, and *Load classifier…*
+  opens any of them. The log lists the permutation importances of the winner's
+  columns.
+* **Size sweep** (the lower half of the Model tab): *how small can the
+  network be?* Enter a ladder of architectures (`64-32, 32-16, 16-8, 8-4, 4`;
+  layers joined by `-`, rungs by `,`) and the trials to spend per rung, then
+  **Sweep sizes**. Each rung is a fixed-size search -- the architecture is
+  pinned and alpha, learning rate, batch, early stopping, dropout and the
+  feature subset are searched -- so a small net is judged at its own best
+  settings rather than the big net's. The table fills in as rungs finish: size,
+  parameter count, held-out log-loss and balanced accuracy, the loss relative to
+  the best rung, trials, and the best settings; rungs more than 5 % worse than
+  the best are red, the smallest rung within 5 % is shaded green, and the
+  summary names the best, the smallest that still holds, and where the ladder
+  breaks down. The best rung is installed, saved and classified when the sweep
+  ends; **Install selected size** makes any other rung the model (its refit
+  estimator, saved the same way). The rows, specs and table are also written as
+  `models/sweep_<timestamp>.json`, and the log carries the table. The Optimize
+  time limit caps the whole sweep; Cancel stops after the current trial and
+  keeps the rungs already scored.
+* **Trial budget**: a trial is a 5-fold CV of one candidate. Each fold trains
+  for at most `SEARCH_MAX_ITER` = 300 epochs with an early-stop patience of 10
+  (the winner is refit afterwards with the full 1000-epoch budget); a torch
+  trial also reports its folds' mean held-out loss every 25 epochs so Optuna's
+  median pruner can stop a hopeless candidate early. Mini-batch training is a
+  Python loop of ~1.5 ms per optimizer step on either device, so candidates
+  with a batch below `TORCH_MIN_BATCH` = 256 rows train on sklearn's CPU MLP
+  (6 ms per epoch per fold) while full-batch and 256/512 candidates use the
+  stacked torch loop; `spec.backend` records the request, the readout the
+  backend that actually trained it. On ~6000 labeled regions a trial is then
+  seconds rather than the minutes a 16-row batch cost on torch.
+* **Backend** (`torch` / `sklearn` / `auto`): with PyTorch installed
+  (`pip install msseg-mscoupon[torch]`, CUDA wheels from
+  `download.pytorch.org/whl/cu128`) the net is `torch_mlp.TorchMLPClassifier`
+  -- the same `hidden/alpha/lr/batch/early stopping` semantics plus
+  **dropout**, which then joins the search -- and every fold of a trial trains
+  as **one stacked batch** on the GPU (`torch_mlp.train_stacked`: weights are
+  `(folds, in, out)` tensors, per-fold standardisation on the padded batch,
+  per-fold early stopping keeping each fold's best epoch). `sklearn` forces
+  `MLPClassifier` on the CPU; `auto` is torch when importable. The readout
+  names the backend and device; a torch pickle needs torch to load but
+  predicts on a CPU-only machine.
+* **Afterwards**: the Model tab readout renders the winning spec (layers,
+  alpha, learning rate, batch, early stopping, `k/n features`, CV log-loss and
+  balanced accuracy against the baseline); the model hint and strip show the
+  layers, feature count and CV balanced accuracy. **Train** on the
+  `dense (tuned)` kind rebuilds that spec on the current labels without
+  re-searching (before any search it builds the baseline). The spec rides the
+  classifier pickle (v3, `spec`; v1/v2 pickles still load) and the session's
+  model record, so a loaded tuned model is described and retrainable.

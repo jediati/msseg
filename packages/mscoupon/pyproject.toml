@@ -19,9 +19,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The labeler's Train/Classify buttons (random forest); everything else works
-# without it, and the import is lazy with a status-bar hint when missing.
-classify = ["scikit-learn"]
+# The labeler's Train/Classify buttons (random forest / dense FC); everything
+# else works without it, and the import is lazy with a status-bar hint when
+# missing. >= 1.7 for MLPClassifier's sample_weight (balanced classes).
+classify = ["scikit-learn>=1.7"]
+# The labeler's "Optimize network" search over the dense FC architecture and
+# feature subset. optuna is the TPE searcher; without it the same space is
+# searched at random (the status bar says so).
+optimize = ["scikit-learn>=1.7", "optuna>=4"]
+# The GPU dense classifier (torch_mlp.TorchMLPClassifier): every fold of a
+# search trial trains as one stacked batch on CUDA, and Train uses it too.
+# PyPI's Windows torch wheel is CPU-only; for CUDA install torch first from
+# https://download.pytorch.org/whl/cu128 (Blackwell GPUs need cu128 or newer).
+torch = ["torch>=2.7"]
 
 [project.scripts]
 mscoupon = "msseg.mscoupon.analysis:main"

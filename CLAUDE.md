@@ -219,6 +219,56 @@ respectively -- show the active workflow rendered by
 and `stats: base→norm(gmm)→12ch×4`, polled every 0.7 s from the panel) and the active model -- each a
 click away from its tab.
 
+**mscoupon labeler "Optimize network"** (`dense (tuned)` kind, key `O`, see
+[docs/mscoupon_labeler.md](docs/mscoupon_labeler.md)): the dense FC classifier
+was one fixed `(64, 32)` net fit with no held-out score. `model_search.py`
+(headless, pytest-covered) describes a net as a plain-data `ModelSpec`, builds
+its pipeline (`FeatureSubset` -> `StandardScaler` -> `MLPClassifier`, balanced
+sample weights), scores it by **leave-slices-out** CV (`StratifiedGroupKFold` by
+slice when >= 3 slices carry labels; mean held-out log-loss, since the
+probabilities feed magic-fill `proba` and the uncertainty coloring) and searches
+depth, widths, alpha, learning rate, batch, early stopping and a **per-channel
+feature mask** -- Optuna TPE + median pruning when installed (`[optimize]`
+extra), else seeded random search over the same space; trial 1 is always the
+baseline so the winner never loses to it. The labeler runs it on a worker
+thread drained by a `root.after` pump (Cancel keeps the best so far), installs
+the winner via the `_install_model` tail Train also uses, and classifies. The
+subset lives INSIDE the estimator, so the feature fingerprint, compat gate and
+pickle/predict paths are untouched; the spec rides the pickle (v3, `spec`),
+the session model record, and `view.model_search` carries the search settings.
+**GPU backend** (`torch_mlp.py`, `spec.backend` = `torch`/`sklearn`, `auto` =
+torch when importable, `[torch]` extra): `TorchMLPClassifier` is an
+`MLPClassifier` drop-in (plus dropout, searched) and `train_stacked` trains
+every CV fold of a trial as ONE batched computation -- `(F, in, out)` weights
+via `baddbmm`, per-fold standardisation/early stopping/best-epoch snapshots
+vectorised with `torch.where`, one host sync per epoch -- so a trial is one
+training loop, not five; labels encode over the global class list so a fold
+missing a class still yields its probability column. **Trial cost**: a
+mini-batch step is ~1.5 ms of per-op overhead on either device, so specs with
+`batch_size` < `TORCH_MIN_BATCH` (256) train on sklearn (`effective_backend`;
+`spec.backend` keeps the request), trials run under a separate budget
+(`SEARCH_MAX_ITER` 300 / `SEARCH_PATIENCE` 10; the winner is refit with the
+full 1000 via `refit_max_iter`), and a torch trial reports its held-out loss
+every `REPORT_EVERY` epochs through `train_stacked(monitor=...)` so Optuna can
+prune. Defaults are overnight-sized (300 trials, 480 min, the entry in minutes,
+the session in seconds) and `_finish_search` pickles the winner to
+`<app_data_dir>/models/tuned_<stamp>.pkl` and records it, so a restore reloads
+it. **Size sweep** (`run_size_sweep`, lower half of the Model tab): one
+fixed-architecture search per rung of a ladder (`SearchSpace.fixed_hidden`
+pins the size, trial 1 is that size at baseline settings, `spec.baseline_hidden`
+records it), reported as a Treeview (params, CV log-loss, bal. acc, loss vs the
+best rung, best settings) with `SweepResult.summary()` naming the best rung, the
+smallest within `SWEEP_TOLERANCE` (5 %) and the breakdown rung; the best rung is
+installed + saved, any rung is installable from the table, and the sweep is
+written as `models/sweep_<stamp>.json`.
+**Edge-pairs experiment** (2026-09-05, [docs/mscoupon_edge_pairs.md](docs/mscoupon_edge_pairs.md),
+script `packages/mscoupon/experiments/edge_pairs.py`): a logistic pair model on the
+16-8 net's 8-d layer tells same/different-class edges of the region graph better
+than the net's own argmax (97 % / 94 % boundary recall / precision vs 93 % / 88 %),
+and three rounds of neighbour voting cut held-out region errors 115 -> 66. Paths
+forward are listed in the doc (real MSC arcs + saddles, a `learned` magic-fill
+metric, a refine-with-neighbours action, joint training).
+
 **mscoupon extremum statistics** (`ext_x`, `ext_y`, `ext_base`, `ext_filtered`):
 the per-slice selection chain can also ask about a region's **seeding critical
 point** — the minimum for ascending manifolds, the maximum for descending — not

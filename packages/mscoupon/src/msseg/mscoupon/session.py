@@ -302,7 +302,10 @@ def session_doc_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[s
             models.append({"path": str(md["path"]),
                            "fingerprint": [str(n) for n in _as_list(md.get("fingerprint"))],
                            "kind": str(md.get("kind") or "random forest"),
-                           "statistics": _as_dict(md.get("statistics"))})
+                           "statistics": _as_dict(md.get("statistics")),
+                           # The tuned dense spec (model_search.ModelSpec as a
+                           # dict), opaque here; absent for the other kinds.
+                           "spec": _as_dict(md.get("spec")) or None})
 
     return {
         "app": str(root.get("app") or ""),
