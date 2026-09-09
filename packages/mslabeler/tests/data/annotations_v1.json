@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "app": "mscoupon-labeler",
+  "n_classes": 3,
+  "interactions": [
+    {
+      "uid": 1,
+      "slice": "s0.tiff",
+      "tool": "box",
+      "class": 1,
+      "points": [
+        [
+          1.0,
+          1.0
+        ],
+        [
+          5.0,
+          5.0
+        ]
+      ]
+    },
+    {
+      "uid": 2,
+      "slice": "dup.tiff",
+      "tool": "taps",
+      "class": 2,
+      "points": [
+        [
+          2.0,
+          2.0
+        ]
+      ]
+    },
+    {
+      "uid": 3,
+      "slice": "gone.tiff",
+      "tool": "squiggle",
+      "class": 2,
+      "points": [
+        [
+          2.0,
+          2.0
+        ]
+      ]
+    }
+  ]
+}

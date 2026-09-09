@@ -13,9 +13,9 @@ import pytest
 pytest.importorskip("sklearn")
 torch = pytest.importorskip("torch")
 
-from msseg.mscoupon import model_search as ms
-from msseg.mscoupon import torch_mlp as tm
-from msseg.mscoupon.torch_mlp import TorchMLPClassifier
+from msseg.labeler import model_search as ms
+from msseg.labeler import torch_mlp as tm
+from msseg.labeler.torch_mlp import TorchMLPClassifier
 
 
 def blobs(n=300, d=8, seed=0, classes=3):

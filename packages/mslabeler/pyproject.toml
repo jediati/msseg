@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "msseg-labeler"
+version = "0.1.0"
+description = "MSSeg labeler framework: the Tk viewer/annotation shell, slice canvas, gesture-based annotation store, region-graph tools and classifier training shared by the MSSeg labelers."
+requires-python = ">=3.9"
+# Pure Python. numpy for every raster/table operation, Pillow for gesture
+# rasterization and the canvas composite. Everything heavier is an extra.
+dependencies = ["numpy", "pillow"]
+
+[project.optional-dependencies]
+# Region classifier (random forest / dense nets), model search and the edge model.
+classify = ["scikit-learn>=1.7"]
+# `Optimize network`: Optuna TPE + median pruning (else seeded random search).
+optimize = ["scikit-learn>=1.7", "optuna>=4"]
+# GPU dense nets (`torch_mlp`); install a CUDA wheel from download.pytorch.org.
+torch = ["torch>=2.7"]
+# Pyramidal (tiled) base-image rendering in the canvas.
+pyramid = ["large-image[tiff,tifffile]"]
+
+[tool.hatch.build.targets.wheel]
+# PEP 420 namespace: ship msseg/labeler/ with no top-level msseg/__init__.py.
+packages = ["src/msseg"]

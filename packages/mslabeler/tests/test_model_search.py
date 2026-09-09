@@ -12,8 +12,8 @@ import pytest
 
 sklearn = pytest.importorskip("sklearn")
 
-from msseg.mscoupon import model_search as ms
-from msseg.mscoupon.model_search import (ModelSpec, FeatureSubset, SearchSpace,
+from msseg.labeler import model_search as ms
+from msseg.labeler.model_search import (ModelSpec, FeatureSubset, SearchSpace,
                                          build_estimator, feature_groups, make_cv,
                                          cv_evaluate, run_search)
 

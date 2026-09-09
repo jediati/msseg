@@ -7,8 +7,8 @@ Runs headless with numpy + PIL only (no Tk, no compiled extension):
 import numpy as np
 import pytest
 
-from msseg.mscoupon import labeling
-from msseg.mscoupon.labeling import (LabelStore, Interaction, touched_ids,
+from msseg.labeler import labeling
+from msseg.labeler.labeling import (LabelStore, Interaction, touched_ids,
                                      resolve_slice, class_lut, line_pixels,
                                      scalar_lut, CLASS_COLORS, polygon_mask,
                                      preview_lut)

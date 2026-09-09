@@ -39,10 +39,9 @@ from .config_io import (FILTER_SCHEMA, FILTER_OPERATIONS, COLOR_METHODS, QUERY_O
 # Shared helpers live in common.py (re-exported here so existing imports of
 # `msseg.mscoupon.app` keep working) and the small reusable widgets in
 # widgets.py -- both are shared with the labeler app.
-from .common import (log, natural_key, list_tiffs, _wheel_delta,
-                     _bind_click_to_value, _id_lut, FeatureTable,
-                     _parse_sigmas, _format_sigmas, group_contiguous)
-from .widgets import ScrollFrame, jump_scale, scrolled_listbox, attach_tooltip
+from .common import (log, natural_key, list_tiffs, _id_lut, FeatureTable, _parse_sigmas, _format_sigmas, group_contiguous)
+from msseg.labeler.widgets import (ScrollFrame, jump_scale, scrolled_listbox, attach_tooltip,
+                                   _wheel_delta, _bind_click_to_value)
 from .engine import ComputeEngine
 from . import session
 
@@ -1525,7 +1524,7 @@ class MscouponApp:
         self.canvas_holder.pack(fill="both", expand=True)
         self.viewer = None
         try:
-            from .viewer_canvas import SliceCanvas
+            from msseg.labeler.canvas import SliceCanvas
             self.viewer = SliceCanvas(self.canvas_holder)
             self.viewer.pack(fill="both", expand=True)
             self.viewer.on_hover = self._on_hover

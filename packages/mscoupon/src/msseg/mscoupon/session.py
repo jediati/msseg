@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from . import config_io
 from .config_io import _as_dict, _as_int, _as_list, _note, _opt_float
 
-SESSION_DOC_VERSION = 2
+from msseg.labeler.session_doc import SESSION_DOC_VERSION  # noqa: F401
 PROFILE_FILE_APP = "mscoupon-profile"
 PROFILE_FILE_VERSION = 1
 
@@ -186,182 +186,19 @@ def profile_file_doc(profile: Dict[str, Any]) -> Dict[str, Any]:
     return doc
 
 
-def dedupe_profile_name(name: str, taken: Sequence[str]) -> str:
-    taken_set = set(taken)
-    if name not in taken_set:
-        return name
-    i = 2
-    while f"{name} ({i})" in taken_set:
-        i += 1
-    return f"{name} ({i})"
-
-
-# --------------------------------------------------------------------------- #
-# Folders and sequences
-# --------------------------------------------------------------------------- #
-def folder_display_name(path: str, taken: Sequence[str]) -> str:
-    """Human-readable unique name for a folder: its basename, qualified with
-    trailing parent parts only as needed to dodge a collision."""
-    parts = [p for p in os.path.normpath(path).replace("\\", "/").split("/") if p]
-    taken_set = set(taken)
-    for depth in range(1, len(parts) + 1):
-        name = "/".join(parts[-depth:])
-        if name not in taken_set:
-            return name
-    # Everything collides (pathological); make it unique numerically.
-    base = "/".join(parts) or "folder"
-    return dedupe_profile_name(base, taken)
-
-
-def sequence_row_text(seq: Dict[str, Any]) -> str:
-    """`folder  [first – last] (n)` for the sequences listbox."""
-    files = seq.get("files") or []
-    def stem(p):
-        return os.path.splitext(os.path.basename(p))[0]
-    span = ""
-    if files:
-        span = (f"[{stem(files[0])}]" if len(files) == 1
-                else f"[{stem(files[0])} – {stem(files[-1])}]")
-    return f"{seq.get('folder', '?')}  {span} ({len(files)})"
-
-
-def resolve_sequence_files(seq: Dict[str, Any],
-                           folders_by_name: Dict[str, Dict[str, Any]],
-                           notes: Optional[List[str]] = None) -> List[str]:
-    """Doc-form sequence (basenames under a folder name) -> absolute paths.
-    A missing folder resolves to nothing (with a note), never half a list."""
-    folder = folders_by_name.get(str(seq.get("folder") or ""))
-    if folder is None:
-        _note(notes, f"sequence {seq.get('name')!r}: folder "
-                     f"{seq.get('folder')!r} is not in the session - skipped")
-        return []
-    root = str(folder.get("path") or "")
-    out = []
-    for base in _as_list(seq.get("files")):
-        if isinstance(base, str) and base:
-            out.append(base if os.path.isabs(base) else os.path.join(root, base))
-    return out
-
-
-# --------------------------------------------------------------------------- #
-# The session document
-# --------------------------------------------------------------------------- #
-def build_session_doc(*, app: str,
-                      folders: Sequence[Dict[str, Any]],
-                      sequences: Sequence[Dict[str, Any]],
-                      profiles: Sequence[Dict[str, Any]],
-                      active_profile: str,
-                      run: Dict[str, Any],
-                      view: Dict[str, Any],
-                      annotations: Optional[Dict[str, Any]] = None,
-                      models: Optional[Sequence[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    doc: Dict[str, Any] = {
-        "app": str(app),
-        "session_version": SESSION_DOC_VERSION,
-        "folders": [{"path": str(f.get("path") or ""),
-                     "name": str(f.get("name") or "")} for f in folders],
-        "sequences": [{"name": str(s.get("name") or ""),
-                       "folder": str(s.get("folder") or ""),
-                       "files": [os.path.basename(p) for p in (s.get("files") or [])]}
-                      for s in sequences],
-        "profiles": [dict(p) for p in profiles],
-        "active_profile": str(active_profile),
-        "run": dict(run),
-        "view": dict(view),
-    }
-    if annotations is not None:
-        doc["annotations"] = annotations
-    if models is not None:
-        doc["models"] = [dict(m) for m in models]
-    return doc
-
-
-def _first_dict(*candidates: Any) -> Optional[Dict[str, Any]]:
-    """The first candidate that is actually a dict, else None -- for reading a
-    key that has been renamed, newest spelling first."""
-    for c in candidates:
-        if isinstance(c, dict):
-            return c
-    return None
-
-
-def is_session_doc(doc: Any) -> bool:
-    return isinstance(doc, dict) and _as_int(doc.get("session_version"), 0) >= 2
+# The generic session document (folders, sequences, doc build/read, disk I/O)
+# lives in the labeler framework; the names stay importable from here.
+from msseg.labeler import session_doc as _session_doc
+from msseg.labeler.session_doc import (dedupe_profile_name, folder_display_name,      # noqa: F401
+                                       sequence_row_text, resolve_sequence_files,
+                                       build_session_doc, _first_dict, is_session_doc)
 
 
 def session_doc_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[str, Any]:
     """Total reader: any dict-ish input -> a fully-populated v2 session dict
-    (folders/sequences/profiles normalized, at least one profile, a valid
-    active_profile name)."""
-    root = _as_dict(doc)
-
-    folders: List[Dict[str, Any]] = []
-    taken: List[str] = []
-    for f in _as_list(root.get("folders")):
-        fd = _as_dict(f)
-        path = str(fd.get("path") or "")
-        if not path:
-            _note(notes, "folder entry without a path - skipped")
-            continue
-        name = str(fd.get("name") or "") or folder_display_name(path, taken)
-        if name in taken:
-            name = folder_display_name(path, taken)
-        folders.append({"path": path, "name": name})
-        taken.append(name)
-
-    sequences: List[Dict[str, Any]] = []
-    for s in _as_list(root.get("sequences")):
-        sd = _as_dict(s)
-        files = [str(b) for b in _as_list(sd.get("files")) if isinstance(b, str) and b]
-        if not files:
-            _note(notes, f"sequence {sd.get('name')!r} has no files - skipped")
-            continue
-        sequences.append({"name": str(sd.get("name") or ""),
-                          "folder": str(sd.get("folder") or ""),
-                          "files": files})
-
-    profiles = [profile_from_json(p, notes) for p in _as_list(root.get("profiles"))]
-    if not profiles:
-        profiles = [default_profile()]
-    names: List[str] = []
-    for p in profiles:
-        p["name"] = dedupe_profile_name(p["name"], names)
-        names.append(p["name"])
-    active = str(root.get("active_profile") or "")
-    if active not in names:
-        active = names[0]
-
-    run = _as_dict(root.get("run"))
-    models = []
-    for m in _as_list(root.get("models")):
-        md = _as_dict(m)
-        if md.get("path"):
-            models.append({"path": str(md["path"]),
-                           "fingerprint": [str(n) for n in _as_list(md.get("fingerprint"))],
-                           "kind": str(md.get("kind") or "random forest"),
-                           "statistics": _as_dict(md.get("statistics")),
-                           # The tuned dense spec (model_search.ModelSpec as a
-                           # dict), opaque here; absent for the other kinds.
-                           "spec": _as_dict(md.get("spec")) or None,
-                           # Whether an edge model rides the pickle (v4).
-                           "edge": bool(md.get("edge"))})
-
-    return {
-        "app": str(root.get("app") or ""),
-        "session_version": SESSION_DOC_VERSION,
-        "folders": folders,
-        "sequences": sequences,
-        "profiles": profiles,
-        "active_profile": active,
-        "run": {"cores_per_slice": _as_int(run.get("cores_per_slice"), 0) or None,
-                "concurrent_slices": _as_int(run.get("concurrent_slices"), 0) or None},
-        "view": _as_dict(root.get("view")),
-        # "labels" is what sessions written before the rename call this, and it
-        # is the ONLY thing that key ever meant here (the raw gesture geometry);
-        # elsewhere in the tree "labels" is the MSC label raster.
-        "annotations": _first_dict(root.get("annotations"), root.get("labels")),
-        "models": models,
-    }
+    whose profiles are coupon compute profiles (``profile_from_json``)."""
+    return _session_doc.session_doc_from_json(doc, notes, profile_reader=profile_from_json,
+                                              default_profile=default_profile)
 
 
 # --------------------------------------------------------------------------- #

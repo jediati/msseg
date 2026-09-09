@@ -10,8 +10,8 @@ import math
 import numpy as np
 import pytest
 
-from msseg.mscoupon import magic_fill as mf
-from msseg.mscoupon.common import FeatureTable
+from msseg.labeler import magic_fill as mf
+from msseg.labeler.table import FeatureTable
 
 from test_labeling import blocks_raster
 

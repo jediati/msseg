@@ -971,79 +971,9 @@ def split_session(doc: Any) -> tuple:
     return {k: v for k, v in root.items() if k != SESSION_KEY}, gui
 
 
-def app_data_dir(app: str = "mscoupon") -> str:
-    """Per-user config directory. Stdlib only -- one auto-saved file does not
-    justify a dependency. Never raises, never creates."""
-    base = os.environ.get("APPDATA") if os.name == "nt" else None
-    if not base:
-        base = os.environ.get("XDG_CONFIG_HOME")
-    if not base:
-        base = os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, app)
-
-
-def session_path(app: str = "mscoupon", name: str = "last_session.json") -> str:
-    return os.path.join(app_data_dir(app), name)
-
-
-def read_json_file(path: str) -> Optional[Dict[str, Any]]:
-    """The parsed top-level object, or None when the file is missing,
-    unreadable, malformed, or not an object. Never raises."""
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            doc = json.load(fh)
-    except (OSError, ValueError, UnicodeDecodeError):
-        return None
-    return doc if isinstance(doc, dict) else None
-
-
-def serialize_session(doc: Dict[str, Any]) -> str:
-    """`sort_keys` so key ordering can never make an unchanged session look
-    changed -- the auto-save compares this text against the last one written."""
-    return json.dumps(doc, indent=2, sort_keys=True)
-
-
-def rotate_session_backups(path: str, keep: int = 3) -> None:
-    """Roll `path` back one generation: .1 -> .2 -> ... -> .<keep>, then copy
-    the live file to .1. Never raises, and never removes the live file.
-
-    Auto-save is the only writer that runs without the user asking for it, so
-    it is the one that needs an undo: a bad automatic write then costs the last
-    `keep` states rather than everything. The copy (rather than a move) for the
-    newest generation keeps `path` readable even if the write that follows
-    fails."""
-    if keep < 1 or not os.path.isfile(path):
-        return
-    root, ext = os.path.splitext(path)
-    try:
-        for i in range(keep, 1, -1):
-            src = f"{root}.{i - 1}{ext}"
-            if os.path.isfile(src):
-                os.replace(src, f"{root}.{i}{ext}")
-        shutil.copy2(path, f"{root}.1{ext}")
-    except OSError:
-        return          # a full or read-only directory must not stop the save
-
-
-def write_session_text(text: str, path: str) -> bool:
-    """Atomically replace `path` with `text`. False (never an exception) when the
-    directory is unwritable, read-only, or full."""
-    tmp = path + ".tmp"
-    try:
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.replace(tmp, path)
-        return True
-    except OSError:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        return False
-
-
-def write_session(doc: Dict[str, Any], path: str) -> bool:
-    return write_session_text(serialize_session(doc), path)
+# The session-file I/O moved to the labeler framework (it is generic across
+# labelers); re-exported so `config_io.session_path(...)` etc. keep working and
+# stay monkeypatchable through this module.
+from msseg.labeler.session_doc import (app_data_dir, session_path, read_json_file,      # noqa: E402,F401
+                                       serialize_session, rotate_session_backups,
+                                       write_session_text, write_session)

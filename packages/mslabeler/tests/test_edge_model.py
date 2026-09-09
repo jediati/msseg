@@ -11,8 +11,8 @@ import pytest
 pytest.importorskip("sklearn")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from msseg.mscoupon import edge_model as em          # noqa: E402
-from msseg.mscoupon import model_search as ms         # noqa: E402
+from msseg.labeler import edge_model as em          # noqa: E402
+from msseg.labeler import model_search as ms         # noqa: E402
 
 NAMES = [f"mean_c{i}" for i in range(6)]
 

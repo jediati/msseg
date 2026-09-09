@@ -11,6 +11,7 @@ requires-python = ">=3.9"
 # installable on its own; this is only for users who want everything.
 dependencies = [
     "msseg-viz",
+    "msseg-labeler",
     "msseg-mscoupon",
     "msseg-cellseg",
     "msseg-workflow",

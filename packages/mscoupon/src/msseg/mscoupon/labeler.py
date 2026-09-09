@@ -64,13 +64,13 @@ from . import config_io
 from . import session
 from .app import MscouponApp
 from .common import log
-from .widgets import ScrollFrame, attach_tooltip
-from .labeling import (LabelStore, MAX_CLASSES, TOOLS,
+from msseg.labeler.widgets import ScrollFrame, attach_tooltip
+from msseg.labeler.labeling import (LabelStore, MAX_CLASSES, TOOLS,
                        resolve_slice, resolve_sets, touched_sets, class_lut,
                        scalar_lut, line_pixels, polygon_mask, preview_lut)
-from . import magic_fill
-from . import model_search
-from . import edge_model
+from msseg.labeler import magic_fill
+from msseg.labeler import model_search
+from msseg.labeler import edge_model
 
 # How faint the inherited region overlay is drawn under the class layer
 # (0..255); the class colors themselves stay fully opaque in the LUT and are
@@ -4900,7 +4900,7 @@ def _selftest():
     the pure geometry/ordering/LUT math is covered by tests/test_labeling.py."""
     import tempfile
     import numpy as np
-    from . import labeling
+    from msseg.labeler import labeling
 
     root = tk.Tk()
     root.withdraw()
