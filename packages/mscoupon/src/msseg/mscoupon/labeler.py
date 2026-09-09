@@ -4695,6 +4695,10 @@ class LabelerApp(MscouponApp):
                       "drag_px": _bounded_float(self.magic_drag_var.get(),
                                                 _DEFAULT_DRAG_PX, *_DRAG_PX_RANGE)}
         d["center_tab"] = self._center_tab_name()
+        # The PICKED kind, apart from the trained model: a plain Train writes
+        # no pickle, so a restore that reloads the newest saved model would
+        # otherwise land on that pickle's kind (e.g. the last Optimize winner).
+        d["model_kind"] = self.model_kind_var.get()
         trials, timeout_s, seed, feat, backend = self._search_settings()
         d["model_search"] = {"trials": trials, "timeout_s": timeout_s, "seed": seed,
                              "feature_search": feat, "backend": backend,
@@ -4745,6 +4749,75 @@ class LabelerApp(MscouponApp):
         doc["models"] = [dict(m) for m in self.models]
         return doc
 
+    # -- new session ---------------------------------------------------- #
+    def _new_session_options(self):
+        return super()._new_session_options() + [(
+            "model",
+            "Keep model selection & settings (kind, loaded model, edge and search settings)",
+            "The picked kind, the model in memory and its saved-model records, the "
+            "custom base / edge settings and the Optimize settings carry over. Off: no "
+            "model, dense FC selected, default settings.")]
+
+    def _new_session_blurb(self):
+        return ("Start a new session: no folders, no sequences, nothing computed, "
+                "no annotations (class count and colours stay).")
+
+    def _new_session_doc(self, keep):
+        doc = super()._new_session_doc(keep)
+        empty = self.store.to_json()
+        empty["interactions"] = []            # classes + colours, no gestures
+        doc["annotations"] = empty
+        keep_model = keep.get("model", True)
+        doc["models"] = [dict(m) for m in self.models] if keep_model else []
+        if not keep_model:
+            for key in ("model_search", "neighbours", "model_kind"):
+                doc["view"].pop(key, None)
+        # The in-memory model is not in the document (a plain Train writes
+        # no pickle): stash it so the apply's pickle reload cannot replace it.
+        self._new_session_stash = ((self._clf, self._clf_names, self._clf_kind,
+                                    self._clf_spec, self._edge_model, self._search_spec)
+                                   if keep_model else None)
+        return doc
+
+    def _after_new_session(self, keep):
+        stash = getattr(self, "_new_session_stash", None)
+        self._new_session_stash = None
+        if keep.get("model", True):
+            if stash is not None and stash[0] is not None:
+                (self._clf, self._clf_names, self._clf_kind, self._clf_spec,
+                 self._edge_model, self._search_spec) = stash
+                self.classify_btn.config(state="normal")
+        else:
+            self._reset_model_selection()
+        self._pred.clear()
+        self._cm_cell = None
+        self._refresh_region_modes()
+        self._refresh_confusion()
+        self._refresh_model_readout()
+        self._refresh_model_strip()
+        self._refresh_edge_readout()
+        self._fill_error_list(None)
+
+    def _reset_model_selection(self):
+        """No model, the default kind, default edge / search settings."""
+        self._clf = None
+        self._clf_names = None
+        self._clf_kind = "dense FC"
+        self._clf_spec = None
+        self._edge_model = None
+        self._search_spec = None
+        self.models = []
+        self.model_kind_var.set("dense FC")
+        self.custom_hidden_var.set(_DEFAULT_CUSTOM_HIDDEN)
+        self.freeze_base_var.set(False)
+        self._apply_edge_spec(edge_model.EdgeSpec())
+        self.search_trials_var.set(str(_SEARCH_TRIALS))
+        self.search_timeout_var.set(str(_SEARCH_TIMEOUT_MIN))
+        self.search_seed_var.set("0")
+        self.search_features_var.set(True)
+        self.search_backend_var.set("auto")
+        self.classify_btn.config(state="disabled")
+
     def _apply_session_doc(self, doc, source="session", notes=None):
         notes = super()._apply_session_doc(doc, source,
                                            notes if notes is not None else [])
@@ -4775,6 +4848,10 @@ class LabelerApp(MscouponApp):
         self._apply_magic_view(view.get("magic"))
         self._apply_search_view(view.get("model_search"))
         self._apply_neighbours_view(view.get("neighbours"))
+        # The picked kind wins over the reloaded pickle's kind (the model
+        # reload above set model_kind_var from the pickle).
+        if view.get("model_kind") in _MODEL_KINDS:
+            self.model_kind_var.set(view["model_kind"])
         # Keep the regions toggle in sync with whatever seg_source restored to.
         self.show_regions_var.set(self.seg_source_var.get() == "msc")
         # The center tab, by name; an unknown or missing value leaves it alone.
@@ -5098,8 +5175,12 @@ def _selftest():
     # Session round-trip: the store rides the v2 session doc, and so does
     # the selected center tab (by name).
     app.center.select(app.model_tab)
+    kind_pick = app.model_kind_var.get()
+    app.model_kind_var.set(_CUSTOM_EDGE_KIND)
     sdoc = app._session_doc()
     assert sdoc["view"]["center_tab"] == "Model"
+    assert sdoc["view"]["model_kind"] == _CUSTOM_EDGE_KIND, "the picked kind rides the view"
+    app.model_kind_var.set("dense FC")
     app.center.select(app.right)
     assert "labels" not in sdoc, "the gesture geometry is 'annotations' now"
     assert sdoc["annotations"]["n_classes"] == 2
@@ -5108,6 +5189,13 @@ def _selftest():
     app.store = LabelStore()             # clobber
     app._apply_session_doc(sdoc, "test")
     assert app._center_tab_name() == "Model", "the center tab restores by name"
+    assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND, "the picked kind restores"
+    bad = json.loads(json.dumps(sdoc))
+    bad["view"]["model_kind"] = "no such kind"
+    app._apply_session_doc(bad, "test")
+    assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND, "an unknown kind is ignored"
+    sdoc["view"]["model_kind"] = kind_pick        # later re-applies keep the default
+    app.model_kind_var.set(kind_pick)
     app.center.select(app.right)
     assert len(app.store.interactions) == 2
     assert all(it.bound for it in app.store.interactions), \
@@ -6191,6 +6279,34 @@ def _selftest():
     app.engine.work_q.put(("done", []))
     app.engine.poll()
     assert app._commit_id == c0 + 1, "re-prime must bump the commit"
+
+    # New session: data, sequences, primed stacks and annotations go; the
+    # profiles and the model selection stay when asked to, and the model in
+    # memory survives the apply (it is not in the document).
+    app.model_kind_var.set(_CUSTOM_EDGE_KIND)
+    app.custom_hidden_var.set("4")
+    prof_names = [p["name"] for p in app.profiles]
+    n_cls = app.store.n_classes
+    app.store.add("squiggle", [(3.0, 3.0)], 1, "data/s0.tiff")
+    assert app.store.interactions
+    clf_keep = app._clf
+    assert [o[0] for o in app._new_session_options()] == ["profiles", "model"]
+    assert app._new_session(keep={"profiles": True, "model": True})
+    assert app.folders == [] and app.subsequences == [] and not app.primed
+    assert not app.flat_slices and not app._pred
+    assert app.store.interactions == [] and app.store.n_classes == n_cls
+    assert [p["name"] for p in app.profiles] == prof_names
+    assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND
+    assert app.custom_hidden_var.get() == "4"
+    assert app._clf is clf_keep, "the in-memory model survives"
+    assert app._session_owned and "kept" in app.status_var.get()
+    assert app._new_session(keep={"profiles": False, "model": False})
+    assert len(app.profiles) == 1 and app.profiles[0]["name"] == "default"
+    assert app._clf is None and app._edge_model is None and app.models == []
+    assert app.model_kind_var.get() == "dense FC"
+    assert app.custom_hidden_var.get() == _DEFAULT_CUSTOM_HIDDEN
+    assert str(app.classify_btn.cget("state")) == "disabled"
+    assert "nothing kept" in app.status_var.get()
 
     # The labeler's session file never collides with the viewer's.
     assert config_io.session_path(app=app.SESSION_APP) != config_io.session_path()

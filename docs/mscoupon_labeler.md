@@ -48,7 +48,12 @@ on, then channels × reductions); hover for the code table -- and the classifier
 section, above Train/Classify, by the **active model** (the kind Train will
 build, or the trained model and its feature count); clicking either opens its
 tab. The selected tab rides the session as
-`view.center_tab` and is restored by name. The hotkeys are window-wide, so `Tab` still toggles the overlay from any
+`view.center_tab` and is restored by name, and so does the picked model kind
+(`view.model_kind`: a plain Train writes no pickle, so without it a restore
+would land on the kind of the newest saved model). **New session…** (toolbar)
+starts over with no data and no annotations; its dialog keeps the compute
+profiles and the model selection (kind, the model in memory, edge and search
+settings) unless unticked. The hotkeys are window-wide, so `Tab` still toggles the overlay from any
 tab. The viewer (`mscoupon-gui`) keeps its two-pane layout.
 
 ## Annotations are gestures, not region ids

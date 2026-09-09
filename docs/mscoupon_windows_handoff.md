@@ -13,7 +13,7 @@ A wheel with a compiled extension is locked to one interpreter version
 Published as GitHub Release assets on the (public) `jediati/msseg` repo, so the
 collaborator needs no GitHub account and no manual download:
 
-**<https://github.com/jediati/msseg/releases/tag/mscoupon-win-0.1.0>**
+**<https://github.com/jediati/msseg/releases/tag/mscoupon-win-0.2.0>**
 
 GitHub Packages is not an option — it has no Python/PyPI registry — and
 committing wheels into the tree would bloat it, so Releases is the mechanism.
@@ -32,7 +32,7 @@ Two files — or, with the release above, just the install line:
 
 | File | What it is |
 |---|---|
-| `msseg_mscoupon-0.1.0-cp311-cp311-win_amd64.whl` | the CLI, GUI, labeler + the compiled `mscoupon_py` extension (GPU-enabled) |
+| `msseg_mscoupon-0.2.0-cp311-cp311-win_amd64.whl` | the CLI, GUI, labeler + the compiled `mscoupon_py` extension (GPU-enabled) |
 | `msseg_viz-0.1.0-py3-none-any.whl` | the shared palette / icicle package; pure Python, not on PyPI, so it has to travel with the other wheel |
 
 Every other dependency (numpy, scipy, pandas, tifffile, bokeh, matplotlib,
@@ -61,17 +61,19 @@ Straight from the release, nothing to download by hand (the PEP 508
 `<url>[classify]` does not parse):
 
 ```bash
-pip install "msseg-viz @ https://github.com/jediati/msseg/releases/download/mscoupon-win-0.1.0/msseg_viz-0.1.0-py3-none-any.whl" "msseg-mscoupon[classify] @ https://github.com/jediati/msseg/releases/download/mscoupon-win-0.1.0/msseg_mscoupon-0.1.0-cp311-cp311-win_amd64.whl"
+pip install "msseg-viz @ https://github.com/jediati/msseg/releases/download/mscoupon-win-0.2.0/msseg_viz-0.1.0-py3-none-any.whl" "msseg-mscoupon[classify] @ https://github.com/jediati/msseg/releases/download/mscoupon-win-0.2.0/msseg_mscoupon-0.2.0-cp311-cp311-win_amd64.whl"
 ```
 
 Or from local files:
 
 ```bash
-pip install msseg_viz-0.1.0-py3-none-any.whl "msseg_mscoupon-0.1.0-cp311-cp311-win_amd64.whl[classify]"
+pip install msseg_viz-0.1.0-py3-none-any.whl "msseg_mscoupon-0.2.0-cp311-cp311-win_amd64.whl[classify]"
 ```
 
-Both wheels are version `0.1.0`; a later build that reuses that version needs
-`pip install --force-reinstall` to take effect.
+`msseg-viz` is unchanged at `0.1.0` and its asset is carried forward; only
+`msseg-mscoupon` moves. **Bump the version on every rebuild you hand out** — a
+second upload at the same version is a silent no-op on the recipient's `pip`,
+which then keeps the old build with no error to notice.
 
 The `[classify]` extra pulls scikit-learn, which powers the labeler's
 Train/Classify buttons. Drop it and everything else still works; the import is

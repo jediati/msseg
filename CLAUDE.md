@@ -205,8 +205,14 @@ viewer-area builder packs into it unchanged) and **Model** (kind + architecture
 readout formatted from the `_make_model` constants). `MscouponApp` grew three
 layout hooks (`_build_center`, `_profile_tools_parent`, `_processing_parent`)
 whose defaults reproduce the viewer's tree exactly; the labeler overrides them
-rather than forking `_build_left`. The selected tab is `view.center_tab` in the
-session. Two more hooks (`_build_left_shell`, `_left_section_parent`,
+rather than forking `_build_left`. The session view keeps the selected tab
+(`view.center_tab`) and the picked model kind (`view.model_kind`, restored after
+the pickle reload, which would otherwise impose the saved model's kind). **New
+session…** (`_new_session`, headless-callable with a `keep` dict; hooks
+`_new_session_options` / `_new_session_doc` / `_after_new_session`) empties
+folders, sequences, results and (labeler) annotations, keeping profiles and,
+in the labeler, the model selection with the in-memory model stashed across the
+apply; the old session is auto-saved first. Two more hooks (`_build_left_shell`, `_left_section_parent`,
 `_session_group`) let the labeler drop the left scroll frame for a vertical
 `ttk.PanedWindow` over the session's three lists with Run packed first at the
 bottom. **Previews compute channels**: `_preview_channel` runs the base chain /

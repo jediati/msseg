@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "msseg-mscoupon"
-version = "0.1.0"
+version = "0.2.0"
 description = "MSSeg mscoupon: 2D TIFF-slice Morse-Smale segmentation + coupon analysis CLI."
 requires-python = ">=3.9"
 # numpy is needed by the pybind API; the rest power the `mscoupon` analysis CLI

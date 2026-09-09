@@ -57,15 +57,18 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(diffg
   GIT_REPOSITORY https://github.com/jediati/diffg.git
-  GIT_TAG 88d57f5ef18ad6e84340564c99d59e4a6ec6047c   # + large-sigma pyramid path: sigma > 16 stays on the GPU bank (radius cap 64)
+  GIT_TAG f7d4078ff8349ee1b727b427fae387f63101de1d   # main: large-sigma pyramid path + the 3D single-base invariant check
 )
 FetchContent_Declare(msceer
   GIT_REPOSITORY https://github.com/sci-visus/MSCEER.git
-  GIT_TAG 309ddde9b7f5a1a1db143711a4eab15d2317223a   # + DigitizeSegmentInternal returns a value (GCC segfault in every 2D MSC build)
+  GIT_TAG 5f843e3ce64081200556de096ee9c3332af02bc1   # cuda-gradient: DigitizeSegmentInternal fix merged + Stages A0-A6 (tiled successor resolver, useGpuAccurate)
 )
 FetchContent_Declare(tinytiff
   GIT_REPOSITORY https://github.com/jkriege2/TinyTIFF.git
-  GIT_TAG master
+  # Pinned to a SHA rather than `master`: a floating branch means two builds of
+  # the same MSSeg commit can ship different TinyTIFF, which a distributed wheel
+  # cannot afford. This is exactly what master resolved to on 2026-09-09.
+  GIT_TAG c879e6eeedc274706c6138f7823318df68147c1b
 )
 FetchContent_Declare(nlohmann_json
   GIT_REPOSITORY https://github.com/nlohmann/json.git

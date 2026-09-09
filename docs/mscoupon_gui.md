@@ -27,6 +27,12 @@ rendering; optional — the canvas falls back to in-memory display without it).
   dialog is multi-select: hand it the `config_0.json … config_N.json` that
   *Export* wrote and all N subsequences come back, with the parameters taken from
   the first file.
+- **New session…** — start over with no folders, sequences or computed
+  results. The dialog lets you keep the compute profiles (the labeler also
+  offers keeping the model selection and its settings; annotations are always
+  dropped, class colours stay). The session you leave is auto-saved first and
+  survives as `last_session.1.json`; *Save current session…* in the dialog
+  keeps it under a name.
 - **Restore last** — reloads the auto-saved session (see **Session file** below).
 - **auto-save** (on by default) — records the session every few seconds when
   something has changed, and again on window close. Unchecking stops it.

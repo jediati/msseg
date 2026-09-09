@@ -42,7 +42,7 @@ from .config_io import (FILTER_SCHEMA, FILTER_OPERATIONS, COLOR_METHODS, QUERY_O
 from .common import (log, natural_key, list_tiffs, _wheel_delta,
                      _bind_click_to_value, _id_lut, FeatureTable,
                      _parse_sigmas, _format_sigmas, group_contiguous)
-from .widgets import ScrollFrame, jump_scale, scrolled_listbox
+from .widgets import ScrollFrame, jump_scale, scrolled_listbox, attach_tooltip
 from .engine import ComputeEngine
 from . import session
 
@@ -407,9 +407,17 @@ class MscouponApp:
         bar = ttk.Frame(parent)
         bar.pack(side="top", fill="x")
         self.toolbar = bar
+        self.new_session_btn = ttk.Button(bar, text="New session…",
+                                          command=self._new_session)
+        self.new_session_btn.pack(side="left", padx=(6, 2), pady=3)
+        attach_tooltip(self.new_session_btn,
+                       "Start over with no folders, sequences or results, keeping "
+                       "what you tick in the dialog (the parameters, and in the "
+                       "labeler the model selection). The session you leave is "
+                       "auto-saved first.")
         self.save_session_btn = ttk.Button(bar, text="Save session…",
                                            command=self._save_session_as)
-        self.save_session_btn.pack(side="left", padx=(6, 2), pady=3)
+        self.save_session_btn.pack(side="left", padx=2, pady=3)
         self.load_btn = ttk.Button(bar, text="Load session…",
                                    command=self._load_session)
         self.load_btn.pack(side="left", padx=2)
@@ -3000,6 +3008,116 @@ class MscouponApp:
             return
         self._apply_session_docs([(path, doc)], "last session")
 
+    # -- new session ---------------------------------------------------- #
+    def _new_session_options(self):
+        """``[(key, label, tooltip)]`` the New session dialog offers, every
+        one ticked by default. Subclasses extend (the labeler adds the
+        model selection)."""
+        return [("profiles",
+                 "Keep compute profiles (filter chains, MSC parameters, statistics)",
+                 "The named parameter sets carry over; only folders, sequences and "
+                 "computed results are dropped. Off: one fresh default profile.")]
+
+    def _new_session_blurb(self):
+        return ("Start a new session: no folders, no sequences, nothing computed.")
+
+    def _new_session_dialog(self):
+        """Modal: which parts to carry over. ``{key: bool}``, or None."""
+        opts = self._new_session_options()
+        dlg = tk.Toplevel(self.root)
+        dlg.title("New session")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        ttk.Label(dlg, text=self._new_session_blurb(), wraplength=440,
+                  justify="left").pack(anchor="w", padx=12, pady=(12, 6))
+        flags = {}
+        for key, label, tip in opts:
+            var = tk.BooleanVar(master=self.root, value=True)
+            flags[key] = var
+            cb = ttk.Checkbutton(dlg, text=label, variable=var)
+            cb.pack(anchor="w", padx=16, pady=2)
+            attach_tooltip(cb, tip)
+        ttk.Label(dlg, wraplength=440, justify="left", foreground="#555",
+                  text="The session you are leaving is auto-saved first and kept as "
+                       "last_session.1.json; Restore last brings the NEW session back. "
+                       "To keep the old one under a name, save it now.").pack(
+            anchor="w", padx=12, pady=(8, 6))
+        result = {}
+
+        def create():
+            result.update({k: bool(v.get()) for k, v in flags.items()})
+            dlg.destroy()
+
+        row = ttk.Frame(dlg); row.pack(fill="x", padx=12, pady=(4, 12))
+        ttk.Button(row, text="Save current session…",
+                   command=self._save_session_as).pack(side="left")
+        ttk.Button(row, text="Cancel", command=dlg.destroy).pack(side="right")
+        ttk.Button(row, text="Create", command=create).pack(side="right", padx=(0, 6))
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.bind("<Return>", lambda e: create())
+        try:
+            dlg.update_idletasks()
+            x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_width()) // 2
+            y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_height()) // 3
+            dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+            dlg.grab_set()
+            dlg.focus_set()
+            self.root.wait_window(dlg)
+        except tk.TclError:
+            return None
+        return result or None
+
+    def _new_session(self, keep=None):
+        """A session with no data -- no folders, no sequences, nothing
+        computed (the labeler also drops annotations) -- carrying over what
+        `keep` says: the dialog's answer, or a ``{key: bool}`` from a
+        headless caller. Returns True when a new session was made."""
+        if self._run_active:
+            self.status_var.set("Busy priming — wait for the run to finish.")
+            return False
+        if keep is None:
+            keep = self._new_session_dialog()
+            if keep is None:
+                return False
+        # The session being left goes to disk first (and to the .1 backup
+        # through rotate_session_backups), so it can be brought back.
+        if self._session_owned and self.autosave_var.get():
+            try:
+                self._autosave_now()
+            except Exception as exc:
+                log(f"auto-save before the new session skipped: {exc}")
+        doc = self._new_session_doc(keep)
+        self._apply_session_doc(doc, "new session")
+        self._after_new_session(keep)
+        kept = [label.split(" (")[0].replace("Keep ", "") for key, label, _t in
+                self._new_session_options() if keep.get(key, True)]
+        self.status_var.set("New session" + (" - kept " + ", ".join(kept) if kept
+                                              else " - nothing kept"))
+        return True
+
+    def _new_session_doc(self, keep):
+        """The empty session document, with the profiles carried over or
+        replaced by one default; the view state (windowing, tool choices)
+        always carries over."""
+        self._snapshot_active_profile()
+        if keep.get("profiles", True) and self.profiles:
+            profiles = [json.loads(json.dumps(p)) for p in self.profiles]
+            idx = self.active_profile_idx
+            active = profiles[idx]["name"] if 0 <= idx < len(profiles) else profiles[0]["name"]
+        else:
+            profiles = [self._default_profile()]
+            active = profiles[0]["name"]
+        return session.build_session_doc(
+            app=self.SESSION_APP, folders=[], sequences=[], profiles=profiles,
+            active_profile=active,
+            run={"cores_per_slice": self._cores_per_slice(),
+                 "concurrent_slices": self._concurrent_slices()},
+            view=self._view_state())
+
+    def _after_new_session(self, keep):
+        """Hook for what the document cannot express (the labeler resets or
+        keeps the in-memory model here)."""
+
     # -- auto-save ------------------------------------------------------ #
     def _schedule_autosave(self):
         if self._autosave_after is None:
@@ -3630,6 +3748,20 @@ def _selftest():
     print("selftest OK: session (folders/sequences/preview + preview channels + colour), filters, base chain, "
           "stat channels, assembly tiers, per-slice selection, pixel trim, "
           "profiles + switch + file round-trip, session v2 round-trip, legacy import")
+    # New session: folders, sequences and computed results go; the profiles
+    # stay (or reset) as asked; ownership passes to the new session.
+    names_before = [p["name"] for p in app.profiles]
+    assert app._new_session_options()[0][0] == "profiles"
+    assert app._new_session(keep={"profiles": True})
+    assert app.folders == [] and app.subsequences == [] and not app.primed
+    assert [p["name"] for p in app.profiles] == names_before
+    assert app._session_owned and app.status_var.get().startswith("New session")
+    assert app._new_session(keep={"profiles": False})
+    assert len(app.profiles) == 1 and app.profiles[0]["name"] == "default"
+    app._run_active = True
+    assert not app._new_session(keep={"profiles": True}), "refused while priming"
+    app._run_active = False
+
     root.destroy()
 
 
