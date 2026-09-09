@@ -143,6 +143,9 @@ def single_channel_params(params_json, name):
     keep["kind"] = kind
     keep["sigmas"] = [float(card.get("sigma", 0.0))]
     stats["channels"] = [keep]
+    # A histogram names channels this one-channel spec no longer has, and a
+    # preview raster needs no bins anyway.
+    stats.pop("histogram", None)
     doc["statistics"] = stats
     return json.dumps(doc)
 
@@ -3212,6 +3215,63 @@ def _selftest():
         app.stat_kind_vars["edges"][0].set(False)
         app._on_stat_spec_change()
         app._preview_cache.pop(fake, None)
+
+        # A COLOUR preview: planar (C,h,w) planes. The picker offers the
+        # composite and each plane; `base` goes through the default colour
+        # method (luminance) or the chain's own `color` card; the statistics
+        # panel can read the planes, and the params JSON declares their count.
+        planes = np.stack([raw, 2 * raw, 0.5 * raw]).astype(np.float32)
+        rgb = os.path.join(data_dir, "rgb.tiff")
+        app._preview_cache[rgb] = planes
+        app._preview_path = rgb
+        app._refresh_channel_picker()
+        values = list(app.background_combo.cget("values"))
+        assert values[:4] == ["color", "color_c0", "color_c1", "color_c2"], values
+        assert app.color_channels_var.get() == 3, "plane count follows the slice on screen"
+        assert app._preview_channel(planes, rgb, "color") is planes
+        assert np.array_equal(app._preview_channel(planes, rgb, "color_c1"), 2 * raw)
+        lum = app._preview_channel(planes, rgb, "base")
+        assert lum.shape == raw.shape and np.allclose(lum, (0.2126 + 2 * 0.7152 + 0.5 * 0.0722) * raw)
+        app.base_cards = [{"operation": "color", "params": {"method": "pick", "channel": 2}},
+                          app._new_filter_card()]
+        app._rebuild_filter_cards("base")
+        assert np.allclose(app._preview_channel(planes, rgb, "base"), 0.5 * raw), "a color card at index 0 wins"
+        app.background_var.set("color")
+        app._refresh_render()
+        assert app.viewer.base_is_rgb and app.viewer._base.shape == (32, 32, 3), "the canvas shows RGB"
+        app.stat_color_var.set(True)
+        app.stat_kind_vars["dizenzo"][0].set(True)
+        app.stat_kind_vars["blur"][0].set(True)
+        app.stat_kind_vars["blur"][1].set("0.7")
+        app.stat_kind_vars["blur"][2].set("color")
+        app.hist_on_var.set(True)
+        app.hist_channels_var.set("base, color_c0")
+        app._on_stat_spec_change()
+        doc = json.loads(app._params_json())
+        assert doc["input"]["color"]["channels"] == 3, doc.get("input")
+        names = app._stat_channel_names()
+        assert "color_c2" in names and "dizenzo_largest_s0.7" in names and "blur_c1_s0.7" in names, names
+        assert "hist00_color_c0" in config_io.query_fields(app._params_json())
+        app._measure_hist_ranges()
+        assert app.hist_ranges_var.get().startswith("*: 0, ") or app.hist_ranges_var.get().startswith("*: "),             app.hist_ranges_var.get()
+        d = app._preview_channel(planes, rgb, "dizenzo_largest_s0.7")
+        assert d.shape == raw.shape and d is not planes, "a colour-sourced channel previews"
+        one = json.loads(single_channel_params(app._params_json(), "blur_c1_s0.7"))
+        assert one["statistics"]["channels"] == [{"kind": "blur", "sigmas": [0.7], "source": "color"}], one
+        prof = app._profile_from_ui()
+        assert prof["input"]["color"]["channels"] == 3 and prof["statistics"]["histogram"]["bins"] == 16
+        assert session.profile_summary(prof).splitlines()[1].endswith("+16h×2"), session.profile_summary(prof)
+        app.hist_on_var.set(False)
+        app.stat_color_var.set(False)
+        app.stat_kind_vars["dizenzo"][0].set(False)
+        app.stat_kind_vars["blur"][0].set(False)
+        app.stat_kind_vars["blur"][2].set("base")
+        app.base_cards = [app._new_filter_card()]
+        app._rebuild_filter_cards("base")
+        app._on_stat_spec_change()
+        app.background_var.set("base")
+        app._preview_cache.pop(rgb, None)
+        app._preview_path = fake
         app._preview_chan_cache.clear()
         app._preview_path = None
 
@@ -3567,7 +3627,7 @@ def _selftest():
         assert app.filter_cards[0]["operation"] == "blur", "v1 filters imported"
         assert float(app.alpha_var.get()) == 0.25
         assert app.persist_live_var.get() == "5"
-    print("selftest OK: session (folders/sequences/preview + preview channels), filters, base chain, "
+    print("selftest OK: session (folders/sequences/preview + preview channels + colour), filters, base chain, "
           "stat channels, assembly tiers, per-slice selection, pixel trim, "
           "profiles + switch + file round-trip, session v2 round-trip, legacy import")
     root.destroy()

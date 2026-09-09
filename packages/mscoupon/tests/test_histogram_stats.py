@@ -104,3 +104,45 @@ def test_extension_projects_histogram_columns_last():
     assert np.allclose(values[:, cols].sum(axis=1), 1.0)
     with pytest.raises(RuntimeError):
         engine.feature_fields(json.dumps({"statistics": {"histogram": {"bins": 8}}}))   # no range
+
+
+def test_optimize_search_ingests_colour_and_histogram_columns():
+    """The classifier side, end to end and headless: a colour+histogram profile
+    primes a slice, its feature table trains through the Optimize search with
+    the feature-subset mask, and a channel's bins ride with the channel."""
+    engine = pytest.importorskip("msseg.mscoupon")
+    from scipy import ndimage
+    rng = np.random.default_rng(5)
+    base = ndimage.gaussian_filter(rng.random((96, 96)), 1.5).astype(np.float32)
+    planes = np.stack([base, np.sqrt(base), 1.0 - base]).astype(np.float32)
+    params = json.dumps({
+        "input": {"color": {"channels": 3}},
+        "msc": {"persistence_percent": 2.0},
+        "statistics": {"channels": ["base", "color", {"kind": "dizenzo", "sigmas": [1.0]}],
+                       "reductions": ["mean", "std"],
+                       "histogram": {"bins": 6, "channels": ["base", "color_c2"],
+                                     "ranges": {"*": [0, 1]}}}})
+    try:
+        pipe = engine.prime_slice(base, base, params, planes)
+    except RuntimeError:
+        pytest.skip("extension predates colour statistics")
+    names, values = pipe.feature_table()
+    names = list(names)
+    keep = [n for n in names if n not in magic_fill.POSITIONAL_FIELDS]
+    X = values[:, [names.index(n) for n in keep]]
+    assert X.shape[0] >= 12, "enough regions to train on"
+    y = (X[:, keep.index("mean_color_c2")] > np.median(X[:, keep.index("mean_color_c2")])).astype(int)
+    schema = engine.feature_schema(params)
+    groups = model_search.feature_groups(keep, schema)
+    assert set(groups["color_c2"]) >= {"mean_color_c2", "std_color_c2", "ext_color_c2"} | {
+        f"hist{b:02d}_color_c2" for b in range(6)}, groups["color_c2"]
+    assert "dizenzo_largest_s1" in groups
+    result = model_search.run_search(X, y, None, keep, schema, n_trials=2, seed=1,
+                                     searcher="random", backend="sklearn", max_iter=50,
+                                     importances=False)
+    est = result.estimator
+    proba = est.predict_proba(X)
+    assert proba.shape == (X.shape[0], 2) and np.allclose(proba.sum(axis=1), 1.0)
+    # The FeatureSubset step sees the full schema and masks by channel group.
+    subset = est.named_steps["select"]
+    assert list(subset.names) == keep
