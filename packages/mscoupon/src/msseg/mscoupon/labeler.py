@@ -71,6 +71,8 @@ from msseg.labeler.labeling import (LabelStore, MAX_CLASSES, TOOLS,
 from msseg.labeler import magic_fill
 from msseg.labeler import model_search
 from msseg.labeler import edge_model
+from msseg.labeler import bundle as model_bundle
+from msseg.labeler.training import TrainingSetBuilder, TrainingProblem
 
 # How faint the inherited region overlay is drawn under the class layer
 # (0..255); the class colors themselves stay fully opaque in the LUT and are
@@ -776,6 +778,7 @@ def _extremum_points(labels, ids, table, np):
 
 class LabelerApp(MscouponApp):
     SESSION_APP = "mscoupon-labeler"
+    MODEL_APP_TAG = model_bundle.DEFAULT_APP_TAG     # the classifier pickle "app" tag
 
     def _default_profile(self, name="default"):
         return session.default_profile(name, relevance=False)
@@ -3243,15 +3246,8 @@ class LabelerApp(MscouponApp):
                     continue
                 yield si, li, key, rec, table
 
-    @staticmethod
-    def _feature_matrix(table, names, np):
-        """(n_regions, len(names)) float64, or None if a column is missing."""
-        cols = [table.column(n) for n in names]
-        if any(c is None for c in cols):
-            return None
-        mat = np.stack(cols, axis=1).astype(np.float64)
-        mat[~np.isfinite(mat)] = 0.0
-        return mat
+    _feature_matrix = staticmethod(TrainingSetBuilder.feature_matrix)
+    _training_builder = TrainingSetBuilder(_NON_FEATURE_FIELDS)
 
     def _train_classifier(self, preserve_view=False):
         """Fit the selected model kind on the labeled regions' statistics rows.
@@ -3350,37 +3346,12 @@ class LabelerApp(MscouponApp):
         slices = self._all_stat_slices("Preparing training")
         if slices is None:
             return None
-        X, y, g, names = [], [], [], None
-        for si, li, key, rec, table in slices:
-            if names is None:
-                names = [n for n in table.names if n not in _NON_FEATURE_FIELDS]
-            mat = self._feature_matrix(table, names, np)
-            fids = table.column("feature_id")
-            if mat is None or fids is None:
-                self.status_var.set(
-                    f"Training stopped: incomplete statistics on slice {si}:{li}.")
-                return None
-            rc = resolve_slice(self.store.for_slice(key), rec["labels"], np)
-            fid = fids.astype(int)
-            ok = (fid >= 0) & (fid < len(rc))
-            cls = np.zeros(len(fid), int)
-            cls[ok] = rc[fid[ok]]
-            m = cls > 0
-            if m.any():
-                X.append(mat[m])
-                y.append(cls[m])
-                g.append(np.full(int(m.sum()), si, int))
-        if not X:
-            self.status_var.set("No labeled regions on computed slices - "
-                                "draw some (and Run/Rerun) first.")
+        items = [(key, rec, table, si, f"{si}:{li}") for si, li, key, rec, table in slices]
+        try:
+            return self._training_builder.labeled_set(items, self.store, np)
+        except TrainingProblem as problem:
+            self.status_var.set(str(problem))
             return None
-        X = np.concatenate(X)
-        y = np.concatenate(y)
-        g = np.concatenate(g)
-        if len(set(y.tolist())) < 2:
-            self.status_var.set("Need labels from at least 2 classes to train.")
-            return None
-        return X, y, g, names
 
     def _install_model(self, clf, names, kind, spec=None, preserve_view=False, edge=None):
         """Make `clf` the current model (Train and Optimize share this tail).
@@ -3427,27 +3398,14 @@ class LabelerApp(MscouponApp):
         slices = self._all_stat_slices("Gathering edges")
         if slices is None:
             return None
-        names = list(names)
-        ext_col = names.index("ext_filtered") if "ext_filtered" in names else None
-        X, cls, grp, ext, per = [], [], [], [], []
-        for k, (si, li, key, rec, table) in enumerate(slices):
-            mat = self._feature_matrix(table, names, np)
-            fids = table.column("feature_id")
-            if mat is None or fids is None:
-                self.status_var.set(f"Edges stopped: incomplete statistics on slice {si}:{li}.")
-                return None
-            rc = resolve_slice(self.store.for_slice(key), rec["labels"], np)
-            fid = fids.astype(int)
-            ok = (fid >= 0) & (fid < len(rc))
-            c = np.zeros(len(fid), int)
-            c[ok] = rc[fid[ok]]
-            X.append(mat); cls.append(c); grp.append(np.full(len(c), k, int))
-            if ext_col is not None:
-                ext.append(mat[:, ext_col])
-            per.append((fid, self._record_arcs(rec, np), c, k))
-        edges = edge_model.gather_edges(per)
-        return (np.concatenate(X), np.concatenate(cls), np.concatenate(grp),
-                np.concatenate(ext) if ext else None, edges, names)
+        items = [(key, rec, table, k, f"{si}:{li}")
+                 for k, (si, li, key, rec, table) in enumerate(slices)]
+        try:
+            return self._training_builder.edge_set(
+                items, self.store, names, lambda rec: self._record_arcs(rec, np), np)
+        except TrainingProblem as problem:
+            self.status_var.set(str(problem))
+            return None
 
     def _fit_edge_model_now(self, clf, names):
         """Fit the pair model on top of `clf`: (EdgeModel | None, status note)."""
@@ -4165,24 +4123,10 @@ class LabelerApp(MscouponApp):
             log(f"model compatibility check skipped ({context}): "
                 "compiled extension not available")
             return None
-        want, have = set(names), set(expected)
-        if want == have:
-            return None
         prof = "?"
         if 0 <= self.active_profile_idx < len(self.profiles):
             prof = self.profiles[self.active_profile_idx]["name"]
-        missing = sorted(want - have)
-        extra = sorted(have - want)
-        parts = []
-        if missing:
-            parts.append("model needs: " + ", ".join(missing[:6])
-                         + ("…" if len(missing) > 6 else ""))
-        if extra:
-            parts.append("profile adds: " + ", ".join(extra[:6])
-                         + ("…" if len(extra) > 6 else ""))
-        return (f"Model does not match profile '{prof}' statistics "
-                f"({context}) - " + "; ".join(parts)
-                + ". Switch profiles or retrain.")
+        return model_bundle.compat_message(names, expected, prof, context)
 
     # -- model provenance ------------------------------------------------ #
     def _stats_brief(self, stats):
@@ -4495,11 +4439,11 @@ class LabelerApp(MscouponApp):
         self.status_var.set(f"Wrote {path}")
 
     def _save_classifier_to(self, path):
-        """Pickle v3: model + feature names + kind + the statistics block it
-        was trained under (the fingerprint the session records) + the tuned
-        spec (None for the other kinds). v1 (no kind/statistics) and v2 (no
-        spec) pickles still load."""
-        import pickle
+        """Pickle v4 (`msseg.labeler.bundle.ModelBundle`): model + feature names
+        + kind + the statistics block it was trained under (the fingerprint the
+        session records) + the tuned spec + the edge model and stack settings.
+        v1 (no kind/statistics), v2 (no spec) and v3 (no edge/stack) pickles
+        still load."""
         self._snapshot_active_profile()
         stats = dict(self.profiles[self.active_profile_idx].get("statistics") or {})
         spec = None if self._clf_spec is None else self._clf_spec.to_dict()
@@ -4508,21 +4452,17 @@ class LabelerApp(MscouponApp):
         edge = None if self._edge_model is None else self._edge_model.to_dict()
         stack = {"custom_hidden": self.custom_hidden_var.get(),
                  "edge_spec": self._edge_spec_from_ui().to_dict()}
-        with open(path, "wb") as f:
-            pickle.dump({"app": "mscoupon-labeler-classifier", "version": 4,
-                         "kind": self._clf_kind, "names": self._clf_names,
-                         "model": self._clf, "statistics": stats, "spec": spec,
-                         "edge": edge, "stack": stack}, f)
+        model_bundle.ModelBundle(model=self._clf, names=list(self._clf_names), kind=self._clf_kind,
+                                 statistics=stats, spec=spec, edge=edge, stack=stack,
+                                 app_tag=self.MODEL_APP_TAG).save(path)
         self._record_model(path, stats)
 
     def _record_model(self, path, statistics):
         """Register a saved/loaded model on the session (deduped by path)."""
-        entry = {"path": os.path.abspath(path),
-                 "fingerprint": list(self._clf_names or []),
-                 "kind": self._clf_kind,
-                 "statistics": dict(statistics or {}),
-                 "spec": None if self._clf_spec is None else self._clf_spec.to_dict(),
-                 "edge": self._edge_model is not None}
+        entry = model_bundle.model_record_entry(
+            path, self._clf_names, self._clf_kind, statistics,
+            None if self._clf_spec is None else self._clf_spec.to_dict(),
+            self._edge_model is not None)
         self.models = [m for m in self.models if m.get("path") != entry["path"]]
         self.models.append(entry)
 
@@ -4543,53 +4483,45 @@ class LabelerApp(MscouponApp):
     def _load_classifier_from(self, path, interactive=False):
         """Install a pickled model. `interactive` is opt-in: session restore
         and the selftest call this headlessly, where a modal would hang."""
-        import pickle
-        with open(path, "rb") as f:
-            doc = pickle.load(f)
-        if (not isinstance(doc, dict)
-                or doc.get("app") != "mscoupon-labeler-classifier"
-                or "model" not in doc or not doc.get("names")):
-            raise ValueError("not a labeler classifier file")
+        doc = model_bundle.ModelBundle.load(path, self.MODEL_APP_TAG)
         # The compatibility gate: a model trained under different statistics
         # is refused OUTRIGHT (per-feature values would silently mean the
         # wrong thing), before anything is installed. Interactively -- and only
         # for a v2 pickle, which carries the statistics it was trained under --
         # the user is first offered a profile built from those statistics.
-        msg = self._check_model_compat(doc["names"], "load")
-        if msg and interactive and doc.get("statistics"):
+        msg = self._check_model_compat(doc.names, "load")
+        if msg and interactive and doc.statistics:
             if not messagebox.askyesno(
                     "mscoupon labeler",
                     msg + "\n\nCreate a profile from the model's own statistics "
                           "and switch to it?"):
                 raise ValueError(msg)
-            self._profile_from_model(path, doc["statistics"])
+            self._profile_from_model(path, doc.statistics)
             # The new profile can still miss: feature_fields may resolve
             # differently here than in the build that saved the pickle.
-            msg = self._check_model_compat(doc["names"], "load")
+            msg = self._check_model_compat(doc.names, "load")
         if msg:
             raise ValueError(msg)
         self._pred.clear()               # predictions belong to the old model
-        self._clf = doc["model"]
-        self._clf_names = list(doc["names"])
-        self._clf_kind = str(doc.get("kind") or "random forest")
-        spec = doc.get("spec")
-        self._clf_spec = (model_search.ModelSpec.from_dict(spec)
-                          if isinstance(spec, dict) else None)
+        self._clf = doc.model
+        self._clf_names = list(doc.names)
+        self._clf_kind = doc.kind
+        self._clf_spec = (model_search.ModelSpec.from_dict(doc.spec)
+                          if doc.spec is not None else None)
         if self._clf_spec is not None and _base_kind(self._clf_kind) == _TUNED_KIND:
             self._search_spec = self._clf_spec   # Train rebuilds what was loaded
         # v4: the edge model on top, only when it was fit over these features.
         self._edge_model = None
-        edge = doc.get("edge")
-        if isinstance(edge, dict):
+        if doc.edge is not None:
             try:
-                em = edge_model.EdgeModel.from_dict(edge)
+                em = edge_model.EdgeModel.from_dict(doc.edge)
                 if em.names_hash == edge_model.names_hash(self._clf_names):
                     self._edge_model = em
                 else:
                     log("edge model in the pickle was fit over other features - dropped")
             except Exception as exc:
                 log(f"edge model in the pickle not restored: {exc}")
-        stack = doc.get("stack") or {}
+        stack = doc.stack
         if isinstance(stack.get("custom_hidden"), str):
             try:
                 model_search.parse_sizes(stack["custom_hidden"])
@@ -4602,7 +4534,7 @@ class LabelerApp(MscouponApp):
             self.model_kind_var.set(self._clf_kind)
         self._refresh_model_readout()
         self.classify_btn.config(state="normal")
-        self._record_model(path, doc.get("statistics") or {})
+        self._record_model(path, doc.statistics)
         self._refresh_model_strip()
         self._refresh_edge_readout()
 
