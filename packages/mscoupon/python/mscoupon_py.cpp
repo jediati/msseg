@@ -251,16 +251,14 @@ py::tuple stat_channel_images(const FloatArray& base, const FloatArray& filtered
   const diffg::Image<float> base_img = to_image(base, bh, bw);
   const diffg::Image<float> filt_img = to_image(filtered, fh, fw);
   if (bh != fh || bw != fw) throw std::runtime_error("base and filtered must share shape");
-  // The colour planes are checked against the raster here; colour-sourced
-  // statistics channels are what consume them.
   const diffg::MultiImage<float> color_planes = optional_planes(color, bh, bw);
-  (void)color_planes;
   const msseg::StatsSpec spec = parse_stats_spec(parse_params(params_json));
 
   msseg::StatChannelBank bank;
   {
     py::gil_scoped_release release;
-    bank = msseg::build_stat_channels(base_img, filt_img, spec);
+    bank = msseg::build_stat_channels(base_img, filt_img, spec, {},
+                                      color_planes.channels() ? &color_planes : nullptr);
   }
 
   py::list names;
@@ -285,13 +283,12 @@ msseg::Msc2DPipeline prime_slice(const FloatArray& base, const FloatArray& filte
   const diffg::Image<float> filt_img = to_image(filtered, fh, fw);
   if (bh != fh || bw != fw) throw std::runtime_error("base and filtered must share shape");
   const diffg::MultiImage<float> color_planes = optional_planes(color, bh, bw);
-  (void)color_planes;
   const msseg::Msc2DParams msc = parse_msc(parse_params(params_json));
 
   msseg::Msc2DPipeline pipe;
   {
     py::gil_scoped_release release;
-    pipe.build(base_img, filt_img, msc);
+    pipe.build(base_img, filt_img, msc, nullptr, color_planes.channels() ? &color_planes : nullptr);
   }
   return pipe;
 }
@@ -381,6 +378,8 @@ py::list stat_channels_py(const std::string& params_json) {
     d["name"] = c.name;
     d["kind"] = c.kind;
     d["sigma"] = c.sigma;
+    d["source"] = c.source;
+    d["input_channel"] = c.input_channel;
     out.append(std::move(d));
   }
   return out;
@@ -719,8 +718,9 @@ PYBIND11_MODULE(mscoupon_py, m) {
         "Per-column schema as dicts {name, channel, reduction}, in table order. Drives the "
         "GUI's two-level channel/reduction pickers without re-parsing field names.");
   m.def("stat_channels", &stat_channels_py, py::arg("params_json") = std::string(),
-        "The measurement channels the params JSON resolves to, as dicts {name, kind, sigma} "
-        "in slot order -- base/filtered plus every derived scale-space channel.");
+        "The measurement channels the params JSON resolves to, as dicts {name, kind, sigma, "
+        "source, input_channel} in slot order -- base/filtered, the raw colour planes, and "
+        "every derived scale-space channel (per plane on the colour source).");
 
   m.def("fit_gmm", &fit_gmm, py::arg("image"), py::arg("params_json") = std::string(),
         "Fit a 1-D Gaussian mixture to the pixels of a real numeric array of any shape "

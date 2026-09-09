@@ -35,9 +35,28 @@ PROFILE_FILE_VERSION = 1
 # --------------------------------------------------------------------------- #
 # Compute profiles (JSON/writer-shaped dicts)
 # --------------------------------------------------------------------------- #
+def default_color_input() -> Dict[str, Any]:
+    """How a multi-sample TIFF is read: the alpha policy, the colour->scalar
+    method a chain without a leading `color` stage gets, and the plane count
+    the statistics schema is resolved for (0 = grayscale / unknown; the GUI
+    fills it from the slice on screen)."""
+    return {"alpha": "drop", "default_method": "luminance", "channels": 0}
+
+
+def color_input_from_json(doc: Any) -> Dict[str, Any]:
+    col = _as_dict(_as_dict(doc).get("color"))
+    method = str(col.get("default_method") or "luminance")
+    if method not in config_io.COLOR_METHODS:
+        method = "luminance"
+    return {"alpha": "keep" if col.get("alpha") == "keep" else "drop",
+            "default_method": method,
+            "channels": max(0, _as_int(col.get("channels"), 0))}
+
+
 def default_profile(name: str = "default", relevance: bool = True) -> Dict[str, Any]:
     return {
         "name": str(name),
+        "input": {"color": default_color_input()},
         "filters": [],
         "base_filters": [],
         "msc": {"manifold": "ascending", "persistence_percent": 10.0,
@@ -60,6 +79,7 @@ def profile_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[str, 
     root = _as_dict(doc)
     out = default_profile(str(root.get("name") or "profile"))
 
+    out["input"] = {"color": color_input_from_json(root.get("input"))}
     out["filters"] = config_io.filters_to_json(
         config_io.filters_from_json(root.get("filters"), notes))
     out["base_filters"] = config_io.filters_to_json(
@@ -110,7 +130,8 @@ def profile_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[str, 
     return out
 
 
-def profile_params_json(profile: Dict[str, Any], cores: int = 1) -> str:
+def profile_params_json(profile: Dict[str, Any], cores: int = 1,
+                        color_channels: Optional[int] = None) -> str:
     """THE composer of the priming params JSON: the profile's compute blocks
     plus the session-level core count. cores > 1 selects MSCEER's partitioned
     builder (compute_algorithm/requested_parallelism ride in `msc`, matching
@@ -133,13 +154,28 @@ def profile_params_json(profile: Dict[str, Any], cores: int = 1) -> str:
     if cores > 1:
         msc["compute_algorithm"] = "partitioned"
         msc["requested_parallelism"] = int(cores)
-    return json.dumps({
+    doc: Dict[str, Any] = {
         "filters": list(profile.get("filters") or []),
         "base_filters": list(profile.get("base_filters") or []),
         "msc": msc,
         "statistics": _as_dict(profile.get("statistics")) or
                       default_profile()["statistics"],
-    })
+    }
+    # `color_channels` (the planes of the slice on screen) overrides the
+    # profile's declared count. The block is emitted only when it says
+    # something non-default, so a grayscale workflow's params are unchanged.
+    col = color_input_from_json(profile.get("input"))
+    channels = int(color_channels) if color_channels else int(col["channels"])
+    block: Dict[str, Any] = {}
+    if col["alpha"] != "drop":
+        block["alpha"] = col["alpha"]
+    if col["default_method"] != "luminance":
+        block["default_method"] = col["default_method"]
+    if channels > 0:
+        block["channels"] = channels
+    if block:
+        doc["input"] = {"color": block}
+    return json.dumps(doc)
 
 
 def profile_file_doc(profile: Dict[str, Any]) -> Dict[str, Any]:
@@ -494,14 +530,24 @@ def msc_code(msc: Dict[str, Any]) -> str:
     return f"msc({', '.join(args)})"
 
 
-def stats_width(statistics: Any) -> str:
+def stats_width(statistics: Any, color_channels: int = 0) -> str:
     """`12ch×4`: how many channels a feature is measured on times the
-    reductions -- the width of every per-feature row."""
+    reductions -- the width of every per-feature row. A colour source counts
+    its planes: the raw planes are `color_channels` channels, and a
+    per-channel kind on the colour source yields one response per plane."""
     stats = config_io.statistics_from_json(statistics or {})
+    planes = max(0, int(color_channels or 0))
     n_ch = 0
     for c in stats["channels"]:
+        kind = c.get("kind")
+        if kind == "color":
+            n_ch += planes
+            continue
         sig = c.get("sigmas") or []
-        n_ch += max(1, len(sig)) * (2 if c.get("kind") == "hessian" else 1)
+        slots = 2 if kind in config_io.TWO_SLOT_KINDS else 1
+        per_plane = (planes if (c.get("source") == "color"
+                                and kind not in config_io.COLOR_ONLY_KINDS) else 1)
+        n_ch += max(1, len(sig)) * slots * per_plane
     return f"{n_ch}ch×{len(stats['reductions'])}"
 
 
@@ -519,7 +565,8 @@ def profile_summary(profile: Dict[str, Any]) -> str:
     topo = topo.replace("→__msc__", "→" + msc_code(profile.get("msc") or {}))
     stats_stages = list(profile.get("base_filters") or [])
     try:
-        width = stats_width(profile.get("statistics"))
+        width = stats_width(profile.get("statistics"),
+                            color_input_from_json(profile.get("input"))["channels"])
     except Exception:
         width = "?ch"
     stats = chain_text(stats_stages) + "→" + width

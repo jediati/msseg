@@ -41,6 +41,14 @@ def color_planes(p, li, np):
     return np.ascontiguousarray(planes[li], dtype=np.float32)
 
 
+def prime(engine, base, filt, params, color=None):
+    """`engine.prime_slice`, handing the colour planes along when the slice has
+    them (an extension without the argument only sees scalars)."""
+    if color is None:
+        return engine.prime_slice(base, filt, params)
+    return engine.prime_slice(base, filt, params, color)
+
+
 def stat_images(engine, base, filt, params, color=None):
     """`engine.stat_channel_images`, handing the colour planes along when the
     slice has them (an extension without the argument only sees scalars)."""
@@ -169,7 +177,11 @@ class ComputeEngine:
             # linked MSCEER lacks the partitioned ComputeOptions surface.
             msc_serial = {k: v for k, v in msc.items()
                           if k not in ("compute_algorithm", "requested_parallelism")}
-            params_serial = json.dumps({"filters": filters, "msc": msc_serial})
+            # Everything but the builder choice rides along: the statistics
+            # spec and the colour input decide which channels a primed slice
+            # carries, so the serial variant must name them too.
+            params_serial = json.dumps({**{k: v for k, v in p.items() if k != "msc"},
+                                        "msc": msc_serial})
             use_serial = "compute_algorithm" not in msc
             n_reused = sum(1 for s in subseqs if s.get("_reuse") is not None)
             total = sum(len(s["files"]) for s in subseqs
@@ -243,18 +255,20 @@ class ComputeEngine:
                     base, slice_norms = self._apply_base_chain(arr, base_filters, engine, log,
                                                                default_color_method)
                     t_filter = time.perf_counter()
+                    planes = (np.ascontiguousarray(arr, dtype=np.float32)
+                              if arr.ndim == 3 else None)
                     if use_serial:
-                        pipe = engine.prime_slice(base, filt, params_serial)
+                        pipe = prime(engine, base, filt, params_serial, planes)
                     else:
                         try:
-                            pipe = engine.prime_slice(base, filt, params)
+                            pipe = prime(engine, base, filt, params, planes)
                         except RuntimeError as pe:
                             msg = str(pe)
                             if any(t in msg for t in ("BuilderMode", "ComputeOptions", "partitioned")):
                                 log(f"  WARN: partitioned MSC unavailable ({msg}); "
                                     "falling back to serial MSC for remaining slices")
                                 use_serial = True
-                                pipe = engine.prime_slice(base, filt, params_serial)
+                                pipe = prime(engine, base, filt, params_serial, planes)
                             else:
                                 raise
                     t_prime = time.perf_counter()

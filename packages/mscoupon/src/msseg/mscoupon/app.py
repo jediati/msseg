@@ -108,13 +108,16 @@ def single_channel_params(params_json, name):
     except StopIteration:
         return None
     kind = card.get("kind")
-    if kind in ("base", "filtered") or not kind:
+    if kind in ("base", "filtered", "color") or not kind:
         return None
+    source = card.get("source") or "base"
     doc = json.loads(params_json)
     stats = dict(doc.get("statistics") or {})
     keep = {}
     for c in stats.get("channels") or []:
-        if isinstance(c, dict) and c.get("kind") == kind:
+        if (isinstance(c, dict) and c.get("kind") == kind
+                and (c.get("source") or ("color" if kind in config_io.COLOR_ONLY_KINDS
+                                         else "base")) == source):
             keep = {k: v for k, v in c.items() if k != "sigmas"}
             break
     keep["kind"] = kind
@@ -192,6 +195,14 @@ class MscouponApp:
         # the base channel. One card per kind; the sigma list is the cross-product
         # that makes a multi-scale stack one line of config instead of many.
         self.stat_base_var = tk.BooleanVar(value=True)
+        self.stat_color_var = tk.BooleanVar(value=False)   # the raw colour planes
+        # How a multi-sample TIFF is read (profile `input.color`): alpha policy,
+        # the default colour->scalar method, and the plane count the statistics
+        # schema is resolved for (filled from the slice on screen).
+        self.color_alpha_var = tk.StringVar(value="drop")
+        self.color_default_var = tk.StringVar(value="luminance")
+        self.color_channels_var = tk.IntVar(value=0)
+        self.color_planes_text = tk.StringVar(value="planes: - (grayscale)")
         self.stat_filtered_var = tk.BooleanVar(value=False)
         self.stat_kind_vars = {}       # kind -> (BooleanVar, StringVar sigmas)
         self.stat_reduction_vars = {}  # reduction -> BooleanVar
@@ -400,11 +411,15 @@ class MscouponApp:
                         command=self._on_stat_spec_change).pack(side="left")
         ttk.Checkbutton(row, text="filtered", variable=self.stat_filtered_var,
                         command=self._on_stat_spec_change).pack(side="left", padx=8)
+        # The raw input planes (color_c0, ...) of a colour slice.
+        ttk.Checkbutton(row, text="color planes", variable=self.stat_color_var,
+                        command=self._on_stat_spec_change).pack(side="left", padx=8)
 
         for kind in config_io.DERIVED_CHANNEL_KINDS:
             row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=1)
             on = tk.BooleanVar(value=False)
             sigmas = tk.StringVar(value="0.7, 1.5, 3.0")
+            color_only = kind in config_io.COLOR_ONLY_KINDS
             ttk.Checkbutton(row, text=kind, variable=on, width=10,
                             command=self._on_stat_spec_change).pack(side="left")
             ttk.Label(row, text="sigmas:").pack(side="left")
@@ -414,9 +429,16 @@ class MscouponApp:
             # the schema and rebuild the query dropdowns mid-typing.
             entry.bind("<Return>", lambda e: self._on_stat_spec_change())
             entry.bind("<FocusOut>", lambda e: self._on_stat_spec_change())
-            if kind == "hessian":
+            # What the response is computed on: the base scalar, or the colour
+            # planes (one response per plane; the cross-channel kinds only).
+            source = tk.StringVar(value="color" if color_only else "base")
+            src = ttk.Combobox(row, textvariable=source, values=config_io.STAT_SOURCES,
+                               state="disabled" if color_only else "readonly", width=6)
+            src.pack(side="left", padx=2)
+            src.bind("<<ComboboxSelected>>", lambda e: self._on_stat_spec_change())
+            if kind in config_io.TWO_SLOT_KINDS:
                 ttk.Label(row, text="(largest + smallest)").pack(side="left")
-            self.stat_kind_vars[kind] = (on, sigmas)
+            self.stat_kind_vars[kind] = (on, sigmas, source)
 
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=(4, 2))
         ttk.Label(row, text="reductions:").pack(side="left")
@@ -446,20 +468,27 @@ class MscouponApp:
             return
         setvar(self.stat_base_var, any(c.get("kind") == "base" for c in channels))
         setvar(self.stat_filtered_var, any(c.get("kind") == "filtered" for c in channels))
+        setvar(self.stat_color_var, any(c.get("kind") == "color" for c in channels))
         by_kind = {}
+        by_source = {}
         for card in channels:
             kind = card.get("kind")
-            if kind in ("base", "filtered") or kind not in self.stat_kind_vars:
+            if kind in ("base", "filtered", "color") or kind not in self.stat_kind_vars:
                 continue
+            # One row per kind: a config naming a kind on both sources keeps
+            # the first source it saw (the other lossy merge, besides sigmas).
+            by_source.setdefault(kind, card.get("source") or "base")
             for sigma in card.get("sigmas") or []:
                 by_kind.setdefault(kind, [])
                 if sigma not in by_kind[kind]:
                     by_kind[kind].append(float(sigma))
-        for kind, (on, sigmas) in self.stat_kind_vars.items():
+        for kind, (on, sigmas, source) in self.stat_kind_vars.items():
             values = by_kind.get(kind)
             setvar(on, bool(values))
             if values:
                 setvar(sigmas, _format_sigmas(sorted(values)))
+            setvar(source, "color" if kind in config_io.COLOR_ONLY_KINDS
+                   else by_source.get(kind, "base"))
 
         reductions = state.get("stat_reductions")
         if reductions is not None:
@@ -483,7 +512,14 @@ class MscouponApp:
         # A colour slice also offers its composite and each raw plane.
         n_color = self._current_color_count()
         if n_color:
-            names = ["color"] + [f"color_c{i}" for i in range(n_color)] + names
+            extra = ["color"] + [f"color_c{i}" for i in range(n_color)]
+            names = [n for n in extra if n not in names] + names
+            # The plane count the statistics schema is resolved for.
+            if self.color_channels_var.get() != n_color:
+                self.color_channels_var.set(n_color)
+            self.color_planes_text.set(f"planes: {n_color} (the slice on screen)")
+        else:
+            self.color_planes_text.set("planes: - (grayscale slice on screen)")
         self._picker_color_count = n_color
         try:
             combo.config(values=names)
@@ -745,6 +781,25 @@ class MscouponApp:
         self.seq_btn_row = row
         ttk.Button(row, text="Remove", command=self._remove_subsequence).pack(side="left")
         ttk.Button(row, text="Clear all", command=self._clear_subsequences).pack(side="left", padx=4)
+
+        # 1b. Colour input: how a multi-sample TIFF's planes are read. The
+        # conversion itself is a `color` stage at the head of each chain.
+        c = ttk.LabelFrame(self._processing_parent("filters"), text="1b. Colour input")
+        c.pack(fill="x", padx=6, pady=4)
+        self.color_frame = c
+        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
+        ttk.Label(row, text="alpha:").pack(side="left")
+        cb = ttk.Combobox(row, textvariable=self.color_alpha_var, values=["drop", "keep"],
+                          state="readonly", width=6)
+        cb.pack(side="left", padx=(2, 8))
+        cb.bind("<<ComboboxSelected>>", lambda e: self._on_color_input_change(reload=True))
+        ttk.Label(row, text="default method:").pack(side="left")
+        cb = ttk.Combobox(row, textvariable=self.color_default_var, values=COLOR_METHODS,
+                          state="readonly", width=14)
+        cb.pack(side="left", padx=2)
+        cb.bind("<<ComboboxSelected>>", lambda e: self._on_color_input_change())
+        ttk.Label(c, textvariable=self.color_planes_text, foreground="#555").pack(
+            anchor="w", padx=4, pady=(0, 3))
 
         # 2. Filter chain
         self.filters_frame = ttk.LabelFrame(self._processing_parent("filters"),
@@ -1221,11 +1276,26 @@ class MscouponApp:
 
     def _color_alpha(self):
         """The alpha policy colour files load under (`input.color.alpha`)."""
-        return "drop"
+        try:
+            return self.color_alpha_var.get() or "drop"
+        except tk.TclError:
+            return "drop"
 
     def _default_color_method(self):
         """The conversion a chain without a leading `color` stage gets."""
-        return "luminance"
+        try:
+            return self.color_default_var.get() or "luminance"
+        except tk.TclError:
+            return "luminance"
+
+    def _on_color_input_change(self, reload=False):
+        """The colour input block changed. The default method is part of every
+        preview key already; a new alpha policy needs the files read again."""
+        if reload:
+            self._preview_cache.clear()
+            self._preview_chan_cache.clear()
+        self._refresh_stat_summary()
+        self._repreview_if_active()
 
     def _render_preview(self, first=False):
         """Paint the active preview in the Image dropdown's channel."""
@@ -1674,7 +1744,8 @@ class MscouponApp:
         profile all agree."""
         if cores is None:
             cores = self._cores_per_slice()
-        return session.profile_params_json(self._profile_from_ui(), cores)
+        return session.profile_params_json(self._profile_from_ui(), cores,
+                                           self._current_color_count() or None)
 
     # ------------------------------------------------------------------ #
     # Compute profiles: the left panel edits the ACTIVE one
@@ -1694,6 +1765,9 @@ class MscouponApp:
                 self.profiles[self.active_profile_idx].get("statistics"))["relevance"]
         return {
             "name": name,
+            "input": {"color": {"alpha": self._color_alpha(),
+                                "default_method": self._default_color_method(),
+                                "channels": max(0, int(self.color_channels_var.get()))}},
             "filters": config_io.filters_to_json(self.filter_cards),
             "base_filters": config_io.filters_to_json(self.base_cards),
             "msc": {"manifold": self.manifold_var.get(),
@@ -1719,6 +1793,10 @@ class MscouponApp:
         (the query dropdowns are generated from the field universe it defines),
         then the card chains -- topo before base, because the base rebuild is
         what resets _normalize_readouts."""
+        col = session.color_input_from_json(profile.get("input"))
+        setvar(self.color_alpha_var, col["alpha"])
+        setvar(self.color_default_var, col["default_method"])
+        setvar(self.color_channels_var, int(col["channels"]))
         msc = profile.get("msc") or {}
         if msc.get("manifold"):
             setvar(self.manifold_var, msc["manifold"])
@@ -1910,12 +1988,17 @@ class MscouponApp:
             cards.append({"kind": "base"})
         if self.stat_filtered_var.get():
             cards.append({"kind": "filtered"})
-        for kind, (on, sigmas) in self.stat_kind_vars.items():
+        if self.stat_color_var.get():
+            cards.append({"kind": "color"})
+        for kind, (on, sigmas, source) in self.stat_kind_vars.items():
             if not on.get():
                 continue
             values = _parse_sigmas(sigmas.get())
             if values:
-                cards.append({"kind": kind, "sigmas": values})
+                card = {"kind": kind, "sigmas": values}
+                if kind in config_io.COLOR_ONLY_KINDS or source.get() == "color":
+                    card["source"] = "color"
+                cards.append(card)
         return cards
 
     def _stat_reductions(self):
@@ -3332,7 +3415,7 @@ def _selftest():
         app.primed = saved_primed2
 
         # Restore the default spec so nothing below inherits a wide channel set.
-        for on, _sig in app.stat_kind_vars.values():
+        for on, *_rest in app.stat_kind_vars.values():
             on.set(False)
         app.stat_reduction_vars["std"].set(True)
 

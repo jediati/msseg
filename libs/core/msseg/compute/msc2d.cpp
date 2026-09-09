@@ -479,6 +479,8 @@ bool try_gpu_accumulate(ImplT& impl, const diffg::Image<float>& base,
   for (std::size_t k = 0; k < channels.size(); ++k) {
     const ResolvedStatChannel& c = channels[k];
     if (c.kind == "base" || c.kind == "filtered") continue;
+    // diffg's GPU bank is single-channel: colour sources stay on the CPU.
+    if (c.kind == "color" || c.source == "color") return false;
     if (c.slot_in_request == 0) {
       diffg_gpu::FilterRequest r;
       if (c.kind == "blur") {
@@ -602,7 +604,8 @@ Msc2DPipeline::Msc2DPipeline(Msc2DPipeline&&) noexcept = default;
 Msc2DPipeline& Msc2DPipeline::operator=(Msc2DPipeline&&) noexcept = default;
 
 void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<float>& filtered,
-                          const Msc2DParams& cfg, const StatChannelBank* external_bank) {
+                          const Msc2DParams& cfg, const StatChannelBank* external_bank,
+                          const diffg::MultiImage<float>* color) {
   const int width = static_cast<int>(filtered.dims().width);
   const int height = static_cast<int>(filtered.dims().height);
   if (width <= 0 || height <= 0) throw std::runtime_error("Invalid image dimensions for MSC.");
@@ -738,8 +741,10 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
   // (diffg JIT bank) and the reduces run over the resident label CSR. Callers
   // that hand in an external bank already paid for the host rasters, so they
   // keep the CPU loop. Any failure re-inits the leaves and falls through.
+  // Colour-sourced channels have no device path (diffg's GPU bank takes one
+  // plane), so a spec naming one keeps the CPU loop.
   bool gpu_done = false;
-  if (external_bank == nullptr && gpu_stats_wanted(cfg)) {
+  if (external_bank == nullptr && gpu_stats_wanted(cfg) && !spec.uses_color()) {
     impl_->channels = resolve_stat_channels(spec);
     init_leaves(impl_->channels.size());
     gpu_done = try_gpu_accumulate(*impl_, base, filtered, spec, ext_radius);
@@ -760,7 +765,7 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
     bank_exec.threads = std::max(1, cfg.requested_parallelism);
     StatChannelBank owned_bank;
     if (external_bank == nullptr) {
-      owned_bank = build_stat_channels(base, filtered, spec, bank_exec);
+      owned_bank = build_stat_channels(base, filtered, spec, bank_exec, color);
     }
     const StatChannelBank& bank = external_bank != nullptr ? *external_bank : owned_bank;
     impl_->channels = bank.channels;

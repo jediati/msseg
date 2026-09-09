@@ -215,7 +215,51 @@ diffg::FilterRequest to_diffg_request(const ResolvedStatChannel& c) {
   if (c.kind == "gradmag" || c.kind == "edges") return diffg::gradient_magnitude_filter(sigma);
   if (c.kind == "laplacian") return diffg::laplacian_filter(sigma);
   if (c.kind == "hessian") return diffg::hessian_filter(sigma, c.sort_by_absolute_value);
+  if (c.kind == "chgradmag") return diffg::channel_gradient_magnitude_filter(sigma);
+  if (c.kind == "dizenzo") return diffg::dizenzo_filter(sigma);
   throw std::runtime_error("Unknown derived statistics channel kind: '" + c.kind + "'.");
+}
+
+bool is_derived_slot(const ResolvedStatChannel& c) {
+  return c.kind != "base" && c.kind != "filtered" && c.kind != "color";
+}
+
+// One bank traversal over `input` for the derived channels whose source it
+// is. Requests dedup on slot_in_request == 0: a `hessian` entry covers two
+// consecutive resolved channels but is one diffg request, and on the colour
+// source a per-channel kind covers planes * k of them. Returns the stacked
+// responses in resolved order; the caller aliases the slots once the stack
+// has its final address.
+diffg::MultiImage<float> run_bank(diffg::MultiImageView<const float> input,
+                                  const std::vector<ResolvedStatChannel>& channels,
+                                  const std::string& source, const diffg::ExecutionOptions& exec) {
+  std::vector<diffg::FilterRequest> requests;
+  std::size_t n_slots = 0;
+  for (const ResolvedStatChannel& c : channels) {
+    if (!is_derived_slot(c) || c.source != source) continue;
+    if (c.slot_in_request == 0) requests.push_back(to_diffg_request(c));
+    ++n_slots;
+  }
+  if (requests.empty()) return {};
+  diffg::FilterBankOptions options;
+  options.execution = exec;
+  auto result = diffg::apply_filter_bank(input, requests, diffg::OutputShape::MultiChannel, options);
+  if (result.channel_count() != n_slots) {
+    throw std::runtime_error("build_stat_channels: the " + source + " filter bank returned " +
+                             std::to_string(result.channel_count()) + " channels, expected " +
+                             std::to_string(n_slots) + ".");
+  }
+  return std::move(result.stacked);
+}
+
+// Point every derived slot of `source` at its plane of `stack`, in order.
+void alias_derived(StatChannelBank& bank, const std::string& source, const diffg::MultiImage<float>& stack) {
+  std::size_t i = 0;
+  for (std::size_t k = 0; k < bank.channels.size(); ++k) {
+    const ResolvedStatChannel& c = bank.channels[k];
+    if (!is_derived_slot(c) || c.source != source) continue;
+    bank.data[k] = stack.channel_data(i++);
+  }
 }
 
 }  // namespace
@@ -223,49 +267,48 @@ diffg::FilterRequest to_diffg_request(const ResolvedStatChannel& c) {
 StatChannelBank build_stat_channels(const diffg::Image<float>& base,
                                     const diffg::Image<float>& filtered,
                                     const StatsSpec& spec,
-                                    const diffg::ExecutionOptions& exec) {
+                                    const diffg::ExecutionOptions& exec,
+                                    const diffg::MultiImage<float>* color) {
   if (base.dims().width != filtered.dims().width ||
       base.dims().height != filtered.dims().height ||
       base.dims().depth != filtered.dims().depth) {
     throw std::runtime_error("build_stat_channels: base and filtered dimensions differ.");
+  }
+  if (spec.uses_color()) {
+    if (color == nullptr || color->channels() == 0) {
+      throw std::runtime_error("build_stat_channels: the statistics read the colour planes, but the "
+                               "slice has none (a grayscale input, or planes not handed in).");
+    }
+    if (static_cast<int>(color->channels()) != spec.color_channels) {
+      throw std::runtime_error("build_stat_channels: input.color.channels is " +
+                               std::to_string(spec.color_channels) + " but the slice has " +
+                               std::to_string(color->channels()) + " plane(s).");
+    }
+    if (color->dims().width != base.dims().width || color->dims().height != base.dims().height ||
+        color->dims().depth != base.dims().depth) {
+      throw std::runtime_error("build_stat_channels: colour planes and base dimensions differ.");
+    }
   }
 
   StatChannelBank bank;
   bank.channels = resolve_stat_channels(spec);
   bank.data.assign(bank.channels.size(), nullptr);
 
-  // Collect the derived slots, deduplicating requests: a `hessian` entry covers
-  // two consecutive resolved channels but is one diffg request.
-  std::vector<diffg::FilterRequest> requests;
-  std::vector<std::size_t> derived_slots;   // resolved index per derived output channel
+  // Two traversals: the scalar base for base-sourced kinds, the planes for
+  // colour-sourced ones. Slots are aliased only once each stack sits in its
+  // final member, so no stored pointer can be invalidated by a move.
+  bank.derived = run_bank(diffg::MultiImageView<const float>(base.view()), bank.channels, "base", exec);
+  alias_derived(bank, "base", bank.derived);
+  if (spec.uses_color()) {
+    bank.derived_color = run_bank(color->view(), bank.channels, "color", exec);
+    alias_derived(bank, "color", bank.derived_color);
+  }
+
   for (std::size_t k = 0; k < bank.channels.size(); ++k) {
     const ResolvedStatChannel& c = bank.channels[k];
-    if (c.kind == "base" || c.kind == "filtered") continue;
-    if (c.slot_in_request == 0) requests.push_back(to_diffg_request(c));
-    derived_slots.push_back(k);
-  }
-
-  if (!requests.empty()) {
-    diffg::FilterBankOptions options;
-    options.execution = exec;
-    const auto result =
-        diffg::apply_filter_bank(base.view(), requests, diffg::OutputShape::MultiChannel, options);
-    if (result.channel_count() != derived_slots.size()) {
-      throw std::runtime_error("build_stat_channels: filter bank returned " +
-                               std::to_string(result.channel_count()) + " channels, expected " +
-                               std::to_string(derived_slots.size()) + ".");
-    }
-    bank.derived = std::move(result.stacked);
-    for (std::size_t i = 0; i < derived_slots.size(); ++i) {
-      bank.data[derived_slots[i]] = bank.derived.channel_data(i);
-    }
-  }
-
-  // base/filtered are aliased last, after `derived` has stopped moving, so no
-  // pointer stored above can be invalidated by the move.
-  for (std::size_t k = 0; k < bank.channels.size(); ++k) {
-    if (bank.channels[k].kind == "base") bank.data[k] = base.data();
-    else if (bank.channels[k].kind == "filtered") bank.data[k] = filtered.data();
+    if (c.kind == "base") bank.data[k] = base.data();
+    else if (c.kind == "filtered") bank.data[k] = filtered.data();
+    else if (c.kind == "color") bank.data[k] = color->channel_data(static_cast<std::size_t>(c.input_channel));
   }
   return bank;
 }

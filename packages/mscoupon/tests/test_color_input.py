@@ -134,3 +134,69 @@ def test_filter_slice_reduces_planes_with_the_default_and_an_explicit_stage():
         engine.filter_chain(planes, json.dumps(
             {"filters": [{"operation": "blur", "params": {"sigma": 1.0}},
                          {"operation": "color", "params": {"method": "mean"}}]}))
+
+
+def test_statistics_json_carries_colour_sources():
+    cards = [{"kind": "base"}, {"kind": "color"},
+             {"kind": "blur", "sigmas": [1.5], "source": "color"},
+             {"kind": "blur", "sigmas": [0.7]},
+             {"kind": "dizenzo", "sigmas": [1.0]}]
+    doc = config_io.statistics_to_json(cards, ["mean"], True, 0)
+    assert doc["channels"] == ["base", "color",
+                               {"kind": "blur", "sigmas": [1.5], "source": "color"},
+                               {"kind": "blur", "sigmas": [0.7]},
+                               {"kind": "dizenzo", "sigmas": [1.0], "source": "color"}]
+    back = config_io.statistics_from_json(doc)
+    assert back["channels"] == cards[:2] + [
+        {"kind": "blur", "sigmas": [1.5], "source": "color"},
+        {"kind": "blur", "sigmas": [0.7]},
+        {"kind": "dizenzo", "sigmas": [1.0], "source": "color"}]
+    notes = []
+    odd = config_io.statistics_from_json(
+        {"channels": [{"kind": "blur", "sigmas": [1.0], "source": "sideways"}]}, notes)
+    assert "source" not in odd["channels"][0] and notes
+    # The width counts planes: base + 3 raw + 3 colour blurs + 1 base blur + 2 dizenzo.
+    assert session.stats_width(doc, color_channels=3) == "10ch×1"
+    assert session.stats_width(doc, color_channels=0) == "4ch×1"
+
+
+def test_profile_input_block_rides_only_when_non_default():
+    p = session.default_profile("p")
+    assert p["input"]["color"] == {"alpha": "drop", "default_method": "luminance", "channels": 0}
+    assert "input" not in json.loads(session.profile_params_json(p))
+    doc = json.loads(session.profile_params_json(p, color_channels=3))
+    assert doc["input"] == {"color": {"channels": 3}}
+    p["input"]["color"].update({"alpha": "keep", "default_method": "mean", "channels": 4})
+    assert session.profile_from_json(p) == p
+    doc = json.loads(session.profile_params_json(p))
+    assert doc["input"] == {"color": {"alpha": "keep", "default_method": "mean", "channels": 4}}
+    assert session.profile_params_json(p, color_channels=3).count('"channels": 3') == 1
+    assert session.profile_summary(p).splitlines()[1] == "stats: base→1ch×4"
+
+
+def test_extension_measures_colour_channels():
+    engine = pytest.importorskip("msseg.mscoupon")
+    if not hasattr(engine, "read_tiff_planes"):
+        pytest.skip("extension predates the colour bindings")
+    rng = np.random.default_rng(3)
+    base = rng.random((24, 30), dtype=np.float32)
+    planes = np.stack([base, 2 * base + 1, 0.5 * base]).astype(np.float32)
+    params = json.dumps({"input": {"color": {"channels": 3}},
+                         "statistics": {"channels": ["base", "color",
+                                                     {"kind": "blur", "sigmas": [1.5], "source": "color"},
+                                                     {"kind": "chgradmag", "sigmas": [1.0]}],
+                                        "reductions": ["mean"]}})
+    names = [c["name"] for c in engine.stat_channels(params)]
+    assert names == ["base", "color_c0", "color_c1", "color_c2", "blur_c0_s1.5", "blur_c1_s1.5",
+                     "blur_c2_s1.5", "chgradmag_s1"]
+    assert [c["source"] for c in engine.stat_channels(params)][1:] == ["color"] * 7
+    got, imgs = engine.stat_channel_images(base, base, params, planes)
+    assert list(got) == names and imgs.shape == (8, 24, 30)
+    assert np.array_equal(imgs[2], planes[1])
+    with pytest.raises(RuntimeError):
+        engine.stat_channel_images(base, base, params)      # planes missing
+    pipe = engine.prime_slice(base, base, params, planes)
+    fields, values = pipe.feature_table()
+    fields = list(fields)
+    c0, c1 = fields.index("mean_color_c0"), fields.index("mean_color_c1")
+    assert np.allclose(values[:, c1], 2 * values[:, c0] + 1, atol=1e-3)

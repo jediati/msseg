@@ -206,9 +206,11 @@ void parse_statistics_json(const nlohmann::json& root, StatisticsConfig& stats) 
           stats.spec.base_channel = true;
         } else if (name == "filtered") {
           stats.spec.filtered_channel = true;
+        } else if (name == "color") {
+          stats.spec.color_channel = true;   // the raw input planes, color_c0..
         } else {
           throw std::runtime_error(
-              "statistics.channels[] string must be base/filtered (got '" + name +
+              "statistics.channels[] string must be base/filtered/color (got '" + name +
               "'); a derived channel is an object like "
               "{\"kind\": \"blur\", \"sigmas\": [1.0]}.");
         }
@@ -221,6 +223,7 @@ void parse_statistics_json(const nlohmann::json& root, StatisticsConfig& stats) 
       set_if_present(item, "kind", req.kind);
       if (req.kind == "base") { stats.spec.base_channel = true; continue; }
       if (req.kind == "filtered") { stats.spec.filtered_channel = true; continue; }
+      if (req.kind == "color") { stats.spec.color_channel = true; continue; }
       if (!msseg::is_derived_channel_kind(req.kind)) {
         std::string known = "base, filtered";
         for (const auto& k : msseg::derived_channel_kinds()) known += ", " + k;
@@ -234,7 +237,22 @@ void parse_statistics_json(const nlohmann::json& root, StatisticsConfig& stats) 
       }
       set_if_present(item, "sort_by_absolute_value", req.sort_by_absolute_value);
       set_if_present(item, "name", req.name);
+      set_if_present(item, "source", req.source);
+      // The cross-channel kinds only ever read the planes; let a config omit
+      // the redundant source rather than reject it.
+      if (msseg::is_cross_channel_kind(req.kind)) req.source = "color";
       stats.spec.derived.push_back(std::move(req));
+    }
+    // The plane count the colour source has: declared on the input block
+    // (3 when a colour source is named but nothing is declared), so the schema
+    // exists before any raster does.
+    if (stats.spec.uses_color()) {
+      int declared = 0;
+      if (root.contains("input") && root.at("input").is_object() &&
+          root.at("input").contains("color") && root.at("input").at("color").is_object()) {
+        set_if_present(root.at("input").at("color"), "channels", declared);
+      }
+      stats.spec.color_channels = declared > 0 ? declared : 3;
     }
     // Resolve now so a bad sigma or a duplicate channel name is a config error
     // rather than a surprise on the first slice.
@@ -479,6 +497,12 @@ AppConfig load_config(const CliOptions& cli) {
   parse_timing(root, cfg.timing);
   parse_debug_output(root, cfg.debug_output);
 
+  // A colour statistics source implies the plane count the pipeline checks
+  // every slice against, so a config that only named the source still gets one.
+  if (cfg.input.color.channels == 0 && cfg.statistics.spec.uses_color()) {
+    cfg.input.color.channels = cfg.statistics.spec.color_channels;
+  }
+
   apply_cli_overrides(cli, cfg);
   validate_config(cfg);
   return cfg;
@@ -501,6 +525,13 @@ void validate_config(const AppConfig& cfg) {
                              cfg.input.color.default_method + "').");
   }
   if (cfg.input.color.channels < 0) throw std::runtime_error("input.color.channels must be >= 0.");
+  if (cfg.statistics.spec.uses_color() &&
+      cfg.statistics.spec.color_channels != cfg.input.color.channels) {
+    throw std::runtime_error("statistics name a colour source for " +
+                             std::to_string(cfg.statistics.spec.color_channels) +
+                             " plane(s) but input.color.channels is " +
+                             std::to_string(cfg.input.color.channels) + ".");
+  }
   validate_color_chain("filters", cfg.filters, cfg.input.color);
   validate_color_chain("base_filters", cfg.base_filters, cfg.input.color);
   if (cfg.output.folder.empty()) throw std::runtime_error("output.folder must not be empty");

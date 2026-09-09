@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "diffg/image.hpp"
+#include "diffg/multi_image.hpp"
 #include "msseg/compute/channel_stats.hpp"
 #include "msseg/graph/msc_graph.hpp"
 #include "msseg/workflow/params.hpp"
@@ -106,8 +107,14 @@ class Msc2DPipeline {
   // traversed once per slice; the GUI passes nullptr so the rasters are freed
   // as soon as the per-manifold cells are accumulated, rather than held for
   // every primed slice.
+  //
+  // `color` is the slice's planar input stack, needed only when `cfg.stats`
+  // names a colour source (raw planes or colour-sourced derived channels);
+  // the GUI hands it in for a colour slice, the CLI always. Ignored when a
+  // caller-owned `bank` is given (that bank already measured the planes).
   void build(const diffg::Image<float>& base, const diffg::Image<float>& filtered,
-             const Msc2DParams& cfg, const StatChannelBank* bank = nullptr);
+             const Msc2DParams& cfg, const StatChannelBank* bank = nullptr,
+             const diffg::MultiImage<float>* color = nullptr);
 
   int width() const;
   int height() const;

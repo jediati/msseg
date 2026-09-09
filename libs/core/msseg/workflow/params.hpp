@@ -50,16 +50,28 @@ struct StatChannelRequest {
   bool sort_by_absolute_value = true;
   // Optional name prefix, replacing the generated one (e.g. "blur" -> "sharp").
   std::string name;
+  // The raster the response is computed on: "base" (the post-`base_filters`
+  // scalar) or "color" (the input's planes). On "color" a per-channel kind
+  // yields one response per plane (`blur_c0_s1.5`, ...) and the cross-channel
+  // kinds `chgradmag` / `dizenzo` reduce over the planes (they REQUIRE it).
+  std::string source = "base";
 };
 
 // One channel after expansion: a stable name plus how to produce it. Resolved
 // once per run, so the hot loops index channels by SLOT and never by name.
 struct ResolvedStatChannel {
   std::string name;           // "base", "filtered", "blur_s0.7", "hess_largest_s3"
-  std::string kind;           // the request kind it came from
-  double sigma = 0.0;         // 0 for base/filtered
-  int slot_in_request = 0;    // hessian: 0 = largest, 1 = smallest
+  std::string kind;           // the request kind it came from ("color" for a raw plane)
+  double sigma = 0.0;         // 0 for base/filtered/color planes
+  // Index of this channel among the request's outputs at one sigma; what the
+  // filter bank hands back in that position. hessian: 0 = largest, 1 = smallest;
+  // on the colour source a per-channel kind is plane-major (plane * k + slot).
+  int slot_in_request = 0;
   bool sort_by_absolute_value = true;
+  std::string source = "base";  // "base" | "color"
+  // The input plane a per-channel response (or a raw plane) came from; -1 for
+  // base-sourced and cross-channel channels.
+  int input_channel = -1;
 };
 
 // Aggregate reductions on the channels a workflow actually reads.
@@ -76,6 +88,13 @@ struct StatsSpec {
   // Derived measurement channels, in config order. Empty (the default) is
   // exactly the pre-existing two-channel behaviour.
   std::vector<StatChannelRequest> derived;
+  // The raw input planes as measurement channels (`color_c0`, `color_c1`, ...).
+  bool color_channel = false;
+  // Planes the colour source has (`input.color.channels`). The schema must be
+  // computable with no raster in hand -- config validation, the CSV header,
+  // the GUI pickers -- so this is a declared fact, verified against every
+  // loaded slice. 0 means no colour source is named.
+  int color_channels = 0;
   bool mean = true, min = true, max = true, std = true;
   bool extremum = true;
   // Experimental merge-tree-inspired contrast on the base channel. The slice
@@ -91,6 +110,14 @@ struct StatsSpec {
   int extremum_sample_radius = 0;
 
   bool any_aggregate() const { return mean || min || max || std; }
+  // Whether any measurement channel reads the input's colour planes.
+  bool uses_color() const {
+    if (color_channel) return true;
+    for (const auto& r : derived) {
+      if (r.source == "color") return true;
+    }
+    return false;
+  }
   bool needs_sums() const { return (mean || std) && (base_channel || filtered_channel); }
   // The filtered channel's min/max are load-bearing for the extremum even when
   // its aggregates are switched off.

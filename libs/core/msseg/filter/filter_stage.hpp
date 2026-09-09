@@ -49,6 +49,10 @@ struct StatChannelBank {
   // Derived responses only, planar (channel-slowest). Empty when the spec asks
   // for no derived channel, in which case nothing is computed at all.
   diffg::MultiImage<float> derived;
+  // The colour-sourced derived responses: a second bank traversal over the
+  // input planes (per-channel kinds replicate per plane; the cross-channel
+  // kinds reduce over them). Raw planes are aliased from the caller's stack.
+  diffg::MultiImage<float> derived_color;
   // Per-slot pointer into either the caller's base/filtered raster or `derived`.
   std::vector<const float*> data;
 
@@ -63,9 +67,15 @@ struct StatChannelBank {
 // are in normalized units too. `filtered` is only ever aliased.
 //
 // Both images must share dimensions. Throws for an unknown channel kind.
+//
+// `color`, when the spec names a colour source, is the slice's planar input
+// stack (spec.color_channels planes, the raster's dimensions): its raw planes
+// are aliased and its derived responses computed in one more bank traversal.
+// Null or the wrong plane count with a colour-sourced channel is an error.
 StatChannelBank build_stat_channels(const diffg::Image<float>& base,
                                     const diffg::Image<float>& filtered,
                                     const StatsSpec& spec,
-                                    const diffg::ExecutionOptions& exec = {});
+                                    const diffg::ExecutionOptions& exec = {},
+                                    const diffg::MultiImage<float>* color = nullptr);
 
 }  // namespace msseg

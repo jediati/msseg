@@ -27,6 +27,7 @@
 #include "mscoupon/region_measure.hpp"
 #include "mscoupon/sequence.hpp"
 #include "mscoupon/stats.hpp"
+#include "diffg/blur.hpp"
 #include "diffg/filter_bank.hpp"
 #include "diffg/structure.hpp"
 #include "msseg/compute/msc2d.hpp"
@@ -1911,6 +1912,98 @@ void test_tiff_planes_roundtrip() {
   check_planes(via_pkg, 3, "mscoupon::read_input_slice forwards to the planar reader");
 }
 
+msseg::StatChannelRequest stat_req(const char* kind, std::vector<double> sigmas, const char* source) {
+  msseg::StatChannelRequest r;
+  r.kind = kind;
+  r.sigmas = std::move(sigmas);
+  r.source = source;
+  return r;
+}
+
+// Colour planes as statistics sources: resolution order and names, the bank's
+// values against diffg, a primed pipeline's fields, and the error paths.
+void test_color_stat_channels() {
+  msseg::StatsSpec spec;
+  spec.std = false;
+  spec.color_channel = true;
+  spec.color_channels = 3;
+  spec.derived.push_back(stat_req("blur", {1.5}, "color"));
+  spec.derived.push_back(stat_req("hessian", {1.0}, "color"));
+  spec.derived.push_back(stat_req("chgradmag", {1.5}, "color"));
+  spec.derived.push_back(stat_req("dizenzo", {1.5}, "color"));
+  spec.derived.push_back(stat_req("blur", {0.7}, "base"));
+  const auto ch = msseg::resolve_stat_channels(spec);
+  expect(ch.size() == 1 + 3 + 3 + 6 + 1 + 2 + 1, "base, planes, blur x3, hessian x6, chgradmag, dizenzo x2, blur");
+  expect(ch[1].name == "color_c0" && ch[1].kind == "color" && ch[1].input_channel == 0, "raw planes follow base");
+  expect(ch[4].name == "blur_c0_s1.5" && ch[4].slot_in_request == 0 && ch[4].source == "color", "per-plane blur");
+  expect(ch[6].name == "blur_c2_s1.5" && ch[6].slot_in_request == 2 && ch[6].input_channel == 2, "plane-major slots");
+  expect(ch[7].name == "hessian_largest_c0_s1" && ch[8].name == "hessian_smallest_c0_s1", "eigen slots within a plane");
+  expect(ch[9].name == "hessian_largest_c1_s1" && ch[9].slot_in_request == 2, "then the next plane");
+  expect(ch[13].name == "chgradmag_s1.5" && ch[13].input_channel == -1, "cross-channel kinds emit once");
+  expect(ch[14].name == "dizenzo_largest_s1.5" && ch[15].name == "dizenzo_smallest_s1.5", "dizenzo has two slots");
+  expect(ch[16].name == "blur_s0.7" && ch[16].source == "base", "base-sourced kinds are named as before");
+  expect(msseg::channels_per_sigma("blur", "color", 3) == 3 && msseg::channels_per_sigma("dizenzo", "color", 3) == 2,
+         "channels_per_sigma counts planes for per-channel kinds only");
+
+  // A spec without a colour source resolves exactly as it always has.
+  msseg::StatsSpec plain;
+  plain.derived.push_back(stat_req("blur", {0.7}, "base"));
+  const auto old = msseg::resolve_stat_channels(plain);
+  expect(old.size() == 2 && old[1].name == "blur_s0.7" && !plain.uses_color(), "no colour source: unchanged");
+
+  bool threw = false;
+  msseg::StatsSpec bad = plain;
+  bad.derived.push_back(stat_req("chgradmag", {1.0}, "base"));
+  try { msseg::resolve_stat_channels(bad); } catch (const std::exception&) { threw = true; }
+  expect(threw, "a cross-channel kind on the base source is rejected");
+  threw = false;
+  msseg::StatsSpec undeclared = plain;
+  undeclared.color_channel = true;
+  try { msseg::resolve_stat_channels(undeclared); } catch (const std::exception&) { threw = true; }
+  expect(threw, "a colour source without input.color.channels is rejected");
+
+  // The bank: raw planes are aliased, per-plane responses equal diffg on that
+  // plane, cross-channel responses equal diffg's multi-channel bank.
+  const diffg::Image<float> base = make_wells(40, 32);
+  msseg::InputSlice rgb;
+  rgb.planes = diffg::MultiImage<float>(base.dims(), 3);
+  for (std::size_t i = 0; i < base.size(); ++i) {
+    rgb.planes.channel_data(0)[i] = base.data()[i];
+    rgb.planes.channel_data(1)[i] = 2.0f * base.data()[i] + 1.0f;
+    rgb.planes.channel_data(2)[i] = -0.5f * base.data()[i];
+  }
+  const msseg::StatChannelBank bank = msseg::build_stat_channels(base, base, spec, {}, &rgb.planes);
+  expect(bank.size() == ch.size(), "bank has one slot per resolved channel");
+  expect(bank.channel(2) == rgb.planes.channel_data(1), "raw planes are aliased, not copied");
+  const diffg::Image<float> blur1 = diffg::blur(rgb.planes.channel(1), 1.5, {});
+  expect(std::memcmp(bank.channel(5), blur1.data(), base.size() * sizeof(float)) == 0, "blur_c1 is the blur of plane 1");
+  const auto ref = diffg::apply_filter_bank(rgb.view(), {diffg::channel_gradient_magnitude_filter(1.5),
+                                                          diffg::dizenzo_filter(1.5)},
+                                            diffg::OutputShape::SeparateImages);
+  expect(std::memcmp(bank.channel(13), ref.images[0].data(), base.size() * sizeof(float)) == 0, "chgradmag matches diffg");
+  expect(std::memcmp(bank.channel(15), ref.images[2].data(), base.size() * sizeof(float)) == 0, "dizenzo smallest matches diffg");
+  const diffg::Image<float> blur0 = diffg::blur(base.view(), 0.7, {});
+  expect(std::memcmp(bank.channel(16), blur0.data(), base.size() * sizeof(float)) == 0, "base-sourced blur unchanged");
+  threw = false;
+  try { msseg::build_stat_channels(base, base, spec, {}, nullptr); } catch (const std::exception&) { threw = true; }
+  expect(threw, "a colour spec needs the planes");
+
+  // A primed pipeline carries the colour fields, and plane 1 = 2*plane 0 + 1
+  // survives the per-region means.
+  msseg::Msc2DParams cfg;
+  cfg.stats = spec;
+  msseg::Msc2DPipeline pipe;
+  pipe.build(base, base, cfg, nullptr, &rgb.planes);
+  expect(mscoupon::is_feature_field("mean_color_c0", spec) && mscoupon::is_feature_field("ext_dizenzo_largest_s1.5", spec),
+         "colour fields are queryable");
+  const auto table = mscoupon::feature_table(pipe.feature_stats(), pipe.feature_channels(), pipe.channels(), spec);
+  const int c0 = table.column("mean_color_c0"), c1 = table.column("mean_color_c1");
+  expect(c0 >= 0 && c1 >= 0 && table.n_rows > 0, "the table has the colour means");
+  for (std::size_t r = 0; r < table.n_rows; ++r) {
+    expect(std::abs(table.at(r, c1) - (2.0 * table.at(r, c0) + 1.0)) < 1e-3, "means are measured per plane");
+  }
+}
+
 int main() try {
   test_stats_bbox();
   test_sequence_stride();
@@ -1961,6 +2054,7 @@ int main() try {
   test_color_stage_methods();
   test_color_chain_rules_and_identity();
   test_tiff_planes_roundtrip();
+  test_color_stat_channels();
   std::cout << "mscoupon tests passed\n";
   return 0;
 } catch (const std::exception& e) {

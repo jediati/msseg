@@ -271,7 +271,7 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
           const diffg::Image<float> base_img = to_diffg(base);
           const diffg::Image<float> filtered_img = to_diffg(filtered);
           const msseg::StatChannelBank bank = msseg::build_stat_channels(
-              base_img, filtered_img, cfg.statistics.spec, bank_exec);
+              base_img, filtered_img, cfg.statistics.spec, bank_exec, &loaded.original.planes);
           loaded.timing.filter_ms = elapsed_ms(filter_start);
 
           // Merge-tree authoritative segmentation (same engine the GUI drives),

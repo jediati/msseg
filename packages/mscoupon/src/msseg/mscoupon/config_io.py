@@ -248,7 +248,16 @@ QUERY_OPS = ["lt", "le", "gt", "ge", "eq", "between"]
 # Derived measurement-channel kinds a `statistics.channels[]` entry may name.
 # `base`/`filtered` are the two rasters the pipeline already builds and are
 # spelled as bare strings instead. Must match msseg::derived_channel_kinds().
-DERIVED_CHANNEL_KINDS = ["blur", "edges", "gradmag", "laplacian", "hessian"]
+DERIVED_CHANNEL_KINDS = ["blur", "edges", "gradmag", "laplacian", "hessian",
+                         "chgradmag", "dizenzo"]
+# The kinds that reduce across the input's colour planes (diffg's channel
+# gradient magnitude and Di Zenzo eigenvalues): their source is always "color".
+COLOR_ONLY_KINDS = ["chgradmag", "dizenzo"]
+# What a derived channel is computed on: the post-`base_filters` scalar, or the
+# input's colour planes (one response per plane for a per-channel kind).
+STAT_SOURCES = ["base", "color"]
+# Kinds that yield two channels per sigma (largest + smallest eigenvalue).
+TWO_SLOT_KINDS = ["hessian", "dizenzo"]
 STAT_REDUCTIONS = ["mean", "min", "max", "std"]
 
 # Pixel intensity filter (trim): per-pixel keep/omit by a channel value threshold,
@@ -357,7 +366,7 @@ def statistics_to_json(channels: Sequence[Dict[str, Any]],
     out: List[Any] = []
     for entry in channels:
         kind = str(entry.get("kind") or "")
-        if kind in ("base", "filtered"):
+        if kind in ("base", "filtered", "color"):
             out.append(kind)
             continue
         if kind not in DERIVED_CHANNEL_KINDS:
@@ -366,6 +375,10 @@ def statistics_to_json(channels: Sequence[Dict[str, Any]],
         if not sigmas:
             continue
         item: Dict[str, Any] = {"kind": kind, "sigmas": sigmas}
+        # `source` is emitted only for the colour planes, so a base-sourced
+        # spec is the document it always was.
+        if kind in COLOR_ONLY_KINDS or entry.get("source") == "color":
+            item["source"] = "color"
         if kind == "hessian" and not entry.get("sort_by_absolute_value", True):
             item["sort_by_absolute_value"] = False
         if entry.get("name"):
@@ -396,14 +409,14 @@ def statistics_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[st
     if isinstance(raw, list):
         for item in raw:
             if isinstance(item, str):
-                if item in ("base", "filtered"):
+                if item in ("base", "filtered", "color"):
                     channels.append({"kind": item})
                 else:
                     _note(notes, f"statistics.channels: unknown channel {item!r} - dropped")
                 continue
             entry = _as_dict(item)
             kind = str(entry.get("kind") or "")
-            if kind in ("base", "filtered"):
+            if kind in ("base", "filtered", "color"):
                 channels.append({"kind": kind})
                 continue
             if kind not in DERIVED_CHANNEL_KINDS:
@@ -417,6 +430,12 @@ def statistics_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[st
                 _note(notes, f"statistics.channels: {kind!r} has no positive sigma - dropped")
                 continue
             out: Dict[str, Any] = {"kind": kind, "sigmas": sigmas}
+            source = str(entry.get("source") or "base")
+            if source not in STAT_SOURCES:
+                _note(notes, f"statistics.channels: {kind!r} has source {source!r} - using base")
+                source = "base"
+            if kind in COLOR_ONLY_KINDS or source == "color":
+                out["source"] = "color"
             if kind == "hessian":
                 out["sort_by_absolute_value"] = bool(
                     entry.get("sort_by_absolute_value", True))
