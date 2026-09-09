@@ -1,31 +1,29 @@
-"""Zoomable/pannable slice canvas for the mscoupon viewer.
+"""Zoomable/pannable slice canvas.
 
-Shows one slice at a time: a grayscale base image with brightness/contrast, plus
-alpha-composited overlay channels (filter field, segmentation, mask). The base is
-served pyramidally by ``large_image`` when available (``getRegion`` reads only the
-viewport at an appropriate level); otherwise it falls back to the in-memory base
-array. Overlays are full-resolution numpy arrays cropped+resized to the viewport
-(nearest-neighbour for label/mask layers) so they stay aligned to the base.
+Shows one item at a time: a base image with brightness/contrast, plus
+alpha-composited overlay layers (a filter field, a segmentation, a mask, the
+labeler's class layers). The base is any ``ImageSource``: an in-memory array
+(``ArrayImageSource``, exact float windowing) or a tiled pyramid served by
+level (``PyramidImageSource`` over ``large_image``), read only over the
+viewport at the level nearest the current zoom. Region overlays are
+``LabelLayer``s recoloured through a LUT at render time; a layer that can hand
+over its whole raster (``full()``) is gathered exactly onto the viewport grid,
+one that cannot is asked for a crop at the best level and resized nearest.
 
-Coordinates ``view_x``/``view_y`` and ``scale`` are in full-resolution base pixels
-(scale = base px per screen px), so overlays and future annotations map trivially.
-Requires numpy + Pillow (both mscoupon deps); ``large_image`` is optional.
+Coordinates ``view_x``/``view_y`` and ``scale`` are in full-resolution base
+pixels (scale = base px per screen px), so overlays and annotations map
+trivially. Requires numpy + Pillow; ``large_image`` is optional.
 """
 from __future__ import annotations
 
-import io
 import time
 import tkinter as tk
 
 import numpy as np
 from PIL import Image, ImageTk
 
-try:  # optional pyramidal backend for the base image
-    import large_image
-    _HAVE_LARGE_IMAGE = True
-except Exception:  # pragma: no cover
-    _HAVE_LARGE_IMAGE = False
-
+from .sources import (ArrayImageSource, ArrayLabelLayer, PyramidImageSource,
+                      HAVE_LARGE_IMAGE as _HAVE_LARGE_IMAGE, level_index_vectors)
 
 class SliceCanvas(tk.Frame):
     def __init__(self, master, **kwargs):
@@ -33,15 +31,19 @@ class SliceCanvas(tk.Frame):
         self.canvas = tk.Canvas(self, background="black", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
 
-        self._source = None          # large_image source (base), or None
-        self._source_path = None     # path currently open in _source (cache key)
-        self._base = None            # in-memory base array (H,W) float, fallback
-        self._base_min = 0.0
+        # Two candidate base sources: an in-memory array (preferred: exact,
+        # windowed in the data's own range) and a pyramid opened from a path
+        # (the fallback when there is no array, cached by path so repeated
+        # renders of one slice never re-open the file).
+        self._array_src = None       # ArrayImageSource | None
+        self._pyramid_src = None     # PyramidImageSource | None
+        self._source_path = None     # path the pyramid source was opened for
+        self._base_min = 0.0         # the active source's value range
         self._base_max = 1.0
         self.image_width = 1
         self.image_height = 1
 
-        self._overlays = []          # tagged: ("rgba",rgba,vis) | ("label",labels,lut,vis)
+        self._overlays = []          # tagged: ("rgba",rgba,vis) | ("label",layer,lut,vis)
         self._vmin = 0.0             # window fractions of [base_min, base_max]
         self._vmax = 1.0
         self._alpha = 0.5
@@ -98,73 +100,127 @@ class SliceCanvas(tk.Frame):
         self.canvas.bind("<Leave>", self._on_leave)
 
     # -- content ------------------------------------------------------- #
+    @property
+    def source(self):
+        """The ImageSource being drawn: the in-memory array when there is one,
+        else the pyramid, else None."""
+        return self._array_src if self._array_src is not None else self._pyramid_src
+
+    @property
+    def has_base(self):
+        return self.source is not None
+
+    # Legacy views kept for callers (and the selftests) that read them: the
+    # in-memory array, and the raw large_image source behind the pyramid.
+    @property
+    def _base(self):
+        return None if self._array_src is None else self._array_src.array
+
+    @property
+    def _source(self):
+        return None if self._pyramid_src is None else self._pyramid_src._src
+
+    def set_source(self, source, path=None):
+        """Make `source` (an ImageSource) the base. A ``native`` source (values
+        in the data's own range) takes the in-memory slot and wins over the
+        pyramid; a non-native one (display-scaled) takes the pyramid slot."""
+        if getattr(source, "native", True):
+            self._array_src = source
+        else:
+            self._pyramid_src = source
+            self._source_path = path if path is not None else getattr(source, "path", None)
+        self._sync_dims()
+
+    def _sync_dims(self):
+        src = self.source
+        if src is None:
+            return
+        self.image_height, self.image_width = src.level_shape(0)
+        self._base_min, self._base_max = src.value_range()
+
     def set_base(self, array=None, path=None, reset_array=False):
         """Set the base image from an in-memory array and/or a file path
-        (the path is used pyramidally by large_image when available). The
-        large_image source is cached by path so repeated renders of the same
-        slice (e.g. dragging the persistence slider) don't re-open the file.
+        (the path is opened pyramidally by large_image when available). The
+        pyramid is cached by path so repeated renders of the same slice
+        (e.g. dragging the persistence slider) don't re-open the file.
         reset_array=True drops a previously-set in-memory array, so a
         path-only base (the preview fallback) actually renders via the
         pyramidal source instead of the stale array."""
         if reset_array and array is None:
-            self._base = None
+            self._array_src = None
         if path != self._source_path:
-            self._source = None
+            self._pyramid_src = None
             self._source_path = path
             if path and _HAVE_LARGE_IMAGE:
                 try:
-                    self._source = large_image.open(str(path))
-                    md = self._source.getMetadata()
-                    self.image_width = int(md["sizeX"])
-                    self.image_height = int(md["sizeY"])
+                    self._pyramid_src = PyramidImageSource(str(path))
                 except Exception:
-                    self._source = None
+                    self._pyramid_src = None
         if array is not None:
-            arr = np.asarray(array, dtype=np.float32)
-            if arr.ndim == 3:
-                # Planar (C,h,w) colour planes: shown as RGB from the first three
-                # (a lone extra plane is repeated), windowed with one shared
-                # [lo, hi] so the channels keep their relative brightness.
-                planes = arr[:3] if arr.shape[0] >= 3 else np.repeat(arr[:1], 3, axis=0)
-                self._base = np.ascontiguousarray(np.transpose(planes, (1, 2, 0)))
-            else:
-                self._base = arr
-            self.image_height, self.image_width = self._base.shape[:2]
-            self._base_min = float(self._base.min())
-            self._base_max = float(self._base.max())
+            self._array_src = ArrayImageSource(array, path)
+        self._sync_dims()
 
     @property
     def base_is_rgb(self):
-        return self._base is not None and self._base.ndim == 3
+        return self._array_src is not None and self._array_src.channels == 3
+
+    @staticmethod
+    def _as_layer(o):
+        """A LabelLayer from an overlay dict: ``{"layer": LabelLayer}`` as is,
+        ``{"labels": array}`` wrapped."""
+        if o.get("layer") is not None:
+            return o["layer"]
+        labels = o.get("labels")
+        return None if labels is None else ArrayLabelLayer(labels)
 
     def set_overlays(self, overlays):
         """overlays: list of dicts, either a pre-colored RGBA layer
         ``{"rgba": HxWx4 uint8, "visible": bool}`` (e.g. the filtered field) or a
-        label+LUT layer ``{"labels": HxW int, "lut": (K,4) uint8, "visible": bool}``
-        recolored at render time over the viewport (segmentation / mask). Stored as
-        tagged tuples: ``("rgba", rgba, vis)`` or ``("label", labels, lut, vis)``."""
+        region layer ``{"labels": HxW int | "layer": LabelLayer, "lut": (K,4) uint8,
+        "visible": bool}`` recolored at render time over the viewport
+        (segmentation / mask). Stored as tagged tuples: ``("rgba", rgba, vis)`` or
+        ``("label", layer, lut, vis)``."""
         tagged = []
         for o in overlays:
             vis = o.get("visible", True)
-            if "labels" in o:
-                tagged.append(("label", o["labels"], o["lut"], vis))
+            if "labels" in o or "layer" in o:
+                tagged.append(("label", self._as_layer(o), o["lut"], vis))
             else:
                 tagged.append(("rgba", o["rgba"], vis))
         self._overlays = tagged
 
     def set_transient(self, overlay):
         """Set (or clear, with None) the transient preview layer: a
-        ``{"labels": HxW int, "lut": (K,4) uint8}`` dict as in set_overlays."""
+        ``{"labels": HxW int | "layer": LabelLayer, "lut": (K,4) uint8}`` dict as
+        in set_overlays."""
         if overlay is None:
             self._transient = None
         else:
-            self._transient = ("label", overlay["labels"], overlay["lut"], True)
+            self._transient = ("label", self._as_layer(overlay), overlay["lut"], True)
 
     def set_window(self, vmin, vmax):
         self._vmin, self._vmax = float(vmin), float(vmax)
 
     def set_alpha(self, alpha):
         self._alpha = float(alpha)
+
+    def set_view(self, view_x=None, view_y=None, scale=None):
+        """Move the view (full-resolution pixel offsets, base px per screen px)
+        and repaint; None keeps a component. The public way to scroll without
+        re-centring (see ``center_on`` for that)."""
+        if scale is not None:
+            self.scale = min(max(float(scale), 0.05), max(self.image_width, self.image_height))
+        if view_x is not None:
+            self.view_x = float(view_x)
+        if view_y is not None:
+            self.view_y = float(view_y)
+        self._schedule()
+        self._view_changed()
+
+    @property
+    def hud(self):
+        """``(mode, text)`` of the status badge (see ``set_hud``)."""
+        return self._hud_mode, self._hud_text
 
     def fit(self):
         w = max(self.canvas.winfo_width(), 1)
@@ -323,20 +379,26 @@ class SliceCanvas(tk.Frame):
             self.after_cancel(self._job)
         self._job = self.after(15, self.render)
 
+    def invalidate(self):
+        """Repaint soon (debounced): the public way to say a layer changed."""
+        self._schedule()
+
     def _base_region(self, left, top, right, bottom, out_w, out_h):
         """Return an (out_h, out_w) uint8 grayscale array for the base region,
         or (out_h, out_w, 3) when the base is colour."""
-        # Window over the base channel's own [min, max]. The in-memory base holds
-        # the native (float32) values, so we window there directly -- this is the
-        # correct, detail-preserving path. large_image's getRegion, by contrast,
-        # returns display-scaled 8-bit data whose values don't match the native
-        # [base_min, base_max] range, so it's only a fallback (windowed in [0,1]
-        # fraction space) for when no in-memory base is available.
+        src = self.source
         lo = self._base_min + self._vmin * (self._base_max - self._base_min)
         hi = self._base_min + self._vmax * (self._base_max - self._base_min)
         span = (hi - lo) or 1.0
-        if self._base is not None:
-            crop = self._base[top:bottom, left:right]
+        if getattr(src, "native", True):
+            # Native values: window in the data's own range, then resample.
+            # An in-memory array has one level, so this is the exact crop; a
+            # native pyramid would be read at the level nearest the zoom.
+            level = src.best_level(self.scale)
+            sc = src.level_scale(level)
+            crop = src.read_region(level, int(left / sc), int(top / sc),
+                                   max(1, int(round((right - left) / sc))),
+                                   max(1, int(round((bottom - top) / sc))))
             norm = np.clip((crop - lo) / span, 0, 1)
             if norm.ndim == 3:
                 im = Image.fromarray((norm * 255).astype(np.uint8), "RGB")
@@ -345,21 +407,46 @@ class SliceCanvas(tk.Frame):
             im = Image.fromarray(norm.astype(np.float32))
             im = im.resize((out_w, out_h), Image.BILINEAR)
             return (np.asarray(im, dtype=np.float32) * 255).astype(np.uint8)
-        # Fallback: no in-memory base -> use the pyramidal source. Its 8-bit output
-        # is already display-scaled, so window in normalized [0,1] fraction space.
-        png, _ = self._source.getRegion(
-            region={"left": left, "top": top, "right": right, "bottom": bottom,
-                    "units": "base_pixels"},
-            output={"maxWidth": out_w, "maxHeight": out_h}, encoding="PNG")
-        im = Image.open(io.BytesIO(png)).convert("L").resize((out_w, out_h))
+        # Display-scaled source (the pyramid): its 8-bit output does not match
+        # the native range, so window in normalized [0,1] fraction space.
+        level = src.best_level(self.scale)
+        sc = src.level_scale(level)
+        g = src.read_region(level, int(left / sc), int(top / sc),
+                            max(1, int(round((right - left) / sc))),
+                            max(1, int(round((bottom - top) / sc))))
+        im = Image.fromarray(np.asarray(g, dtype=np.uint8)).resize((out_w, out_h))
         g = np.asarray(im, dtype=np.float32) / 255.0
         g = np.clip((g - self._vmin) / ((self._vmax - self._vmin) or 1.0), 0, 1)
         return (g * 255).astype(np.uint8)
 
+    def _label_region(self, layer, left, top, right, bottom, out_w, out_h, cache):
+        """(out_h, out_w) region ids of `layer` over the viewport. A layer that
+        hands over its raster is gathered exactly onto the viewport grid
+        (index vectors shared across layers through `cache`); otherwise its
+        crop at the best level is resized nearest-neighbour."""
+        full = layer.full()
+        if full is not None:
+            if cache.get("ys") is None:
+                cache["ys"] = np.clip((top + (np.arange(out_h) + 0.5) * (bottom - top) / out_h)
+                                      .astype(np.intp), top, bottom - 1)
+                cache["xs"] = np.clip((left + (np.arange(out_w) + 0.5) * (right - left) / out_w)
+                                      .astype(np.intp), left, right - 1)
+            return full[cache["ys"]][:, cache["xs"]]
+        level = 0
+        sc = 1.0
+        while 2.0 ** (level + 1) <= max(self.scale, 1.0):
+            level += 1
+            sc = 2.0 ** level
+        sub = layer.crop(level, int(left / sc), int(top / sc),
+                         max(1, int(round((right - left) / sc))),
+                         max(1, int(round((bottom - top) / sc))))
+        im = Image.fromarray(np.asarray(sub, dtype=np.int32)).resize((out_w, out_h), Image.NEAREST)
+        return np.asarray(im, dtype=np.int32)
+
     def render(self):
         self._job = None
         cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
-        if cw <= 1 or ch <= 1 or (self._base is None and self._source is None):
+        if cw <= 1 or ch <= 1 or self.source is None:
             return
         left = max(0, int(self.view_x)); top = max(0, int(self.view_y))
         right = min(self.image_width, int(self.view_x + cw * self.scale))
@@ -379,7 +466,7 @@ class SliceCanvas(tk.Frame):
         n_ov = 0
         # Nearest-neighbour source indices for the visible region -> viewport grid
         # (shared by label overlays; O(out_w+out_h) to build).
-        ys = xs = None
+        index_cache = {}
         entries = list(self._overlays)
         if self._transient is not None:
             entries.append(self._transient)
@@ -395,16 +482,12 @@ class SliceCanvas(tk.Frame):
                 crop = rgba[top:bottom, left:right]
                 im = Image.fromarray(crop, mode="RGBA").resize((out_w, out_h), Image.NEAREST)
                 ov = np.asarray(im, dtype=np.float32)
-            else:  # "label": recolor the label image through the LUT at render time
-                labels, lut = entry[1], entry[2]
-                if labels is None or lut is None:
+            else:  # "label": recolor the region layer through the LUT at render time
+                layer, lut = entry[1], entry[2]
+                if layer is None or lut is None:
                     continue
-                if ys is None:
-                    ys = np.clip((top + (np.arange(out_h) + 0.5) * (bottom - top) / out_h)
-                                 .astype(np.intp), top, bottom - 1)
-                    xs = np.clip((left + (np.arange(out_w) + 0.5) * (right - left) / out_w)
-                                 .astype(np.intp), left, right - 1)
-                sub = labels[ys][:, xs]                       # (out_h, out_w) feature ids
+                sub = self._label_region(layer, left, top, right, bottom, out_w, out_h,
+                                         index_cache)   # (out_h, out_w) region ids
                 ov = lut[np.where(sub >= 0, sub, 0)].astype(np.float32)
                 ov[sub < 0] = 0                               # background -> transparent
             a = ov[:, :, 3:4] / 255.0
@@ -431,7 +514,7 @@ class SliceCanvas(tk.Frame):
         # pan/zoom doesn't flood the terminal.
         total_ms = 1e3 * (t_blit - t0)
         if total_ms >= 50.0:
-            src = "large_image" if self._source is not None else "in-memory"
+            src = "in-memory" if self._array_src is not None else "pyramid"
             print(f"[mscoupon]   canvas.render {out_w}x{out_h} via {src}: "
                   f"base={1e3 * (t_base - t0):.0f}ms "
                   f"overlays({n_ov})={1e3 * (t_ov - t_base):.0f}ms "

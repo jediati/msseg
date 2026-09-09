@@ -638,7 +638,7 @@ class MagicFillController:
                    "ring_cls": ring_cls,
                    "ring_rgba": app.store.rgba(ring_cls) if ring_cls else None,
                    "ring": None,
-                   "hud": (v._hud_mode, v._hud_text)}
+                   "hud": v.hud}
         app._begin_preview()
         self._preview(k0)
         return True
@@ -732,7 +732,7 @@ class MagicFillController:
     def _finish(self, s):
         v = self.app.viewer
         self.app._end_preview()
-        if v is not None and v._hud_mode == "info":
+        if v is not None and v.hud[0] == "info":
             v.set_hud(*s["hud"])       # give the canvas HUD back to the engine
 
 
@@ -1693,10 +1693,9 @@ class LabelerApp(MscouponApp):
 
     def _refresh_render(self):
         viewer = self.viewer
-        first = (viewer is not None and viewer._base is None
-                 and viewer._source is None)
+        first = viewer is not None and not viewer.has_base
         super()._refresh_render()
-        if first and viewer is not None and viewer._base is not None:
+        if first and viewer is not None and viewer.has_base:
             try:
                 mapped = bool(viewer.canvas.winfo_viewable())
             except tk.TclError:
@@ -2091,14 +2090,14 @@ class LabelerApp(MscouponApp):
         import numpy as np
         v.set_transient({"labels": labels,
                          "lut": preview_lut(K, ids, colors, np, emphasize=emphasize)})
-        v._schedule()
+        v.invalidate()
 
     def _end_preview(self):
         self._hover_suppressed = False
         v = self.viewer
         if v is not None:
             v.set_transient(None)
-            v._schedule()
+            v.invalidate()
 
     def _commit_magic(self, si, li, labels, ids, cls, meta):
         """Magic-fill release: one part, see _commit_blob."""
@@ -3160,8 +3159,7 @@ class LabelerApp(MscouponApp):
         cy = sum(y for _x, y in it.points) / len(it.points)
         w = max(v.canvas.winfo_width(), 1)
         h = max(v.canvas.winfo_height(), 1)
-        v.view_x = cx - (w / 2) * v.scale     # zoom (v.scale) stays as-is
-        v.view_y = cy - (h / 2) * v.scale
+        v.set_view(cx - (w / 2) * v.scale, cy - (h / 2) * v.scale)   # zoom stays as-is
         v.render()
         self._show_interaction_geometry(uid)  # redraw at the new view
 

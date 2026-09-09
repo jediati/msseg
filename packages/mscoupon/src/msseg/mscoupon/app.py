@@ -1330,7 +1330,7 @@ class MscouponApp:
                 # Fall back to the pyramidal path-only source (large_image);
                 # reset_array drops any stale in-memory base first.
                 log(f"preview load failed for {os.path.basename(path)}: {exc}")
-                first = self.viewer._base is None and self.viewer._source is None
+                first = not self.viewer.has_base
                 self.viewer.set_base(array=None, path=path, reset_array=True)
                 self._preview_path = path
                 self.viewer.set_overlays([])
@@ -1344,7 +1344,7 @@ class MscouponApp:
         else:
             # Re-insert for LRU recency.
             self._preview_cache[path] = self._preview_cache.pop(path)
-        first = self.viewer._base is None and self.viewer._source is None
+        first = not self.viewer.has_base
         self._preview_path = path
         if self._current_color_count() != getattr(self, "_picker_color_count", 0):
             self._refresh_channel_picker()
@@ -2592,7 +2592,7 @@ class MscouponApp:
             rec = None                    # stale: a Rerun superseded it
         overlays = self._seg_overlays(si, li, rec, data, np, min_colors)
 
-        first = self.viewer._base is None and self.viewer._source is None
+        first = not self.viewer.has_base
         channel = self.background_var.get()
         image_window = self._image_window(channel)
         if channel == "filtered":

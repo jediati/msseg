@@ -121,6 +121,11 @@ class RegionProvider(Protocol):
         without a record."""
         ...
 
+    def label_layer(self, key: ItemKey) -> Optional["LabelLayer"]:
+        """The item's current region raster as a ``LabelLayer`` (its ``rev`` is
+        the record's commit); None without a record."""
+        ...
+
 
 @runtime_checkable
 class ImageSource(Protocol):

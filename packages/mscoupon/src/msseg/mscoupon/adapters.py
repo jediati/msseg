@@ -138,6 +138,13 @@ class EngineRegionProvider:
         rec = self.record(key)
         return None if rec is None else self.arcs_for_record(rec, np, key)
 
+    def label_layer(self, key):
+        rec = self.record(key)
+        if rec is None or rec.get("labels") is None:
+            return None
+        from msseg.labeler.sources import ArrayLabelLayer
+        return ArrayLabelLayer(rec["labels"], rev=int(rec.get("commit") or 0))
+
     @staticmethod
     def arcs_for_record(rec, np, key=None):
         """The record's living-region arcs (MSC saddles), or pixel adjacency
