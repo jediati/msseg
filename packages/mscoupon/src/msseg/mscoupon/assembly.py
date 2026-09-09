@@ -110,10 +110,20 @@ def chan_col(name: str, part: str) -> str:
 _CHANNEL_PARTS = ("sum", "sumsq", "min", "max", "ext")
 
 
+def hist_bins(values: np.ndarray, lo: float, hi: float, bins: int) -> np.ndarray:
+    """Bin index per value over [lo, hi) with `bins` equal-width bins;
+    out-of-range values clamp into the end bins, NaN goes to bin 0 with no
+    count (the caller masks it). Mirrors ChannelStats::add."""
+    b = np.floor((values - lo) * (bins / (hi - lo)))
+    b = np.where(np.isfinite(b), b, 0.0)
+    return np.clip(b, 0, bins - 1).astype(np.int64)
+
+
 def node_stats(lbl: np.ndarray, n: int, base: np.ndarray, filt: np.ndarray,
                ascending: bool = True, relevance_floor: float = 0.0,
                relevance_ceiling: float = 0.0,
                channels: Optional[Sequence[Tuple[str, np.ndarray]]] = None,
+               histogram: Optional[Dict[str, Any]] = None,
                ) -> Dict[str, np.ndarray]:
     """Per-component (1..n) statistics from the actual pixel sets. Structure-of-
     arrays indexed 0..n-1. Sums use bincount; min/max/bbox use ufunc.at.
@@ -130,10 +140,17 @@ def node_stats(lbl: np.ndarray, n: int, base: np.ndarray, filt: np.ndarray,
     because its extent is what LOCATES that extremum -- exactly as `filt_min`/
     `filt_max` survive on Msc2DFeatureStat whether or not `filtered` is measured.
     Defaults to the base channel alone, which is the default StatsSpec.
+
+    `histogram` is ``{"bins": K, "ranges": {name: (lo, hi)}}`` for the
+    channels to histogram; each gets an (n, K) count table under
+    ``chan_col(name, "hist")`` that merges bin-wise across slices, exactly
+    like the C++ ChannelStats table.
     """
     h, w = lbl.shape
     if channels is None:
         channels = [("base", base)]
+    hist_ranges = dict((histogram or {}).get("ranges") or {})
+    hist_k = int((histogram or {}).get("bins") or 0)
     out: Dict[str, np.ndarray] = {}
     if n == 0:
         for k in ("area", "filt_min", "filt_max",
@@ -144,6 +161,8 @@ def node_stats(lbl: np.ndarray, n: int, base: np.ndarray, filt: np.ndarray,
         for name, _ in channels:
             for part in _CHANNEL_PARTS:
                 out[chan_col(name, part)] = np.zeros(0, dtype=np.float64)
+            if hist_k and name in hist_ranges:
+                out[chan_col(name, "hist")] = np.zeros((0, hist_k), dtype=np.float64)
         return out
     # Everything below works on the compressed foreground vectors, not the full
     # raster. `ndimage.minimum`/`maximum`/`minimum_position` with an index array
@@ -171,6 +190,13 @@ def node_stats(lbl: np.ndarray, n: int, base: np.ndarray, filt: np.ndarray,
         out[chan_col(name, "sumsq")] = np.bincount(idx, weights=v * v, minlength=n)
         out[chan_col(name, "min")] = _reduce(np.minimum, v, np.inf)
         out[chan_col(name, "max")] = _reduce(np.maximum, v, -np.inf)
+        if hist_k and name in hist_ranges:
+            lo, hi = hist_ranges[name]
+            b = hist_bins(v, float(lo), float(hi), hist_k)
+            counted = np.isfinite(v)
+            out[chan_col(name, "hist")] = np.bincount(
+                (idx * hist_k + b)[counted], minlength=n * hist_k
+            )[:n * hist_k].reshape(n, hist_k).astype(np.float64)
 
     out["base_relevance_floor"] = np.full(n, relevance_floor, dtype=np.float64)
     out["base_relevance_ceiling"] = np.full(n, relevance_ceiling, dtype=np.float64)
@@ -247,6 +273,7 @@ def assemble_cc(
     reductions: Sequence[str] = ("mean", "min", "max", "std"),
     extremum: bool = True,
     timing: Optional[Dict[str, float]] = None,
+    histogram: Optional[Dict[str, Any]] = None,
 ):
     """Assemble a stack into 3D connected components.
 
@@ -320,7 +347,7 @@ def assemble_cc(
         slice_channels = (list(channels_list[z]) if channels_list is not None
                           else [("base", base_list[z])])
         st = node_stats(lbl, n, base_list[z], filt_list[z], ascending,
-                        float(floor), float(ceiling), slice_channels)
+                        float(floor), float(ceiling), slice_channels, histogram)
         timing["node_stats"] += _t() - t
         for k, v in st.items():
             node_cols.setdefault(k, []).append(v)
@@ -328,7 +355,7 @@ def assemble_cc(
         slice_offset.append(slice_offset[-1] + n)
 
     N = slice_offset[-1]
-    cols = {k: (np.concatenate(v) if v else np.zeros(0)) for k, v in node_cols.items()}
+    cols = {k: (np.concatenate(v, axis=0) if v else np.zeros(0)) for k, v in node_cols.items()}
     z_of = np.concatenate(node_z) if node_z else np.zeros(0, dtype=np.int64)
 
     # --- cross-slice edges (vectorized 6/18/26 stencil, +z only) ----------- #
@@ -413,6 +440,16 @@ def assemble_cc(
             "min": reduce_min(chan_col(name, "min")),
             "max": reduce_max(chan_col(name, "max")),
         }
+    # Histograms merge bin-wise, like the sums.
+    hist_k = int((histogram or {}).get("bins") or 0)
+    hist_g = {}
+    for name in channel_names:
+        key = chan_col(name, "hist")
+        if hist_k and key in cols:
+            acc = np.zeros((n_global, hist_k), dtype=np.float64)
+            if N:
+                np.add.at(acc, comp, cols[key])
+            hist_g[name] = acc
     relevance_floor_g = reduce_min("base_relevance_floor")
     relevance_ceiling_g = reduce_max("base_relevance_ceiling")
     filt_min_g, filt_max_g = reduce_min("filt_min"), reduce_max("filt_max")
@@ -524,6 +561,10 @@ def assemble_cc(
                 if name != "filtered":
                     row[f"ext_{name}"] = float(ext_chan_g[name][gid])
             row["ext_filtered"] = float(ext_filt_g[gid])
+        for name, acc in hist_g.items():
+            width = max(2, len(str(hist_k - 1)))
+            for b in range(hist_k):
+                row[f"hist{b:0{width}d}_{name}"] = float(acc[gid, b] / a) if a else 0.0
         row.update({k: float(v[gid]) for k, v in ps.items()})
         global_table.append(row)
 

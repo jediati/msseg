@@ -106,7 +106,8 @@ def profile_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[str, 
     stats = config_io.statistics_from_json(root.get("statistics"), notes)
     out["statistics"] = config_io.statistics_to_json(
         stats["channels"], stats["reductions"], stats["extremum"],
-        out["msc"]["extremum_sample_radius"], stats["relevance"])
+        out["msc"]["extremum_sample_radius"], stats["relevance"],
+        stats.get("histogram"))
 
     sel = _as_dict(root.get("selection"))
     # Feature filters validate against the schema THIS profile's statistics
@@ -548,7 +549,12 @@ def stats_width(statistics: Any, color_channels: int = 0) -> str:
         per_plane = (planes if (c.get("source") == "color"
                                 and kind not in config_io.COLOR_ONLY_KINDS) else 1)
         n_ch += max(1, len(sig)) * slots * per_plane
-    return f"{n_ch}ch×{len(stats['reductions'])}"
+    width = f"{n_ch}ch×{len(stats['reductions'])}"
+    hist = stats.get("histogram") or {}
+    if hist.get("bins"):
+        # `+16h×2`: bins times the histogrammed channels (base alone by default).
+        width += f"+{int(hist['bins'])}h×{max(1, len(hist.get('channels') or []))}"
+    return width
 
 
 def profile_summary(profile: Dict[str, Any]) -> str:

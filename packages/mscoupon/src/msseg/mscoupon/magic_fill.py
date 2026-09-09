@@ -56,8 +56,9 @@ from __future__ import annotations
 
 import heapq
 import math
+import re
 
-METRICS = ("mean", "bhattacharyya", "cosine", "proba", "barrier", "learned")
+METRICS = ("mean", "bhattacharyya", "histogram", "cosine", "proba", "barrier", "learned")
 MODES = ("anchor", "chain")
 
 # Metrics that need the saddle value per arc (unavailable on pixel adjacency).
@@ -66,7 +67,10 @@ EDGE_ONLY_METRICS = ("barrier",)
 # the saddle barrier, and the edge model's learned P(different) per arc.
 ARC_METRICS = ("barrier", "learned")
 # Metrics that read the channel list (the others use the whole row / extra).
-CHANNEL_METRICS = ("mean", "bhattacharyya")
+CHANNEL_METRICS = ("mean", "bhattacharyya", "histogram")
+# The per-region histogram columns (`hist00_base`, ...): a distribution, not a
+# scalar, so `cosine` leaves them out and `histogram` reads them as one.
+HIST_RE = re.compile(r"^hist\d+_(.+)$")
 # Metrics that need a per-region array the table does not carry: metric -> the
 # key build_ladder expects in `extra`.
 EXTRA_METRICS = {"proba": "proba", "learned": "pdiff"}
@@ -172,8 +176,12 @@ def row_vectors(table, metric, channels, np, extra=None):
                 for c, m in zip(channels, means)]
         X = np.concatenate([np.stack(means, axis=1), np.stack(stds, axis=1)], axis=1)
         return X, "bhattacharyya"
+    if metric == "histogram":
+        X = histogram_vectors(table, channels, np)
+        return X, "hellinger"
     if metric == "cosine":
-        names = [n for n in table.names if n not in POSITIONAL_FIELDS]
+        names = [n for n in table.names
+                 if n not in POSITIONAL_FIELDS and not HIST_RE.match(n)]
         if not names:
             raise ValueError("no statistics columns for cosine")
         cols = []
@@ -198,6 +206,33 @@ def row_vectors(table, metric, channels, np, extra=None):
     if metric in EDGE_ONLY_METRICS:
         raise ValueError(f"{metric!r} is an arc metric, not a region metric")
     raise ValueError(f"unknown metric {metric!r}")
+
+
+def histogram_columns(table):
+    """channel -> [column names] of the table's histogram bins, in bin order."""
+    out = {}
+    for n in table.names:
+        m = HIST_RE.match(n)
+        if m:
+            out.setdefault(m.group(1), []).append(n)
+    return out
+
+
+def histogram_vectors(table, channels, np):
+    """One row per region: the concatenated bin fractions of every selected
+    channel that carries a histogram, scaled by 1/k so the whole row sums to
+    one and the Hellinger distance stays in [0, 1]. Channels without bins are
+    skipped; none at all is an error (the spec has no histogram)."""
+    by_channel = histogram_columns(table)
+    picked = [c for c in channels if c in by_channel] or list(by_channel)
+    if not picked:
+        raise ValueError("no histogram columns: enable statistics.histogram first")
+    blocks = []
+    for c in picked:
+        cols = [np.nan_to_num(_column(table, n, np), nan=0.0) for n in by_channel[c]]
+        blocks.append(np.stack(cols, axis=1))
+    X = np.concatenate(blocks, axis=1) / float(len(picked))
+    return X
 
 
 def pairwise(X, I, J, kind, np):

@@ -260,6 +260,28 @@ void parse_statistics_json(const nlohmann::json& root, StatisticsConfig& stats) 
   }
   parse_reductions(s, "reductions", stats.spec.mean, stats.spec.min, stats.spec.max,
                    stats.spec.std);
+  // Per-region histograms: {"bins": K, "channels": [names], "ranges": {name|"*": [lo, hi]}}.
+  if (s.contains("histogram") && !s.at("histogram").is_null()) {
+    const auto& h = s.at("histogram");
+    if (!h.is_object()) throw std::runtime_error("statistics.histogram must be an object.");
+    set_if_present(h, "bins", stats.spec.hist.bins);
+    if (h.contains("channels") && !h.at("channels").is_null()) {
+      stats.spec.hist.channels = h.at("channels").get<std::vector<std::string>>();
+    }
+    if (h.contains("ranges") && !h.at("ranges").is_null()) {
+      const auto& r = h.at("ranges");
+      if (!r.is_object()) throw std::runtime_error("statistics.histogram.ranges must be an object.");
+      for (auto it = r.begin(); it != r.end(); ++it) {
+        if (!it.value().is_array() || it.value().size() != 2) {
+          throw std::runtime_error("statistics.histogram.ranges['" + it.key() + "'] must be [lo, hi].");
+        }
+        stats.spec.hist.ranges[it.key()] = {it.value()[0].get<float>(), it.value()[1].get<float>()};
+      }
+    }
+    // Resolve so a bad bin count, an unknown channel or a missing range is a
+    // config error rather than a first-slice surprise.
+    (void)msseg::resolve_stat_channels(stats.spec);
+  }
   set_if_present(s, "extremum", stats.spec.extremum);
   set_if_present(s, "extremum_sample_radius", stats.spec.extremum_sample_radius);
   if (s.contains("relevance") && !s.at("relevance").is_null()) {

@@ -2004,6 +2004,103 @@ void test_color_stat_channels() {
   }
 }
 
+// Per-region histograms: the accumulator, the projection (after ext_filtered,
+// summing to one), the 3D merge, and the CSV.
+void test_histogram_stats() {
+  msseg::StatsSpec spec;
+  spec.std = false;
+  spec.derived.push_back(stat_req("blur", {1.0}, "base"));
+  spec.hist.bins = 4;
+  spec.hist.channels = {"base", "blur_s1"};
+  spec.hist.ranges["*"] = {0.0f, 1.0f};
+  spec.hist.ranges["blur_s1"] = {-1.0f, 1.0f};
+  const auto ch = msseg::resolve_stat_channels(spec);
+  expect(ch[0].hist && ch[0].hist_lo == 0.0f && ch[0].hist_hi == 1.0f, "base takes the * range");
+  expect(ch[1].hist && ch[1].hist_lo == -1.0f, "a named range wins over *");
+
+  // Accumulate two regions by hand: values 0.1 (bin 0), 0.6 (bin 2), 5 (clamps to 3), NaN (skipped).
+  msseg::ChannelStats st;
+  st.reset(2, ch, spec);
+  const float base_px[] = {0.1f, 0.6f, 5.0f, std::numeric_limits<float>::quiet_NaN(), -3.0f};
+  const float blur_px[] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  const std::vector<const float*> data{base_px, blur_px};
+  st.add(0, 0, data); st.add(0, 1, data); st.add(0, 2, data); st.add(0, 3, data);
+  st.add(1, 4, data);
+  const std::uint32_t* h0 = st.hist(0, 0);
+  expect(h0 != nullptr && h0[0] == 1 && h0[1] == 0 && h0[2] == 1 && h0[3] == 1, "bins count, clamp high, skip NaN");
+  expect(st.hist(1, 0)[0] == 1, "clamp low into bin 0");
+  expect(st.hist(0, 1)[2] == 4, "blur's zero sits mid-range in bin 2 of [-1, 1)");
+  msseg::ChannelStats merged;
+  merged.reset(1, ch, spec);
+  merged.merge_region(0, st, 0);
+  merged.merge_region(0, st, 1);
+  expect(merged.hist(0, 0)[0] == 2 && merged.hist(0, 0)[3] == 1, "merge adds bin-wise");
+  msseg::ChannelStats appended;
+  appended.append(st);
+  appended.append(merged);
+  expect(appended.regions() == 3 && appended.hist(2, 0)[0] == 2, "append carries the histograms");
+  appended.clear_region(2);
+  expect(appended.hist(2, 0)[0] == 0, "clear zeroes the bins");
+
+  // Schema: the histogram block is last, and the table's rows sum to one.
+  const auto schema = mscoupon::feature_schema(spec);
+  const auto names = mscoupon::feature_fields(spec);
+  int ext_at = -1, hist_at = -1;
+  for (std::size_t i = 0; i < schema.size(); ++i) {
+    if (schema[i].name == "ext_filtered") ext_at = static_cast<int>(i);
+    if (schema[i].name == "hist00_base" && hist_at < 0) hist_at = static_cast<int>(i);
+  }
+  expect(ext_at >= 0 && hist_at == ext_at + 1, "hist columns follow ext_filtered");
+  expect(names.back() == "hist03_blur_s1", "bins are zero-padded and grouped per channel");
+  expect(mscoupon::is_feature_field("hist02_base", spec), "bins are queryable fields");
+  for (const auto& f : schema) {
+    if (f.name.rfind("hist", 0) == 0) expect(f.channel == "base" || f.channel == "blur_s1", "a bin names its channel");
+  }
+  const diffg::Image<float> img = make_wells(32, 24);
+  msseg::Msc2DParams cfg;
+  cfg.stats = spec;
+  msseg::Msc2DPipeline pipe;
+  pipe.build(img, img, cfg);
+  const auto table = mscoupon::feature_table(pipe.feature_stats(), pipe.feature_channels(), pipe.channels(), spec);
+  expect(table.n_rows > 0, "features exist");
+  for (std::size_t r = 0; r < table.n_rows; ++r) {
+    double sum = 0.0;
+    for (int b = 0; b < 4; ++b) sum += table.at(r, static_cast<std::size_t>(table.column("hist0" + std::to_string(b) + "_base")));
+    expect(std::abs(sum - 1.0) < 1e-9, "a region's bins sum to one");
+  }
+
+  // 3D: the matcher merges histograms bin-wise into the global table and CSV.
+  mscoupon::StatisticsConfig scfg;
+  scfg.spec = spec;
+  mscoupon::SliceMatcher m;
+  m.configure(scfg, true, ch);
+  msseg::ChannelStats n0, n1;
+  n0.reset(1, ch, spec); n1.reset(1, ch, spec);
+  n0.add(0, 0, data); n0.add(0, 1, data);   // bins 0 and 2
+  n1.add(0, 2, data);                        // bin 3
+  mscoupon::CcNodeStat c0; c0.area = 2; c0.min_x = c0.min_y = c0.max_x = c0.max_y = 0;
+  mscoupon::CcNodeStat c1; c1.area = 1; c1.min_x = c1.min_y = c1.max_x = c1.max_y = 0;
+  m.add_slice({0}, 1, 1, {c0}, n0, 0, 6);
+  m.add_slice({0}, 1, 1, {c1}, n1, 1, 6);
+  std::vector<mscoupon::FeatureMapRow> map;
+  mscoupon::GlobalFeatureTable gt;
+  std::vector<mscoupon::GlobalLabelRaster> rasters;
+  m.finalize(map, gt, rasters);
+  expect(gt.rows.size() == 1 && gt.rows[0].voxel_count == 3, "one 3D feature of three voxels");
+  const std::uint32_t* gh = gt.channels.hist(0, 0);
+  expect(gh != nullptr && gh[0] == 1 && gh[2] == 1 && gh[3] == 1, "global bins are the slice bins added");
+  const auto gtab = mscoupon::global_feature_table(gt.rows, gt.channels, gt.schema, spec);
+  expect(std::abs(gtab.at(0, static_cast<std::size_t>(gtab.column("hist03_base"))) - 1.0 / 3.0) < 1e-9,
+         "3D bins are fractions of the voxel count");
+  const auto path = std::filesystem::temp_directory_path() / "mscoupon_hist.csv";
+  mscoupon::write_global_table_csv(path, gt, scfg);
+  std::ifstream in(path);
+  std::string header;
+  std::getline(in, header);
+  expect(header.find("hist00_base") != std::string::npos && header.find("hist03_blur_s1") != std::string::npos,
+         "the global CSV carries the bins");
+}
+
 int main() try {
   test_stats_bbox();
   test_sequence_stride();
@@ -2055,6 +2152,7 @@ int main() try {
   test_color_chain_rules_and_identity();
   test_tiff_planes_roundtrip();
   test_color_stat_channels();
+  test_histogram_stats();
   std::cout << "mscoupon tests passed\n";
   return 0;
 } catch (const std::exception& e) {

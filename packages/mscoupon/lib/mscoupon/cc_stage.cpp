@@ -79,7 +79,7 @@ int label_selected_components(const std::vector<int>& labels, int width, int hei
   const std::vector<const float*>& chan = bank.data;
 
   stats_out.assign(static_cast<std::size_t>(n_comp), CcNodeStat{});
-  channels_out.reset(static_cast<std::size_t>(n_comp), bank.size(), spec);
+  channels_out.reset(static_cast<std::size_t>(n_comp), bank.channels, spec);
   for (auto& s : stats_out) {
     s.base_relevance_floor = base_relevance_floor;
     s.base_relevance_ceiling = base_relevance_ceiling;

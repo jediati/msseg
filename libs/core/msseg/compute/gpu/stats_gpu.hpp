@@ -1,5 +1,9 @@
 #pragma once
 
+// NOTE: the device path reduces sum/sumsq/min/max (+ the extremum sample) over
+// single-plane diffg channels only. Colour-sourced channels and per-region
+// histograms are CPU-only; msc2d.cpp keeps the host loop for those specs.
+
 // GPU per-region statistics accumulation for the 2D pipeline.
 //
 // Plain C++ boundary in the diffg_gpu/dgrad_gpu style: no CUDA types, raw

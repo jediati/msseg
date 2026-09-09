@@ -716,7 +716,8 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
   std::vector<Msc2DFeatureStat>& leaf = impl_->leaf_stats;
   auto init_leaves = [&](std::size_t n_ch_init) {
     leaf.assign(num_base, Msc2DFeatureStat{});
-    impl_->leaf_channels.reset(num_base, n_ch_init, spec);
+    (void)n_ch_init;
+    impl_->leaf_channels.reset(num_base, impl_->channels, spec);
     for (std::size_t c = 0; c < num_base; ++c) {
       leaf[c].feature_id = static_cast<NodeId>(c);
       leaf[c].base_relevance_floor = impl_->base_relevance_floor;
@@ -744,7 +745,8 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
   // Colour-sourced channels have no device path (diffg's GPU bank takes one
   // plane), so a spec naming one keeps the CPU loop.
   bool gpu_done = false;
-  if (external_bank == nullptr && gpu_stats_wanted(cfg) && !spec.uses_color()) {
+  // Histograms have no device reduce either.
+  if (external_bank == nullptr && gpu_stats_wanted(cfg) && !spec.uses_color() && !spec.hist.enabled()) {
     impl_->channels = resolve_stat_channels(spec);
     init_leaves(impl_->channels.size());
     gpu_done = try_gpu_accumulate(*impl_, base, filtered, spec, ext_radius);
@@ -964,7 +966,8 @@ void Msc2DPipeline::select_persistence(float persistence_absolute) {
   const std::size_t n_rows = row_living.size();
   const std::size_t n_ch = impl_->leaf_channels.channels();
   impl_->features.assign(n_rows, Msc2DFeatureStat{});
-  impl_->feature_channels.reset(n_rows, n_ch, impl_->stats);
+  (void)n_ch;
+  impl_->feature_channels.reset(n_rows, impl_->channels, impl_->stats);
   for (std::size_t r = 0; r < n_rows; ++r) {
     impl_->features[r].feature_id = static_cast<NodeId>(row_living[r]);
   }

@@ -380,6 +380,8 @@ py::list stat_channels_py(const std::string& params_json) {
     d["sigma"] = c.sigma;
     d["source"] = c.source;
     d["input_channel"] = c.input_channel;
+    d["hist"] = c.hist;
+    if (c.hist) d["hist_range"] = py::make_tuple(c.hist_lo, c.hist_hi);
     out.append(std::move(d));
   }
   return out;

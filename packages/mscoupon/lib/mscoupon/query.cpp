@@ -118,6 +118,48 @@ void append_ext_columns(std::vector<FeatureField>& out,
   out.push_back(FeatureField{"ext_filtered", "filtered", "ext"});
 }
 
+// The histogram block: `bins` columns per histogrammed channel, named
+// hist<kk>_<channel> with the bin index zero-padded to the width of bins-1
+// (at least two digits), so the columns sort and the reduction name `hist<kk>`
+// composes with the channel exactly like `mean_<channel>` does. It comes
+// LAST, after the extremum block, so every column order that existed before
+// histograms is a prefix of the new one.
+std::string hist_reduction(int bin, int bins) {
+  int width = 0;
+  for (int v = std::max(bins - 1, 1); v > 0; v /= 10) ++width;
+  width = std::max(width, 2);
+  std::string digits = std::to_string(bin);
+  while (static_cast<int>(digits.size()) < width) digits.insert(digits.begin(), '0');
+  return "hist" + digits;
+}
+
+void append_hist_columns(std::vector<FeatureField>& out,
+                         const std::vector<msseg::ResolvedStatChannel>& channels,
+                         const msseg::StatsSpec& spec) {
+  if (!spec.hist.enabled()) return;
+  for (const auto& c : channels) {
+    if (!c.hist) continue;
+    for (int b = 0; b < spec.hist.bins; ++b) {
+      const std::string red = hist_reduction(b, spec.hist.bins);
+      out.push_back(FeatureField{red + "_" + c.name, c.name, red});
+    }
+  }
+}
+
+// The histogram block's values: each bin's share of the region's pixels.
+void fill_hist_values(double* row, std::size_t& col, const msseg::ChannelStats& channels,
+                      std::size_t r, const std::vector<msseg::ResolvedStatChannel>& channel_schema,
+                      const msseg::StatsSpec& spec, double area) {
+  if (!spec.hist.enabled()) return;
+  for (std::size_t k = 0; k < channel_schema.size(); ++k) {
+    if (!channel_schema[k].hist) continue;
+    const std::uint32_t* h = channels.hist(r, k);
+    for (int b = 0; b < spec.hist.bins; ++b) {
+      row[col++] = (h != nullptr && area > 0) ? static_cast<double>(h[b]) / area : 0.0;
+    }
+  }
+}
+
 }  // namespace
 
 std::vector<FeatureField> feature_schema(const msseg::StatsSpec& spec) {
@@ -130,6 +172,7 @@ std::vector<FeatureField> feature_schema(const msseg::StatsSpec& spec) {
   }
   append_channel_columns(out, channels, spec);
   append_ext_columns(out, channels, spec, /*with_z=*/false);
+  append_hist_columns(out, channels, spec);
   return out;
 }
 
@@ -144,6 +187,7 @@ std::vector<FeatureField> global_feature_schema(const msseg::StatsSpec& spec) {
   }
   append_channel_columns(out, channels, spec);
   append_ext_columns(out, channels, spec, /*with_z=*/true);
+  append_hist_columns(out, channels, spec);
   return out;
 }
 
@@ -215,6 +259,7 @@ FeatureTable feature_table(const std::vector<msseg::Msc2DFeatureStat>& features,
       }
       row[col++] = s.ext_filtered;
     }
+    fill_hist_values(row, col, channels, r, channel_schema, spec, area);
   }
   return table;
 }
@@ -270,6 +315,7 @@ FeatureTable global_feature_table(const std::vector<GlobalFeatureStat>& rows,
       }
       row[col++] = s.ext_filtered;
     }
+    fill_hist_values(row, col, channels, r, channel_schema, spec, area);
   }
   return table;
 }

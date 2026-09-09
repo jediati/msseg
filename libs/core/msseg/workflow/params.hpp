@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <map>
+#include <utility>
 #include <optional>
 #include <string>
 #include <vector>
@@ -72,6 +74,26 @@ struct ResolvedStatChannel {
   // The input plane a per-channel response (or a raw plane) came from; -1 for
   // base-sourced and cross-channel channels.
   int input_channel = -1;
+  // Whether this channel is histogrammed (StatsSpec::hist), and over what range.
+  bool hist = false;
+  float hist_lo = 0.0f;
+  float hist_hi = 1.0f;
+};
+
+// A per-region histogram of a measurement channel: `bins` equal-width bins
+// over a FIXED range per channel. The range is fixed by config rather than
+// measured per slice because the counts must add across slices (the 3D
+// matcher and the GUI assembly merge bin-wise) and a bin must mean the same
+// thing on every slice a classifier is trained over; out-of-range values
+// clamp into the end bins so the counts always sum to the region's area.
+// Opt-in per channel (`channels`, resolved names; empty = the base channel
+// only) since the counts live per base manifold. `ranges` maps a channel name
+// -- or "*" for every histogrammed channel -- to [lo, hi].
+struct HistSpec {
+  int bins = 0;                                              // 0 = off
+  std::vector<std::string> channels;                         // empty => {"base"}
+  std::map<std::string, std::pair<float, float>> ranges;     // name | "*" -> [lo, hi)
+  bool enabled() const { return bins > 0; }
 };
 
 // Aggregate reductions on the channels a workflow actually reads.
@@ -108,6 +130,8 @@ struct StatsSpec {
   // the (2r+1)^2 window, clamped at the image border, trading the exact critical
   // value for noise robustness.
   int extremum_sample_radius = 0;
+  // Per-region histograms (off unless `hist.bins` > 0).
+  HistSpec hist;
 
   bool any_aggregate() const { return mean || min || max || std; }
   // Whether any measurement channel reads the input's colour planes.

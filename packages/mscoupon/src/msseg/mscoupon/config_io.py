@@ -351,11 +351,46 @@ def pixel_filters_to_json(rules: Sequence[Dict[str, Any]]) -> List[Dict[str, Any
     return out
 
 
+# Per-region histograms (`statistics.histogram`): K equal-width bins over a
+# FIXED range per channel, so the counts add across slices and a bin means
+# the same thing on every slice a classifier sees. {bins, channels, ranges}.
+HIST_MAX_BINS = 256
+
+
+def histogram_to_json(hist: Any) -> Optional[Dict[str, Any]]:
+    """The `statistics.histogram` block, or None when off (bins <= 0)."""
+    h = _as_dict(hist)
+    bins = _as_int(h.get("bins"), 0)
+    if bins <= 0:
+        return None
+    out: Dict[str, Any] = {"bins": int(min(max(bins, 2), HIST_MAX_BINS))}
+    channels = [str(c) for c in _as_list(h.get("channels")) if str(c)]
+    if channels:
+        out["channels"] = channels
+    ranges = {}
+    for name, pair in _as_dict(h.get("ranges")).items():
+        lst = _as_list(pair)
+        if len(lst) == 2 and _is_number(lst[0]) and _is_number(lst[1]):
+            ranges[str(name)] = [float(lst[0]), float(lst[1])]
+    out["ranges"] = ranges
+    return out
+
+
+def histogram_from_json(doc: Any) -> Dict[str, Any]:
+    """Total reader: {bins (0 = off), channels, ranges}."""
+    out = histogram_to_json(doc)
+    if out is None:
+        return {"bins": 0, "channels": [], "ranges": {}}
+    return {"bins": out["bins"], "channels": list(out.get("channels") or []),
+            "ranges": dict(out.get("ranges") or {})}
+
+
 def statistics_to_json(channels: Sequence[Dict[str, Any]],
                        reductions: Sequence[str],
                        extremum: bool = True,
                        extremum_sample_radius: int = 0,
-                       relevance: bool = True) -> Dict[str, Any]:
+                       relevance: bool = True,
+                       histogram: Any = None) -> Dict[str, Any]:
     """The `statistics` block for a config.
 
     `channels` mirrors what the CLI parses: a bare string for `base`/`filtered`,
@@ -396,13 +431,16 @@ def statistics_to_json(channels: Sequence[Dict[str, Any]],
     # existing viewer profiles and exported configs retain their old shape.
     if not relevance:
         block["relevance"] = False
+    hist = histogram_to_json(histogram)
+    if hist is not None:
+        block["histogram"] = hist
     return block
 
 
 def statistics_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[str, Any]:
     """Inverse of statistics_to_json, total (never raises) like the rest of the
     read side. Returns {channels, reductions, extremum, extremum_sample_radius,
-    relevance} with `channels` always in the dict form the GUI edits."""
+    relevance, histogram} with `channels` always in the dict form the GUI edits."""
     block = _as_dict(doc)
     raw = block.get("channels")
     channels: List[Dict[str, Any]] = []
@@ -460,6 +498,7 @@ def statistics_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[st
         "extremum": bool(block.get("extremum", True)),
         "extremum_sample_radius": _as_int(block.get("extremum_sample_radius"), 0),
         "relevance": relevance,
+        "histogram": histogram_from_json(block.get("histogram")),
     }
 
 

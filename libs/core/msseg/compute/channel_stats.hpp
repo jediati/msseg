@@ -62,6 +62,43 @@ class ChannelStats {
       }
     }
     ext_.assign(want_ext_ ? n_regions_ * n_channels_ : 0, 0.0f);
+    hist_slots_.clear();
+    hist_index_.assign(n_channels_, -1);
+    hist_lo_.clear();
+    hist_inv_w_.clear();
+    bins_ = 0;
+    hist_.clear();
+  }
+
+  // As above, and also lay out the histogram table for the channels `channels`
+  // marks (`spec.hist`): `n_regions x n_hist x bins` uint32 counts, addressed
+  // by slot through hist_index_. The channel list must be the one the caller
+  // will project with -- it is what says which slots are histogrammed.
+  void reset(std::size_t n_regions, const std::vector<ResolvedStatChannel>& channels,
+             const StatsSpec& spec) {
+    reset(n_regions, channels.size(), spec);
+    if (!spec.hist.enabled()) return;
+    bins_ = spec.hist.bins;
+    for (std::size_t k = 0; k < channels.size(); ++k) {
+      if (!channels[k].hist) continue;
+      hist_index_[k] = static_cast<int>(hist_slots_.size());
+      hist_slots_.push_back(k);
+      hist_lo_.push_back(channels[k].hist_lo);
+      hist_inv_w_.push_back(static_cast<float>(bins_) / (channels[k].hist_hi - channels[k].hist_lo));
+    }
+    hist_.assign(n_regions_ * hist_slots_.size() * static_cast<std::size_t>(bins_), 0u);
+  }
+
+  bool has_hist() const { return !hist_slots_.empty(); }
+  int hist_bins() const { return bins_; }
+  std::size_t hist_channels() const { return hist_slots_.size(); }
+  // The counts of `slot`'s histogram for `region` (bins() entries), or nullptr
+  // when that slot is not histogrammed.
+  const std::uint32_t* hist(std::size_t region, std::size_t slot) const {
+    const int j = slot < hist_index_.size() ? hist_index_[slot] : -1;
+    if (j < 0) return nullptr;
+    return hist_.data() + (region * hist_slots_.size() + static_cast<std::size_t>(j)) *
+                              static_cast<std::size_t>(bins_);
   }
 
   std::size_t regions() const { return n_regions_; }
@@ -100,6 +137,18 @@ class ChannelStats {
       if (want_extent_) {
         a.min = std::min(a.min, v);
         a.max = std::max(a.max, v);
+      }
+    }
+    if (!hist_slots_.empty()) {
+      std::uint32_t* h = hist_.data() + region * hist_slots_.size() * static_cast<std::size_t>(bins_);
+      for (std::size_t j = 0; j < hist_slots_.size(); ++j) {
+        const float v = data[hist_slots_[j]][pixel];
+        if (v != v) continue;   // NaN: not counted
+        // Out-of-range values clamp into the end bins, so the counts always
+        // sum to the pixels seen and merge bin-wise across slices.
+        int b = static_cast<int>((v - hist_lo_[j]) * hist_inv_w_[j]);
+        b = b < 0 ? 0 : (b >= bins_ ? bins_ - 1 : b);
+        ++h[j * static_cast<std::size_t>(bins_) + static_cast<std::size_t>(b)];
       }
     }
   }
@@ -142,6 +191,15 @@ class ChannelStats {
       dst[k].min = std::min(dst[k].min, s[k].min);
       dst[k].max = std::max(dst[k].max, s[k].max);
     }
+    if (!hist_slots_.empty() && src.hist_slots_.size() == hist_slots_.size() && src.bins_ == bins_) {
+      const std::size_t n = hist_slots_.size() * static_cast<std::size_t>(bins_);
+      std::uint32_t* d = hist_.data() + dst_region * n;
+      const std::uint32_t* h = src.hist_.data() + src_region * n;
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::uint64_t sum = static_cast<std::uint64_t>(d[i]) + h[i];
+        d[i] = sum > 0xFFFFFFFFu ? 0xFFFFFFFFu : static_cast<std::uint32_t>(sum);   // saturating
+      }
+    }
   }
 
   // Copy every channel's extremum sample from one region of `src`. Used where a
@@ -167,11 +225,24 @@ class ChannelStats {
       want_sumsq_ = src.want_sumsq_;
       want_extent_ = src.want_extent_;
       want_ext_ = src.want_ext_;
+      hist_slots_ = src.hist_slots_;
+      hist_index_ = src.hist_index_;
+      hist_lo_ = src.hist_lo_;
+      hist_inv_w_ = src.hist_inv_w_;
+      bins_ = src.bins_;
     }
     if (src.n_channels_ != n_channels_) return;
     cells_.insert(cells_.end(), src.cells_.begin(), src.cells_.end());
     if (want_ext_ && src.want_ext_) ext_.insert(ext_.end(), src.ext_.begin(), src.ext_.end());
     else if (want_ext_) ext_.resize(ext_.size() + src.n_regions_ * n_channels_, 0.0f);
+    const std::size_t hn = hist_slots_.size() * static_cast<std::size_t>(bins_);
+    if (hn != 0) {
+      if (src.hist_slots_.size() == hist_slots_.size() && src.bins_ == bins_) {
+        hist_.insert(hist_.end(), src.hist_.begin(), src.hist_.end());
+      } else {
+        hist_.resize(hist_.size() + src.n_regions_ * hn, 0u);
+      }
+    }
     n_regions_ += src.n_regions_;
   }
 
@@ -180,6 +251,8 @@ class ChannelStats {
   void clear_region(std::size_t region) {
     ChannelAccum* row = cells_.data() + region * n_channels_;
     for (std::size_t k = 0; k < n_channels_; ++k) row[k] = ChannelAccum{};
+    const std::size_t hn = hist_slots_.size() * static_cast<std::size_t>(bins_);
+    if (hn != 0) std::fill_n(hist_.data() + region * hn, hn, 0u);
   }
 
   const std::vector<ChannelAccum>& cells() const { return cells_; }
@@ -193,6 +266,14 @@ class ChannelStats {
   bool want_ext_ = false;
   std::vector<ChannelAccum> cells_;
   std::vector<float> ext_;
+  // Histograms: which slots (in order), each slot's index into that order (or
+  // -1), the bin geometry, and the region-major counts.
+  std::vector<std::size_t> hist_slots_;
+  std::vector<int> hist_index_;
+  std::vector<float> hist_lo_;
+  std::vector<float> hist_inv_w_;
+  int bins_ = 0;
+  std::vector<std::uint32_t> hist_;
 };
 
 }  // namespace msseg

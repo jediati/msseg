@@ -91,6 +91,26 @@ class _RasterCache:
         return len(self._d)
 
 
+def parse_hist_ranges(text):
+    """`"*: 0, 1; hessian_largest_s1.5: -0.2, 0.2"` -> {name: [lo, hi]}."""
+    out = {}
+    for part in str(text or "").split(";"):
+        if ":" not in part:
+            continue
+        name, _, pair = part.partition(":")
+        nums = [t for t in pair.replace(",", " ").split() if t]
+        try:
+            out[name.strip()] = [float(nums[0]), float(nums[1])]
+        except (IndexError, ValueError):
+            continue
+    return out
+
+
+def format_hist_ranges(ranges):
+    """Inverse of parse_hist_ranges."""
+    return "; ".join(f"{k}: {v[0]:g}, {v[1]:g}" for k, v in ranges.items() if len(v) == 2)
+
+
 def single_channel_params(params_json, name):
     """`params_json` with its statistics block cut down to the ONE derived
     channel `name` (its kind at its sigma, keeping the card's other keys such
@@ -196,6 +216,11 @@ class MscouponApp:
         # that makes a multi-scale stack one line of config instead of many.
         self.stat_base_var = tk.BooleanVar(value=True)
         self.stat_color_var = tk.BooleanVar(value=False)   # the raw colour planes
+        # Per-region histograms: K bins over a fixed range per channel.
+        self.hist_on_var = tk.BooleanVar(value=False)
+        self.hist_bins_var = tk.StringVar(value="16")
+        self.hist_channels_var = tk.StringVar(value="base")
+        self.hist_ranges_var = tk.StringVar(value="*: 0, 1")
         # How a multi-sample TIFF is read (profile `input.color`): alpha policy,
         # the default colour->scalar method, and the plane count the statistics
         # schema is resolved for (filled from the slice on screen).
@@ -450,6 +475,25 @@ class MscouponApp:
         ttk.Checkbutton(c, text="seeding extremum (ext_* per channel)",
                         variable=self.stat_extremum_var,
                         command=self._on_stat_spec_change).pack(anchor="w", padx=4)
+        # Histograms: a fixed range per channel (or "*" for all), so the bins
+        # add across slices and mean the same thing on every slice.
+        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=(4, 1))
+        ttk.Checkbutton(row, text="histogram", variable=self.hist_on_var, width=10,
+                        command=self._on_stat_spec_change).pack(side="left")
+        ttk.Label(row, text="bins:").pack(side="left")
+        for var, width in ((self.hist_bins_var, 4), (self.hist_channels_var, 14)):
+            e = ttk.Entry(row, textvariable=var, width=width); e.pack(side="left", padx=2)
+            e.bind("<Return>", lambda ev: self._on_stat_spec_change())
+            e.bind("<FocusOut>", lambda ev: self._on_stat_spec_change())
+            if var is self.hist_bins_var:
+                ttk.Label(row, text="channels:").pack(side="left")
+        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=1)
+        ttk.Label(row, text="ranges (name: lo, hi; ...):").pack(side="left")
+        e = ttk.Entry(row, textvariable=self.hist_ranges_var, width=22); e.pack(side="left", padx=2)
+        e.bind("<Return>", lambda ev: self._on_stat_spec_change())
+        e.bind("<FocusOut>", lambda ev: self._on_stat_spec_change())
+        ttk.Button(row, text="measure", width=8,
+                   command=self._measure_hist_ranges).pack(side="left", padx=2)
         self.stat_summary_var = tk.StringVar(value="")
         ttk.Label(c, textvariable=self.stat_summary_var, foreground="#555",
                   wraplength=330, justify="left").pack(anchor="w", padx=4, pady=(0, 3))
@@ -496,6 +540,13 @@ class MscouponApp:
                 setvar(var, name in reductions)
         if state.get("stat_extremum") is not None:
             setvar(self.stat_extremum_var, bool(state["stat_extremum"]))
+        hist = state.get("stat_histogram")
+        if hist is not None:
+            setvar(self.hist_on_var, bool(hist.get("bins")))
+            if hist.get("bins"):
+                setvar(self.hist_bins_var, str(int(hist["bins"])))
+                setvar(self.hist_channels_var, ", ".join(hist.get("channels") or ["base"]))
+                setvar(self.hist_ranges_var, format_hist_ranges(hist.get("ranges") or {}))
         self._chan_cache.clear()
 
     def _refresh_channel_picker(self):
@@ -1778,7 +1829,8 @@ class MscouponApp:
                     "simplification": self.simplification_var.get()},
             "statistics": config_io.statistics_to_json(
                 self._stat_channel_cards(), self._stat_reductions(),
-                self.stat_extremum_var.get(), radius, relevance),
+                self.stat_extremum_var.get(), radius, relevance,
+                self._stat_histogram()),
             "selection": {
                 "feature_filters": config_io.queries_to_json(self.query_cards),
                 "pixel_filters": config_io.pixel_filters_to_json(self.pixel_cards),
@@ -1820,7 +1872,8 @@ class MscouponApp:
         stats = config_io.statistics_from_json(profile.get("statistics"), notes)
         self._apply_stat_state({"stat_channels": stats["channels"],
                                 "stat_reductions": stats["reductions"],
-                                "stat_extremum": stats["extremum"]}, setvar)
+                                "stat_extremum": stats["extremum"],
+                                "stat_histogram": stats.get("histogram")}, setvar)
 
         fields = config_io.query_fields(
             json.dumps({"statistics": profile.get("statistics") or {}}))
@@ -2003,6 +2056,50 @@ class MscouponApp:
 
     def _stat_reductions(self):
         return [r for r, v in self.stat_reduction_vars.items() if v.get()]
+
+    def _hist_channel_names(self):
+        return [c.strip() for c in self.hist_channels_var.get().replace(";", ",").split(",")
+                if c.strip()]
+
+    def _stat_histogram(self):
+        """The `statistics.histogram` model: {bins, channels, ranges} or None."""
+        if not self.hist_on_var.get():
+            return None
+        try:
+            bins = int(float(self.hist_bins_var.get()))
+        except (ValueError, tk.TclError):
+            bins = 16
+        return {"bins": bins, "channels": self._hist_channel_names(),
+                "ranges": parse_hist_ranges(self.hist_ranges_var.get())}
+
+    def _measure_hist_ranges(self):
+        """Fill the "*" range from the slice on screen: the min/max over every
+        histogrammed channel's raster, so the bins cover what the data spans
+        (the C++ clamps anything outside into the end bins)."""
+        try:
+            import numpy as np
+        except Exception:
+            return
+        lo, hi = np.inf, -np.inf
+        cur = self._current() if self.primed else None
+        path = getattr(self, "_preview_path", None)
+        for name in self._hist_channel_names() or ["base"]:
+            raster = None
+            if cur is not None:
+                raster = self._channel_raster(cur[0], cur[1], name, np)
+            elif path in self._preview_cache:
+                raster = self._preview_channel(self._preview_cache[path], path, name)
+            if raster is None:
+                continue
+            r = np.asarray(raster, dtype=np.float64)
+            r = r[np.isfinite(r)]
+            if r.size:
+                lo, hi = min(lo, float(r.min())), max(hi, float(r.max()))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            self.status_var.set("histogram ranges: nothing on screen to measure")
+            return
+        self.hist_ranges_var.set(f"*: {lo:.6g}, {hi:.6g}")
+        self._on_stat_spec_change()
 
     def _stat_channel_names(self):
         """Resolved channel names for the current spec, for the pickers."""

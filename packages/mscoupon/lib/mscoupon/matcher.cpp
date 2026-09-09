@@ -199,7 +199,7 @@ void SliceMatcher::finalize(std::vector<FeatureMapRow>& map_out, GlobalFeatureTa
 
   // Voxel-pooled per-channel aggregates, one row per global feature.
   msseg::ChannelStats gid_channels;
-  gid_channels.reset(static_cast<std::size_t>(next_gid), node_channels_.channels(), stats_.spec);
+  gid_channels.reset(static_cast<std::size_t>(next_gid), channel_schema_, stats_.spec);
 
   for (int node = 0; node < N; ++node) {
     const int gid = gid_of_node[node];

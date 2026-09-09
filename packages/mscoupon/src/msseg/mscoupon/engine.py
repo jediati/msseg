@@ -49,6 +49,22 @@ def prime(engine, base, filt, params, color=None):
     return engine.prime_slice(base, filt, params, color)
 
 
+def histogram_ranges(engine, params_json):
+    """The assembly's histogram spec for `params_json`: {bins, ranges: {name:
+    (lo, hi)}} over the channels the C++ schema marks, or None when off."""
+    try:
+        import json as _json
+        bins = int(((_json.loads(params_json).get("statistics") or {})
+                    .get("histogram") or {}).get("bins") or 0)
+        if bins <= 0:
+            return None
+        ranges = {c["name"]: tuple(c["hist_range"]) for c in engine.stat_channels(params_json)
+                  if c.get("hist")}
+        return {"bins": bins, "ranges": ranges} if ranges else None
+    except Exception:
+        return None
+
+
 def stat_images(engine, base, filt, params, color=None):
     """`engine.stat_channel_images`, handing the colour planes along when the
     slice has them (an extension without the argument only sees scalars)."""
@@ -629,7 +645,8 @@ class ComputeEngine:
                                       channels_list=channels_list,
                                       reductions=params["reductions"],
                                       extremum=params["extremum"],
-                                      timing=asm_timing)
+                                      timing=asm_timing,
+                                      histogram=histogram_ranges(engine, params["json"]))
             tm["assemble"] = time.perf_counter() - t_sel
             out["merged_labels"] = merged_labels
             out["merged_stats"] = merged_stats

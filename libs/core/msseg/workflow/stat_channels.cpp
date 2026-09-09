@@ -139,6 +139,39 @@ std::vector<ResolvedStatChannel> resolve_stat_channels(const StatsSpec& spec) {
     }
   }
 
+  // Histograms: mark the channels and pin their ranges. Every named channel
+  // must exist, and every histogrammed channel needs a range (its own or "*").
+  if (spec.hist.bins != 0) {
+    if (spec.hist.bins < 2 || spec.hist.bins > 256) {
+      throw std::runtime_error("statistics.histogram.bins must be in [2, 256] (got " +
+                               std::to_string(spec.hist.bins) + ").");
+    }
+    const std::vector<std::string> names =
+        spec.hist.channels.empty() ? std::vector<std::string>{"base"} : spec.hist.channels;
+    for (const auto& name : names) {
+      ResolvedStatChannel* hit = nullptr;
+      for (auto& c : out) {
+        if (c.name == name) hit = &c;
+      }
+      if (hit == nullptr) {
+        throw std::runtime_error("statistics.histogram.channels names '" + name +
+                                 "', which is not a measurement channel of this spec.");
+      }
+      auto r = spec.hist.ranges.find(name);
+      if (r == spec.hist.ranges.end()) r = spec.hist.ranges.find("*");
+      if (r == spec.hist.ranges.end()) {
+        throw std::runtime_error("statistics.histogram.ranges has no range for '" + name +
+                                 "' (give one per channel, or \"*\" for all).");
+      }
+      if (!(r->second.first < r->second.second)) {
+        throw std::runtime_error("statistics.histogram.ranges['" + r->first + "'] must satisfy lo < hi.");
+      }
+      hit->hist = true;
+      hit->hist_lo = r->second.first;
+      hit->hist_hi = r->second.second;
+    }
+  }
+
   // A duplicate name would silently alias two columns in the feature table and
   // the CSV, so reject it here rather than letting the ambiguity propagate.
   for (std::size_t i = 0; i < out.size(); ++i) {
