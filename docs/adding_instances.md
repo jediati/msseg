@@ -261,6 +261,34 @@ colour-sourced statistics channels (`source: "color"`, `chgradmag`, `dizenzo`)
 can be measured. An instance that only ever sees grayscale keeps calling the
 scalar overloads.
 
+## 4. Add a labeler (a GUI on the labeler framework)
+
+Interactive tools are NOT written from scratch: `packages/mslabeler`
+(`msseg-labeler`, pure Python, see [labeler_framework.md](labeler_framework.md))
+provides the viewer shell, the annotation shell, the canvas and the classifier.
+A new labeler is a new `packages/<name>/` (or a module inside an instance
+package, as `mscoupon` does) that
+
+1. implements the four protocols in `msseg.labeler.protocols` over its data
+   and compute -- `ItemCatalogue` (what can be annotated, under stable string
+   keys), `RegionProvider` (an item's region raster + statistics table + arcs at
+   a `commit`), `ImageSource` (base pixels by level and region) and
+   `LabelLayer` (region ids by crop) -- and a `FieldConventions` for its
+   statistics table's column names;
+2. subclasses `ViewerShell` for the viewer half, filling the hooks
+   (`_init_compute`, `_make_catalogue`, `_make_region_provider`,
+   `_build_processing_sections`, `_refresh_render`, the profile hooks, ...);
+3. composes `class MyLabeler(AnnotationShell, MyViewer)` and sets
+   `SESSION_APP`, `FIELDS` and the annotation hooks (`_workflow_summary`,
+   `_expected_feature_names`, ...);
+4. adds a `[project.scripts]` entry and depends on `msseg-labeler`.
+
+`packages/mscoupon/src/msseg/mscoupon/{adapters,app,labeler}.py` are the
+reference implementation. Keep the compatibility contracts (annotations.json
+v2, the classifier pickle, the session document) as documented there.
+
+---
+
 ## Python bindings pattern
 
 Follow MSCEER's `msc_py` style and the existing modules

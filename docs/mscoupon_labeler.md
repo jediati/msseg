@@ -1,7 +1,11 @@
 # mscoupon labeler (`mscoupon-labeler`)
 
 The labeler is the viewer (`mscoupon-gui`, see [mscoupon_gui.md](mscoupon_gui.md))
-with an annotation panel: the user paints **classes** onto the living MSC regions
+with an annotation panel. Both are bindings of the labeler framework
+(`msseg.labeler`, see [labeler_framework.md](labeler_framework.md)):
+`LabelerApp(AnnotationShell, MscouponApp)` adds only the coupon profile, the
+persistence panel and the exports; the annotation model, tools and classifier
+live in the framework. The user paints **classes** onto the living MSC regions
 of a slice, trains a per-region classifier on the statistics table, and exports
 training sets. This page covers the annotation model and the drawing tools;
 the engine, session file and config schema are the viewer's.
@@ -9,9 +13,9 @@ the engine, session file and config schema are the viewer's.
 ```bash
 mscoupon-labeler                  # GUI
 mscoupon-labeler --selftest       # Tk wiring check, no engine needed
-# from a source checkout (both namespace packages on the path):
-PYTHONPATH="packages/mscoupon/src;packages/msseg-viz/src" python -c "from msseg.mscoupon.labeler import main; import sys; sys.argv=['x','--selftest']; main()"
-PYTHONPATH=packages/mscoupon/src pytest packages/mscoupon/tests/test_labeling.py packages/mscoupon/tests/test_magic_fill.py
+# from a source checkout (the three namespace packages on the path):
+PYTHONPATH="packages/mslabeler/src;packages/mscoupon/src;packages/msseg-viz/src" python -c "from msseg.mscoupon.labeler import main; import sys; sys.argv=['x','--selftest']; main()"
+pytest packages/mslabeler/tests packages/mscoupon/tests      # conftest.py puts the source trees on sys.path
 ```
 
 ## Layout
@@ -59,7 +63,8 @@ tab. The viewer (`mscoupon-gui`) keeps its two-pane layout.
 ## Annotations are gestures, not region ids
 
 An annotation (`labeling.Interaction`) is one gesture in **image coordinates**
-bound to one slice (`"folder/basename"`) and one class. Nothing stores a region
+bound to one item key and one class -- for the coupon labeler the key is the
+slice's `"folder/basename"` (`adapters.SequenceCatalogue.key_of`). Nothing stores a region
 id: on every render the slice's gestures are rasterized against whatever
 label raster is current (`touched_ids` → `resolve_slice`), later gestures
 painting over earlier ones on any region both touch. That is what lets a
@@ -298,7 +303,9 @@ space instead and installs the winner as the `dense (tuned)` model:
   gate and the pickle/predict paths are those of every other kind.
 * **How a candidate is scored**: mean held-out **log-loss** (balanced accuracy
   alongside) under cross-validation that **leaves whole slices out** whenever
-  three or more slices carry labels (`StratifiedGroupKFold` by slice index;
+  three or more slices carry labels (`StratifiedGroupKFold` by slice, the group
+  `SequenceCatalogue.group_of` assigns -- the same grouping the edge model's
+  evaluation uses; before 2026-09-09 the region model grouped by sequence;
   plain stratified folds below that, folds capped by the rarest class). Regions
   on one slice share the scan's intensity drift, so a split that mixes them
   reports how well the net memorised the slice, not how it transfers. Log-loss

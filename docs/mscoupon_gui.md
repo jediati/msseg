@@ -120,6 +120,13 @@ parameters that produced it have just been replaced; click *Run* again.
 
 ## How it works (engine)
 
+The window itself -- toolbar, session browser, profiles, slice navigation, the
+work-queue pump, the session file and the canvas -- is the labeler framework's
+`ViewerShell` and `SliceCanvas` (`msseg.labeler`, see
+[labeler_framework.md](labeler_framework.md)); `MscouponApp(ViewerShell)`
+adds the coupon parameter sections, the priming run, the assembly tiers and
+the render. The compute below is what the coupon binding brings.
+
 The interactivity comes from a two-phase C++ core facade,
 `msseg::Msc2DPipeline` (`libs/core/msseg/compute/msc2d.cpp`), mirroring cellseg's
 `Msc3D`/`CellPipeline`:

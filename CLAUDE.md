@@ -28,6 +28,8 @@ packages/             one independently pip-installable distribution each:
   cellseg/            "msseg-cellseg":  3D fluorescent-membrane cell seg (lib + cli + pybind) + `cellseg` GUI
   msworkflow/         "msseg-workflow": generic JSON workflow runner (cli + pybind)
   msseg-viz/          "msseg-viz": pure-Python shared viewers (palette, merge-tree icicle) — universal wheel
+  mslabeler/          "msseg-labeler": pure-Python labeler framework (viewer/annotation shells, canvas,
+                      annotation store, region-graph tools, classifier training) — universal wheel
   msseg-meta/         "msseg": umbrella that depends on all of the above
 CMakeLists.txt        dev "build & test everything" root (add_subdirectory libs/core + each package)
 ```
@@ -39,6 +41,7 @@ CMakeLists.txt        dev "build & test everything" root (add_subdirectory libs/
 | C++ **core** (`libs/core`) | source-shared: each package `add_subdirectory(../../libs/core)`, static-linked | yes (into each pyd/CLI) | yes |
 | C++ **render** (`libs/render`) | source-shared, gated by `MSSEG_BUILD_VIEWER` (Windows-x64, OFF in wheels) | **no** | no (desktop) |
 | Python **viz** (`packages/msseg-viz`) | its own pure-Python distribution; instance packages depend on it | it *is* a wheel | yes (universal) |
+| Python **labeler framework** (`packages/mslabeler`) | its own pure-Python distribution (`msseg.labeler`); the labeler packages subclass its shells and implement its four protocols -- see [docs/labeler_framework.md](docs/labeler_framework.md) | it *is* a wheel | yes (universal) |
 
 **Namespace:** every distribution ships `src/msseg/<name>/` with **no** top-level
 `msseg/__init__.py` — `msseg` is a PEP 420 namespace, so `msseg.mscoupon`,
@@ -70,6 +73,7 @@ own via scikit-build-core (`add_subdirectory`'ing `libs/core`):
 
 ```bash
 pip install ./packages/msseg-viz ./packages/cellseg   # local dep first
+pip install ./packages/mslabeler                       # the labeler framework (mscoupon depends on it)
 pip install ./packages/mscoupon                        # -> `mscoupon` CLI
 ```
 
@@ -166,6 +170,33 @@ morphology `erode/dilate/open/close`) and the feature-query chain
 (`feature_filters[]`, evaluated by the single-source `mscoupon::row_passes`) are
 honored by the CLI; the GUI's on-the-fly 3D assembly
 (`src/msseg/mscoupon/assembly.py`) mirrors the matcher's connectivity.
+
+**Labeler framework** (`packages/mslabeler`, `msseg.labeler`, 2026-09-09, see
+[docs/labeler_framework.md](docs/labeler_framework.md)): the viewer and the
+labeler are bindings of a pure-Python framework. `ViewerShell` (window,
+session browser, profiles, navigation, work-queue pump, session document) and
+`AnnotationShell` (annotation store + undo, drawing tools, three panes,
+classifier lifecycle in `classifier.py`, UI clusters as `panels/*` mixins) are
+cooperative base classes: `MscouponApp(ViewerShell)` and
+`LabelerApp(AnnotationShell, MscouponApp)`. Data and compute reach the
+framework only through four protocols -- `ItemCatalogue` (items under opaque
+string keys; coupon: slices as `"folder/basename"`), `RegionProvider` (records
+`{commit, labels, stats, arcs}` on demand; coupon: `adapters.EngineRegionProvider`
+over `ComputeEngine`), `ImageSource` (base pixels by level + region; the canvas
+draws a tiled pyramid without holding it) and `LabelLayer` (region ids by
+crop) -- plus `FieldConventions` for the statistics table's column names.
+Headless pieces: `labeling`, `magic_fill`, `training.TrainingSetBuilder`,
+`bundle.ModelBundle` (pickle v4 writer, v1-v4 reader, the compat gate),
+`model_search`, `edge_model`, `torch_mlp`, `session_doc`. The old
+`msseg.mscoupon.<module>` paths are shims that re-export the framework modules
+wholesale -- classifier pickles name `msseg.mscoupon.model_search.FeatureSubset`
+and `msseg.mscoupon.torch_mlp.TorchMLPClassifier`, so the shims must stay. One
+behaviour change rode along: cross-validation groups are now one per slice for
+both the region model and the edge model (`SequenceCatalogue.group_of`); the
+region model used to group by sequence, which for a single sequence silently
+fell back to plain stratified folds. Both selftests, the pytest suites and the
+byte-level baselines (annotations.json round trip, canvas composite, classifier
+pickles) were held identical through the extraction.
 
 **mscoupon labeler magic fill + gesture previews** (`mscoupon-labeler`, see
 [docs/mscoupon_labeler.md](docs/mscoupon_labeler.md)): every drawing gesture now
