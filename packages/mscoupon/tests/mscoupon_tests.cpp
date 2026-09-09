@@ -46,6 +46,12 @@
 
 namespace {
 
+// Name of the test currently running, so a crash or an escaping exception can
+// say which one it was. MSCEER writes progress to stdout from deep inside the
+// build, so a hard fault otherwise leaves nothing behind but the last library
+// line.
+const char* g_current_test = "<none>";
+
 void expect(bool cond, const char* message) {
   if (!cond) throw std::runtime_error(message);
 }
@@ -2101,63 +2107,68 @@ void test_histogram_stats() {
          "the global CSV carries the bins");
 }
 
+// Announce every test before it runs and flush, so a hard fault inside a
+// library names the test that was in flight instead of leaving only the
+// library's own last line of output behind.
+#define RUN(test) do { g_current_test = #test; std::cout << "[run] " #test << std::endl; test(); } while (0)
+
 int main() try {
-  test_stats_bbox();
-  test_sequence_stride();
-  test_matcher_links_overlap();
-  test_matcher_merge_unifies();
-  test_matcher_first_seen_ids();
-  test_matcher_relevance_range();
-  test_global_csv_includes_relevance();
-  test_cc_stage_trim_and_split();
-  test_matcher_carries_extremal_tuple();
-  test_matcher_extremum_follows_manifold_direction();
-  test_config_matching_flag();
-  test_relevance_config();
-  test_msc2d_pipeline_monotone_and_stats();
-  test_msc2d_pipeline_consistency();
-  test_msc2d_pipeline_descending();
-  test_msc2d_pipeline_region_arcs();
-  test_msc2d_extremum_stats();
-  test_msc2d_extremum_sample_radius();
-  test_feature_query();
-  test_derived_stat_channels();
-  test_stat_channel_bank_matches_single_filters();
-  test_gmm_default_preset_survives_low_intensities();
-  test_gmm_recovers_two_gaussians();
-  test_gmm_omit_zeros();
-  test_no_data_sentinel_is_configurable();
-  test_gmm_downsample();
-  test_gmm_quantile_init();
-  test_gmm_hard_stats();
-  test_gmm_mode_unimodal();
-  test_gmm_trim();
-  test_gmm_rejects_degenerate_input();
-  test_gmm_integer_pixels();
-  test_gmm_image_overload();
-  test_two_point_round_trip();
-  test_normalize_apply_is_affine();
-  test_normalize_statistics_transform();
-  test_normalize_preserves_msc_labels();
-  test_normalize_from_gmm();
-  test_normalize_manual_and_fallback();
-  test_normalize_filter_op_in_chain();
-  test_histogram_finds_two_peaks();
-  test_histogram_omit_zeros();
-  test_region_measure();
-  test_region_zero_policy();
-  test_region_options_parse_from_top_level();
-  test_base_filters_config();
-  test_color_stage_methods();
-  test_color_chain_rules_and_identity();
-  test_tiff_planes_roundtrip();
-  test_color_stat_channels();
-  test_histogram_stats();
+  RUN(test_stats_bbox);
+  RUN(test_sequence_stride);
+  RUN(test_matcher_links_overlap);
+  RUN(test_matcher_merge_unifies);
+  RUN(test_matcher_first_seen_ids);
+  RUN(test_matcher_relevance_range);
+  RUN(test_global_csv_includes_relevance);
+  RUN(test_cc_stage_trim_and_split);
+  RUN(test_matcher_carries_extremal_tuple);
+  RUN(test_matcher_extremum_follows_manifold_direction);
+  RUN(test_config_matching_flag);
+  RUN(test_relevance_config);
+  RUN(test_msc2d_pipeline_monotone_and_stats);
+  RUN(test_msc2d_pipeline_consistency);
+  RUN(test_msc2d_pipeline_descending);
+  RUN(test_msc2d_pipeline_region_arcs);
+  RUN(test_msc2d_extremum_stats);
+  RUN(test_msc2d_extremum_sample_radius);
+  RUN(test_feature_query);
+  RUN(test_derived_stat_channels);
+  RUN(test_stat_channel_bank_matches_single_filters);
+  RUN(test_gmm_default_preset_survives_low_intensities);
+  RUN(test_gmm_recovers_two_gaussians);
+  RUN(test_gmm_omit_zeros);
+  RUN(test_no_data_sentinel_is_configurable);
+  RUN(test_gmm_downsample);
+  RUN(test_gmm_quantile_init);
+  RUN(test_gmm_hard_stats);
+  RUN(test_gmm_mode_unimodal);
+  RUN(test_gmm_trim);
+  RUN(test_gmm_rejects_degenerate_input);
+  RUN(test_gmm_integer_pixels);
+  RUN(test_gmm_image_overload);
+  RUN(test_two_point_round_trip);
+  RUN(test_normalize_apply_is_affine);
+  RUN(test_normalize_statistics_transform);
+  RUN(test_normalize_preserves_msc_labels);
+  RUN(test_normalize_from_gmm);
+  RUN(test_normalize_manual_and_fallback);
+  RUN(test_normalize_filter_op_in_chain);
+  RUN(test_histogram_finds_two_peaks);
+  RUN(test_histogram_omit_zeros);
+  RUN(test_region_measure);
+  RUN(test_region_zero_policy);
+  RUN(test_region_options_parse_from_top_level);
+  RUN(test_base_filters_config);
+  RUN(test_color_stage_methods);
+  RUN(test_color_chain_rules_and_identity);
+  RUN(test_tiff_planes_roundtrip);
+  RUN(test_color_stat_channels);
+  RUN(test_histogram_stats);
   std::cout << "mscoupon tests passed\n";
   return 0;
 } catch (const std::exception& e) {
   // Without this, a failed expect() unwinds out of main and MSVC's release CRT
   // fastfails (0xC0000409) with no message at all.
-  std::cerr << "mscoupon tests FAILED: " << e.what() << "\n";
+  std::cerr << "mscoupon tests FAILED in " << g_current_test << ": " << e.what() << "\n";
   return 1;
 }
