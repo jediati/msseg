@@ -16,6 +16,7 @@ works, matching the original notebook/example usage.
 # mode behind fields showing as "n/a" instead of erroring.
 _EXPORTS = (
     "version",
+    "read_tiff_planes",
     "filter_slice",
     "filter_chain",
     "segment_slice",

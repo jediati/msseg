@@ -32,6 +32,59 @@ def list_tiffs(folder: str):
     return sorted(entries, key=natural_key)
 
 
+def load_slice(path, alpha="drop", engine=None, log=None):
+    """One TIFF as float32: (h,w) for a grayscale file, planar (C,h,w) for a
+    colour one (alpha dropped by default, like the CLI).
+
+    Prefers the extension's `read_tiff_planes` -- the CLI's own TinyTIFF reader,
+    so the GUI loads exactly what a batch run will -- and falls back to Pillow
+    (which also handles the compressed files TinyTIFF cannot), transposing its
+    (H,W,C) into the planar layout every C++ entry point takes.
+    """
+    import numpy as np
+    if engine is None:
+        try:
+            from msseg import mscoupon as engine
+        except Exception:
+            engine = None
+    if engine is not None and hasattr(engine, "read_tiff_planes"):
+        try:
+            arr = engine.read_tiff_planes(str(path), alpha)
+            return np.ascontiguousarray(arr[0] if arr.shape[0] == 1 else arr)
+        except Exception as exc:
+            if log is not None:
+                log(f"read_tiff_planes failed for {os.path.basename(str(path))} "
+                    f"({exc}); falling back to Pillow")
+    from PIL import Image
+    arr = np.asarray(Image.open(path))
+    if arr.ndim == 3:
+        if alpha == "drop" and arr.shape[2] in (2, 4):
+            arr = arr[..., :-1]
+        arr = np.transpose(arr, (2, 0, 1))
+        if arr.shape[0] == 1:
+            arr = arr[0]
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
+def compact_planes(arr):
+    """The smallest integer dtype that holds `arr` losslessly (uint8, uint16),
+    else the array itself. Colour planes are kept per primed slice for the 3D
+    assembly and the Image dropdown, and three float32 planes at 3232^2 are
+    125 MB a slice; the file's own 8-bit samples are a quarter of that."""
+    import numpy as np
+    if arr is None:
+        return None
+    a = np.asarray(arr)
+    if a.dtype.kind in "ui":
+        return a
+    if not np.isfinite(a).all():
+        return a
+    lo, hi = float(a.min()), float(a.max())
+    if lo < 0 or hi > 65535 or not np.array_equal(a, np.rint(a)):
+        return a
+    return a.astype(np.uint8 if hi <= 255 else np.uint16)
+
+
 def _wheel_delta(event):
     """Scroll units for one wheel event, normalized across platforms.
 

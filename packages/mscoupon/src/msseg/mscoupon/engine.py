@@ -32,6 +32,23 @@ import time
 from .common import log, FeatureTable
 
 
+def color_planes(p, li, np):
+    """The planar (C,h,w) float32 colour planes of primed slice `li` of
+    subsequence record `p`, or None for a grayscale slice / an older record."""
+    planes = p.get("color") or []
+    if li >= len(planes) or planes[li] is None:
+        return None
+    return np.ascontiguousarray(planes[li], dtype=np.float32)
+
+
+def stat_images(engine, base, filt, params, color=None):
+    """`engine.stat_channel_images`, handing the colour planes along when the
+    slice has them (an extension without the argument only sees scalars)."""
+    if color is None:
+        return engine.stat_channel_images(base, filt, params)
+    return engine.stat_channel_images(base, filt, params, color)
+
+
 class ComputeEngine:
     def __init__(self, params_provider):
         # params_provider(si, level, li) -> dict: the UI-state snapshot for one
@@ -80,7 +97,34 @@ class ComputeEngine:
         t.start()
 
     @staticmethod
-    def _apply_base_chain(arr, base_filters, engine, log):
+    def _leading_color(arr, chain, engine, log, default_method="luminance"):
+        """Peel a chain's leading `color` stage.
+
+        Returns (scalar raster, remaining stages). A planar (C,h,w) slice is
+        reduced by the chain's first stage when that is a `color` stage, else by
+        `default_method` -- the same rule the C++ chain applies -- so an empty
+        chain on a colour slice still yields a scalar. A (h,w) slice passes
+        through unless the chain itself starts with a colour stage (one-plane
+        methods such as pick are allowed there).
+        """
+        import numpy as np
+        chain = list(chain or [])
+        head = chain[0] if chain and chain[0].get("operation") == "color" else None
+        if head is None and getattr(arr, "ndim", 2) != 3:
+            return arr, chain
+        stage = head if head is not None else {"operation": "color",
+                                               "params": {"method": default_method}}
+        cur = engine.filter_slice(np.ascontiguousarray(arr, dtype=np.float32),
+                                  json.dumps({"filter": stage}), default_method)
+        cur = np.ascontiguousarray(cur, dtype=np.float32)
+        params = stage.get("params", {})
+        log(f"  color {params.get('method', default_method)}({params})"
+            f"{'' if head is not None else ' [default]'} "
+            f"-> min={cur.min():.4g} max={cur.max():.4g}")
+        return cur, (chain[1:] if head is not None else chain)
+
+    @staticmethod
+    def _apply_base_chain(arr, base_filters, engine, log, default_color_method="luminance"):
         """Run the base-channel chain, returning (raster, measured landmarks).
 
         A `normalize` stage is measured here rather than inside
@@ -91,9 +135,10 @@ class ComputeEngine:
         import numpy as np
         from msseg.mscoupon.normalize import measure_two_point
 
-        cur = arr
+        cur, rest = ComputeEngine._leading_color(arr, base_filters, engine, log,
+                                                 default_color_method)
         measured = []
-        for i, f in enumerate(base_filters):
+        for i, f in enumerate(rest, start=len(base_filters) - len(rest)):
             if f.get("operation") == "normalize":
                 params = dict(f.get("params", {}))
                 tp = measure_two_point(cur, **params)
@@ -112,11 +157,14 @@ class ComputeEngine:
         try:
             import numpy as np
             from msseg import mscoupon as engine
-            from PIL import Image
+            from .common import compact_planes, load_slice
             p = json.loads(params)
             filters = p.get("filters", [])
             base_filters = p.get("base_filters", [])
             msc = p.get("msc", {})
+            color_in = (p.get("input") or {}).get("color") or {}
+            alpha = color_in.get("alpha", "drop")
+            default_color_method = color_in.get("default_method", "luminance")
             # Serial-MSC variant of the params, used as a graceful fallback if the
             # linked MSCEER lacks the partitioned ComputeOptions surface.
             msc_serial = {k: v for k, v in msc.items()
@@ -159,21 +207,22 @@ class ComputeEngine:
                     continue
                 log(f"subsequence: {os.path.basename(s['files'][0])} .. "
                     f"({len(s['files'])} slices)")
-                base_slices, filt_slices, pipes, norms = [], [], [], []
+                base_slices, filt_slices, pipes, norms, color_slices = [], [], [], [], []
                 for path in s["files"]:
                     t_slice = time.perf_counter()
-                    arr = np.asarray(Image.open(path), dtype=np.float32)
-                    if arr.ndim == 3:
-                        arr = arr.mean(axis=2).astype(np.float32)
-                    arr = np.ascontiguousarray(arr)
+                    arr = load_slice(path, alpha, engine, log)
                     t_load = time.perf_counter()
                     log(f"slice {done + 1}/{total} {os.path.basename(path)}: "
-                        f"shape={arr.shape} min={arr.min():.4g} max={arr.max():.4g} "
-                        f"mean={arr.mean():.4g}")
+                        f"shape={arr.shape}{' (planar colour)' if arr.ndim == 3 else ''} "
+                        f"min={arr.min():.4g} max={arr.max():.4g} mean={arr.mean():.4g}")
+                    # The colour planes ride with the primed slice (in the file's
+                    # own integer dtype) for the Image dropdown and the 3D assembly.
+                    color = compact_planes(arr) if arr.ndim == 3 else None
                     # Apply the filter chain step by step so each stage's params +
                     # output range are logged (functionally == filter_chain).
-                    cur = arr
-                    for i, f in enumerate(filters):
+                    cur, rest = self._leading_color(arr, filters, engine, log,
+                                                    default_color_method)
+                    for i, f in enumerate(rest, start=len(filters) - len(rest)):
                         cur = engine.filter_slice(cur, json.dumps({"filter": f}))
                         log(f"  filter[{i}] {f['operation']}({f.get('params', {})}) "
                             f"-> min={cur.min():.4g} max={cur.max():.4g}")
@@ -191,7 +240,8 @@ class ComputeEngine:
                     # Base channel: the raster statistics and pixel thresholds are
                     # read from. Derived from the raw slice like `filters`, not
                     # chained onto it, matching the C++ pipeline.
-                    base, slice_norms = self._apply_base_chain(arr, base_filters, engine, log)
+                    base, slice_norms = self._apply_base_chain(arr, base_filters, engine, log,
+                                                               default_color_method)
                     t_filter = time.perf_counter()
                     if use_serial:
                         pipe = engine.prime_slice(base, filt, params_serial)
@@ -219,12 +269,12 @@ class ComputeEngine:
                         f"prime={1e3 * (t_prime - t_filter):.0f}ms "
                         f"total={1e3 * (t_prime - t_slice):.0f}ms")
                     base_slices.append(base); filt_slices.append(filt); pipes.append(pipe)
-                    norms.append(slice_norms)
+                    norms.append(slice_norms); color_slices.append(color)
                     done += 1
                     self.work_q.put(("progress", (done, total)))
                 primed.append({"files": s["files"], "base": base_slices,
                                "filtered": filt_slices, "pipes": pipes,
-                               "normalizers": norms})
+                               "normalizers": norms, "color": color_slices})
             log(f"RUN complete: primed {total} slices")
             self.work_q.put(("done", primed))
         except Exception as exc:  # surfaced on the UI thread
@@ -549,8 +599,8 @@ class ComputeEngine:
                 try:
                     channels_list = []
                     for li in range(len(base_list)):
-                        names, imgs = engine.stat_channel_images(
-                            base_list[li], filt_list[li], params["json"])
+                        names, imgs = stat_images(engine, base_list[li], filt_list[li],
+                                                  params["json"], color_planes(p, li, np))
                         channels_list.append(list(zip(list(names), list(imgs))))
                 except Exception as exc:
                     log(f"measurement channels unavailable, falling back to base: {exc}")

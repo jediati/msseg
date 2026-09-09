@@ -9,6 +9,7 @@
 // MSC is computed over, which `segment_slice` does not return.
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -28,7 +29,10 @@
 #include "mscoupon/query.hpp"
 #include "mscoupon/region_measure.hpp"
 #include "msseg/compute/msc2d.hpp"
+#include "msseg/filter/color_stage.hpp"
 #include "msseg/filter/filter_stage.hpp"
+#include "msseg/io/tiff_io.hpp"
+#include "msseg/workflow/input_slice.hpp"
 
 namespace py = pybind11;
 
@@ -45,6 +49,44 @@ diffg::Image<float> to_image(const FloatArray& image, std::size_t& h, std::size_
   diffg::Image<float> slice(diffg::Dimensions{w, h, 1});
   std::memcpy(slice.data(), info.ptr, slice.size() * sizeof(float));
   return slice;
+}
+
+// Copy a (h,w) or planar (C,h,w) float32 numpy array into diffg planes.
+diffg::MultiImage<float> to_planes(const FloatArray& image, std::size_t& h, std::size_t& w) {
+  const auto info = image.request();
+  if (info.ndim != 2 && info.ndim != 3) {
+    throw std::runtime_error("expected a (h,w) or planar (C,h,w) float32 array");
+  }
+  const std::size_t channels = info.ndim == 3 ? static_cast<std::size_t>(info.shape[0]) : 1;
+  if (channels == 0) throw std::runtime_error("expected at least one plane");
+  h = static_cast<std::size_t>(info.shape[info.ndim - 2]);
+  w = static_cast<std::size_t>(info.shape[info.ndim - 1]);
+  diffg::MultiImage<float> planes(diffg::Dimensions{w, h, 1}, channels);
+  std::memcpy(planes.data(), info.ptr, planes.size() * sizeof(float));
+  return planes;
+}
+
+bool is_planar(const FloatArray& image) { return image.request().ndim == 3; }
+
+// `input.color.default_method` of a params JSON, else the keyword argument.
+std::string default_color_method(const nlohmann::json& cfg, const std::string& fallback) {
+  if (cfg.contains("input") && cfg["input"].is_object() && cfg["input"].contains("color") &&
+      cfg["input"]["color"].is_object()) {
+    return cfg["input"]["color"].value("default_method", fallback);
+  }
+  return fallback;
+}
+
+// The optional colour planes handed alongside base/filtered: None, or a planar
+// (C,h,w) float32 array over the same raster. Returns an empty MultiImage for None.
+diffg::MultiImage<float> optional_planes(const py::object& color, std::size_t h, std::size_t w) {
+  if (color.is_none()) return {};
+  const FloatArray arr = color.cast<FloatArray>();
+  if (arr.request().ndim != 3) throw std::runtime_error("color must be a planar (C,h,w) float32 array");
+  std::size_t ch = 0, cw = 0;
+  diffg::MultiImage<float> planes = to_planes(arr, ch, cw);
+  if (ch != h || cw != w) throw std::runtime_error("color planes must share the slice's (h,w)");
+  return planes;
 }
 
 // Parse the optional "filter" block of a params-JSON string into FilterParams.
@@ -129,13 +171,22 @@ std::vector<mscoupon::FeatureQuery> parse_feature_queries(const std::string& que
   return out;
 }
 
-FloatArray filter_slice(const FloatArray& image, const std::string& params_json) {
+FloatArray filter_slice(const FloatArray& image, const std::string& params_json,
+                        const std::string& default_color_method_kw) {
   std::size_t h = 0, w = 0;
-  const diffg::Image<float> slice = to_image(image, h, w);
-  const msseg::FilterParams filter = parse_filter(parse_params(params_json));
+  const nlohmann::json cfg = parse_params(params_json);
+  const msseg::FilterParams filter = parse_filter(cfg);
 
   diffg::Image<float> filtered;
-  {
+  if (is_planar(image) || filter.operation == msseg::kColorOperation) {
+    // Planes in, or a colour stage: the multi-channel chain entry (one plane +
+    // a one-plane-capable colour method is allowed there too).
+    const diffg::MultiImage<float> planes = to_planes(image, h, w);
+    const std::string method = default_color_method(cfg, default_color_method_kw);
+    py::gil_scoped_release release;
+    filtered = msseg::apply_filter_chain(planes.view(), std::vector<msseg::FilterParams>{filter}, method);
+  } else {
+    const diffg::Image<float> slice = to_image(image, h, w);
     py::gil_scoped_release release;
     filtered = msseg::apply_filter(slice, filter);
   }
@@ -166,13 +217,20 @@ py::array_t<std::int32_t> segment_slice(const FloatArray& image, const std::stri
 
 // Apply an ordered filter chain (params_json['filters'] array, or a single
 // 'filter'); returns the float32 (h,w) field the MSC would run over.
-FloatArray filter_chain(const FloatArray& image, const std::string& params_json) {
+FloatArray filter_chain(const FloatArray& image, const std::string& params_json,
+                        const std::string& default_color_method_kw) {
   std::size_t h = 0, w = 0;
-  const diffg::Image<float> slice = to_image(image, h, w);
-  const std::vector<msseg::FilterParams> chain = parse_filter_chain(parse_params(params_json));
+  const nlohmann::json cfg = parse_params(params_json);
+  const std::vector<msseg::FilterParams> chain = parse_filter_chain(cfg);
 
   diffg::Image<float> filtered;
-  {
+  if (is_planar(image) || (!chain.empty() && chain.front().operation == msseg::kColorOperation)) {
+    const diffg::MultiImage<float> planes = to_planes(image, h, w);
+    const std::string method = default_color_method(cfg, default_color_method_kw);
+    py::gil_scoped_release release;
+    filtered = msseg::apply_filter_chain(planes.view(), chain, method);
+  } else {
+    const diffg::Image<float> slice = to_image(image, h, w);
     py::gil_scoped_release release;
     filtered = msseg::apply_filter_chain(slice, chain);
   }
@@ -188,11 +246,15 @@ FloatArray filter_chain(const FloatArray& image, const std::string& params_json)
 // dropped again rather than cached with each primed slice -- twelve float32
 // rasters per slice would dominate a primed subsequence's memory.
 py::tuple stat_channel_images(const FloatArray& base, const FloatArray& filtered,
-                              const std::string& params_json) {
+                              const std::string& params_json, const py::object& color) {
   std::size_t bh = 0, bw = 0, fh = 0, fw = 0;
   const diffg::Image<float> base_img = to_image(base, bh, bw);
   const diffg::Image<float> filt_img = to_image(filtered, fh, fw);
   if (bh != fh || bw != fw) throw std::runtime_error("base and filtered must share shape");
+  // The colour planes are checked against the raster here; colour-sourced
+  // statistics channels are what consume them.
+  const diffg::MultiImage<float> color_planes = optional_planes(color, bh, bw);
+  (void)color_planes;
   const msseg::StatsSpec spec = parse_stats_spec(parse_params(params_json));
 
   msseg::StatChannelBank bank;
@@ -217,11 +279,13 @@ py::tuple stat_channel_images(const FloatArray& base, const FloatArray& filtered
 // Build a primed Msc2DPipeline over `base` (original image) + `filtered` (the
 // topology field, already filter-chained). Both are float32 (h,w).
 msseg::Msc2DPipeline prime_slice(const FloatArray& base, const FloatArray& filtered,
-                                 const std::string& params_json) {
+                                 const std::string& params_json, const py::object& color) {
   std::size_t bh = 0, bw = 0, fh = 0, fw = 0;
   const diffg::Image<float> base_img = to_image(base, bh, bw);
   const diffg::Image<float> filt_img = to_image(filtered, fh, fw);
   if (bh != fh || bw != fw) throw std::runtime_error("base and filtered must share shape");
+  const diffg::MultiImage<float> color_planes = optional_planes(color, bh, bw);
+  (void)color_planes;
   const msseg::Msc2DParams msc = parse_msc(parse_params(params_json));
 
   msseg::Msc2DPipeline pipe;
@@ -564,17 +628,40 @@ py::dict measure_regions(const py::array& image, const std::string& params_json)
   return out;
 }
 
+// Every sample plane of a TIFF as a planar (C,h,w) float32 array -- the CLI's
+// reader, so the GUI loads exactly what a batch run will.
+FloatArray read_tiff_planes_py(const std::string& path, const std::string& alpha) {
+  msseg::ColorInputPolicy policy;
+  policy.alpha = alpha == "keep" ? msseg::ColorInputPolicy::Alpha::Keep : msseg::ColorInputPolicy::Alpha::Drop;
+  msseg::InputSlice slice;
+  {
+    py::gil_scoped_release release;
+    slice = msseg::read_tiff_planes(std::filesystem::path(path), policy);
+  }
+  FloatArray out({static_cast<py::ssize_t>(slice.channels()), static_cast<py::ssize_t>(slice.height()),
+                  static_cast<py::ssize_t>(slice.width())});
+  std::memcpy(out.request().ptr, slice.planes.data(), slice.planes.size() * sizeof(float));
+  return out;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(mscoupon_py, m) {
   m.doc() = "mscoupon instance: 2D Morse-Smale slice segmentation.";
   m.def("version", []() { return "0.1.0"; }, "Module version tag.");
   m.def("filter_slice", &filter_slice, py::arg("image"), py::arg("params_json") = std::string(),
-        "Apply the diffg filter from params_json['filter'] to a float32 (h,w) slice; "
-        "returns the transformed float32 (h,w) field (the topo field the MSC runs over).");
+        py::arg("default_color_method") = std::string("luminance"),
+        "Apply the diffg filter from params_json['filter'] to a float32 (h,w) slice -- or to a "
+        "planar (C,h,w) colour slice, where the stage must be (or is synthesized as) a `color` "
+        "stage; returns the transformed float32 (h,w) field.");
   m.def("filter_chain", &filter_chain, py::arg("image"), py::arg("params_json") = std::string(),
+        py::arg("default_color_method") = std::string("luminance"),
         "Apply the ordered filter chain from params_json['filters'] (or a single 'filter') "
-        "to a float32 (h,w) slice; returns the float32 (h,w) topology field.");
+        "to a float32 (h,w) slice or a planar (C,h,w) colour slice (a leading `color` stage, "
+        "explicit or defaulted, reduces the planes); returns the float32 (h,w) topology field.");
+  m.def("read_tiff_planes", &read_tiff_planes_py, py::arg("path"), py::arg("alpha") = std::string("drop"),
+        "Every sample plane of a TIFF as planar (C,h,w) float32 -- the CLI's reader (TinyTIFF), "
+        "so a grayscale file is (1,h,w) and RGB (3,h,w); alpha='drop' discards a 4th/2nd sample.");
   m.def("segment_slice", &segment_slice, py::arg("image"), py::arg("params_json") = std::string(),
         "Filter + 2D MSC segment a float32 (h,w) slice; returns int32 (h,w) manifold labels.");
 
@@ -607,7 +694,7 @@ PYBIND11_MODULE(mscoupon_py, m) {
            "per feature, which is what keeps a wide channel set usable on a slider.");
 
   m.def("prime_slice", &prime_slice, py::arg("base"), py::arg("filtered"),
-        py::arg("params_json") = std::string(),
+        py::arg("params_json") = std::string(), py::arg("color") = py::none(),
         "Build a primed Msc2DPipeline over base (original) + filtered (topology field, "
         "already filter-chained), both float32 (h,w). params_json['msc'] configures it.");
   m.def("evaluate_queries_table", &evaluate_queries_table, py::arg("names"),
@@ -624,7 +711,7 @@ PYBIND11_MODULE(mscoupon_py, m) {
         "exactly the fields feature_filters may name. Derived from the same schema the CLI "
         "validates against, so the GUI dropdown cannot drift out of sync.");
   m.def("stat_channel_images", &stat_channel_images, py::arg("base"), py::arg("filtered"),
-        py::arg("params_json") = std::string(),
+        py::arg("params_json") = std::string(), py::arg("color") = py::none(),
         "The slice's measurement channels as pixels: (names, (C, h, w) float32), in the same "
         "slot order as stat_channels(). Used by the GUI's 3D assembly so it measures exactly "
         "what the CLI does.");

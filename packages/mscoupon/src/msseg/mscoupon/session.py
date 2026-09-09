@@ -441,12 +441,13 @@ OP_CODES = {
     "hessian_eigenvalues": "hess", "structure_eigenvalues": "struct",
     "edges": "e", "erode": "ero", "dilate": "dil", "open": "open",
     "close": "close", "label_components": "cc", "normalize": "norm",
+    "color": "col",
 }
 # The parameter shown in parentheses; "sigma" unless the operation has none.
 HEADLINE_PARAM = {
     "structure_eigenvalues": "smoothing_sigma", "erode": "radius",
     "dilate": "radius", "open": "radius", "close": "radius",
-    "label_components": "threshold", "normalize": "method",
+    "label_components": "threshold", "normalize": "method", "color": "method",
 }
 
 

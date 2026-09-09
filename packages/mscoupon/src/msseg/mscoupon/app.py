@@ -34,7 +34,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from . import config_io
-from .config_io import FILTER_SCHEMA, FILTER_OPERATIONS, QUERY_OPS, query_fields
+from .config_io import (FILTER_SCHEMA, FILTER_OPERATIONS, COLOR_METHODS, QUERY_OPS,
+                        filter_param_schema, query_fields)
 # Shared helpers live in common.py (re-exported here so existing imports of
 # `msseg.mscoupon.app` keep working) and the small reusable widgets in
 # widgets.py -- both are shared with the labeler app.
@@ -479,12 +480,48 @@ class MscouponApp:
         # not a workflow also measures aggregates on it.
         if "filtered" not in names:
             names = names + ["filtered"]
+        # A colour slice also offers its composite and each raw plane.
+        n_color = self._current_color_count()
+        if n_color:
+            names = ["color"] + [f"color_c{i}" for i in range(n_color)] + names
+        self._picker_color_count = n_color
         try:
             combo.config(values=names)
         except tk.TclError:
             return
         if self.background_var.get() not in names:
             self.background_var.set(names[0] if names else "base")
+
+    def _current_color_count(self):
+        """Planes of the slice on screen (primed, else the preview), 0 for gray."""
+        try:
+            cur = self._current() if self.primed else None
+        except Exception:
+            cur = None
+        if cur is not None:
+            si, li = cur
+            if si < len(self.primed):
+                planes = self.primed[si].get("color") or []
+                if li < len(planes) and planes[li] is not None:
+                    return int(getattr(planes[li], "shape", (0,))[0])
+            return 0
+        arr = self._preview_cache.get(getattr(self, "_preview_path", None))
+        if arr is not None and getattr(arr, "ndim", 2) == 3:
+            return int(arr.shape[0])
+        return 0
+
+    @staticmethod
+    def _color_plane(planes, name, fallback):
+        """`color` -> the planes; `color_c<i>` -> one plane; else `fallback`."""
+        if planes is None:
+            return fallback
+        if name == "color":
+            return planes
+        try:
+            idx = int(name[len("color_c"):])
+        except ValueError:
+            return fallback
+        return planes[idx] if 0 <= idx < planes.shape[0] else fallback
 
     def _channel_raster(self, si, li, name, np):
         """The named measurement channel for one slice, computed on demand.
@@ -507,6 +544,11 @@ class MscouponApp:
             return p["base"][li]
         if name == "filtered":
             return p["filtered"][li]
+        if name == "color" or name.startswith("color_c"):
+            planes = (p.get("color") or [])
+            planes = planes[li] if li < len(planes) else None
+            return self._color_plane(None if planes is None else np.asarray(planes), name,
+                                     p["base"][li])
         key = (si, li, name)
         hit = self._chan_cache.get(key)
         if hit is not None:
@@ -524,9 +566,10 @@ class MscouponApp:
             return p["base"][li]
         t0 = time.perf_counter()
         try:
-            names, imgs = engine.stat_channel_images(
-                np.asarray(p["base"][li], dtype=np.float32),
-                np.asarray(p["filtered"][li], dtype=np.float32), params)
+            from .engine import color_planes, stat_images
+            names, imgs = stat_images(engine, np.asarray(p["base"][li], dtype=np.float32),
+                                      np.asarray(p["filtered"][li], dtype=np.float32), params,
+                                      color_planes(p, li, np))
         except Exception as exc:
             log(f"channel '{name}' unavailable: {exc}")
             return p["base"][li]
@@ -798,7 +841,9 @@ class MscouponApp:
         frame.pack(fill="x", padx=4, pady=2)
         top = ttk.Frame(frame); top.pack(fill="x")
         op_var = tk.StringVar(value=card["operation"])
-        combo = ttk.Combobox(top, textvariable=op_var, values=FILTER_OPERATIONS,
+        # `color` consumes the input planes, so only the head of a chain may be one.
+        ops = FILTER_OPERATIONS if idx == 0 else [o for o in FILTER_OPERATIONS if o != "color"]
+        combo = ttk.Combobox(top, textvariable=op_var, values=ops,
                              state="readonly", width=20)
         combo.pack(side="left", padx=2, pady=2)
         combo.bind("<<ComboboxSelected>>",
@@ -808,10 +853,35 @@ class MscouponApp:
                        command=lambda i=idx, c=chain: self._remove_filter_card(i, c)
                        ).pack(side="right", padx=2)
         # param widgets for the selected operation
-        for pname, kind, default in FILTER_SCHEMA.get(card["operation"], []):
-            self._build_param_row(frame, card["params"], pname, kind, default)
+        if card["operation"] == "color":
+            self._build_color_method_row(frame, card, chain)
+            for pname, kind, default in filter_param_schema("color", card["params"])[1:]:
+                self._build_param_row(frame, card["params"], pname, kind, default)
+        else:
+            for pname, kind, default in FILTER_SCHEMA.get(card["operation"], []):
+                self._build_param_row(frame, card["params"], pname, kind, default)
         if card["operation"] == "normalize":
             self._build_normalize_readout(frame, card)
+
+    def _build_color_method_row(self, frame, card, chain):
+        """The `method` picker of a color card. Switching it swaps the card's
+        parameter rows, so the card is rebuilt with only the new method's keys."""
+        params = card["params"]
+        if params.get("method") not in COLOR_METHODS:
+            params["method"] = "luminance"
+        row = ttk.Frame(frame); row.pack(fill="x", padx=6, pady=1)
+        ttk.Label(row, text="method", width=16).pack(side="left")
+        var = tk.StringVar(value=params["method"])
+        combo = ttk.Combobox(row, textvariable=var, values=COLOR_METHODS, state="readonly", width=16)
+        combo.pack(side="left")
+
+        def on_method(_e=None, c=card, v=var, ch=chain):
+            method = v.get()
+            if method == c["params"].get("method"):
+                return
+            c["params"] = {"method": method}
+            self._rebuild_filter_cards(ch)
+        combo.bind("<<ComboboxSelected>>", on_method)
 
     def _build_normalize_readout(self, frame, card):
         """Show the landmarks measured for the slice currently on screen.
@@ -859,10 +929,10 @@ class MscouponApp:
             var.trace_add("write", lambda *_: params.__setitem__(pname, var.get()))
             ttk.Combobox(row, textvariable=var, values=choices, state="readonly",
                          width=12).pack(side="left")
-        elif kind == "str":
+        elif kind in ("str", "floats", "numstr"):
             var = tk.StringVar(value=str(params[pname]))
             var.trace_add("write", lambda *_: params.__setitem__(pname, var.get()))
-            ttk.Entry(row, textvariable=var, width=14).pack(side="left")
+            ttk.Entry(row, textvariable=var, width=18 if kind == "floats" else 14).pack(side="left")
         elif kind in ("optfloat", "nullfloat"):
             # Blank means "not set". For optfloat it is dropped on export, so an
             # unset optional bound cannot be mistaken for a real 0.0; for
@@ -1123,12 +1193,8 @@ class MscouponApp:
         arr = self._preview_cache.get(path)
         if arr is None:
             try:
-                import numpy as np
-                from PIL import Image
-                arr = np.asarray(Image.open(path), dtype=np.float32)
-                if arr.ndim == 3:
-                    arr = arr.mean(axis=2).astype(np.float32)
-                arr = np.ascontiguousarray(arr)
+                from .common import load_slice
+                arr = load_slice(path, self._color_alpha(), log=log)
             except Exception as exc:
                 # Fall back to the pyramidal path-only source (large_image);
                 # reset_array drops any stale in-memory base first.
@@ -1149,7 +1215,17 @@ class MscouponApp:
             self._preview_cache[path] = self._preview_cache.pop(path)
         first = self.viewer._base is None and self.viewer._source is None
         self._preview_path = path
+        if self._current_color_count() != getattr(self, "_picker_color_count", 0):
+            self._refresh_channel_picker()
         self._render_preview(first)
+
+    def _color_alpha(self):
+        """The alpha policy colour files load under (`input.color.alpha`)."""
+        return "drop"
+
+    def _default_color_method(self):
+        """The conversion a chain without a leading `color` stage gets."""
+        return "luminance"
 
     def _render_preview(self, first=False):
         """Paint the active preview in the Image dropdown's channel."""
@@ -1203,34 +1279,43 @@ class MscouponApp:
         filters = doc.get("filters") or []
         stem = os.path.basename(path)
         cache = self._preview_chan_cache
+        planar = getattr(arr, "ndim", 2) == 3
+        default_method = self._default_color_method()
         try:
+            if channel == "color" or channel.startswith("color_c"):
+                return self._color_plane(arr if planar else None, channel, arr)
             if channel in ("", "base"):
-                if not base_filters:
+                # A colour slice always goes through its leading colour stage
+                # (explicit or the default), so an empty chain still converts.
+                if not base_filters and not planar:
                     return arr
-                key = (path, "base", json.dumps(base_filters, sort_keys=True))
+                key = (path, "base", json.dumps({"chain": base_filters,
+                                                 "default": default_method}, sort_keys=True))
                 hit = cache.get(key)
                 if hit is not None:
                     return hit
                 self.status_var.set(f"preview: applying the base chain to {stem}…")
                 self.root.update_idletasks()
                 t0 = time.perf_counter()
-                raster, _ = self.engine._apply_base_chain(arr, base_filters, engine, log)
+                raster, _ = self.engine._apply_base_chain(arr, base_filters, engine, log,
+                                                          default_method)
                 log(f"preview base chain on {stem}: "
                     f"{1e3 * (time.perf_counter() - t0):.0f}ms")
                 cache.put(key, raster)
                 return raster
             if channel == "filtered":
-                if not filters:
+                if not filters and not planar:
                     return arr
-                key = (path, "filtered", json.dumps(filters, sort_keys=True))
+                key = (path, "filtered", json.dumps({"chain": filters,
+                                                     "default": default_method}, sort_keys=True))
                 hit = cache.get(key)
                 if hit is not None:
                     return hit
                 self.status_var.set(f"preview: applying the filter chain to {stem}…")
                 self.root.update_idletasks()
                 t0 = time.perf_counter()
-                cur = arr
-                for f in filters:
+                cur, rest = self.engine._leading_color(arr, filters, engine, log, default_method)
+                for f in rest:
                     cur = engine.filter_slice(cur, json.dumps({"filter": f}))
                 raster = np.ascontiguousarray(cur, dtype=np.float32)
                 log(f"preview filter chain on {stem}: "
@@ -1256,9 +1341,10 @@ class MscouponApp:
             self.status_var.set(f"preview: computing {channel} on {stem}…")
             self.root.update_idletasks()
             t0 = time.perf_counter()
-            names, imgs = engine.stat_channel_images(
-                np.asarray(base, dtype=np.float32),
-                np.asarray(filt, dtype=np.float32), single)
+            from .engine import stat_images
+            names, imgs = stat_images(engine, np.asarray(base, dtype=np.float32),
+                                      np.asarray(filt, dtype=np.float32), single,
+                                      np.ascontiguousarray(arr, dtype=np.float32) if planar else None)
             names = list(names)
             log(f"preview channel {channel} on {stem}: "
                 f"{1e3 * (time.perf_counter() - t0):.0f}ms ({len(names)} plane(s))")
@@ -2286,6 +2372,8 @@ class MscouponApp:
             return
         si, li = cur
         p = self.primed[si]
+        if self._current_color_count() != getattr(self, "_picker_color_count", 0):
+            self._refresh_channel_picker()
         base = np.asarray(p["base"][li], dtype=np.float32)
         filt = np.asarray(p["filtered"][li], dtype=np.float32)
         data = self._assembly.get(si)

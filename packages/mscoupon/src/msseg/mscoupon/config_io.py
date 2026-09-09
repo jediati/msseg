@@ -68,7 +68,51 @@ FILTER_SCHEMA: Dict[str, List[tuple]] = {
                   ("clamp", "bool", False)],
 }
 
+# The colour->scalar stage. Valid only as the FIRST stage of a chain (it
+# consumes the input's planes; every later stage runs on the scalar it
+# produces), and each chain picks its own: the topology field may run on a
+# colour-edge measure while statistics read luminance. `method` selects the
+# extra rows in COLOR_METHOD_PARAMS. Mirrors msseg/filter/color_stage.hpp.
+COLOR_METHODS = ["luminance", "mean", "max", "min", "pick", "weighted", "hsv",
+                 "optical_density", "chgradmag", "dizenzo", "structure"]
+FILTER_SCHEMA["color"] = [("method", "choice:" + ",".join(COLOR_METHODS), "luminance")]
+# `floats` is a comma-separated list rendered in one entry and exported as a
+# JSON array; `numstr` is a number or a keyword ("max" = the slice's own
+# per-plane maximum, the C++ default when i0 is absent). Blanks are dropped.
+COLOR_METHOD_PARAMS: Dict[str, List[tuple]] = {
+    "luminance": [], "mean": [], "max": [], "min": [],
+    "pick": [("channel", "int", 0)],
+    "weighted": [("weights", "floats", "0.2126, 0.7152, 0.0722")],
+    "hsv": [("component", "choice:hue,saturation,value", "value")],
+    "optical_density": [("i0", "numstr", "max"), ("stain", "floats", ""),
+                        ("eps", "float", 0.001)],
+    "chgradmag": [("sigma", "float", 1.0)],
+    "dizenzo": [("sigma", "float", 1.0), ("eigen", "choice:largest,smallest", "largest")],
+    "structure": [("smoothing_sigma", "float", 1.0), ("integration_sigma", "float", 2.0),
+                  ("eigen", "choice:largest,smallest", "largest")],
+}
+
 FILTER_OPERATIONS = list(FILTER_SCHEMA.keys())
+
+
+def filter_param_schema(operation: str, params: Any = None) -> List[tuple]:
+    """The [(param, kind, default), ...] rows a card renders: the operation's
+    schema, plus -- for `color` -- the rows of the method `params` names."""
+    rows = list(FILTER_SCHEMA.get(operation, []))
+    if operation == "color":
+        method = (params or {}).get("method", "luminance") if isinstance(params, dict) else "luminance"
+        rows += COLOR_METHOD_PARAMS.get(str(method), [])
+    return rows
+
+
+def _parse_floats(value: Any) -> List[float]:
+    """A `floats` param as a list: from a JSON array or a comma/space list."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [float(v) for v in value]
+    text = str(value).replace(",", " ").split()
+    return [float(t) for t in text]
 
 # Which landmark names each method can pick from, for the GUI's pickers. The
 # empty default means "use the method's own default pair" (mu_1/mu_2,
@@ -235,9 +279,25 @@ def filters_to_json(filters: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # where the empty value asks for the method's default landmark pair).
         # Emitting "" would override that default with an unknown name.
         raw = dict(f.get("params", {}))
+        kinds = {name: kind for name, kind, _default in filter_param_schema(op, raw)}
         params = {}
         for k, v in raw.items():
-            if _is_nullfloat(op, k):
+            kind = kinds.get(k, "")
+            if op == "color" and k not in kinds:
+                continue          # a row left over from a previous method
+            if kind == "floats":
+                try:
+                    vals = _parse_floats(v)
+                except (TypeError, ValueError):
+                    vals = []
+                if vals:
+                    params[k] = vals
+            elif kind == "numstr":
+                if v in ("", None):
+                    continue
+                num = _as_float(v, _UNSET)
+                params[k] = str(v) if num is _UNSET else num
+            elif _is_nullfloat(op, k):
                 # Blank here means "keep every pixel", which is a real setting and
                 # must survive as null -- dropping it would silently restore the
                 # default sentinel instead. None passes through so an
@@ -551,11 +611,11 @@ def filter_params_from_json(operation: str, params: Any,
     declares renders with a value -- `_build_param_row` would otherwise fill them
     in silently and the card would disagree with the file it came from.
     """
-    schema = FILTER_SCHEMA.get(operation)
-    if schema is None:
+    if operation not in FILTER_SCHEMA:
         _note(notes, f"unknown filter operation {operation!r} - stage skipped")
         return None
     raw = _as_dict(params)
+    schema = filter_param_schema(operation, raw)
     known = {name for name, _kind, _default in schema}
     for key in raw:
         if key not in known:
@@ -580,6 +640,20 @@ def filter_params_from_json(operation: str, params: Any,
                              f"{', '.join(choices)} - using {default!r}")
         elif kind == "str":
             out[name] = "" if value is None else str(value)
+        elif kind == "floats":
+            try:
+                out[name] = ", ".join(f"{x:g}" for x in _parse_floats(value))
+            except (TypeError, ValueError):
+                out[name] = default
+                _note(notes, f"{operation}.{name}: {value!r} is not a list of numbers "
+                             f"- using the default")
+        elif kind == "numstr":
+            if value is None or value == "":
+                out[name] = ""
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                out[name] = f"{float(value):g}"
+            else:
+                out[name] = str(value)
         elif kind in ("optfloat", "nullfloat"):
             # Blank is a real state in the GUI, and the two kinds mean different
             # things by it: optfloat blank is "unset" (dropped on export),

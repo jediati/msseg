@@ -120,10 +120,22 @@ class SliceCanvas(tk.Frame):
                 except Exception:
                     self._source = None
         if array is not None:
-            self._base = np.asarray(array, dtype=np.float32)
+            arr = np.asarray(array, dtype=np.float32)
+            if arr.ndim == 3:
+                # Planar (C,h,w) colour planes: shown as RGB from the first three
+                # (a lone extra plane is repeated), windowed with one shared
+                # [lo, hi] so the channels keep their relative brightness.
+                planes = arr[:3] if arr.shape[0] >= 3 else np.repeat(arr[:1], 3, axis=0)
+                self._base = np.ascontiguousarray(np.transpose(planes, (1, 2, 0)))
+            else:
+                self._base = arr
             self.image_height, self.image_width = self._base.shape[:2]
             self._base_min = float(self._base.min())
             self._base_max = float(self._base.max())
+
+    @property
+    def base_is_rgb(self):
+        return self._base is not None and self._base.ndim == 3
 
     def set_overlays(self, overlays):
         """overlays: list of dicts, either a pre-colored RGBA layer
@@ -312,7 +324,8 @@ class SliceCanvas(tk.Frame):
         self._job = self.after(15, self.render)
 
     def _base_region(self, left, top, right, bottom, out_w, out_h):
-        """Return an (out_h, out_w) uint8 grayscale array for the base region."""
+        """Return an (out_h, out_w) uint8 grayscale array for the base region,
+        or (out_h, out_w, 3) when the base is colour."""
         # Window over the base channel's own [min, max]. The in-memory base holds
         # the native (float32) values, so we window there directly -- this is the
         # correct, detail-preserving path. large_image's getRegion, by contrast,
@@ -324,7 +337,12 @@ class SliceCanvas(tk.Frame):
         span = (hi - lo) or 1.0
         if self._base is not None:
             crop = self._base[top:bottom, left:right]
-            im = Image.fromarray(np.clip((crop - lo) / span, 0, 1).astype(np.float32))
+            norm = np.clip((crop - lo) / span, 0, 1)
+            if norm.ndim == 3:
+                im = Image.fromarray((norm * 255).astype(np.uint8), "RGB")
+                im = im.resize((out_w, out_h), Image.BILINEAR)
+                return np.asarray(im, dtype=np.uint8)
+            im = Image.fromarray(norm.astype(np.float32))
             im = im.resize((out_w, out_h), Image.BILINEAR)
             return (np.asarray(im, dtype=np.float32) * 255).astype(np.uint8)
         # Fallback: no in-memory base -> use the pyramidal source. Its 8-bit output
@@ -353,7 +371,9 @@ class SliceCanvas(tk.Frame):
 
         t0 = time.perf_counter()
         gray = self._base_region(left, top, right, bottom, out_w, out_h)
-        rgb = np.dstack([gray, gray, gray]).astype(np.float32)
+        # A colour base already comes back as (out_h, out_w, 3).
+        rgb = (gray.astype(np.float32) if gray.ndim == 3
+               else np.dstack([gray, gray, gray]).astype(np.float32))
         t_base = time.perf_counter()
 
         n_ov = 0
