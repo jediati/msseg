@@ -158,6 +158,16 @@ class MscouponApp:
         """Factory hook for tools with a different lean statistics default."""
         return session.default_profile(name)
 
+    def _make_catalogue(self):
+        """Factory hook: the framework ItemCatalogue over this app's data."""
+        from .adapters import SequenceCatalogue
+        return SequenceCatalogue(self)
+
+    def _make_region_provider(self):
+        """Factory hook: the framework RegionProvider over this app's compute."""
+        from .adapters import EngineRegionProvider
+        return EngineRegionProvider(self)
+
     def __init__(self, root, initial=None, autosave=True):
         self.root = root
         self.root.title("mscoupon viewer")
@@ -187,6 +197,11 @@ class MscouponApp:
         # rest of the class -- and the selftest -- reads as before.
         self.engine = ComputeEngine(self._assembly_params)
         self.flat_slices = []                    # [(subseq_idx, local_idx)] linearized
+        # The labeler framework's seams over this viewer's data (see
+        # adapters.py): items are slices keyed "folder/basename", regions are
+        # the engine's per-slice records. Subclasses swap them via the hooks.
+        self.catalogue = self._make_catalogue()
+        self.regions = self._make_region_provider()
         self._pump_started = False
 
         # --- tk variables ------------------------------------------------ #
@@ -2260,6 +2275,7 @@ class MscouponApp:
         for si, p in enumerate(self.primed):
             for li in range(len(p["pipes"])):
                 self.flat_slices.append((si, li))
+        self.catalogue.refresh()
         combo = getattr(self, "slice_combo", None)
         if combo is not None:
             try:

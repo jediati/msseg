@@ -78,7 +78,8 @@ def test_edge_set_matches_gather_edges():
     it = items()
     names = b.feature_names(it[0][2])
     X, cls, grp, ext, edges, out_names = b.edge_set(
-        it, store_two_classes(), names, lambda rec: magic_fill.arcs_from_labels(rec["labels"], np), np)
+        it, store_two_classes(), names,
+        lambda key, rec: magic_fill.arcs_from_labels(rec["labels"], np), np)
     assert out_names == names and X.shape == (8, 4)
     assert cls.tolist() == [2, 2, 1, 1, 0, 0, 0, 1]
     assert grp.tolist() == [10] * 4 + [11] * 4

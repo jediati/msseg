@@ -56,7 +56,8 @@ from __future__ import annotations
 
 import heapq
 import math
-import re
+
+from .fields import DEFAULT, HIST_RE, POSITIONAL_FIELDS  # noqa: F401  (re-exported)
 
 METRICS = ("mean", "bhattacharyya", "histogram", "cosine", "proba", "barrier", "learned")
 MODES = ("anchor", "chain")
@@ -68,16 +69,13 @@ EDGE_ONLY_METRICS = ("barrier",)
 ARC_METRICS = ("barrier", "learned")
 # Metrics that read the channel list (the others use the whole row / extra).
 CHANNEL_METRICS = ("mean", "bhattacharyya", "histogram")
-# The per-region histogram columns (`hist00_base`, ...): a distribution, not a
-# scalar, so `cosine` leaves them out and `histogram` reads them as one.
-HIST_RE = re.compile(r"^hist\d+_(.+)$")
+# The per-region histogram columns (`hist00_base`, ...) are a distribution, not
+# a scalar, so `cosine` leaves them out and `histogram` reads them as one; the
+# spelling (HIST_RE) and the positional set come from fields.DEFAULT, and every
+# table-reading function below takes a `conv` to use another schema.
 # Metrics that need a per-region array the table does not carry: metric -> the
 # key build_ladder expects in `extra`.
 EXTRA_METRICS = {"proba": "proba", "learned": "pdiff"}
-# Statistics columns that say WHERE a region is, not what it looks like --
-# never part of the cosine row (the labeler's classifier excludes the same).
-POSITIONAL_FIELDS = frozenset({"feature_id", "min_x", "max_x", "min_y", "max_y",
-                               "ext_x", "ext_y"})
 # Distance between probability vectors: "tv" (total variation) or "hellinger".
 PROBA_DIST = "tv"
 
@@ -106,14 +104,10 @@ def arcs_from_labels(labels, np):
             "saddle": None, "source": "pixels"}
 
 
-def channel_names(table):
-    """The measurement channels the table carries a ``mean_`` column for, in
-    table order (``base`` first when present)."""
-    names = [n[5:] for n in table.names if n.startswith("mean_")]
-    if "base" in names:
-        names.remove("base")
-        names.insert(0, "base")
-    return names
+def channel_names(table, conv=DEFAULT):
+    """The measurement channels the table carries a mean column for, in table
+    order (the schema's preferred channel -- ``base`` -- first when present)."""
+    return conv.channel_names(table)
 
 
 def index_arcs(arcs, ids, np):
@@ -157,31 +151,31 @@ def _std_floor(sd, m, np):
     return np.maximum(sd, floor)
 
 
-def row_vectors(table, metric, channels, np, extra=None):
+def row_vectors(table, metric, channels, np, extra=None, conv=DEFAULT):
     """One vector per table row for `metric`, plus the distance kind that
     compares them: ``(X float64[n_rows, d], kind)``. Every region metric goes
     through here so node (seed vs all) and arc (a vs b) dissimilarities are
     the same function applied to different index pairs."""
     if metric == "mean":
-        cols = [_column(table, f"mean_{c}", np) for c in channels]
+        cols = [_column(table, conv.mean_of(c), np) for c in channels]
         if not cols:
             raise ValueError("no channels selected")
         X = np.stack([(c - c.mean()) / _spread(c, np) for c in cols], axis=1)
         return X, "euclidean"
     if metric == "bhattacharyya":
-        means = [_column(table, f"mean_{c}", np) for c in channels]
+        means = [_column(table, conv.mean_of(c), np) for c in channels]
         if not means:
             raise ValueError("no channels selected")
-        stds = [_std_floor(_column(table, f"std_{c}", np), m, np)
+        stds = [_std_floor(_column(table, conv.std_of(c), np), m, np)
                 for c, m in zip(channels, means)]
         X = np.concatenate([np.stack(means, axis=1), np.stack(stds, axis=1)], axis=1)
         return X, "bhattacharyya"
     if metric == "histogram":
-        X = histogram_vectors(table, channels, np)
+        X = histogram_vectors(table, channels, np, conv)
         return X, "hellinger"
     if metric == "cosine":
         names = [n for n in table.names
-                 if n not in POSITIONAL_FIELDS and not HIST_RE.match(n)]
+                 if n not in conv.positional and not conv.is_histogram_column(n)]
         if not names:
             raise ValueError("no statistics columns for cosine")
         cols = []
@@ -198,7 +192,7 @@ def row_vectors(table, metric, channels, np, extra=None):
         P = np.asarray(P, dtype=np.float64)
         if P.ndim != 2:
             raise ValueError("proba must be an (n_ids, n_classes) array")
-        ids = np.asarray(_column(table, "feature_id", np), dtype=np.intp)
+        ids = np.asarray(_column(table, conv.id_field, np), dtype=np.intp)
         X = np.zeros((len(ids), P.shape[1]), dtype=np.float64)
         ok = (ids >= 0) & (ids < len(P))
         X[ok] = P[ids[ok]]                      # ids outside P stay unscored
@@ -208,22 +202,17 @@ def row_vectors(table, metric, channels, np, extra=None):
     raise ValueError(f"unknown metric {metric!r}")
 
 
-def histogram_columns(table):
+def histogram_columns(table, conv=DEFAULT):
     """channel -> [column names] of the table's histogram bins, in bin order."""
-    out = {}
-    for n in table.names:
-        m = HIST_RE.match(n)
-        if m:
-            out.setdefault(m.group(1), []).append(n)
-    return out
+    return conv.histogram_columns(table)
 
 
-def histogram_vectors(table, channels, np):
+def histogram_vectors(table, channels, np, conv=DEFAULT):
     """One row per region: the concatenated bin fractions of every selected
     channel that carries a histogram, scaled by 1/k so the whole row sums to
     one and the Hellinger distance stays in [0, 1]. Channels without bins are
     skipped; none at all is an error (the spec has no histogram)."""
-    by_channel = histogram_columns(table)
+    by_channel = histogram_columns(table, conv)
     picked = [c for c in channels if c in by_channel] or list(by_channel)
     if not picked:
         raise ValueError("no histogram columns: enable statistics.histogram first")
@@ -275,15 +264,15 @@ def pairwise(X, I, J, kind, np):
     raise ValueError(f"unknown distance {kind!r}")
 
 
-def node_dissimilarity(table, seed_row, metric, channels, np, extra=None):
+def node_dissimilarity(table, seed_row, metric, channels, np, extra=None, conv=DEFAULT):
     """d(seed, r) for every row r (anchor mode). float64[n_rows], 0 at the seed."""
-    X, kind = row_vectors(table, metric, channels, np, extra)
+    X, kind = row_vectors(table, metric, channels, np, extra, conv)
     return pairwise(X, seed_row, np.arange(len(X)), kind, np)
 
 
-def edge_dissimilarity(table, ia, ib, metric, channels, np, extra=None):
+def edge_dissimilarity(table, ia, ib, metric, channels, np, extra=None, conv=DEFAULT):
     """d(a, b) per arc (chain mode). float64[n_arcs]."""
-    X, kind = row_vectors(table, metric, channels, np, extra)
+    X, kind = row_vectors(table, metric, channels, np, extra, conv)
     return pairwise(X, ia, ib, kind, np)
 
 
@@ -294,7 +283,7 @@ def barrier_weights(saddle, seed_ext_value, np):
 
 
 def edge_weights(table, ia, ib, seed_row, metric, mode, channels, np,
-                 saddle=None, seed_ext_value=None, extra=None, pdiff=None):
+                 saddle=None, seed_ext_value=None, extra=None, pdiff=None, conv=DEFAULT):
     """One weight per arc, whatever the metric/mode: the bottleneck search
     below only ever sees arcs. `pdiff` is the edge model's P(different)
     per (kept) arc for the `learned` metric."""
@@ -310,10 +299,10 @@ def edge_weights(table, ia, ib, seed_row, metric, mode, channels, np,
             raise ValueError(f"{metric!r} needs the seed's extremum value (ext_filtered)")
         return barrier_weights(saddle, seed_ext_value, np)
     if mode == "anchor":
-        d = node_dissimilarity(table, seed_row, metric, channels, np, extra)
+        d = node_dissimilarity(table, seed_row, metric, channels, np, extra, conv)
         return np.maximum(d[ia], d[ib])
     if mode == "chain":
-        return edge_dissimilarity(table, ia, ib, metric, channels, np, extra)
+        return edge_dissimilarity(table, ia, ib, metric, channels, np, extra, conv)
     raise ValueError(f"unknown mode {mode!r}")
 
 
@@ -519,7 +508,7 @@ class Ladder:
 
 
 def build_ladder(table, arcs, seed_id, metric, mode, channels, np,
-                 hop_gain=1.0, extra=None):
+                 hop_gain=1.0, extra=None, conv=DEFAULT):
     """Join ladder for `seed_id` (a label id present in `table`). `extra`
     carries what the table does not (``{"proba": (K, C)}`` for the proba
     metric); `hop_gain` is the flood's per-hop multiplier (>= 1)."""
@@ -530,9 +519,9 @@ def build_ladder(table, arcs, seed_id, metric, mode, channels, np,
     need = EXTRA_METRICS.get(metric)
     if need is not None and (extra is None or extra.get(need) is None):
         raise ValueError(f"{metric!r} needs {need} (extra[{need!r}]) - Classify first")
-    fid = table.column("feature_id")
+    fid = table.column(conv.id_field)
     if fid is None:
-        raise ValueError("feature table has no feature_id column")
+        raise ValueError(f"feature table has no {conv.id_field} column")
     ids = np.asarray(fid, dtype=np.intp)
     hit = np.flatnonzero(ids == int(seed_id))
     if len(hit) == 0:
@@ -558,25 +547,25 @@ def build_ladder(table, arcs, seed_id, metric, mode, channels, np,
         pdiff = pd[keep]
     seed_ext = None
     if metric in EDGE_ONLY_METRICS:
-        ext = table.column("ext_filtered")
+        ext = None if conv.extremum_value_field is None else table.column(conv.extremum_value_field)
         if ext is None:
-            raise ValueError(f"{metric!r} needs the ext_filtered statistic")
+            raise ValueError(f"{metric!r} needs the {conv.extremum_value_field or 'extremum value'} statistic")
         seed_ext = float(ext[seed_row])
     node_key = None
     if metric not in ARC_METRICS and mode == "anchor":
         # Anchor mode: the region's own dissimilarity is both the arc weight
         # ingredient and the tie-breaker (most seed-like first).
-        node_key = node_dissimilarity(table, seed_row, metric, channels, np, extra)
+        node_key = node_dissimilarity(table, seed_row, metric, channels, np, extra, conv)
         w = np.maximum(node_key[ia], node_key[ib])
     else:
         w = edge_weights(table, ia, ib, seed_row, metric, mode, channels, np,
                          saddle=saddle, seed_ext_value=seed_ext, extra=extra,
-                         pdiff=pdiff)
+                         pdiff=pdiff, conv=conv)
     order, join = growth_order(len(ids), ia, ib, w, seed_row, np,
                                node_key=node_key, hop_gain=hop_gain)
     sorted_join = join[order]
     n_reach = int(np.count_nonzero(np.isfinite(join)))
-    area = table.column("area")
+    area = None if conv.area_field is None else table.column(conv.area_field)
     cum_area = (np.cumsum(np.asarray(area, dtype=np.int64)[order])
                 if area is not None else None)
     return Ladder(ids, join, order, sorted_join, cum_area, n_reach,

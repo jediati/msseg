@@ -72,6 +72,7 @@ from msseg.labeler import magic_fill
 from msseg.labeler import model_search
 from msseg.labeler import edge_model
 from msseg.labeler import bundle as model_bundle
+from msseg.labeler import fields
 from msseg.labeler.training import TrainingSetBuilder, TrainingProblem
 
 # How faint the inherited region overlay is drawn under the class layer
@@ -365,13 +366,13 @@ class DrawController:
         self._pv = None
         app = self.app
         cur = app._current()
-        rec = app.engine.record(*cur) if cur is not None else None
+        rec = app.regions.record(app.catalogue.key_of(*cur)) if cur is not None else None
         if rec is None or rec.get("labels") is None:
             return
         labels = rec["labels"]
         pred = None
         if self._accept:
-            pr = app._pred.get(cur)
+            pr = app._pred.get(app.catalogue.key_of(*cur))
             if pr is None or pr[0] != rec.get("commit"):
                 return             # nothing would be accepted: no preview
             pred = pr[1]
@@ -559,7 +560,7 @@ class MagicFillController:
                 app.status_var.set("Blobber needs a second class for the ring "
                                    "(Classes >= 3).")
                 return False
-        rec = app.engine.record(*cur)
+        rec = app.regions.record(app.catalogue.key_of(*cur))
         if rec is None or rec.get("labels") is None or rec.get("stats") is None:
             app.status_var.set("Magic fill needs computed regions - Rerun first.")
             return False
@@ -574,18 +575,12 @@ class MagicFillController:
         seed = int(labels[iy, ix])
         if seed < 0:
             return False                     # background: pan as usual
-        arcs = rec.get("arcs")
-        if arcs is None:
-            # Extension without region_arcs(): pixel adjacency, once per
-            # record (commit-keyed, so a Rerun recomputes it).
-            t0 = time.perf_counter()
-            arcs = magic_fill.arcs_from_labels(labels, np)
-            rec["arcs"] = arcs
-            log(f"magic fill: pixel adjacency for slice {cur[1]}: "
-                f"{len(arcs['a'])} pairs ({1e3 * (time.perf_counter() - t0):.0f}ms)")
+        # The record's MSC arcs, or (extension without region_arcs()) pixel
+        # adjacency the provider derives once per record.
+        arcs = app.regions.arcs(app.catalogue.key_of(*cur), np)
         metric, mode, want = self.options()
         table = rec["stats"]
-        avail = magic_fill.channel_names(table)
+        avail = magic_fill.channel_names(table, app.FIELDS)
         chans = [c for c in want if c in avail]
         if not chans:
             chans = ["base"] if "base" in avail else avail[:1]
@@ -599,7 +594,7 @@ class MagicFillController:
             # only count at the commit they were made for. No silent fallback:
             # painting with `mean` under a row that says `proba` would mislead
             # while tuning, so the press is refused like one on background.
-            pr = app._pred.get((cur[0], cur[1]))
+            pr = app._pred.get(app.catalogue.key_of(*cur))
             if pr is None or pr[0] != rec.get("commit"):
                 app.status_var.set(f"{metric} needs predictions at this commit "
                                    "- Classify first")
@@ -620,7 +615,8 @@ class MagicFillController:
             app.status_var.set(f"hop\u00d7 is not a number - using {gain:g}")
         try:
             ladder = magic_fill.build_ladder(table, arcs, seed, metric, mode,
-                                             chans, np, hop_gain=gain, extra=extra)
+                                             chans, np, hop_gain=gain, extra=extra,
+                                             conv=app.FIELDS)
         except ValueError as exc:
             app.status_var.set(f"magic fill: {exc}")
             return False
@@ -651,7 +647,7 @@ class MagicFillController:
         s = self._s
         if s is None:
             return False
-        rec = self.app.engine.record(s["si"], s["li"])
+        rec = self.app.regions.record(self.app.catalogue.key_of(s["si"], s["li"]))
         if rec is None or rec.get("commit") != s["commit"]:
             self.cancel("magic fill cancelled: regions changed under it")
             return True
@@ -740,16 +736,16 @@ class MagicFillController:
             v.set_hud(*s["hud"])       # give the canvas HUD back to the engine
 
 
-def _extremum_points(labels, ids, table, np):
-    """One image point per region id: its seeding extremum (ext_x/ext_y from
-    the feature table) when that pixel really carries the id, else the
+def _extremum_points(labels, ids, table, np, conv=fields.DEFAULT):
+    """One image point per region id: its seeding extremum (`conv.extremum_xy`
+    from the feature table) when that pixel really carries the id, else the
     region's first pixel in raster order. Both lookups are vectorised -- the
     fallback is one pass over the raster, not one per region."""
     h, w = labels.shape
     pts = {}
-    if table is not None and ids:
-        fid, ex, ey = (table.column("feature_id"), table.column("ext_x"),
-                       table.column("ext_y"))
+    if table is not None and ids and conv.extremum_xy is not None:
+        fid, ex, ey = (table.column(conv.id_field), table.column(conv.extremum_xy[0]),
+                       table.column(conv.extremum_xy[1]))
         if fid is not None and ex is not None and ey is not None and len(fid):
             fid = np.asarray(fid, np.intp)
             K = int(max(int(fid.max()), max(ids))) + 1
@@ -779,6 +775,7 @@ def _extremum_points(labels, ids, table, np):
 class LabelerApp(MscouponApp):
     SESSION_APP = "mscoupon-labeler"
     MODEL_APP_TAG = model_bundle.DEFAULT_APP_TAG     # the classifier pickle "app" tag
+    FIELDS = fields.DEFAULT                          # column conventions of the statistics table
 
     def _default_profile(self, name="default"):
         return session.default_profile(name, relevance=False)
@@ -1219,10 +1216,12 @@ class LabelerApp(MscouponApp):
         every slice classified at the current commit, largest first."""
         import numpy as np
         rows = []
-        for (si, li), entry in self._pred.items():
-            rec = self.engine.record(si, li)
+        for key, entry in self._pred.items():
+            idx = self.catalogue.index_of(key)
+            rec = self.regions.record(key) if idx is not None else None
             if rec is None or rec.get("labels") is None or entry[0] != rec.get("commit"):
                 continue
+            si, li = idx
             truth = self._truth_from_cache(si, li, rec, np)
             if truth is None:
                 continue
@@ -1313,7 +1312,7 @@ class LabelerApp(MscouponApp):
             return False
         self._goto_slice(idx)
         self._show_center_tab("View")
-        rec = self.engine.record(si, li)
+        rec = self.regions.record(self.catalogue.key_of(si, li))
         pt = None
         if rec is not None and rec.get("labels") is not None:
             import numpy as np
@@ -1944,7 +1943,7 @@ class LabelerApp(MscouponApp):
         overlays = super()._seg_overlays(si, li, rec, data, np, min_colors)
         scalar = None
         if rec is not None and self.show_regions_var.get():
-            entry = self._pred.get((si, li))
+            entry = self._pred.get(self.catalogue.key_of(si, li))
             if entry is not None and entry[0] == rec.get("commit"):
                 scalar = self._region_scalar(entry, np)
         if scalar is not None:
@@ -1968,7 +1967,7 @@ class LabelerApp(MscouponApp):
             # Classifier predictions under the user's own labels: the model's
             # view of every region, with the drawn ground truth on top.
             if self.show_pred_var.get():
-                pr = self._pred.get((si, li))
+                pr = self._pred.get(self.catalogue.key_of(si, li))
                 if pr is not None and pr[0] == rec.get("commit"):
                     plut = class_lut(pr[1], np,
                                      self._class_colors_rgba(np)).copy()
@@ -2048,13 +2047,13 @@ class LabelerApp(MscouponApp):
         return len(self.store.for_slice(key)) if key else 0
 
     def _slice_key(self, si, li):
-        """Folder-qualified slice identity ("folder/basename") -- basenames
-        collide across a session's folders, so the folder is part of the key."""
-        try:
-            s = self.subsequences[si]
-            return f"{s.get('folder', '')}/{os.path.basename(s['files'][li])}"
-        except (IndexError, KeyError, TypeError):
-            return None
+        """The item key of slice (si, li): the catalogue's folder-qualified
+        "folder/basename" (see adapters.SequenceCatalogue)."""
+        return self.catalogue.key_of(si, li)
+
+    def _current_key(self):
+        cur = self._current()
+        return self.catalogue.key_of(*cur) if cur is not None else None
 
     # ------------------------------------------------------------------ #
     # Interactions
@@ -2117,7 +2116,7 @@ class LabelerApp(MscouponApp):
         if slice_key is None:
             return
         import numpy as np
-        rec = self.engine.record(si, li)
+        rec = self.regions.record(self.catalogue.key_of(si, li))
         table = rec.get("stats") if rec is not None else None
         added = []
         for ids, cls, meta in parts:
@@ -2152,8 +2151,8 @@ class LabelerApp(MscouponApp):
         if cur is None or len(pts) < 2:
             return
         si, li = cur
-        rec = self.engine.record(si, li)
-        pr = self._pred.get((si, li))
+        rec = self.regions.record(self.catalogue.key_of(si, li))
+        pr = self._pred.get(self.catalogue.key_of(si, li))
         if rec is None or rec.get("labels") is None or pr is None \
                 or pr[0] != rec.get("commit"):
             self.status_var.set("Accept needs predictions - Classify first.")
@@ -2704,13 +2703,17 @@ class LabelerApp(MscouponApp):
         already paid for, so this adds no pass over the interactions."""
         import numpy as np
         counts = {}
-        current = self._current() if scope == "current" else None
+        current = self._current_key() if scope == "current" else None
         items = ([(current, self._pred.get(current))] if current is not None
                  else []) if scope == "current" else self._pred.items()
-        for (si, li), entry in items:
+        for key, entry in items:
             if entry is None:
                 continue
-            rec = self.engine.record(si, li)
+            idx = self.catalogue.index_of(key)
+            rec = self.regions.record(key) if idx is not None else None
+            if rec is None:
+                continue
+            si, li = idx
             if rec is None or rec.get("labels") is None:
                 continue
             if entry[0] != rec.get("commit"):
@@ -2776,8 +2779,8 @@ class LabelerApp(MscouponApp):
         if cur is None:
             return set()
         si, li = cur
-        rec = self.engine.record(si, li)
-        entry = self._pred.get((si, li))
+        rec = self.regions.record(self.catalogue.key_of(si, li))
+        entry = self._pred.get(self.catalogue.key_of(si, li))
         if (rec is None or rec.get("labels") is None or entry is None
                 or entry[0] != rec.get("commit")):
             return set()
@@ -2815,7 +2818,7 @@ class LabelerApp(MscouponApp):
                 slices.setdefault(it.slice_key, (it.si, it.li))
         regions = {}
         for _key, (si, li) in slices.items():
-            rec = self.engine.record(si, li)
+            rec = self.regions.record(self.catalogue.key_of(si, li))
             if rec is None or rec.get("labels") is None:
                 continue
             counts = self._labels_cache_for(si, li, rec, np)[4]
@@ -2969,7 +2972,7 @@ class LabelerApp(MscouponApp):
         if cur is None or ix is None:
             return self._hover_uid
         si, li = cur
-        rec = self.engine.record(si, li)
+        rec = self.regions.record(self.catalogue.key_of(si, li))
         if rec is None or rec.get("labels") is None:
             return self._hover_uid
         labels = rec["labels"]
@@ -3078,7 +3081,7 @@ class LabelerApp(MscouponApp):
             self._draw_interaction_geometry(self.store.get(self._hover_uid))
             return
         si, li, region = self._hover_key
-        rec = self.engine.record(si, li)
+        rec = self.regions.record(self.catalogue.key_of(si, li))
         if rec is None or rec.get("labels") is None:
             return
         import numpy as np
@@ -3098,7 +3101,7 @@ class LabelerApp(MscouponApp):
         region = None
         rec = None
         if ix is not None and iy is not None and cur is not None:
-            rec = self.engine.record(*cur)
+            rec = self.regions.record(self.catalogue.key_of(*cur))
             if rec is not None and rec.get("labels") is not None:
                 labels = rec["labels"]
                 if 0 <= iy < labels.shape[0] and 0 <= ix < labels.shape[1]:
@@ -3110,7 +3113,7 @@ class LabelerApp(MscouponApp):
                         base = ctx["base"]
                         filt = ctx["filt"]
                         probabilities = "-"
-                        pred = self._pred.get(cur)
+                        pred = self._pred.get(self.catalogue.key_of(*cur))
                         if (region is not None and pred is not None
                                 and pred[0] == rec.get("commit")
                                 and region < pred[2].shape[0]):
@@ -3237,7 +3240,7 @@ class LabelerApp(MscouponApp):
         _all_stat_slices()."""
         for si, p in enumerate(self.primed):
             for li in range(len(p["pipes"])):
-                rec = self.engine.record(si, li)
+                rec = self.regions.record(self.catalogue.key_of(si, li))
                 key = self._slice_key(si, li)
                 if rec is None or rec.get("labels") is None or key is None:
                     continue
@@ -3247,7 +3250,7 @@ class LabelerApp(MscouponApp):
                 yield si, li, key, rec, table
 
     _feature_matrix = staticmethod(TrainingSetBuilder.feature_matrix)
-    _training_builder = TrainingSetBuilder(_NON_FEATURE_FIELDS)
+    _training_builder = TrainingSetBuilder(FIELDS)
 
     def _train_classifier(self, preserve_view=False):
         """Fit the selected model kind on the labeled regions' statistics rows.
@@ -3346,7 +3349,8 @@ class LabelerApp(MscouponApp):
         slices = self._all_stat_slices("Preparing training")
         if slices is None:
             return None
-        items = [(key, rec, table, si, f"{si}:{li}") for si, li, key, rec, table in slices]
+        items = [(key, rec, table, self.catalogue.group_of(key), f"{si}:{li}")
+                 for si, li, key, rec, table in slices]
         try:
             return self._training_builder.labeled_set(items, self.store, np)
         except TrainingProblem as problem:
@@ -3379,15 +3383,6 @@ class LabelerApp(MscouponApp):
         except TypeError:
             return False
 
-    def _record_arcs(self, rec, np):
-        """The record's living-region arcs (MSC saddles), or pixel adjacency
-        derived once and cached on the record, as the magic fill does."""
-        arcs = rec.get("arcs")
-        if arcs is None and rec.get("labels") is not None:
-            arcs = magic_fill.arcs_from_labels(rec["labels"], np)
-            rec["arcs"] = arcs
-        return arcs
-
     def _edge_training_data(self, names):
         """Every region of every primed slice (class 0 = unlabeled) with its
         slice index and extremum value, plus the edges of the region graph as
@@ -3398,11 +3393,11 @@ class LabelerApp(MscouponApp):
         slices = self._all_stat_slices("Gathering edges")
         if slices is None:
             return None
-        items = [(key, rec, table, k, f"{si}:{li}")
-                 for k, (si, li, key, rec, table) in enumerate(slices)]
+        items = [(key, rec, table, self.catalogue.group_of(key), f"{si}:{li}")
+                 for si, li, key, rec, table in slices]
         try:
             return self._training_builder.edge_set(
-                items, self.store, names, lambda rec: self._record_arcs(rec, np), np)
+                items, self.store, names, lambda key, rec: self.regions.arcs(key, np), np)
         except TrainingProblem as problem:
             self.status_var.set(str(problem))
             return None
@@ -3491,7 +3486,7 @@ class LabelerApp(MscouponApp):
         active = _is_edge_kind(kind)
         text += " · voting " + ("on" if active else "off") + " (N)"
         cur = self._current()
-        entry = self._pred.get(cur) if cur is not None else None
+        entry = self._pred.get(self.catalogue.key_of(*cur)) if cur is not None else None
         aux = self._pred_aux(entry)
         if active and aux is not None and aux.get("flips") is not None:
             text += f" · {aux['flips']} flipped on this slice"
@@ -4253,7 +4248,7 @@ class LabelerApp(MscouponApp):
         probabilities come out of the same forward pass as the hard label
         (which is their argmax), and the regions coloring modes and any later
         confidence read need them per region, not per feature row."""
-        pr = self._pred.get((si, li))
+        pr = self._pred.get(self.catalogue.key_of(si, li))
         if pr is not None and pr[0] == rec.get("commit"):
             return pr[1]
         if self._clf is None:
@@ -4290,7 +4285,7 @@ class LabelerApp(MscouponApp):
         final = region_class
         edge = self._edge_model
         if edge is not None:
-            arcs = self._record_arcs(rec, np)
+            arcs = self.regions.arcs(self.catalogue.key_of(si, li), np)
             if arcs is not None and len(arcs.get("a", ())):
                 try:
                     ia, ib, keep_e = magic_fill.index_arcs(arcs, fid, np)
@@ -4316,34 +4311,15 @@ class LabelerApp(MscouponApp):
                     aux = None
         entry = ((rec.get("commit"), final, region_proba) if aux is None
                  else (rec.get("commit"), final, region_proba, aux))
-        self._pred[(si, li)] = entry
+        self._pred[self.catalogue.key_of(si, li)] = entry
         return final
 
     # -- training-set export --------------------------------------------- #
     def _ensure_slice_record(self, si, li):
-        """The slice's record at the current commit, computing it SYNCHRONOUSLY
-        when the lazy per-slice tier hasn't visited it yet (the training-set
-        export needs every slice, not just the browsed ones). Caller must
-        ensure no assembly worker is running (the pipes are stateful)."""
-        rec = self.engine.record(si, li)
-        if rec is not None and rec.get("labels") is not None:
-            return rec
-        try:
-            import numpy as np
-            from msseg import mscoupon as ext
-        except ImportError:
-            return None
-        params = dict(self._assembly_params(si, "slice", li))
-        params["commit"] = self.engine.commit_id
-        tm = {"persist": 0.0, "labels": 0.0, "stats": 0.0,
-              "query": 0.0, "rasters": 0.0}
-        try:
-            rec = self.engine._slice_result(si, li, params, ext, np, tm)
-        except Exception as exc:
-            log(f"slice ({si},{li}) record failed: {exc}")
-            return None
-        self.engine.slices[(si, li)] = rec
-        return rec
+        """The slice's record at the current commit, computed synchronously when
+        the lazy per-slice tier hasn't visited it yet (see
+        RegionProvider.ensure_record)."""
+        return self.regions.ensure_record(self.catalogue.key_of(si, li))
 
     def _make_training_set(self):
         """Pick a folder; write `train/` (the raw input TIFFs) and `labels/`
@@ -4569,7 +4545,7 @@ class LabelerApp(MscouponApp):
         rows = []           # (slice_key, region_id, class, predicted, table, row_idx)
         for si, p in enumerate(self.primed):
             for li in range(len(p["pipes"])):
-                rec = self.engine.record(si, li)
+                rec = self.regions.record(self.catalogue.key_of(si, li))
                 key = self._slice_key(si, li)
                 if rec is None or rec.get("labels") is None or key is None:
                     skipped += 1
@@ -4579,7 +4555,7 @@ class LabelerApp(MscouponApp):
                 # Classifier predictions ride along when they exist for this
                 # commit; blank otherwise (a prediction of class 0 never
                 # happens -- the model only knows labeled classes).
-                pr = self._pred.get((si, li))
+                pr = self._pred.get(self.catalogue.key_of(si, li))
                 pred = pr[1] if pr is not None and pr[0] == rec.get("commit") else None
                 table = rec.get("stats")
                 if getattr(table, "values", None) is None:
@@ -5324,8 +5300,8 @@ def _selftest():
         rec3 = app.engine.record(0, 0)
         materialized.clear()
         app._classify()
-        pr = app._pred.get((0, 0))
-        pr_second = app._pred.get((0, 1))
+        pr = app._pred.get(app.catalogue.key_of(0, 0))
+        pr_second = app._pred.get(app.catalogue.key_of(0, 1))
         assert pr is not None and pr[0] == app._commit_id
         assert pr_second is not None and pr_second[0] == app._commit_id
         assert set(materialized) == {(0, 0), (0, 1)}, \
@@ -5378,7 +5354,7 @@ def _selftest():
             list(app.region_mode_combo.cget("values")) == ["label id"], \
             "modes collapse when the cache is dropped"
         app._classify()
-        pr = app._pred.get((0, 0))
+        pr = app._pred.get(app.catalogue.key_of(0, 0))
 
         # -- "-> edges" kinds: an edge model on top of a dense base --------- #
         # The two fake slices carry the block raster (ids 0,2 -> class 2 and
@@ -5405,7 +5381,7 @@ def _selftest():
         assert "-> edges" in app.model_strip_var.get() and "-> edges" in app.model_hint_var.get()
         assert "edges: logistic" in app.model_arch_var.get()
         app._classify()
-        pr = app._pred.get((0, 0))
+        pr = app._pred.get(app.catalogue.key_of(0, 0))
         assert len(pr) == 4, "the cache entry grows an aux dict with an edge model"
         aux = app._pred_aux(pr)
         assert aux is not None and aux["pdiff"].shape == (4,) and np.isfinite(aux["pdiff"]).all()
@@ -5430,16 +5406,16 @@ def _selftest():
         # N flips to the base kind: raw predictions, voting off, no forward pass.
         app._on_edge_key()
         assert app.model_kind_var.get() == _CUSTOM_KIND
-        pr0 = app._pred.get((0, 0))
+        pr0 = app._pred.get(app.catalogue.key_of(0, 0))
         assert np.array_equal(pr0[1], app._pred_aux(pr0)["raw"]) and not app._pred_aux(pr0)["active"]
         assert "voting off" in app.edge_readout_var.get()
         app._on_edge_key()
         assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND
-        assert app._pred_aux(app._pred[(0, 0)])["active"]
+        assert app._pred_aux(app._pred[app.catalogue.key_of(0, 0)])["active"]
         # lambda 0 is the base answer even with voting on; the entry re-votes in place.
         app.edge_lam_var.set("0")
         app._on_edge_settings_change()
-        pr0 = app._pred[(0, 0)]
+        pr0 = app._pred[app.catalogue.key_of(0, 0)]
         assert np.array_equal(pr0[1], app._pred_aux(pr0)["raw"]) and app._pred_aux(pr0)["lam"] == 0.0
         app.edge_lam_var.set("1")
         app._on_edge_settings_change()
@@ -5528,7 +5504,7 @@ def _selftest():
         app.model_kind_var.set(kind_before)
         app._train_classifier()
         app._classify()
-        pr = app._pred.get((0, 0))
+        pr = app._pred.get(app.catalogue.key_of(0, 0))
         assert app._edge_model is None and len(pr) == 3
 
         # Confusion matrix: frozen predictions against live labels.
@@ -5561,7 +5537,7 @@ def _selftest():
             "the same regions, redistributed across the true axis"
         assert sum(app._cm_counts["all"].values()) == sum(before["all"].values()), \
             "the global table retains every slice while truth moves"
-        assert app._pred.get((0, 0))[1] is pr[1], "predictions stay frozen"
+        assert app._pred.get(app.catalogue.key_of(0, 0))[1] is pr[1], "predictions stay frozen"
         app._undo()
         assert app._cm_counts == before, "undo restores both tables"
 
@@ -5635,7 +5611,7 @@ def _selftest():
             assert app._clf_names == ["area", "mean_base"], \
                 "the full profile fingerprint must survive selection"
             app._classify()
-            before_load = app._pred[(0, 0)][1].copy()
+            before_load = app._pred[app.catalogue.key_of(0, 0)][1].copy()
             with tempfile.TemporaryDirectory() as td:
                 dense_path = os.path.join(td, dense_kind + ".pkl")
                 app._save_classifier_to(dense_path)
@@ -5646,7 +5622,7 @@ def _selftest():
                 assert app._clf_kind == dense_kind
                 assert app.model_kind_var.get() == dense_kind
                 app._classify()
-                assert np.array_equal(app._pred[(0, 0)][1], before_load), \
+                assert np.array_equal(app._pred[app.catalogue.key_of(0, 0)][1], before_load), \
                     "loaded dense-top model must preserve predictions"
         # "dense (tuned)": Train with no search yet builds the baseline behind a
         # FeatureSubset; Optimize (run inline here) installs the search winner,
@@ -5841,7 +5817,7 @@ def _selftest():
         assert sum(len(it.points) for it in added) == 4, "all regions accepted"
         rc_now = labeling.resolve_slice(app.store.for_slice("data/s0.tiff"),
                                         lab, np)
-        pr_now = app._pred[(0, 0)][1]
+        pr_now = app._pred[app.catalogue.key_of(0, 0)][1]
         for r in (0, 2, 5, 9):
             assert rc_now[r] == pr_now[r], "accepted labels match predictions"
         app._undo()
@@ -6025,7 +6001,7 @@ def _selftest():
     app.active_class_var.set(1)
     k_hi = app.store.n_classes - 1
     pred_rc = np.zeros(10, np.uint8); pred_rc[0] = 1; pred_rc[9] = k_hi
-    app._pred[(0, 0)] = (app._commit_id, pred_rc,
+    app._pred[app.catalogue.key_of(0, 0)] = (app._commit_id, pred_rc,
                          np.zeros((10, MAX_CLASSES), np.float32))
     assert ctrl.on_press(_FakeEvent(3, 3, state=0x0001))
     assert ctrl.on_move(_FakeEvent(16, 16, state=0x0001))
@@ -6182,9 +6158,9 @@ def _selftest():
     proba = np.zeros((10, MAX_CLASSES), np.float32)
     proba[0, 1] = 1.0; proba[2, 1] = 1.0; proba[5, 2] = 1.0      # 9 unscored
     rc_p = np.zeros(10, np.uint8)
-    app._pred[(0, 0)] = (app._commit_id + 1, rc_p, proba)          # stale
+    app._pred[app.catalogue.key_of(0, 0)] = (app._commit_id + 1, rc_p, proba)          # stale
     assert not ctrl.on_press(_FakeEvent(5, 5))
-    app._pred[(0, 0)] = (app._commit_id, rc_p, proba)
+    app._pred[app.catalogue.key_of(0, 0)] = (app._commit_id, rc_p, proba)
     assert ctrl.on_press(_FakeEvent(5, 5))
     lad_p = ctrl.magic._s["ladder"]
     assert lad_p.ids[lad_p.order].tolist() == [0, 2, 5, 9], lad_p.ids[lad_p.order].tolist()

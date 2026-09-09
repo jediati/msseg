@@ -16,7 +16,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 
-from . import edge_model, magic_fill
+from . import edge_model
+from .fields import DEFAULT, FieldConventions
 from .labeling import resolve_slice
 
 
@@ -27,15 +28,17 @@ class TrainingProblem(Exception):
 class TrainingSetBuilder:
     """Turns items + a ``LabelStore`` into training arrays.
 
-    ``non_feature_fields`` are the table columns that identify or locate a
-    region rather than describe it (ids, bounding box, the extremum position);
-    they never enter the feature matrix. The default is the coupon schema's
-    positional set, shared with the magic fill's ``cosine`` metric.
+    ``conv`` names the table's columns (``FieldConventions``); its positional
+    set -- the columns that identify or locate a region rather than describe
+    it -- never enters the feature matrix (``non_feature_fields`` overrides
+    that set alone). The magic fill's ``cosine`` metric excludes the same.
     """
 
-    def __init__(self, non_feature_fields: Optional[Iterable[str]] = None):
-        self.non_feature = frozenset(magic_fill.POSITIONAL_FIELDS
-                                     if non_feature_fields is None else non_feature_fields)
+    def __init__(self, conv: Optional[FieldConventions] = None,
+                 non_feature_fields: Optional[Iterable[str]] = None):
+        self.conv = conv or DEFAULT
+        self.non_feature = frozenset(self.conv.positional if non_feature_fields is None
+                                     else non_feature_fields)
 
     def feature_names(self, table) -> List[str]:
         return [n for n in table.names if n not in self.non_feature]
@@ -61,8 +64,9 @@ class TrainingSetBuilder:
         cls[ok] = rc[fid[ok]]
         return cls
 
-    def labeled_set(self, items, store, np, id_field: str = "feature_id"):
+    def labeled_set(self, items, store, np, id_field: Optional[str] = None):
         """``(X, y, groups, names)`` over every labeled region of every item."""
+        id_field = id_field or self.conv.id_field
         X, y, g, names = [], [], [], None
         for key, rec, table, group, label in items:
             if names is None:
@@ -89,11 +93,13 @@ class TrainingSetBuilder:
         return X, y, g, names
 
     def edge_set(self, items, store, names: Sequence[str], arcs_of: Callable[[Any], Any], np,
-                 id_field: str = "feature_id", ext_field: str = "ext_filtered"):
+                 id_field: Optional[str] = None, ext_field: Optional[str] = None):
         """Every region of every item (class 0 = unlabeled) with its group and
         extremum value, plus the region-graph edges as global row pairs:
-        ``(X, cls, groups, ext | None, edges, names)``. ``arcs_of(record)``
+        ``(X, cls, groups, ext | None, edges, names)``. ``arcs_of(key, record)``
         supplies the item's arcs (MSC saddles or pixel adjacency)."""
+        id_field = id_field or self.conv.id_field
+        ext_field = ext_field or self.conv.extremum_value_field
         names = list(names)
         ext_col = names.index(ext_field) if ext_field in names else None
         X, cls, grp, ext, per = [], [], [], [], []
@@ -107,7 +113,7 @@ class TrainingSetBuilder:
             X.append(mat); cls.append(c); grp.append(np.full(len(c), group))
             if ext_col is not None:
                 ext.append(mat[:, ext_col])
-            per.append((fid, arcs_of(rec), c, group))
+            per.append((fid, arcs_of(key, rec), c, group))
         edges = edge_model.gather_edges(per)
         return (np.concatenate(X), np.concatenate(cls), np.concatenate(grp),
                 np.concatenate(ext) if ext else None, edges, names)

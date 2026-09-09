@@ -387,6 +387,22 @@ class ComputeEngine:
             return None
         return rec
 
+    def ensure_slice(self, si, li, params, ext, np):
+        """The slice's record at the current commit, computed synchronously
+        (the per-slice tier's work, run inline) when it is not cached yet.
+        `params` is the caller's assembly-params snapshot; the commit is
+        stamped here. Caller must ensure no assembly worker is running (the
+        pipes are stateful)."""
+        rec = self.record(si, li)
+        if rec is not None and rec.get("labels") is not None:
+            return rec
+        params = dict(params)
+        params["commit"] = self.commit_id
+        tm = {"persist": 0.0, "labels": 0.0, "stats": 0.0, "query": 0.0, "rasters": 0.0}
+        rec = self._slice_result(si, li, params, ext, np, tm)
+        self.slices[(si, li)] = rec
+        return rec
+
     def assembly_for(self, si):
         """The 3D assembly at the current commit, or None."""
         data = self.assembly.get(si)
