@@ -1,5 +1,6 @@
 #include "mscoupon/config.hpp"
 
+#include "msseg/filter/color_stage.hpp"
 #include "msseg/workflow/stat_channels.hpp"
 
 #include <fstream>
@@ -49,6 +50,37 @@ void parse_input(const nlohmann::json& root, InputConfig& input) {
   }
   set_if_present(in, "stride", input.stride);
   set_if_present(in, "files", input.files);
+  if (in.contains("color") && in.at("color").is_object()) {
+    const auto& c = in.at("color");
+    set_if_present(c, "alpha", input.color.alpha);
+    set_if_present(c, "default_method", input.color.default_method);
+    set_if_present(c, "channels", input.color.channels);
+  }
+}
+
+// A `color` stage may only head a chain; when the plane count is declared the
+// method is checked against it here rather than on the first slice.
+void validate_color_chain(const char* name, const std::vector<FilterConfig>& chain,
+                          const ColorInputConfig& color) {
+  for (std::size_t i = 0; i < chain.size(); ++i) {
+    if (chain[i].operation != msseg::kColorOperation) continue;
+    if (i != 0) {
+      throw std::runtime_error(std::string(name) + "[" + std::to_string(i) +
+                               "]: 'color' must be the first stage of the chain.");
+    }
+    msseg::FilterParams stage;
+    stage.operation = chain[i].operation;
+    stage.params = chain[i].params;
+    const std::string method = stage.params.value("method", "luminance");
+    std::string why;
+    if (color.channels > 0) {
+      if (!msseg::color_stage_accepts(stage, static_cast<std::size_t>(color.channels), &why)) {
+        throw std::runtime_error(std::string(name) + "[0]: " + why);
+      }
+    } else if (!msseg::is_color_method(method)) {
+      throw std::runtime_error(std::string(name) + "[0]: color: unknown method '" + method + "'.");
+    }
+  }
 }
 
 void parse_output(const nlohmann::json& root, OutputConfig& output) {
@@ -452,8 +484,25 @@ AppConfig load_config(const CliOptions& cli) {
   return cfg;
 }
 
+msseg::ColorInputPolicy ColorInputConfig::policy() const {
+  msseg::ColorInputPolicy out;
+  out.alpha = alpha == "keep" ? msseg::ColorInputPolicy::Alpha::Keep : msseg::ColorInputPolicy::Alpha::Drop;
+  out.default_method = default_method;
+  return out;
+}
+
 void validate_config(const AppConfig& cfg) {
   if (cfg.input.folder.empty()) throw std::runtime_error("input.folder must not be empty");
+  if (cfg.input.color.alpha != "drop" && cfg.input.color.alpha != "keep") {
+    throw std::runtime_error("input.color.alpha must be drop/keep (got '" + cfg.input.color.alpha + "').");
+  }
+  if (!msseg::is_color_method(cfg.input.color.default_method)) {
+    throw std::runtime_error("input.color.default_method is not a color method (got '" +
+                             cfg.input.color.default_method + "').");
+  }
+  if (cfg.input.color.channels < 0) throw std::runtime_error("input.color.channels must be >= 0.");
+  validate_color_chain("filters", cfg.filters, cfg.input.color);
+  validate_color_chain("base_filters", cfg.base_filters, cfg.input.color);
   if (cfg.output.folder.empty()) throw std::runtime_error("output.folder must not be empty");
   if (cfg.input.stride == 0) throw std::runtime_error("input.stride must be >= 1");
   if (cfg.execution.threads_per_slice <= 0) throw std::runtime_error("execution.threads_per_slice must be > 0");

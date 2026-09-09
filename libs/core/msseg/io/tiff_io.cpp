@@ -23,29 +23,50 @@ constexpr std::uint16_t kTiffSampleFormatUInt = 1;
 constexpr std::uint16_t kTiffSampleFormatInt = 2;
 constexpr std::uint16_t kTiffSampleFormatFloat = 3;
 
-// Read the single sample plane as its native integer type T and convert to
+// Read sample plane `sample` as its native integer type T and convert to
 // float. Returns false if TinyTIFF failed to decode the plane.
 template <typename T>
-bool read_plane_as_float(TinyTIFFReaderFile* reader, float* out, std::size_t count) {
+bool read_plane_as_float(TinyTIFFReaderFile* reader, std::uint16_t sample, float* out, std::size_t count) {
   std::vector<T> buffer(count);
-  if (!TinyTIFFReader_getSampleData(reader, buffer.data(), 0)) return false;
+  if (!TinyTIFFReader_getSampleData(reader, buffer.data(), sample)) return false;
   for (std::size_t i = 0; i < count; ++i) out[i] = static_cast<float>(buffer[i]);
   return true;
 }
 
-}  // namespace
+// Decode one sample plane into `out` as float32. Returns false when TinyTIFF
+// failed; throws for a sample layout this reader does not handle.
+bool read_sample_plane(TinyTIFFReaderFile* reader, std::uint16_t fmt, std::uint16_t bits, std::uint16_t sample,
+                       float* out, std::size_t count) {
+  if (fmt == kTiffSampleFormatFloat && bits == 32) return TinyTIFFReader_getSampleData(reader, out, sample) != 0;
+  if (fmt == kTiffSampleFormatUInt && bits == 8) return read_plane_as_float<std::uint8_t>(reader, sample, out, count);
+  if (fmt == kTiffSampleFormatUInt && bits == 16) return read_plane_as_float<std::uint16_t>(reader, sample, out, count);
+  if (fmt == kTiffSampleFormatUInt && bits == 32) return read_plane_as_float<std::uint32_t>(reader, sample, out, count);
+  if (fmt == kTiffSampleFormatInt && bits == 8) return read_plane_as_float<std::int8_t>(reader, sample, out, count);
+  if (fmt == kTiffSampleFormatInt && bits == 16) return read_plane_as_float<std::int16_t>(reader, sample, out, count);
+  if (fmt == kTiffSampleFormatInt && bits == 32) return read_plane_as_float<std::int32_t>(reader, sample, out, count);
+  throw std::runtime_error("Unsupported TIFF sample layout (bits=" + std::to_string(bits) + ", format=" +
+                           std::to_string(fmt) + "); expected 8/16/32-bit integer or 32-bit float samples.");
+}
 
-diffg::Image<float> read_tiff_float32(const std::filesystem::path& path) {
-  TinyTIFFReaderFile* reader = TinyTIFFReader_open(path.string().c_str());
+struct ReaderGuard {
+  TinyTIFFReaderFile* reader = nullptr;
+  ~ReaderGuard() {
+    if (reader != nullptr) TinyTIFFReader_close(reader);
+  }
+};
+
+// The shared reader. `require_single` reproduces read_tiff_float32's historical
+// contract (and error text) exactly; otherwise every sample becomes a plane.
+InputSlice read_planes_impl(const std::filesystem::path& path, const ColorInputPolicy& policy,
+                            bool require_single) {
+  ReaderGuard guard;
+  guard.reader = TinyTIFFReader_open(path.string().c_str());
+  TinyTIFFReaderFile* reader = guard.reader;
   if (reader == nullptr) {
     throw std::runtime_error("Failed to open TIFF: " + path.string());
   }
-
-  const auto close_reader = [&]() { TinyTIFFReader_close(reader); };
-
   if (TinyTIFFReader_wasError(reader)) {
     const std::string err = TinyTIFFReader_getLastError(reader);
-    close_reader();
     throw std::runtime_error("TinyTIFFReader error: " + err);
   }
 
@@ -55,12 +76,26 @@ diffg::Image<float> read_tiff_float32(const std::filesystem::path& path) {
   const std::uint16_t bits = TinyTIFFReader_getBitsPerSample(reader, 0);
   const std::uint16_t format = TinyTIFFReader_getSampleFormat(reader);
 
-  if (samples != 1) {
-    close_reader();
+  if (require_single && samples != 1) {
     throw std::runtime_error("Input TIFF must be single-sample (grayscale).");
   }
+  if (samples == 0) {
+    throw std::runtime_error("Input TIFF reports zero samples per pixel: " + path.string());
+  }
 
-  diffg::Image<float> image(diffg::Dimensions{static_cast<std::size_t>(width), static_cast<std::size_t>(height), 1});
+  // Alpha is inferred from the count: 4 samples read as RGBA, 2 as gray+alpha.
+  std::uint16_t keep = samples;
+  bool alpha_dropped = false;
+  if (policy.alpha == ColorInputPolicy::Alpha::Drop && (samples == 4 || samples == 2)) {
+    keep = static_cast<std::uint16_t>(samples - 1);
+    alpha_dropped = true;
+  }
+
+  InputSlice slice;
+  slice.planes = diffg::MultiImage<float>(
+      diffg::Dimensions{static_cast<std::size_t>(width), static_cast<std::size_t>(height), 1}, keep);
+  slice.file_samples = samples;
+  slice.alpha_dropped = alpha_dropped;
   const std::size_t count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
 
   // A missing SampleFormat tag defaults to unsigned integer per the TIFF spec;
@@ -68,36 +103,23 @@ diffg::Image<float> read_tiff_float32(const std::filesystem::path& path) {
   // integer samples are widened here.
   const std::uint16_t fmt = (format == 0) ? kTiffSampleFormatUInt : format;
 
-  bool ok = false;
-  if (fmt == kTiffSampleFormatFloat && bits == 32) {
-    ok = TinyTIFFReader_getSampleData(reader, image.data(), 0);
-  } else if (fmt == kTiffSampleFormatUInt && bits == 8) {
-    ok = read_plane_as_float<std::uint8_t>(reader, image.data(), count);
-  } else if (fmt == kTiffSampleFormatUInt && bits == 16) {
-    ok = read_plane_as_float<std::uint16_t>(reader, image.data(), count);
-  } else if (fmt == kTiffSampleFormatUInt && bits == 32) {
-    ok = read_plane_as_float<std::uint32_t>(reader, image.data(), count);
-  } else if (fmt == kTiffSampleFormatInt && bits == 8) {
-    ok = read_plane_as_float<std::int8_t>(reader, image.data(), count);
-  } else if (fmt == kTiffSampleFormatInt && bits == 16) {
-    ok = read_plane_as_float<std::int16_t>(reader, image.data(), count);
-  } else if (fmt == kTiffSampleFormatInt && bits == 32) {
-    ok = read_plane_as_float<std::int32_t>(reader, image.data(), count);
-  } else {
-    close_reader();
-    throw std::runtime_error("Unsupported TIFF sample layout (bits=" + std::to_string(bits) + ", format=" +
-                             std::to_string(format) +
-                             "); expected single-sample 8/16/32-bit integer or 32-bit float.");
+  for (std::uint16_t s = 0; s < keep; ++s) {
+    if (!read_sample_plane(reader, fmt, bits, s, slice.planes.channel_data(s), count)) {
+      const std::string err = TinyTIFFReader_getLastError(reader);
+      throw std::runtime_error("TinyTIFFReader_getSampleData failed (sample " + std::to_string(s) + "): " + err);
+    }
   }
+  return slice;
+}
 
-  if (!ok) {
-    const std::string err = TinyTIFFReader_getLastError(reader);
-    close_reader();
-    throw std::runtime_error("TinyTIFFReader_getSampleData failed: " + err);
-  }
+}  // namespace
 
-  close_reader();
-  return image;
+diffg::Image<float> read_tiff_float32(const std::filesystem::path& path) {
+  return read_planes_impl(path, ColorInputPolicy{}, /*require_single=*/true).scalar();
+}
+
+InputSlice read_tiff_planes(const std::filesystem::path& path, const ColorInputPolicy& policy) {
+  return read_planes_impl(path, policy, /*require_single=*/false);
 }
 
 void write_tiff_float32(const std::filesystem::path& path, int width, int height, const float* data) {

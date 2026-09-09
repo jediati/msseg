@@ -22,6 +22,16 @@ diffg::Image<float> apply_filter(const diffg::Image<float>& input, const FilterP
 diffg::Image<float> apply_filter_chain(const diffg::Image<float>& input,
                                        const std::vector<FilterParams>& filters);
 
+// The multi-channel entry: the chain is fed the input's planes. A leading
+// `color` stage (explicit, or synthesized from `default_color_method` when the
+// input has more than one plane) reduces them to the scalar every later stage
+// runs on -- see color_stage.hpp for the rules. With ONE plane and no color
+// stage this is exactly the scalar overload on that plane: same values, same
+// intermediates, so a grayscale workflow is unchanged.
+diffg::Image<float> apply_filter_chain(diffg::MultiImageView<const float> planes,
+                                       const std::vector<FilterParams>& filters,
+                                       const std::string& default_color_method = "luminance");
+
 // The measurement channels a StatsSpec asks for, as pixels.
 //
 // `base` and `filtered` are ALIASED, not copied -- the caller already owns those

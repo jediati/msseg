@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include "mscoupon/config.hpp"
@@ -22,6 +23,15 @@ Image2D apply_filter(const Image2D& image, const FilterConfig& filter);
 // `normalize` stage are appended to it, in chain order, so callers can report
 // or pin them without re-measuring.
 Image2D apply_filter_chain(const Image2D& image, const std::vector<FilterConfig>& filters,
+                           std::vector<TwoPoint>* normalizers_out = nullptr);
+
+// The chain fed a loaded slice's planes. A leading `color` stage -- explicit,
+// or synthesized from `default_color_method` when the slice has more than one
+// plane -- reduces them to the scalar the rest of the chain (normalize
+// included) runs on. A one-plane slice with no color stage is exactly the
+// Image2D overload on that plane.
+Image2D apply_filter_chain(const msseg::InputSlice& input, const std::vector<FilterConfig>& filters,
+                           const std::string& default_color_method = "luminance",
                            std::vector<TwoPoint>* normalizers_out = nullptr);
 
 }  // namespace mscoupon

@@ -23,6 +23,11 @@ Image2D read_tiff_float32(const std::filesystem::path& path) {
   return out;
 }
 
+msseg::InputSlice read_input_slice(const std::filesystem::path& path,
+                                   const msseg::ColorInputPolicy& policy) {
+  return msseg::read_tiff_planes(path, policy);
+}
+
 void write_tiff_mask_u8(const std::filesystem::path& path, const Mask2D& mask) {
   msseg::write_tiff_mask_u8(path, mask.width, mask.height, mask.pixels.data());
 }

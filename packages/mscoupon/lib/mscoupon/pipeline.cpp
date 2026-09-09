@@ -76,7 +76,7 @@ class BlockingQueue {
 
 struct LoadedSlice {
   SliceJob job;
-  Image2D original;
+  msseg::InputSlice original;   // every plane of the file; one for grayscale
   StageTiming timing;
   Clock::time_point total_start;
 };
@@ -203,7 +203,14 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
           loaded.total_start = Clock::now();
 
           const auto read_start = Clock::now();
-          loaded.original = read_tiff_float32(loaded.job.input_path);
+          loaded.original = read_input_slice(loaded.job.input_path, cfg.input.color.policy());
+          if (cfg.input.color.channels > 0 &&
+              loaded.original.channels() != static_cast<std::size_t>(cfg.input.color.channels)) {
+            throw std::runtime_error(loaded.job.input_path.string() + ": input.color.channels is " +
+                                     std::to_string(cfg.input.color.channels) + " but the file has " +
+                                     std::to_string(loaded.original.channels()) + " plane(s)" +
+                                     (loaded.original.alpha_dropped ? " after dropping alpha." : "."));
+          }
           loaded.timing.read_ms = elapsed_ms(read_start);
 
           compute_queue.push(std::move(loaded));
@@ -239,12 +246,14 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
           // A `normalize` stage in either chain puts that channel on a two-point
           // [0,1] scale; because the map is affine and order-preserving it cannot
           // change the MSC, only the units the thresholds are read in.
+          // A colour slice enters each chain through its leading `color` stage
+          // (explicit, or the input's default method), so an EMPTY chain on a
+          // colour slice still yields a scalar; on a grayscale slice it is the
+          // raw plane, as before.
           std::vector<TwoPoint> base_normalizers;
-          Image2D base = cfg.base_filters.empty()
-                             ? loaded.original
-                             : apply_filter_chain(loaded.original, cfg.base_filters,
-                                                  &base_normalizers);
-          Image2D filtered = apply_filter_chain(loaded.original, cfg.filters);
+          Image2D base = apply_filter_chain(loaded.original, cfg.base_filters,
+                                            cfg.input.color.default_method, &base_normalizers);
+          Image2D filtered = apply_filter_chain(loaded.original, cfg.filters, cfg.input.color.default_method);
 
           // The slice's measurement channels, built ONCE and shared by the MSC
           // stage and the connected-component stage below. The derived
@@ -379,12 +388,12 @@ std::vector<SliceOutput> run_pipeline(const AppConfig& cfg, const std::vector<Sl
           }
           if (cfg.debug_output.write_label_tiff) {
             processed.labels = labels;
-            processed.label_width = loaded.original.width;
-            processed.label_height = loaded.original.height;
+            processed.label_width = static_cast<int>(loaded.original.width());
+            processed.label_height = static_cast<int>(loaded.original.height());
           }
           // Per-slice CC nodes: the matcher's input + the CC/global label rasters.
-          processed.width = loaded.original.width;
-          processed.height = loaded.original.height;
+          processed.width = static_cast<int>(loaded.original.width());
+          processed.height = static_cast<int>(loaded.original.height());
           processed.cc_labels = std::move(cc_labels);
           processed.node_stats = std::move(node_stats);
           processed.node_channels = std::move(node_channels);

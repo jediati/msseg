@@ -4,6 +4,7 @@
 #include <cstddef>
 
 #include "diffg/image.hpp"
+#include "msseg/filter/color_stage.hpp"
 #include "msseg/filter/filter_stage.hpp"
 #include "mscoupon/normalize.hpp"
 
@@ -35,13 +36,15 @@ Image2D apply_filter(const Image2D& image, const FilterConfig& filter) {
   return apply_filter_chain(image, {filter});
 }
 
-Image2D apply_filter_chain(const Image2D& image, const std::vector<FilterConfig>& filters,
-                           std::vector<TwoPoint>* normalizers_out) {
-  // `normalize` is an mscoupon op: it needs this package's intensity measures,
-  // which the (instance-agnostic) core filter stage knows nothing about. Run of
-  // consecutive core ops are batched and delegated as before; a normalize stage
-  // is applied here, in place, between them.
-  Image2D current = image;
+namespace {
+
+// The scalar part of a chain, from stage `begin` on. `normalize` is an mscoupon
+// op: it needs this package's intensity measures, which the (instance-agnostic)
+// core filter stage knows nothing about. Runs of consecutive core ops are
+// batched and delegated as before; a normalize stage is applied here, in place,
+// between them.
+Image2D run_scalar_chain(Image2D current, const std::vector<FilterConfig>& filters, std::size_t begin,
+                         std::vector<TwoPoint>* normalizers_out) {
   std::vector<msseg::FilterParams> pending;
 
   const auto flush = [&]() {
@@ -50,7 +53,8 @@ Image2D apply_filter_chain(const Image2D& image, const std::vector<FilterConfig>
     pending.clear();
   };
 
-  for (const auto& f : filters) {
+  for (std::size_t i = begin; i < filters.size(); ++i) {
+    const auto& f = filters[i];
     if (f.operation == kNormalizeOperation) {
       flush();
       const NormalizeConfig cfg = parse_normalize_config(f.params);
@@ -66,6 +70,30 @@ Image2D apply_filter_chain(const Image2D& image, const std::vector<FilterConfig>
   }
   flush();
   return current;
+}
+
+}  // namespace
+
+Image2D apply_filter_chain(const Image2D& image, const std::vector<FilterConfig>& filters,
+                           std::vector<TwoPoint>* normalizers_out) {
+  return run_scalar_chain(image, filters, 0, normalizers_out);
+}
+
+Image2D apply_filter_chain(const msseg::InputSlice& input, const std::vector<FilterConfig>& filters,
+                           const std::string& default_color_method,
+                           std::vector<TwoPoint>* normalizers_out) {
+  std::vector<msseg::FilterParams> params;
+  params.reserve(filters.size());
+  for (const auto& f : filters) {
+    msseg::FilterParams p;
+    p.operation = f.operation;
+    p.params = f.params;
+    params.push_back(std::move(p));
+  }
+  const msseg::ColorChainPlan plan = msseg::plan_color_chain(params, input.channels(), default_color_method);
+  Image2D current = plan.color.has_value() ? from_diffg(msseg::apply_color_stage(input.view(), *plan.color))
+                                           : from_diffg(input.scalar());
+  return run_scalar_chain(std::move(current), filters, plan.first_scalar_stage, normalizers_out);
 }
 
 }  // namespace mscoupon

@@ -7,9 +7,27 @@
 
 #include <nlohmann/json.hpp>
 
+#include "msseg/workflow/input_slice.hpp"  // msseg::ColorInputPolicy
 #include "msseg/workflow/params.hpp"  // msseg::StatsSpec
 
 namespace mscoupon {
+
+// How multi-sample (colour) TIFFs are read. The conversion to the scalar each
+// chain runs on is a `color` stage at the head of `filters` / `base_filters`
+// (see msseg/filter/color_stage.hpp); this block only says what the file's
+// samples mean and what a chain without such a stage gets.
+struct ColorInputConfig {
+  std::string alpha = "drop";                 // drop | keep (4 samples = RGBA, 2 = gray+alpha)
+  std::string default_method = "luminance";   // a chain with no leading `color` stage uses this
+  // Planes the chains and the statistics schema expect. 0 = grayscale / not
+  // checked. Set (3 for RGB) whenever a `color` stage or colour statistics
+  // channel is named, so the config can be validated -- and the field schema
+  // computed -- without a raster in hand; the pipeline verifies each loaded
+  // slice matches.
+  int channels = 0;
+
+  msseg::ColorInputPolicy policy() const;
+};
 
 struct InputConfig {
   std::filesystem::path folder;
@@ -24,6 +42,7 @@ struct InputConfig {
   // over folder scanning + match/start/stride (a GUI-exported subsequence is a
   // concrete list). Paths may be absolute or relative to `folder`.
   std::vector<std::string> files;
+  ColorInputConfig color;
 };
 
 struct OutputConfig {

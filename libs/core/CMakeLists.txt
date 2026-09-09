@@ -11,6 +11,7 @@ if(NOT TARGET msseg_core)
 
 add_library(msseg_core STATIC
   msseg/filter/filter_stage.cpp
+  msseg/filter/color_stage.cpp
   msseg/compute/msc2d.cpp
   msseg/compute/msc3d.cpp
   msseg/graph/graph_ops.cpp

@@ -9,6 +9,9 @@
 namespace mscoupon {
 
 Image2D read_tiff_float32(const std::filesystem::path& path);
+// Every sample plane of the file (colour input); see msseg::read_tiff_planes.
+msseg::InputSlice read_input_slice(const std::filesystem::path& path,
+                                   const msseg::ColorInputPolicy& policy = {});
 void write_tiff_mask_u8(const std::filesystem::path& path, const Mask2D& mask);
 void write_tiff_float32(const std::filesystem::path& path, const Image2D& image);
 void write_tiff_int32(const std::filesystem::path& path, int width, int height, const std::vector<int>& labels);

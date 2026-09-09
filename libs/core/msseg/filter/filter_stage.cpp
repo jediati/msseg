@@ -17,6 +17,7 @@
 #include "diffg/morphology.hpp"
 #include "diffg/options.hpp"
 #include "diffg/structure.hpp"
+#include "msseg/filter/color_stage.hpp"
 #include "msseg/workflow/stat_channels.hpp"
 
 namespace msseg {
@@ -53,6 +54,11 @@ diffg::Image<float> mask_to_float(const MaskImage& mask, const diffg::Image<floa
 diffg::Image<float> apply_filter(const diffg::Image<float>& input, const FilterParams& filter) {
   if (filter.operation == "none" || filter.operation.empty()) {
     return input;
+  }
+  if (filter.operation == kColorOperation) {
+    throw std::runtime_error(
+        "'color' is only valid as the FIRST stage of a chain fed the input planes "
+        "(apply_filter_chain over a MultiImageView); it cannot run on a scalar raster.");
   }
 
   diffg::ExecutionOptions exec{};
@@ -171,6 +177,25 @@ diffg::Image<float> apply_filter_chain(const diffg::Image<float>& input,
   // into the next stage so we only keep one intermediate alive at a time.
   diffg::Image<float> current = apply_filter(input, filters.front());
   for (std::size_t i = 1; i < filters.size(); ++i) {
+    current = apply_filter(current, filters[i]);
+  }
+  return current;
+}
+
+diffg::Image<float> apply_filter_chain(diffg::MultiImageView<const float> planes,
+                                       const std::vector<FilterParams>& filters,
+                                       const std::string& default_color_method) {
+  const ColorChainPlan plan = plan_color_chain(filters, planes.channels(), default_color_method);
+  diffg::Image<float> current;
+  if (plan.color.has_value()) {
+    current = apply_color_stage(planes, *plan.color);
+  } else {
+    // One plane, no colour stage: copy it out and run the scalar chain on the
+    // copy, which is what the scalar overload does with its input.
+    current = diffg::Image<float>(planes.dims(), planes.spacing());
+    std::copy(planes.channel_data(0), planes.channel_data(0) + current.size(), current.data());
+  }
+  for (std::size_t i = plan.first_scalar_stage; i < filters.size(); ++i) {
     current = apply_filter(current, filters[i]);
   }
   return current;

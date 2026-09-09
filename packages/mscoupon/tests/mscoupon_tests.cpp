@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -26,7 +27,21 @@
 #include "mscoupon/region_measure.hpp"
 #include "mscoupon/sequence.hpp"
 #include "mscoupon/stats.hpp"
+#include "diffg/filter_bank.hpp"
+#include "diffg/structure.hpp"
 #include "msseg/compute/msc2d.hpp"
+#include "msseg/filter/color_stage.hpp"
+#include "msseg/filter/filter_stage.hpp"
+#include "msseg/io/tiff_io.hpp"
+#include "msseg/workflow/input_slice.hpp"
+
+#if __has_include("tinytiffwriter.h")
+#include "tinytiffwriter.h"
+#elif __has_include("TinyTIFF/tinytiffwriter.h")
+#include "TinyTIFF/tinytiffwriter.h"
+#else
+#error "TinyTIFF headers not found."
+#endif
 
 namespace {
 
@@ -1662,6 +1677,240 @@ void test_base_filters_config() {
 
 }  // namespace
 
+// --------------------------------------------------------------------------- //
+// Colour input: the color stage, the multi-channel chain, the planar reader.
+// --------------------------------------------------------------------------- //
+
+msseg::InputSlice make_rgb_slice(int w, int h) {
+  msseg::InputSlice s;
+  s.planes = diffg::MultiImage<float>(
+      diffg::Dimensions{static_cast<std::size_t>(w), static_cast<std::size_t>(h), 1}, 3);
+  s.file_samples = 3;
+  for (std::size_t c = 0; c < 3; ++c) {
+    for (std::size_t i = 0; i < static_cast<std::size_t>(w * h); ++i) {
+      s.planes.channel_data(c)[i] = static_cast<float>(10 + 40 * c + 10 * i);
+    }
+  }
+  return s;
+}
+
+msseg::FilterParams color_stage(nlohmann::json params) {
+  msseg::FilterParams p;
+  p.operation = msseg::kColorOperation;
+  p.params = std::move(params);
+  return p;
+}
+
+bool same_pixels(const diffg::Image<float>& a, const diffg::Image<float>& b) {
+  return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+}
+
+void test_color_stage_methods() {
+  const msseg::InputSlice rgb = make_rgb_slice(2, 2);
+  const auto v = rgb.view();
+  const float* r = rgb.planes.channel_data(0);
+  const float* g = rgb.planes.channel_data(1);
+  const float* b = rgb.planes.channel_data(2);
+  const std::size_t n = v.channel_stride();
+  const auto run = [&](nlohmann::json p) { return msseg::apply_color_stage(v, color_stage(std::move(p))); };
+  const auto close = [](float a, float b) { return std::abs(a - b) < 1e-3f; };
+
+  const auto pick = run({{"method", "pick"}, {"channel", 1}});
+  for (std::size_t i = 0; i < n; ++i) expect(pick.data()[i] == g[i], "pick copies the plane");
+  const auto lum = run({{"method", "luminance"}});
+  for (std::size_t i = 0; i < n; ++i) {
+    expect(close(lum.data()[i], 0.2126f * r[i] + 0.7152f * g[i] + 0.0722f * b[i]), "luminance is Rec.709");
+  }
+  const auto wsum = run({{"method", "weighted"}, {"weights", {1.0, 0.0, -1.0}}});
+  for (std::size_t i = 0; i < n; ++i) expect(close(wsum.data()[i], r[i] - b[i]), "weighted sums planes");
+  const auto mean = run({{"method", "mean"}});
+  for (std::size_t i = 0; i < n; ++i) expect(close(mean.data()[i], (r[i] + g[i] + b[i]) / 3.0f), "mean");
+  const auto mx = run({{"method", "max"}});
+  const auto mn = run({{"method", "min"}});
+  for (std::size_t i = 0; i < n; ++i) expect(mx.data()[i] == b[i] && mn.data()[i] == r[i], "max/min across planes");
+
+  const auto value = run({{"method", "hsv"}, {"component", "value"}});
+  const auto sat = run({{"method", "hsv"}, {"component", "saturation"}});
+  const auto hue = run({{"method", "hsv"}, {"component", "hue"}});
+  for (std::size_t i = 0; i < n; ++i) {
+    expect(value.data()[i] == b[i], "hsv value is the max plane");
+    expect(close(sat.data()[i], (b[i] - r[i]) / b[i]), "hsv saturation");
+    expect(close(hue.data()[i], 210.0f), "hsv hue of a blue-dominant pixel is 210");
+  }
+
+  const auto od_total = run({{"method", "optical_density"}, {"i0", 255.0}});
+  const auto od_stain = run({{"method", "optical_density"}, {"i0", 255.0}, {"stain", {2.0, 0.0, 0.0}}});
+  const auto od_chan = run({{"method", "optical_density"}, {"i0", 255.0}, {"channels", {2}}});
+  const auto od_max = run({{"method", "optical_density"}});
+  const auto od = [](float I, float i0) { return static_cast<float>(-std::log10(I / i0)); };
+  float bmax = 0.0f;
+  for (std::size_t i = 0; i < n; ++i) bmax = std::max(bmax, b[i]);
+  for (std::size_t i = 0; i < n; ++i) {
+    expect(close(od_total.data()[i], od(r[i], 255) + od(g[i], 255) + od(b[i], 255)), "total OD");
+    expect(close(od_stain.data()[i], od(r[i], 255)), "a stain vector is unit-normalized and projected");
+    expect(close(od_chan.data()[i], od(b[i], 255)), "channels selects planes");
+    expect(od_max.data()[i] <= od_max.data()[i] + 1e-6f && od_max.data()[i] >= 0.0f, "i0=max gives non-negative OD");
+  }
+  float bmax_od = 1.0f;
+  for (std::size_t i = 0; i < n; ++i) if (b[i] == bmax) bmax_od = od_max.data()[i];
+  (void)bmax_od;
+
+  // The cross-channel kinds on ONE plane are the scalar operators (diffg's
+  // contract), so a grayscale workflow that names them loses nothing.
+  const msseg::InputSlice gray = msseg::InputSlice::from_image(make_wells(24, 20));
+  const diffg::Image<float> scalar = gray.scalar();
+  const auto cg = msseg::apply_color_stage(gray.view(), color_stage({{"method", "chgradmag"}, {"sigma", 1.5}}));
+  const auto ref = diffg::apply_filter_bank(scalar.view(), {diffg::gradient_magnitude_filter(1.5)},
+                                            diffg::OutputShape::SeparateImages);
+  expect(same_pixels(cg, ref.images.front()), "chgradmag of one plane is the gradient magnitude");
+  const auto st = msseg::apply_color_stage(
+      gray.view(), color_stage({{"method", "structure"}, {"smoothing_sigma", 1.0}, {"integration_sigma", 2.0}}));
+  const auto st_ref = diffg::structure_eigenvalues(scalar.view(), 1.0, 2.0);
+  expect(same_pixels(st, st_ref.largest), "structure of one plane is the scalar structure tensor");
+  const auto dz = msseg::apply_color_stage(gray.view(), color_stage({{"method", "dizenzo"}, {"sigma", 1.5}}));
+  const auto dz_small = msseg::apply_color_stage(
+      gray.view(), color_stage({{"method", "dizenzo"}, {"sigma", 1.5}, {"eigen", "smallest"}}));
+  for (std::size_t i = 0; i < dz.size(); ++i) {
+    expect(dz.data()[i] >= dz_small.data()[i] - 1e-6f, "dizenzo eigenvalues are ordered");
+    expect(std::abs(dz.data()[i] - ref.images.front().data()[i] * ref.images.front().data()[i]) < 1e-3f,
+           "one-plane dizenzo largest is |grad|^2");
+  }
+}
+
+void test_color_chain_rules_and_identity() {
+  const diffg::Image<float> img = make_wells(24, 20);
+  const msseg::InputSlice gray = msseg::InputSlice::from_image(img);
+  std::vector<msseg::FilterParams> chain(2);
+  chain[0].operation = "blur";
+  chain[0].params = nlohmann::json{{"sigma", 1.5}};
+  chain[1].operation = "laplacian";
+  chain[1].params = nlohmann::json{{"sigma", 1.0}};
+
+  // One plane, no colour stage: the multi-channel entry IS the scalar chain.
+  expect(same_pixels(msseg::apply_filter_chain(img, chain), msseg::apply_filter_chain(gray.view(), chain)),
+         "one plane + no color stage is byte-identical to the scalar chain");
+  expect(same_pixels(msseg::apply_filter_chain(gray.view(), {}), img), "an empty chain on one plane is the plane");
+
+  // The mscoupon overload agrees with its Image2D twin, normalize included.
+  const mscoupon::Image2D raw = make_mixture_image(32, 32, 7);
+  diffg::Image<float> raw_img(diffg::Dimensions{32, 32, 1});
+  std::copy(raw.pixels.begin(), raw.pixels.end(), raw_img.data());
+  const msseg::InputSlice raw_slice = msseg::InputSlice::from_image(raw_img);
+  mscoupon::FilterConfig norm;
+  norm.operation = "normalize";
+  norm.params = nlohmann::json{{"method", "manual"}, {"low", kMu1}, {"high", kMu2}};
+  mscoupon::FilterConfig blur;
+  blur.operation = "blur";
+  blur.params = nlohmann::json{{"sigma", 1.0}};
+  std::vector<mscoupon::TwoPoint> tp_a, tp_b;
+  const auto a = mscoupon::apply_filter_chain(raw, {norm, blur}, &tp_a);
+  const auto b = mscoupon::apply_filter_chain(raw_slice, {norm, blur}, "luminance", &tp_b);
+  expect(a.pixels == b.pixels && tp_a.size() == 1 && tp_b.size() == 1, "mscoupon overloads agree on a gray slice");
+  expect(mscoupon::apply_filter_chain(raw_slice, {}).pixels == raw.pixels, "empty mscoupon chain copies plane 0");
+
+  // Rules.
+  const msseg::InputSlice rgb = make_rgb_slice(4, 3);
+  bool threw = false;
+  try {
+    msseg::apply_filter_chain(rgb.view(), {chain[0], color_stage({{"method", "mean"}})});
+  } catch (const std::exception&) { threw = true; }
+  expect(threw, "color after index 0 is rejected");
+  threw = false;
+  try {
+    msseg::apply_filter_chain(gray.view(), {color_stage({{"method", "luminance"}})});
+  } catch (const std::exception&) { threw = true; }
+  expect(threw, "luminance on one plane is rejected");
+  threw = false;
+  try {
+    msseg::apply_filter(img, color_stage({{"method", "mean"}}));
+  } catch (const std::exception&) { threw = true; }
+  expect(threw, "apply_filter refuses a color stage on a scalar");
+  expect(same_pixels(msseg::apply_filter_chain(gray.view(), {color_stage({{"method", "pick"}, {"channel", 0}})}), img),
+         "a one-plane-capable color stage is allowed on one plane");
+
+  // No colour stage on RGB synthesizes the default method.
+  const auto synthesized = msseg::apply_filter_chain(rgb.view(), {chain[0]}, "mean");
+  const auto explicit_mean = msseg::apply_filter_chain(rgb.view(), {color_stage({{"method", "mean"}}), chain[0]});
+  expect(same_pixels(synthesized, explicit_mean), "a chain without a color stage gets the default method");
+  const msseg::ColorChainPlan plan = msseg::plan_color_chain({}, 3, "luminance");
+  expect(plan.color.has_value() && plan.first_scalar_stage == 0, "an empty chain on RGB still converts");
+  const msseg::ColorChainPlan gray_plan = msseg::plan_color_chain({chain[0]}, 1, "luminance");
+  expect(!gray_plan.color.has_value(), "one plane plans no conversion");
+  std::string why;
+  expect(!msseg::color_stage_accepts(color_stage({{"method", "nope"}}), 3, &why) && !why.empty(),
+         "unknown methods are refused with a reason");
+}
+
+void write_rgb_tiff(const std::filesystem::path& path, int w, int h, int samples, bool planar) {
+  // Sample c of pixel i is c*50 + i, so a plane is recognisable after reading.
+  const std::size_t n = static_cast<std::size_t>(w * h);
+  std::vector<std::uint8_t> data(n * samples);
+  for (std::size_t i = 0; i < n; ++i) {
+    for (int c = 0; c < samples; ++c) {
+      const std::size_t at = planar ? c * n + i : i * samples + c;
+      data[at] = static_cast<std::uint8_t>(c * 50 + i);
+    }
+  }
+  const auto interp = samples == 4 ? TinyTIFFWriter_RGBA : TinyTIFFWriter_RGB;
+  TinyTIFFWriterFile* writer = TinyTIFFWriter_open(path.string().c_str(), 8, TinyTIFFWriter_UInt,
+                                                   static_cast<std::uint16_t>(samples), w, h, interp);
+  expect(writer != nullptr, "test RGB TIFF opens for writing");
+  const auto layout = planar ? TinyTIFF_Separate : TinyTIFF_Interleaved;
+  expect(TinyTIFFWriter_writeImageMultiSample(writer, data.data(), layout, layout) != 0, "test RGB TIFF writes");
+  TinyTIFFWriter_close(writer);
+}
+
+void test_tiff_planes_roundtrip() {
+  const auto dir = std::filesystem::temp_directory_path() / "mscoupon_color_tiff";
+  std::filesystem::create_directories(dir);
+  const int w = 5, h = 3;
+  const std::size_t n = static_cast<std::size_t>(w * h);
+  const auto check_planes = [&](const msseg::InputSlice& s, std::size_t planes, const char* what) {
+    expect(s.channels() == planes && s.width() == 5 && s.height() == 3, what);
+    for (std::size_t c = 0; c < planes; ++c) {
+      for (std::size_t i = 0; i < n; ++i) {
+        expect(s.planes.channel_data(c)[i] == static_cast<float>(c * 50 + i), "plane values survive the round trip");
+      }
+    }
+  };
+
+  const auto chunky = dir / "rgb_chunky.tiff";
+  write_rgb_tiff(chunky, w, h, 3, /*planar=*/false);
+  check_planes(msseg::read_tiff_planes(chunky), 3, "chunky RGB reads as three planes");
+  const auto planar = dir / "rgb_planar.tiff";
+  write_rgb_tiff(planar, w, h, 3, /*planar=*/true);
+  check_planes(msseg::read_tiff_planes(planar), 3, "planar RGB reads as three planes");
+
+  const auto rgba = dir / "rgba.tiff";
+  write_rgb_tiff(rgba, w, h, 4, /*planar=*/false);
+  const msseg::InputSlice dropped = msseg::read_tiff_planes(rgba);
+  check_planes(dropped, 3, "RGBA drops alpha by default");
+  expect(dropped.file_samples == 4 && dropped.alpha_dropped, "the drop is recorded");
+  msseg::ColorInputPolicy keep;
+  keep.alpha = msseg::ColorInputPolicy::Alpha::Keep;
+  check_planes(msseg::read_tiff_planes(rgba, keep), 4, "alpha=keep keeps four planes");
+
+  bool threw = false;
+  try {
+    msseg::read_tiff_float32(chunky);
+  } catch (const std::exception& e) {
+    threw = std::string(e.what()).find("single-sample") != std::string::npos;
+  }
+  expect(threw, "the scalar reader still refuses a colour file with its historical message");
+
+  // A grayscale file is one plane, and the two readers agree on it.
+  const auto gray = dir / "gray.tiff";
+  const diffg::Image<float> img = make_wells(w, h);
+  msseg::write_tiff_float32(gray, w, h, img.data());
+  const msseg::InputSlice one = msseg::read_tiff_planes(gray);
+  expect(one.channels() == 1 && !one.alpha_dropped && one.file_samples == 1, "gray reads as one plane");
+  expect(same_pixels(one.scalar(), msseg::read_tiff_float32(gray)), "plane 0 is what read_tiff_float32 returns");
+
+  // The mscoupon reader is the same thing.
+  const msseg::InputSlice via_pkg = mscoupon::read_input_slice(chunky);
+  check_planes(via_pkg, 3, "mscoupon::read_input_slice forwards to the planar reader");
+}
+
 int main() try {
   test_stats_bbox();
   test_sequence_stride();
@@ -1709,6 +1958,9 @@ int main() try {
   test_region_zero_policy();
   test_region_options_parse_from_top_level();
   test_base_filters_config();
+  test_color_stage_methods();
+  test_color_chain_rules_and_identity();
+  test_tiff_planes_roundtrip();
   std::cout << "mscoupon tests passed\n";
   return 0;
 } catch (const std::exception& e) {
