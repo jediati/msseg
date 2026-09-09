@@ -328,8 +328,13 @@ void test_cc_stage_trim_and_split() {
   std::vector<mscoupon::PixelFilter> rules = {{"base", "keep", "ge", 2.0}};
   std::vector<int> cc; std::vector<mscoupon::CcNodeStat> stats;
   msseg::ChannelStats cc_channels;
+  // The bank ALIASES these two rasters (see StatChannelBank), so they have to
+  // outlive it -- passing to_diffg2d() temporaries here left every channel
+  // pointer dangling.
+  const diffg::Image<float> base_img = to_diffg2d(base);
+  const diffg::Image<float> filt_img = to_diffg2d(filt);
   const msseg::StatChannelBank bank =
-      msseg::build_stat_channels(to_diffg2d(base), to_diffg2d(filt), base_spec());
+      msseg::build_stat_channels(base_img, filt_img, base_spec());
   const int n = mscoupon::label_selected_components(labels, 5, 1, base, filt, keep, rules, 6,
                                                     /*ascending=*/true, base_spec(), bank,
                                                     0.0f, 10.0f, cc, stats, cc_channels);

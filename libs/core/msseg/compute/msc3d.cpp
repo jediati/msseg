@@ -72,7 +72,11 @@ struct Msc3D::Impl {
   std::unique_ptr<MaxVLType> maxv;
   std::unique_ptr<TopoFuncType> topofunc;
   std::unique_ptr<GradType> grad;
-  std::unique_ptr<MscType> msc;
+  // Held as the DERIVED type: MorseSmaleComplexBasic declares no destructor, so
+  // its implicit one is non-virtual and deleting a CellsegMsc through a
+  // unique_ptr<MscType> was undefined (ASan: new-delete-type-mismatch). Every
+  // reader goes through mscOrThrow(), which still hands back an MscType*.
+  std::unique_ptr<CellsegMsc> msc;
 
   // Maps a compact snapshot NodeId back to the GInt node id (populated by
   // snapshot(), used by fill_manifold()).

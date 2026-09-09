@@ -50,6 +50,11 @@ via FetchContent (`cmake/Dependencies.cmake`), with a `MSSEG_DEPS_DIR` local
 override for offline/HPC. Local checkouts to read as references:
 `../MSCEER` (GInt + `msc_2d_lib`), `../../libraries/FeatureJ/diffg`.
 
+`cmake/PatchMsceer.cmake` applies idempotent in-place fixups to the pinned
+MSCEER checkout for bugs that only its own translation units can fix (today:
+`DigitizeSegmentInternal` falling off the end, which segfaults every 2D MSC
+build under GCC). Retire an entry by bumping the pin past it.
+
 ## Build / test
 
 **Dev build (everything at once).** Run inside a VS dev env

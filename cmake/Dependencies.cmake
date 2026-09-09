@@ -8,6 +8,7 @@
 # Pair with -DFETCHCONTENT_FULLY_DISCONNECTED=ON (see the `hpc` preset).
 # ---------------------------------------------------------------------------
 include(FetchContent)
+include(${CMAKE_CURRENT_LIST_DIR}/PatchMsceer.cmake)
 
 # Honor a local dependency mirror for offline builds by pointing CMake's native
 # per-dependency source override at MSSEG_DEPS_DIR/<name> when it exists.
@@ -81,6 +82,7 @@ FetchContent_GetProperties(msceer)
 if(NOT msceer_POPULATED)
   FetchContent_Populate(msceer)
 endif()
+msseg_patch_msceer("${msceer_SOURCE_DIR}")
 list(APPEND CMAKE_MODULE_PATH "${msceer_SOURCE_DIR}/cmake")
 add_subdirectory(${msceer_SOURCE_DIR} ${msceer_BINARY_DIR} EXCLUDE_FROM_ALL)
 
