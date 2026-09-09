@@ -57,16 +57,19 @@ from __future__ import annotations
 import heapq
 import math
 
-METRICS = ("mean", "bhattacharyya", "cosine", "proba", "barrier")
+METRICS = ("mean", "bhattacharyya", "cosine", "proba", "barrier", "learned")
 MODES = ("anchor", "chain")
 
 # Metrics that need the saddle value per arc (unavailable on pixel adjacency).
 EDGE_ONLY_METRICS = ("barrier",)
+# Metrics defined per ARC rather than per region (no anchor/chain choice):
+# the saddle barrier, and the edge model's learned P(different) per arc.
+ARC_METRICS = ("barrier", "learned")
 # Metrics that read the channel list (the others use the whole row / extra).
 CHANNEL_METRICS = ("mean", "bhattacharyya")
 # Metrics that need a per-region array the table does not carry: metric -> the
 # key build_ladder expects in `extra`.
-EXTRA_METRICS = {"proba": "proba"}
+EXTRA_METRICS = {"proba": "proba", "learned": "pdiff"}
 # Statistics columns that say WHERE a region is, not what it looks like --
 # never part of the cosine row (the labeler's classifier excludes the same).
 POSITIONAL_FIELDS = frozenset({"feature_id", "min_x", "max_x", "min_y", "max_y",
@@ -256,9 +259,15 @@ def barrier_weights(saddle, seed_ext_value, np):
 
 
 def edge_weights(table, ia, ib, seed_row, metric, mode, channels, np,
-                 saddle=None, seed_ext_value=None, extra=None):
+                 saddle=None, seed_ext_value=None, extra=None, pdiff=None):
     """One weight per arc, whatever the metric/mode: the bottleneck search
-    below only ever sees arcs."""
+    below only ever sees arcs. `pdiff` is the edge model's P(different)
+    per (kept) arc for the `learned` metric."""
+    if metric == "learned":
+        if pdiff is None:
+            raise ValueError("'learned' needs per-arc p(diff) (extra['pdiff']) "
+                             "- Classify with an edge model first")
+        return np.asarray(pdiff, dtype=np.float64)
     if metric in EDGE_ONLY_METRICS:
         if saddle is None:
             raise ValueError(f"{metric!r} needs saddle values (pixel adjacency has none)")
@@ -500,6 +509,18 @@ def build_ladder(table, arcs, seed_id, metric, mode, channels, np,
     saddle = arcs.get("saddle")
     if saddle is not None:
         saddle = np.asarray(saddle, dtype=np.float64)[keep]
+    pdiff = None
+    if metric == "learned":
+        # One P(different) per arc of `arcs`, in its order (the labeler
+        # computes it against the record's own arcs at Classify time).
+        pd = None if extra is None else extra.get("pdiff")
+        if pd is None:
+            raise ValueError("'learned' needs per-arc p(diff) (extra['pdiff']) "
+                             "- Classify with an edge model first")
+        pd = np.asarray(pd, dtype=np.float64)
+        if len(pd) != len(arcs["a"]):
+            raise ValueError("extra['pdiff'] must hold one value per arc")
+        pdiff = pd[keep]
     seed_ext = None
     if metric in EDGE_ONLY_METRICS:
         ext = table.column("ext_filtered")
@@ -507,14 +528,15 @@ def build_ladder(table, arcs, seed_id, metric, mode, channels, np,
             raise ValueError(f"{metric!r} needs the ext_filtered statistic")
         seed_ext = float(ext[seed_row])
     node_key = None
-    if metric not in EDGE_ONLY_METRICS and mode == "anchor":
+    if metric not in ARC_METRICS and mode == "anchor":
         # Anchor mode: the region's own dissimilarity is both the arc weight
         # ingredient and the tie-breaker (most seed-like first).
         node_key = node_dissimilarity(table, seed_row, metric, channels, np, extra)
         w = np.maximum(node_key[ia], node_key[ib])
     else:
         w = edge_weights(table, ia, ib, seed_row, metric, mode, channels, np,
-                         saddle=saddle, seed_ext_value=seed_ext, extra=extra)
+                         saddle=saddle, seed_ext_value=seed_ext, extra=extra,
+                         pdiff=pdiff)
     order, join = growth_order(len(ids), ia, ib, w, seed_row, np,
                                node_key=node_key, hop_gain=hop_gain)
     sorted_join = join[order]

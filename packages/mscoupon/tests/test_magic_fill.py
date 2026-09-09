@@ -562,3 +562,36 @@ def test_edge_matches_pairwise_for_cosine_and_proba():
     w = mf.edge_weights(t, ia, ib, 0, "proba", "anchor", [], np, extra={"proba": P})
     d = mf.node_dissimilarity(t, 0, "proba", [], np, extra={"proba": P})
     assert np.allclose(w, np.maximum(d[ia], d[ib]))
+
+
+def test_learned_metric_orders_by_per_arc_pdiff():
+    """The `learned` metric is the edge model's P(different) per arc: the flood
+    admits low-p(diff) neighbours first, in the arcs' own order, and refuses
+    without it."""
+    table = blocks_table()
+    labels = blocks_raster()
+    arcs = mf.arcs_from_labels(labels, np)
+    n = len(arcs["a"])
+    assert n >= 3
+    # Seed 0: make the arc to one neighbour cheap and every other arc dear.
+    pd = np.full(n, 0.9)
+    touching = [i for i in range(n) if 0 in (int(arcs["a"][i]), int(arcs["b"][i]))]
+    cheap = touching[0]
+    pd[cheap] = 0.05
+    other = int(arcs["b"][cheap]) if int(arcs["a"][cheap]) == 0 else int(arcs["a"][cheap])
+    lad = mf.build_ladder(table, arcs, 0, "learned", "anchor", ["base"], np,
+                                  extra={"pdiff": pd})
+    order_ids = [int(lad.ids[r]) for r in lad.order]
+    assert order_ids[0] == 0 and order_ids[1] == other, order_ids
+    assert np.isclose(lad.sorted_join[1], 0.05)
+    # Same result in chain mode (an arc metric has no anchor/chain distinction).
+    lad2 = mf.build_ladder(table, arcs, 0, "learned", "chain", ["base"], np,
+                                   extra={"pdiff": pd})
+    assert [int(lad2.ids[r]) for r in lad2.order] == order_ids
+    with pytest.raises(ValueError):
+        mf.build_ladder(table, arcs, 0, "learned", "anchor", ["base"], np)
+    with pytest.raises(ValueError):
+        mf.build_ladder(table, arcs, 0, "learned", "anchor", ["base"], np,
+                                extra={"pdiff": pd[:-1]})
+    assert "learned" in mf.METRICS and "learned" in mf.ARC_METRICS
+    assert mf.EXTRA_METRICS["learned"] == "pdiff"

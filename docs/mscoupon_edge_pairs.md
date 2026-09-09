@@ -111,6 +111,34 @@ the pair feature sets (`feats` dict), which pair model drives the voting
 (`edge_model = m` on `"emb8 + barrier (LR)"`), `lambda` and the number of
 voting rounds.
 
+## Re-measured with MSC arcs (2026-09-08)
+
+With the refreshed extension the graph is MSCEER's saddle-joined living-region
+pairs (99,981 edges; 10,726 labeled, 7.3 % crossing) and the barrier carries
+the saddle depth. Pooled over the same folds:
+
+| pair model | bal. acc | AUC | log-loss | diff recall | diff precision |
+|---|---|---|---|---|---|
+| baseline: argmax differs | 0.947 | 0.947 | 0.323 | 91.3 % | 79.6 % |
+| baseline: 1 - sum P_a P_b | 0.947 | 0.973 | 0.100 | 91.3 % | 79.6 % |
+| 16-d embedding + barrier, logistic | 0.910 | 0.963 | 0.126 | 85.0 % | 68.8 % |
+| **8-d embedding + barrier, logistic** | **0.975** | 0.980 | **0.058** | **95.9 %** | **88.8 %** |
+| raw 115-d abs-difference + barrier | 0.954 | 0.982 | 0.062 | 91.9 % | 86.6 % |
+| barrier (saddle depth) only | 0.968 | **0.989** | 0.105 | 94.7 % | 87.4 % |
+
+Voting with the 8-d pair model: region errors 115 -> 79 (acc 0.981 -> 0.987,
+bal. acc 0.979 -> 0.983). The saddle depth alone is a strong boundary
+signal (0.968), which the pixel-adjacency run could not see.
+
+## Landed as
+
+Paths 1-3 below are in the labeler (2026-09-08): `edge_model.py` (embedding,
+pair features, `fit_edge_model` / `predict_pdiff`, `vote`, `evaluate_edges`),
+the `dense (tuned) -> edges` / `custom FC -> edges` kinds with `freeze base`,
+the `N` toggle, the Edge model panel with **Evaluate edges**, the `learned`
+magic-fill metric and the `flipped by neighbours` / `boundary p(diff)`
+coloring modes -- see [mscoupon_labeler.md](mscoupon_labeler.md), "Edge models".
+
 ## Paths forward
 
 1. **Real arcs.** Rebuild the extension at a pin with `region_arcs()` (MSCEER

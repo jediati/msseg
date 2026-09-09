@@ -70,6 +70,7 @@ from .labeling import (LabelStore, MAX_CLASSES, TOOLS,
                        scalar_lut, line_pixels, polygon_mask, preview_lut)
 from . import magic_fill
 from . import model_search
+from . import edge_model
 
 # How faint the inherited region overlay is drawn under the class layer
 # (0..255); the class colors themselves stay fully opaque in the LUT and are
@@ -86,11 +87,46 @@ _SCALAR_ALPHA = 150
 # Regions coloring modes; the per-class ones are generated ("P(class 2)").
 _MODE_ID = "label id"
 _MODE_UNCERTAINTY = "uncertainty"
+# ...and, with an edge model, which regions neighbour voting flipped and
+# how boundary-like each region is (its max p(diff) over its arcs).
+_MODE_FLIPPED = "flipped by neighbours"
+_MODE_PDIFF = "boundary p(diff)"
 
 # Classifier kinds are shared by the dropdown, factory, and pickle loader so
 # adding one cannot leave a trained model that the UI does not recognize.
 _TUNED_KIND = "dense (tuned)"
-_MODEL_KINDS = ("random forest", "dense FC", "dense-top-16", "dense-top-32", _TUNED_KIND)
+# "custom FC": a dense net whose hidden sizes are typed on the Model tab.
+# The "-> edges" kinds stack an edge model (edge_model.py: a pair classifier
+# on the base net's hidden layer over the living-region graph, plus
+# neighbour voting) on top of a base net; Train fits the base, then the
+# edges. `_clf` is always the BASE pipeline, `_edge_model` the top.
+_CUSTOM_KIND = "custom FC"
+_TUNED_EDGE_KIND = "dense (tuned) -> edges"
+_CUSTOM_EDGE_KIND = "custom FC -> edges"
+_EDGE_KINDS = (_TUNED_EDGE_KIND, _CUSTOM_EDGE_KIND)
+_MODEL_KINDS = ("random forest", "dense FC", "dense-top-16", "dense-top-32", _TUNED_KIND,
+                _CUSTOM_KIND) + _EDGE_KINDS
+_DEFAULT_CUSTOM_HIDDEN = "16-8"
+_EDGE_LAM_RANGE = (0.0, 5.0)
+_EDGE_ROUNDS_RANGE = (0, 10)
+_EDGE_C_RANGE = (1e-3, 1e3)
+
+
+def _is_edge_kind(kind):
+    return kind in _EDGE_KINDS
+
+
+def _base_kind(kind):
+    """The base net a kind trains: the kind itself, or the one under `-> edges`."""
+    if kind == _TUNED_EDGE_KIND:
+        return _TUNED_KIND
+    if kind == _CUSTOM_EDGE_KIND:
+        return _CUSTOM_KIND
+    return kind
+
+
+def _edge_kind_of(base):
+    return _TUNED_EDGE_KIND if base == _TUNED_KIND else (_CUSTOM_EDGE_KIND if base == _CUSTOM_KIND else None)
 _DENSE_TOP_N = {"dense-top-16": 16, "dense-top-32": 32}
 # The architectures behind the kinds. Module constants rather than literals
 # inside _make_model so the Model tab's readout is formatted from the same
@@ -159,7 +195,7 @@ def _model_description(kind, spec=None, n_features=None):
 
 # The center notebook's tabs, in order. Named (not indexed) in the session
 # view state so a reordered tab list still restores.
-_CENTER_TABS = ("Processing", "View", "Model")
+_CENTER_TABS = ("Processing", "View", "Model", "Analysis")
 # Toolbar hint labels (workflow / model): link-blue, and how often the
 # workflow text is re-snapshotted from the panel.
 _HINT_COLOR = "#1a4fa0"
@@ -566,7 +602,17 @@ class MagicFillController:
                 app.status_var.set(f"{metric} needs predictions at this commit "
                                    "- Classify first")
                 return False
-            extra = {"proba": pr[2]}
+            if metric == "learned":
+                # The edge model's p(diff) per arc, computed against THIS
+                # record's arcs at Classify time.
+                aux = app._pred_aux(pr)
+                if aux is None or aux.get("pdiff") is None:
+                    app.status_var.set("learned needs an edge model at this commit - pick "
+                                       "a '-> edges' kind, Train (R), then Classify")
+                    return False
+                extra = {"pdiff": aux["pdiff"]}
+            else:
+                extra = {"proba": pr[2]}
         gain = self.hop_gain()
         if _bounded_float(app.magic_gain_var.get(), None, *_HOP_GAIN_RANGE) is None:
             app.status_var.set(f"hop\u00d7 is not a number - using {gain:g}")
@@ -775,6 +821,21 @@ class LabelerApp(MscouponApp):
         self.sweep_trials_var = tk.StringVar(master=root, value=str(_SWEEP_TRIALS))
         self.sweep_summary_var = tk.StringVar(master=root, value="")
         self._sweep = None                   # last model_search.SweepResult
+        # "-> edges" kinds: the pair model on top of the base net (rides the
+        # classifier pickle), the custom base's hidden sizes, whether Train
+        # keeps the base (to try edge variants on top), and the edge spec.
+        self._edge_model = None
+        self.custom_hidden_var = tk.StringVar(master=root, value=_DEFAULT_CUSTOM_HIDDEN)
+        self.freeze_base_var = tk.BooleanVar(master=root, value=False)
+        self.edge_layer_var = tk.StringVar(master=root, value="last")
+        self.edge_feat_vars = {f: tk.BooleanVar(master=root, value=True)
+                               for f in edge_model.FEATURE_KINDS}
+        self.edge_model_var = tk.StringVar(master=root, value="logistic")
+        self.edge_c_var = tk.StringVar(master=root, value="1")
+        self.edge_lam_var = tk.StringVar(master=root, value="1")
+        self.edge_rounds_var = tk.StringVar(master=root, value="3")
+        self.edge_readout_var = tk.StringVar(master=root, value="")
+        self.edge_progress_var = tk.StringVar(master=root, value="")
         # Provenance line above the classifier controls: which model is loaded,
         # how wide its feature vector is, and whether it still agrees with the
         # active profile (a mismatch blocks Classify, so say so up front).
@@ -855,9 +916,13 @@ class LabelerApp(MscouponApp):
         self.processing_tab = ttk.Frame(self.center)
         self.right = ttk.Frame(self.center)          # the View tab
         self.model_tab = ttk.Frame(self.center)
+        # Analysis: what the models DO with the annotations -- the region
+        # list behind a confusion cell, the size sweep -- and, later, plots.
+        self.analysis_tab = ttk.Frame(self.center)
         self._center_tabs = {"Processing": self.processing_tab,
                              "View": self.right,
-                             "Model": self.model_tab}
+                             "Model": self.model_tab,
+                             "Analysis": self.analysis_tab}
         for name in _CENTER_TABS:
             self.center.add(self._center_tabs[name], text=name)
 
@@ -879,6 +944,7 @@ class LabelerApp(MscouponApp):
         self.proc_col_b.grid(row=0, column=1, sticky="nsew")
 
         self._build_model_tab(self.model_tab)
+        self._build_analysis_tab(self.analysis_tab)
         self.center.select(self.right)
         # Bound AFTER the initial select: <<NotebookTabChanged>> fires
         # synchronously on select(), and the viewer does not exist yet.
@@ -994,6 +1060,9 @@ class LabelerApp(MscouponApp):
         expected = self._expected_feature_names()
         if expected is not None and set(expected) != set(names):
             bits.append("⚠ profile mismatch")
+        if self._edge_model is not None:
+            r = (self._edge_model.report or {}).get("edge", {}).get("learned")
+            bits.append("-> edges" + (f" {r['diff_recall']:.0%}/{r['diff_precision']:.0%}" if r else ""))
         return "model: " + " · ".join(bits)
 
     def _refresh_hints(self):
@@ -1026,7 +1095,7 @@ class LabelerApp(MscouponApp):
         ttk.Label(row, text="Kind:").pack(side="left")
         self.model_kind_combo = ttk.Combobox(row, textvariable=self.model_kind_var,
                                              state="readonly", values=_MODEL_KINDS,
-                                             width=14)
+                                             width=22)
         self.model_kind_combo.pack(side="left", padx=4)
         self.model_kind_combo.bind("<<ComboboxSelected>>", self._unfocus_entries)
         self.model_arch_var = tk.StringVar(master=self.root, value="")
@@ -1036,8 +1105,9 @@ class LabelerApp(MscouponApp):
         self.model_arch_label.pack(anchor="w", padx=6, pady=(0, 6))
         # A trace rather than the combobox event: Load classifier… sets the
         # kind programmatically and the readout must follow that too.
-        self.model_kind_var.trace_add("write", lambda *_: self._refresh_model_readout())
+        self.model_kind_var.trace_add("write", lambda *_: self._on_kind_change())
         self._refresh_model_readout()
+        self._build_edge_panel(parent)
 
         # -- Optimize network: the search over the dense FC space ------------ #
         srch = ttk.LabelFrame(parent, text="Optimize network (dense FC search)")
@@ -1097,10 +1167,186 @@ class LabelerApp(MscouponApp):
         ttk.Label(srch, textvariable=self.search_progress_var, justify="left",
                   wraplength=700, foreground="#333").pack(anchor="w", padx=6,
                                                           pady=(0, 6))
+
+    def _build_analysis_tab(self, parent):
+        """The Analysis tab: the regions behind a confusion cell (double-click
+        one to go there) above the size sweep. A home for plots later."""
+        self._build_errors_panel(parent)
         self._build_sweep_panel(parent)
 
+    def _build_errors_panel(self, parent):
+        box = ttk.LabelFrame(parent, text="Predictions vs annotations: the regions behind a confusion cell")
+        box.pack(side="top", fill="x", padx=6, pady=4)
+        self.errors_header_var = tk.StringVar(
+            master=self.root,
+            value="Click a cell of the confusion matrix (right panel) to list its regions "
+                  "here; double-click the cell to jump to this tab. Double-click a row "
+                  "to go to that region.")
+        ttk.Label(box, textvariable=self.errors_header_var, justify="left",
+                  wraplength=760, foreground="#333").pack(anchor="w", padx=6, pady=(4, 2))
+        holder = ttk.Frame(box); holder.pack(fill="x", padx=4, pady=(0, 4))
+        cols = ("slice", "region", "true", "pred", "area", "p_true", "p_pred", "flipped")
+        self.errors_tree = ttk.Treeview(holder, columns=cols, show="headings", height=8,
+                                        selectmode="browse")
+        for cid, text, width, anchor in (("slice", "slice", 220, "w"),
+                                         ("region", "region id", 70, "e"),
+                                         ("true", "annotated", 70, "e"),
+                                         ("pred", "predicted", 70, "e"),
+                                         ("area", "area (px)", 80, "e"),
+                                         ("p_true", "P(annotated)", 90, "e"),
+                                         ("p_pred", "P(predicted)", 90, "e"),
+                                         ("flipped", "by neighbours", 90, "center")):
+            self.errors_tree.heading(cid, text=text)
+            self.errors_tree.column(cid, width=width, anchor=anchor, stretch=(cid == "slice"))
+        sb = ttk.Scrollbar(holder, orient="vertical", command=self.errors_tree.yview)
+        self.errors_tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.errors_tree.pack(side="left", fill="x", expand=True)
+        self.errors_tree.bind("<Double-1>", self._on_error_row_open)
+        self.errors_tree.bind("<Return>", self._on_error_row_open)
+        attach_tooltip(self.errors_tree,
+                       "One row per region in the selected confusion cell, every slice, "
+                       "largest first. P(...) are the current model's class probabilities; "
+                       "'by neighbours' marks regions whose class the edge model's voting "
+                       "changed. Double-click (or Enter) to open the slice centred on it.")
+        self._error_rows = []
+
+    def _confusion_cell_rows(self, i, j):
+        """The regions counted in confusion cell (true i, predicted j) on
+        every slice classified at the current commit, largest first."""
+        import numpy as np
+        rows = []
+        for (si, li), entry in self._pred.items():
+            rec = self.engine.record(si, li)
+            if rec is None or rec.get("labels") is None or entry[0] != rec.get("commit"):
+                continue
+            truth = self._truth_from_cache(si, li, rec, np)
+            if truth is None:
+                continue
+            pred, proba = entry[1], entry[2]
+            n = min(len(truth), len(pred))
+            hits = np.nonzero((truth[:n] == i) & (pred[:n] == j))[0]
+            if not len(hits):
+                continue
+            aux = self._pred_aux(entry)
+            table = rec.get("stats")
+            area_of = {}
+            if table is not None:
+                fid, area = table.column("feature_id"), table.column("area")
+                if fid is not None and area is not None:
+                    area_of = {int(f): float(a) for f, a in zip(fid, area)}
+            key = self._slice_key(si, li) or f"{si}:{li}"
+            for r in hits.tolist():
+                rows.append({"si": si, "li": li, "slice": key, "region": int(r),
+                             "true": int(truth[r]), "pred": int(pred[r]),
+                             "area": area_of.get(int(r), 0.0),
+                             "p_true": float(proba[r, i]) if i < proba.shape[1] else 0.0,
+                             "p_pred": float(proba[r, j]) if j < proba.shape[1] else 0.0,
+                             "flipped": bool(aux is not None and aux.get("active")
+                                             and int(aux["raw"][r]) != int(pred[r]))})
+        rows.sort(key=lambda d: (d["si"], d["li"], -d["area"]))
+        return rows
+
+    def _fill_error_list(self, cell):
+        """Repaint the Analysis tab's region list for confusion cell `cell`
+        ((true, predicted) or None to clear)."""
+        tree = getattr(self, "errors_tree", None)
+        if tree is None:
+            return
+        try:
+            tree.delete(*tree.get_children())
+        except tk.TclError:
+            return
+        self._error_rows = []
+        if cell is None:
+            self.errors_header_var.set("No confusion cell selected - click one on the right "
+                                       "panel (double-click jumps here).")
+            return
+        i, j = cell
+        rows = self._confusion_cell_rows(i, j)
+        self._error_rows = rows
+        for k, d in enumerate(rows):
+            tree.insert("", "end", iid=str(k), values=(
+                d["slice"], d["region"], d["true"], d["pred"], f"{d['area']:.0f}",
+                f"{d['p_true']:.3f}", f"{d['p_pred']:.3f}", "yes" if d["flipped"] else ""))
+        what = "correct" if i == j else "misclassified"
+        n_slices = len({(d["si"], d["li"]) for d in rows})
+        self.errors_header_var.set(
+            f"annotated {i} -> predicted {j}: {len(rows)} {what} region(s) on {n_slices} "
+            f"slice(s), largest first. These are the CURRENT model's predictions against "
+            f"the labels it was trained on (a fit check); Evaluate edges / Optimize report "
+            f"held-out numbers. Double-click a row to go there.")
+
+    def _on_confusion_open(self, i, j):
+        """Double-click on a confusion cell: select it, list its regions on
+        the Analysis tab and show that tab."""
+        self._cm_cell = (i, j)
+        self._refresh_confusion()
+        self._refresh_render()
+        self._fill_error_list(self._cm_cell)
+        self._show_center_tab("Analysis")
+
+    def _on_error_row_open(self, _e=None):
+        tree = getattr(self, "errors_tree", None)
+        if tree is None:
+            return
+        sel = tree.selection()
+        if not sel:
+            return
+        try:
+            d = self._error_rows[int(sel[0])]
+        except (ValueError, IndexError):
+            return
+        self._goto_region(d["si"], d["li"], d["region"])
+
+    def _goto_region(self, si, li, region):
+        """Open the View tab on slice (si, li), centred on `region` (its
+        seeding extremum), with the gestures touching it outlined and the
+        selected confusion cell still highlighting it."""
+        try:
+            idx = self.flat_slices.index((si, li))
+        except ValueError:
+            self.status_var.set(f"slice {si}:{li} is not primed")
+            return False
+        self._goto_slice(idx)
+        self._show_center_tab("View")
+        rec = self.engine.record(si, li)
+        pt = None
+        if rec is not None and rec.get("labels") is not None:
+            import numpy as np
+            res = _extremum_points(rec["labels"], [int(region)], rec.get("stats"), np)
+            pt = res.get(int(region)) if isinstance(res, dict) else (res[0] if res else None)
+            if pt is not None and (pt[0] is None or pt[1] is None):
+                pt = None
+        self.status_var.set(f"region {int(region)} on {self._slice_key(si, li)}"
+                            + ("" if pt is not None else " (no position known)"))
+        if pt is None:
+            return True
+
+        def go():
+            # Runs AFTER the View tab's own idle repaint (which may refit the
+            # canvas when the first render happened hidden), so the centring
+            # is what the user ends up seeing.
+            v = self.viewer
+            if v is None:
+                return
+            self._fit_pending = False
+            v.center_on(pt[0], pt[1])
+            self._hover_key = (si, li, int(region))
+            self._hover_uid = None
+            self._redraw_hover_geometry()
+            sx = (pt[0] - v.view_x) / v.scale
+            sy = (pt[1] - v.view_y) / v.scale
+            v.canvas.create_oval(sx - 12, sy - 12, sx + 12, sy + 12, outline="#ffffff",
+                                 width=2, dash=(4, 3), tags=("draw", "ihover"))
+        try:
+            self.root.after_idle(go)
+        except tk.TclError:
+            go()
+        return True
+
     def _build_sweep_panel(self, parent):
-        """The lower half of the Model tab: the size sweep's controls and its
+        """The Analysis tab's lower half: the size sweep's controls and its
         report -- one row per rung, the best settings the search found for
         that architecture, and how far its held-out loss sits from the best
         rung's. A selected rung can be installed as the model."""
@@ -1219,12 +1465,199 @@ class LabelerApp(MscouponApp):
 
     def _model_description_now(self, kind):
         """`_model_description` for the app's state: the tuned kind renders the
-        last search's winner over the trained model's column count."""
-        if kind != _TUNED_KIND:
-            return _model_description(kind)
-        spec = self._search_spec
-        n = len(self._clf_names) if (spec is not None and self._clf_names) else None
-        return _model_description(kind, spec, n)
+        last search's winner over the trained model's column count; the custom
+        kind its typed sizes; an edge kind adds the stacked pair model."""
+        base = _base_kind(kind)
+        n = len(self._clf_names) if self._clf_names else None
+        if base == _TUNED_KIND:
+            spec = self._search_spec
+            text = _model_description(_TUNED_KIND, spec, n if spec is not None else None)
+        elif base == _CUSTOM_KIND:
+            text = (f"custom FC: FeatureSubset(all) -> StandardScaler -> MLP(hidden layers "
+                    f"{self._custom_hidden()}, max_iter {_MLP_MAX_ITER}), fit with balanced "
+                    f"sample weights; backend {model_search.backend_label(self._search_settings()[4])}.")
+        else:
+            text = _model_description(kind)
+        if _is_edge_kind(kind):
+            widths = None
+            try:
+                widths = edge_model.hidden_widths(self._clf) if self._clf is not None else None
+            except TypeError:
+                widths = None
+            spec = self._edge_spec_from_ui()
+            edge = self._edge_model
+            if edge is not None:
+                text += " -> " + edge.describe(widths)
+                if edge.spec != spec:
+                    text += " [edge settings changed - Train (R) to apply]"
+            else:
+                text += " -> " + spec.describe(widths) + " [not trained yet - Train (R)]"
+            if self.freeze_base_var.get():
+                text += " [base frozen: Train refits only the edges]"
+        return text
+
+    def _custom_hidden(self):
+        """The custom base's hidden sizes from the Model tab entry (first rung
+        of a ladder-style string), (16, 8) when unreadable."""
+        try:
+            return model_search.parse_sizes(self.custom_hidden_var.get())[0]
+        except (ValueError, IndexError):
+            return tuple(model_search.parse_sizes(_DEFAULT_CUSTOM_HIDDEN)[0])
+
+    def _edge_spec_from_ui(self):
+        layer = edge_model.LAYER_CHOICES.get(self.edge_layer_var.get(), -1)
+        feats = tuple(f for f in edge_model.FEATURE_KINDS if self.edge_feat_vars[f].get())
+        model = self.edge_model_var.get()
+        if model not in edge_model.EDGE_MODELS:
+            model = "logistic"
+        c = _bounded_float(self.edge_c_var.get(), 1.0, *_EDGE_C_RANGE)
+        lam = _bounded_float(self.edge_lam_var.get(), 1.0, *_EDGE_LAM_RANGE)
+        rounds = int(round(_bounded_float(self.edge_rounds_var.get(), 3.0, *_EDGE_ROUNDS_RANGE)))
+        return edge_model.EdgeSpec(layer=int(layer), features=feats or edge_model.FEATURE_KINDS,
+                                   model=model, C=float(c), lam=float(lam), rounds=rounds,
+                                   seed=int(self._search_settings()[2]))
+
+    def _apply_edge_spec(self, spec):
+        """Push an EdgeSpec onto the Model tab controls."""
+        for name, idx in edge_model.LAYER_CHOICES.items():
+            if idx == spec.layer:
+                self.edge_layer_var.set(name)
+        for f, var in self.edge_feat_vars.items():
+            var.set(f in spec.features)
+        self.edge_model_var.set(spec.model)
+        self.edge_c_var.set(f"{spec.C:g}")
+        self.edge_lam_var.set(f"{spec.lam:g}")
+        self.edge_rounds_var.set(str(int(spec.rounds)))
+
+    def _on_kind_change(self):
+        """The kind combobox / N: the readout follows, and switching between an
+        edge kind and its base re-votes the cached predictions in place."""
+        self._refresh_model_readout()
+        if getattr(self, "_edge_model", None) is not None and getattr(self, "_pred", None):
+            self._revote_all()
+        self._refresh_edge_readout()
+
+    def _build_edge_panel(self, parent):
+        """The edge model behind the `-> edges` kinds: the custom base, the pair
+        model's settings, the voting weight, an evaluation report."""
+        box = ttk.LabelFrame(parent, text="Edge model (-> edges kinds): a pair model over the region graph")
+        box.pack(side="top", fill="x", padx=6, pady=4)
+        row = ttk.Frame(box); row.pack(fill="x", padx=4, pady=(4, 2))
+        ttk.Label(row, text="base hidden:").pack(side="left")
+        en = ttk.Entry(row, textvariable=self.custom_hidden_var, width=8)
+        en.pack(side="left", padx=(2, 6))
+        en.bind("<Return>", lambda e: (self._unfocus_entries(), self._on_edge_settings_change()))
+        en.bind("<FocusOut>", lambda e: self._on_edge_settings_change())
+        attach_tooltip(en, "Hidden layer sizes of the custom FC base (e.g. 16-8), used by "
+                           "the custom FC / custom FC -> edges kinds.")
+        chk = ttk.Checkbutton(row, text="freeze base", variable=self.freeze_base_var,
+                              command=self._on_edge_settings_change)
+        chk.pack(side="left", padx=(0, 10))
+        attach_tooltip(chk, "Train (R) on a -> edges kind keeps the current base net and "
+                            "refits only the edge model: try edge variants on the same base.")
+        ttk.Label(row, text="layer:").pack(side="left")
+        cb = ttk.Combobox(row, textvariable=self.edge_layer_var, state="readonly",
+                          values=list(edge_model.LAYER_CHOICES), width=8)
+        cb.pack(side="left", padx=(2, 6))
+        cb.bind("<<ComboboxSelected>>", lambda e: (self._unfocus_entries(), self._on_edge_settings_change()))
+        attach_tooltip(cb, "Which hidden layer of the base net embeds a region: last (the "
+                           "narrow one, best in the experiment) or the previous, wider one.")
+        ttk.Label(row, text="model:").pack(side="left")
+        cb = ttk.Combobox(row, textvariable=self.edge_model_var, state="readonly",
+                          values=list(edge_model.EDGE_MODELS), width=8)
+        cb.pack(side="left", padx=(2, 6))
+        cb.bind("<<ComboboxSelected>>", lambda e: (self._unfocus_entries(), self._on_edge_settings_change()))
+        attach_tooltip(cb, "The pair classifier: a balanced logistic regression, or an MLP 32-16.")
+        row = ttk.Frame(box); row.pack(fill="x", padx=4, pady=2)
+        lbl = ttk.Label(row, text="pair inputs:")
+        lbl.pack(side="left")
+        attach_tooltip(lbl, "What the pair model sees for an edge between two regions, "
+                            "built from the base net's hidden-layer embedding of each "
+                            "(symmetric in the two regions).")
+        for f, label, tip in (
+                ("absdiff", "|d|", "Absolute difference of the two regions' embeddings, "
+                                   "element by element: how far apart they sit."),
+                ("prod", "product", "Element-wise product of the two embeddings: which "
+                                     "features both regions share."),
+                ("barrier", "barrier", "The saddle joining the two regions: its depth "
+                                       "above their extrema (saddle - max(ext_a, ext_b)) "
+                                       "and |ext_a - ext_b|. Zero on pixel adjacency.")):
+            chk = ttk.Checkbutton(row, text=label, variable=self.edge_feat_vars[f],
+                                  command=self._on_edge_settings_change)
+            chk.pack(side="left", padx=(2, 4))
+            attach_tooltip(chk, tip)
+        for label, var, width, tip in (
+                ("C:", self.edge_c_var, 5, "Logistic inverse regularisation (0.001..1000)."),
+                ("lambda:", self.edge_lam_var, 5,
+                 "Weight of the edge terms in neighbour voting (0 = the base net alone; "
+                 "applies at once to cached predictions)."),
+                ("rounds:", self.edge_rounds_var, 4,
+                 "Voting rounds (0 = no refinement); applies at once.")):
+            ttk.Label(row, text=label).pack(side="left", padx=(8, 0))
+            en = ttk.Entry(row, textvariable=var, width=width)
+            en.pack(side="left", padx=(2, 2))
+            en.bind("<Return>", lambda e: (self._unfocus_entries(), self._on_edge_settings_change()))
+            en.bind("<FocusOut>", lambda e: self._on_edge_settings_change())
+            attach_tooltip(en, tip)
+        row = ttk.Frame(box); row.pack(fill="x", padx=4, pady=2)
+        self.edge_eval_btn = ttk.Button(row, text="Evaluate edges", command=self._evaluate_edges)
+        self.edge_eval_btn.pack(side="left", padx=(0, 6))
+        attach_tooltip(self.edge_eval_btn,
+                       "Leave-slices-out report for the pair model against the base net's own "
+                       "answers (argmax differs / 1 - sum P_a P_b), and region errors before and "
+                       "after voting. Refits the base per fold on a worker thread; Cancel above.")
+        ttk.Label(row, textvariable=self.edge_progress_var, foreground="#333",
+                  wraplength=560, justify="left").pack(side="left", fill="x", expand=True)
+        holder = ttk.Frame(box); holder.pack(fill="x", padx=4, pady=(0, 4))
+        cols = ("model", "n", "bacc", "auc", "logloss", "recall", "prec")
+        self.edge_tree = ttk.Treeview(holder, columns=cols, show="headings", height=5)
+        for cid, text, width, anchor in (("model", "edge model / region", 190, "w"),
+                                         ("n", "n", 60, "e"), ("bacc", "bal. acc", 70, "e"),
+                                         ("auc", "AUC", 60, "e"), ("logloss", "log-loss", 70, "e"),
+                                         ("recall", "diff recall", 80, "e"),
+                                         ("prec", "diff prec", 80, "e")):
+            self.edge_tree.heading(cid, text=text)
+            self.edge_tree.column(cid, width=width, anchor=anchor, stretch=(cid == "model"))
+        self.edge_tree.pack(side="left", fill="x", expand=True)
+        attach_tooltip(self.edge_tree,
+                       "HELD-OUT numbers: every slice is scored by models that never saw "
+                       "it (leave-slices-out folds). Edge rows: how well each answer tells "
+                       "same-class from different-class edges (diff recall / precision = "
+                       "boundary edges found / boundary calls that were right). Region rows: "
+                       "accuracy on the labeled regions before and after neighbour voting. "
+                       "The confusion matrix on the right is NOT held-out (the model saw "
+                       "those labels), so its errors are fewer.")
+
+    def _on_edge_settings_change(self, *_a):
+        """Edge settings edited: lambda / rounds apply to the cached predictions
+        at once; the rest wait for Train (the readout says so)."""
+        self._refresh_model_readout()
+        if self._edge_model is not None and self._pred:
+            self._revote_all()
+        self._refresh_edge_readout()
+
+    def _fill_edge_report(self, report):
+        tree = getattr(self, "edge_tree", None)
+        if tree is None:
+            return
+        try:
+            tree.delete(*tree.get_children())
+        except tk.TclError:
+            return
+        for name in edge_model.EVAL_ROWS:
+            s = (report or {}).get("edge", {}).get(name)
+            if s:
+                tree.insert("", "end", values=(name, s["n"], f"{s['bacc']:.3f}", f"{s['auc']:.3f}",
+                                               f"{s['logloss']:.3f}", f"{s['diff_recall']:.1%}",
+                                               f"{s['diff_precision']:.1%}"))
+        reg = (report or {}).get("region", {})
+        for key, label in (("before", "region net alone (held-out)"),
+                           ("after", "+ neighbour voting (held-out)")):
+            r = reg.get(key)
+            if r:
+                tree.insert("", "end", values=(label, r["n"], f"{r['bacc']:.3f}", "",
+                                               f"acc {r['acc']:.3f}",
+                                               f"{r['errors']} held-out errors", ""))
 
     def _center_tab_name(self):
         """Name of the selected center tab ("View" when unsure)."""
@@ -1380,7 +1813,14 @@ class LabelerApp(MscouponApp):
         if any(len(v) > 2 for v in self._pred.values()):
             modes += [f"P(class {k})" for k in range(1, self.store.n_classes)]
             modes.append(_MODE_UNCERTAINTY)
+        if any((self._pred_aux(v) or {}).get("pdiff") is not None for v in self._pred.values()):
+            modes += [_MODE_FLIPPED, _MODE_PDIFF]
         return modes
+
+    @staticmethod
+    def _pred_aux(entry):
+        """The edge-model side of a prediction cache entry (None without one)."""
+        return entry[3] if entry is not None and len(entry) > 3 else None
 
     def _refresh_region_modes(self):
         """Repopulate the dropdown, falling back to `label id` when the mode
@@ -1409,6 +1849,18 @@ class LabelerApp(MscouponApp):
         if mode == _MODE_UNCERTAINTY:
             top = np.sort(proba, axis=1)
             return 1.0 - (top[:, -1] - top[:, -2]), mask
+        if mode in (_MODE_FLIPPED, _MODE_PDIFF):
+            aux = self._pred_aux(entry)
+            if aux is None or aux.get("pdiff") is None:
+                return None
+            if mode == _MODE_FLIPPED:
+                return (np.asarray(aux["raw"]) != np.asarray(entry[1])).astype(np.float32), mask
+            out = np.zeros(len(entry[1]), np.float32)
+            k = aux["keep"]
+            pd = np.asarray(aux["pdiff"], np.float32)[k]
+            np.maximum.at(out, np.asarray(aux["la"])[k], pd)
+            np.maximum.at(out, np.asarray(aux["lb"])[k], pd)
+            return out, mask
         try:
             k = int(mode[len("P(class "):-1])
         except ValueError:
@@ -1449,6 +1901,7 @@ class LabelerApp(MscouponApp):
             # The class panels list the ON-SLICE interactions only; swap them
             # with the slice.
             self._rebuild_class_panels()
+            self._refresh_edge_readout()
 
     def _build_live_panel(self, parent):
         # persistence: region identity depends on it, so it stays adjustable;
@@ -1823,6 +2276,26 @@ class LabelerApp(MscouponApp):
         # 'O': optimize the dense network (search + install + classify).
         self.root.bind("o", self._on_optimize_key)
         self.root.bind("O", self._on_optimize_key)
+        # 'N': neighbours on/off -- flip between an edge kind and its base.
+        self.root.bind("n", self._on_edge_key)
+        self.root.bind("N", self._on_edge_key)
+
+    def _on_edge_key(self, _e=None):
+        """N: toggle neighbour voting by flipping between the current edge kind
+        and its base (the cached predictions re-vote in place)."""
+        if self._typing():
+            return
+        if self._edge_model is None:
+            self.status_var.set("No edge model - pick a '-> edges' kind and Train (R)")
+            return
+        kind = self.model_kind_var.get()
+        if _is_edge_kind(kind):
+            self.model_kind_var.set(_base_kind(kind))
+            self.status_var.set("Neighbour voting off - base net predictions (N to turn on)")
+        else:
+            target = _edge_kind_of(kind) or _edge_kind_of(_base_kind(self._clf_kind)) or _CUSTOM_EDGE_KIND
+            self.model_kind_var.set(target)
+            self.status_var.set("Neighbour voting on (N to turn off)")
 
     def _on_escape(self, _e=None):
         """Escape abandons a gesture in flight (any tool, preview and all);
@@ -1951,7 +2424,9 @@ class LabelerApp(MscouponApp):
                            "(z-scored, positions excluded; ignores 'on')\n"
                            "proba: total variation between the classifier's class "
                            "probabilities (Classify first; ignores 'on')\n"
-                           "barrier: saddle height above the seed (MSC arcs only)")
+                           "barrier: saddle height above the seed (MSC arcs only)\n"
+                           "learned: the edge model's p(different) per arc "
+                           "(a '-> edges' kind, trained and classified)")
         cb = ttk.Combobox(row, textvariable=self.magic_mode_var,
                           values=list(magic_fill.MODES), state="readonly",
                           width=7)
@@ -2027,6 +2502,14 @@ class LabelerApp(MscouponApp):
                                        state="disabled", command=self._classify)
         self.classify_btn.pack(side="left", fill="x", expand=True, padx=2)
 
+        # The edge model (the "-> edges" kinds): what it scored, whether
+        # voting is on, how many regions it flipped on this slice.
+        row = ttk.Frame(ml); row.pack(side="top", fill="x", padx=4)
+        self.edge_readout = ttk.Label(row, textvariable=self.edge_readout_var,
+                                      foreground="#555", anchor="w", justify="left",
+                                      wraplength=290)
+        self.edge_readout.pack(side="left", fill="x", expand=True)
+
         row = ttk.Frame(ml); row.pack(side="top", fill="x", padx=4)
         self.model_strip = ttk.Label(row, textvariable=self.model_strip_var,
                                      foreground="#555", anchor="w")
@@ -2034,6 +2517,14 @@ class LabelerApp(MscouponApp):
 
         self.confusion_holder = ttk.LabelFrame(ml, text="true \\ predicted")
         self.confusion_holder.pack(side="top", fill="x", padx=4, pady=(2, 4))
+        attach_tooltip(self.confusion_holder,
+                       "The CURRENT model's predictions against your annotations "
+                       "(rows = annotated class, columns = predicted). The model was "
+                       "trained on these same labels, so this is a fit check, not a "
+                       "held-out score -- Evaluate edges and Optimize report held-out "
+                       "numbers, which are higher. Click a cell to highlight its regions "
+                       "on this slice and list them on the Analysis tab; double-click to "
+                       "open that list.")
         self._cm_cells = {}              # scope -> {(true, pred): Label}
         self._cm_counts = {}             # scope -> {(true, pred): int}
         self._rebuild_confusion_grid()
@@ -2192,6 +2683,8 @@ class LabelerApp(MscouponApp):
                     cell.grid(row=i, column=j, sticky="nsew", padx=1, pady=1)
                     cell.bind("<Button-1>",
                               lambda e, i=i, j=j: self._on_confusion_click(i, j))
+                    cell.bind("<Double-Button-1>",
+                              lambda e, i=i, j=j: self._on_confusion_open(i, j))
                     cells[(i, j)] = cell
             for c in range(n):
                 frame.columnconfigure(c, weight=1)
@@ -2262,13 +2755,15 @@ class LabelerApp(MscouponApp):
         self._cm_cell = None if self._cm_cell == (i, j) else (i, j)
         self._refresh_confusion()
         self._refresh_render()
+        self._fill_error_list(self._cm_cell)
         if self._cm_cell is None:
             self.status_var.set("Confusion highlight cleared.")
             return
         current = self._cm_counts.get("current", {}).get((i, j), 0)
         total = self._cm_counts.get("all", {}).get((i, j), 0)
-        self.status_var.set(f"true {i} -> predicted {j}: "
-                            f"{current} on this slice / {total} total")
+        self.status_var.set(f"annotated {i} -> predicted {j}: "
+                            f"{current} on this slice / {total} total - listed on the "
+                            "Analysis tab (double-click the cell to open it)")
 
     def _confusion_hits(self):
         """Region ids on the current slice matching the selected cell."""
@@ -2777,26 +3272,45 @@ class LabelerApp(MscouponApp):
             return
         X, y, _groups, names = got
         kind = self.model_kind_var.get()
-        spec = self._search_spec if kind == _TUNED_KIND else None
+        base = _base_kind(kind)
+        spec = self._search_spec if base == _TUNED_KIND else None
         build_spec = spec
-        if kind == _TUNED_KIND and spec is None:     # baseline on the picked backend
+        if base == _TUNED_KIND and spec is None:     # baseline on the picked backend
             build_spec = model_search.ModelSpec(max_iter=_MLP_MAX_ITER,
                                                 backend=self._search_settings()[4])
-        clf = self._make_model(kind, len(y), len(names), names=names, spec=build_spec)
-        self._compute_badge("Training")
+        if base == _CUSTOM_KIND:
+            spec = build_spec = model_search.ModelSpec(
+                hidden=tuple(self._custom_hidden()), max_iter=_MLP_MAX_ITER,
+                backend=self._search_settings()[4])
+        # A frozen base: an edge kind keeps the current base net (same
+        # features, has an embedding) and refits only the edges on top.
+        frozen = (_is_edge_kind(kind) and bool(self.freeze_base_var.get())
+                  and self._clf is not None and list(self._clf_names or []) == list(names)
+                  and self._has_embedding(self._clf))
         t0 = time.perf_counter()
-        try:
-            if kind == _TUNED_KIND:
-                model_search.fit_estimator(clf, X, y)
-            else:
-                clf.fit(X, y)
-        finally:
-            self._clear_compute_badge()
+        if frozen:
+            clf = self._clf
+            spec = self._clf_spec
+        else:
+            clf = self._make_model(base, len(y), len(names), names=names, spec=build_spec)
+            self._compute_badge("Training")
+            try:
+                if base in (_TUNED_KIND, _CUSTOM_KIND):
+                    model_search.fit_estimator(clf, X, y)
+                else:
+                    clf.fit(X, y)
+            finally:
+                self._clear_compute_badge()
         dt_ms = 1e3 * (time.perf_counter() - t0)
-        self._install_model(clf, names, kind, spec, preserve_view)
-        if kind == _TUNED_KIND:
+        edge, edge_note = (None, "")
+        if _is_edge_kind(kind):
+            edge, edge_note = self._fit_edge_model_now(clf, names)
+        self._install_model(clf, names, kind, spec, preserve_view, edge=edge)
+        if base in (_TUNED_KIND, _CUSTOM_KIND):
             acc = f", train acc {clf.score(X, y):.1%}"
             hint = "" if spec is None else " - " + spec.brief(len(names))
+            if frozen:
+                hint += " (base frozen)"
         elif kind in _DENSE_TOP_N:
             selector = clf.named_steps["select"]
             selected = [(names[i], float(v)) for i, v in
@@ -2820,7 +3334,7 @@ class LabelerApp(MscouponApp):
             hint = ""
         self._refresh_model_strip()
         self.status_var.set(f"Trained {kind} on {len(y)} labeled regions in "
-                            f"{dt_ms:.0f} ms{acc}{hint}")
+                            f"{dt_ms:.0f} ms{acc}{hint}{edge_note}")
 
     def _training_set(self):
         """``(X, y, groups, names)`` over every labeled region of every primed
@@ -2868,21 +3382,169 @@ class LabelerApp(MscouponApp):
             return None
         return X, y, g, names
 
-    def _install_model(self, clf, names, kind, spec=None, preserve_view=False):
-        """Make `clf` the current model (Train and Optimize share this tail)."""
+    def _install_model(self, clf, names, kind, spec=None, preserve_view=False, edge=None):
+        """Make `clf` the current model (Train and Optimize share this tail).
+        `edge` is the edge model fit on top of it (None drops any old one: an
+        edge model belongs to exactly one base net)."""
         self._clf = clf
         self._clf_names = names
         self._clf_kind = kind
         self._clf_spec = spec
+        self._edge_model = edge
         self._pred.clear()               # predictions belong to the old model
         if not preserve_view:
             self._cm_cell = None
             self._refresh_region_modes()
         self._refresh_confusion()
         self.classify_btn.config(state="normal")
+        self._refresh_model_readout()
+        self._refresh_edge_readout()
+
+    @staticmethod
+    def _has_embedding(clf):
+        try:
+            edge_model.hidden_widths(clf)
+            return True
+        except TypeError:
+            return False
+
+    def _record_arcs(self, rec, np):
+        """The record's living-region arcs (MSC saddles), or pixel adjacency
+        derived once and cached on the record, as the magic fill does."""
+        arcs = rec.get("arcs")
+        if arcs is None and rec.get("labels") is not None:
+            arcs = magic_fill.arcs_from_labels(rec["labels"], np)
+            rec["arcs"] = arcs
+        return arcs
+
+    def _edge_training_data(self, names):
+        """Every region of every primed slice (class 0 = unlabeled) with its
+        slice index and extremum value, plus the edges of the region graph as
+        global row pairs -- what the edge model is fit and evaluated on. Tk
+        thread only (records, the store); returns copies the worker may keep.
+        None (with the reason in the status bar) when a slice lacks stats."""
+        import numpy as np
+        slices = self._all_stat_slices("Gathering edges")
+        if slices is None:
+            return None
+        names = list(names)
+        ext_col = names.index("ext_filtered") if "ext_filtered" in names else None
+        X, cls, grp, ext, per = [], [], [], [], []
+        for k, (si, li, key, rec, table) in enumerate(slices):
+            mat = self._feature_matrix(table, names, np)
+            fids = table.column("feature_id")
+            if mat is None or fids is None:
+                self.status_var.set(f"Edges stopped: incomplete statistics on slice {si}:{li}.")
+                return None
+            rc = resolve_slice(self.store.for_slice(key), rec["labels"], np)
+            fid = fids.astype(int)
+            ok = (fid >= 0) & (fid < len(rc))
+            c = np.zeros(len(fid), int)
+            c[ok] = rc[fid[ok]]
+            X.append(mat); cls.append(c); grp.append(np.full(len(c), k, int))
+            if ext_col is not None:
+                ext.append(mat[:, ext_col])
+            per.append((fid, self._record_arcs(rec, np), c, k))
+        edges = edge_model.gather_edges(per)
+        return (np.concatenate(X), np.concatenate(cls), np.concatenate(grp),
+                np.concatenate(ext) if ext else None, edges, names)
+
+    def _fit_edge_model_now(self, clf, names):
+        """Fit the pair model on top of `clf`: (EdgeModel | None, status note)."""
+        if not self._has_embedding(clf):
+            return None, " - edges skipped: the base has no hidden layer to embed with"
+        data = self._edge_training_data(names)
+        if data is None:
+            return None, " - edges skipped: no data"
+        X_all, cls, _grp, ext, edges, _names = data
+        spec = self._edge_spec_from_ui()
+        self._compute_badge("Fitting edges")
+        try:
+            edge = edge_model.fit_edge_model(clf, X_all, cls, edges, ext, spec, names)
+        except ValueError as exc:
+            log(f"edge model not fit: {exc}")
+            return None, f" - edges not fit: {exc}"
+        finally:
+            self._clear_compute_badge()
+        log(f"edge model: {edge.describe()}; {int(edges['both'].sum())} labeled pairs of "
+            f"{len(edges['a'])} edges, {edge.fit_s * 1e3:.0f} ms")
+        return edge, (f" -> edges: {edge.n_edges:,} pairs, "
+                      f"{edge.n_diff / max(1, edge.n_edges):.0%} boundaries, "
+                      f"{'MSC saddles' if edge.used_saddle else 'pixel adjacency'}, "
+                      f"{edge.fit_s * 1e3:.0f} ms")
+
+    def _vote_entry(self, region_proba, aux, lam, rounds, np):
+        """(final classes, flips) for one cached slice: neighbour voting in
+        LABEL space over the classes that carry any probability mass; ids
+        that are not living regions stay class 0."""
+        raw = np.asarray(aux["raw"], np.uint8)
+        cols = np.nonzero(region_proba.sum(0) > 0)[0]
+        k = aux["keep"]
+        if len(cols) < 2 or not k.any():
+            return raw.copy(), 0
+        P = region_proba[:, cols]
+        voted = edge_model.vote(P, cols, np.asarray(aux["la"])[k], np.asarray(aux["lb"])[k],
+                                np.asarray(aux["pdiff"])[k], lam, rounds)
+        living = region_proba.sum(1) > 0
+        final = raw.copy()
+        final[living] = np.asarray(voted, np.uint8)[living]
+        return final, int((final != raw).sum())
+
+    def _revote_all(self):
+        """Re-apply (or lift) neighbour voting on every cached slice from the
+        cached per-arc p(diff): a kind flip or a lambda / rounds edit costs
+        milliseconds, no forward pass. Entries classified before the edge
+        model existed have no aux and force a Classify."""
+        import numpy as np
+        active = self._edge_model is not None and _is_edge_kind(self.model_kind_var.get())
+        spec = self._edge_spec_from_ui()
+        missing = False
+        for key, entry in list(self._pred.items()):
+            aux = self._pred_aux(entry)
+            if aux is None:
+                missing = missing or self._edge_model is not None
+                continue
+            if active:
+                final, flips = self._vote_entry(entry[2], aux, spec.lam, spec.rounds, np)
+            else:
+                final, flips = np.asarray(aux["raw"], np.uint8).copy(), 0
+            aux["lam"], aux["rounds"], aux["flips"], aux["active"] = spec.lam, spec.rounds, flips, active
+            self._pred[key] = (entry[0], final, entry[2], aux)
+        if missing and self._clf is not None:
+            self._pred.clear()
+            self._classify()
+            return
+        self._refresh_region_modes()
+        self._refresh_confusion()
+        self._refresh_render()
+        self._refresh_edge_readout()
+
+    def _refresh_edge_readout(self):
+        var = getattr(self, "edge_readout_var", None)
+        if var is None:
+            return
+        edge = self._edge_model
+        kind = self.model_kind_var.get()
+        if edge is None:
+            var.set("edges: not trained - Train (R) on this kind" if _is_edge_kind(kind)
+                    else "edges: none - pick a '-> edges' kind and Train (R)")
+            return
+        text = edge.brief()
+        active = _is_edge_kind(kind)
+        text += " · voting " + ("on" if active else "off") + " (N)"
+        cur = self._current()
+        entry = self._pred.get(cur) if cur is not None else None
+        aux = self._pred_aux(entry)
+        if active and aux is not None and aux.get("flips") is not None:
+            text += f" · {aux['flips']} flipped on this slice"
+        var.set(text)
 
     @staticmethod
     def _make_model(kind, n_samples, n_features=None, names=None, spec=None):
+        if kind == _CUSTOM_KIND:
+            if not names or spec is None:
+                raise ValueError("custom FC needs the feature names and a spec")
+            return model_search.build_estimator(spec, list(names))
         if kind == _TUNED_KIND:
             # The search winner (or the baseline before any search), built by
             # model_search so the estimator and its description share a spec.
@@ -3117,6 +3779,14 @@ class LabelerApp(MscouponApp):
                 elif ev[0] == "sweep_done":
                     self._finish_sweep(ev[1])
                     finished = True
+                elif ev[0] == "edge_progress":
+                    _, f, n = ev
+                    self.edge_progress_var.set(
+                        f"fold {f}/{n} · {_hms(time.perf_counter() - st['t0'])} elapsed")
+                    self._compute_badge(f"Evaluating edges {f}/{n}")
+                elif ev[0] == "edge_done":
+                    self._finish_edge_eval(ev[1])
+                    finished = True
                 else:
                     self.search_progress_var.set(f"failed: {ev[1]}")
                     self.status_var.set(f"Optimize failed: {ev[1]}")
@@ -3348,6 +4018,95 @@ class LabelerApp(MscouponApp):
         log(f"size sweep: report saved to {path}")
         return path
 
+    # -- Evaluate edges -------------------------------------------------- #
+    def _evaluate_edges(self, sync=False):
+        """Leave-slices-out report for the edge model on top of the CURRENT
+        base kind: per fold the base is refit on the training slices, the
+        pair model on their labeled edges, both scored on the held-out slices,
+        then voting before/after. Same worker / pump / Cancel as Optimize."""
+        if self._search is not None:
+            self.status_var.set("A search is already running - Cancel it first.")
+            return
+        if self._clf is None or not self._has_embedding(self._clf):
+            self.status_var.set("Evaluate edges needs a trained dense base - Train a dense "
+                                "or '-> edges' kind first.")
+            return
+        names = list(self._clf_names)
+        data = self._edge_training_data(names)
+        if data is None:
+            return
+        X_all, cls, grp, ext, edges, _n = data
+        _trials, _timeout, seed, _feat, _backend = self._search_settings()
+        try:
+            model_search.make_cv(cls[cls > 0], grp[cls > 0], seed=seed)
+        except ValueError as exc:
+            self.status_var.set(f"Cannot evaluate edges: {exc}.")
+            return
+        if not (edges["both"] & edges["diff"]).any():
+            self.status_var.set("Cannot evaluate edges: no labeled edge crosses classes - "
+                                "label two touching regions of different classes.")
+            return
+        from sklearn.base import clone
+        template = clone(self._clf)
+        spec = self._edge_spec_from_ui()
+        q = queue.Queue()
+        stop = threading.Event()
+
+        def work():
+            try:
+                rep = edge_model.evaluate_edges(
+                    lambda: clone(template), X_all, cls, grp, edges, ext, spec, seed=seed,
+                    progress_cb=lambda f, n: q.put(("edge_progress", f, n)), stop_event=stop)
+                q.put(("edge_done", rep))
+            except Exception as exc:            # reported, never raised off-thread
+                q.put(("error", f"{type(exc).__name__}: {exc}"))
+
+        self._search = {"queue": q, "stop": stop, "thread": None, "names": names,
+                        "n": int((cls > 0).sum()), "t0": time.perf_counter(), "mode": "edges"}
+        self._set_search_buttons(running=True)
+        self.edge_progress_var.set(f"evaluating: {int(edges['both'].sum()):,} labeled pairs "
+                                   f"({int(edges['diff'].sum()):,} boundaries) on "
+                                   f"{len(set(grp[cls > 0].tolist()))} slice(s)…")
+        self._compute_badge("Evaluating edges")
+        log(f"evaluate edges: {spec.describe()}; {len(edges['a'])} edges, "
+            f"{int(edges['both'].sum())} labeled pairs")
+        if sync:
+            work()
+            self._search_pump()
+            return
+        t = threading.Thread(target=work, name="mscoupon-edge-eval", daemon=True)
+        self._search["thread"] = t
+        t.start()
+        self.root.after(_SEARCH_PUMP_MS, self._search_pump)
+
+    def _finish_edge_eval(self, report):
+        if self._edge_model is not None:
+            self._edge_model.report = report
+        self._fill_edge_report(report)
+        lines = edge_model.report_lines(report)
+        log("evaluate edges:\n  " + "\n  ".join(lines))
+        learned = report.get("edge", {}).get("learned")
+        base = report.get("edge", {}).get("argmax differs", {})
+        reg = report.get("region", {})
+        if learned:
+            summary = (f"learned {learned['diff_recall']:.0%}/{learned['diff_precision']:.0%} "
+                       f"boundary recall/precision vs argmax {base.get('diff_recall', 0):.0%}/"
+                       f"{base.get('diff_precision', 0):.0%}")
+            if reg.get("before") and reg.get("after"):
+                summary += (f" · held-out region errors {reg['before']['errors']} -> "
+                            f"{reg['after']['errors']} with voting")
+        else:
+            summary = "no fold could be scored: " + "; ".join(report.get("skipped", [])[:2])
+        summary += (f" · {report.get('n_folds', 0)}-fold {report.get('cv_kind', '')} CV in "
+                    f"{_hms(report.get('elapsed_s', 0))}")
+        if report.get("stopped"):
+            summary += " (stopped early)"
+        self.edge_progress_var.set(summary)
+        self._refresh_model_readout()
+        self._refresh_model_strip()
+        self._refresh_edge_readout()
+        self.status_var.set("Evaluated edges - " + summary)
+
     def _cancel_search(self):
         st = self._search
         if st is None:
@@ -3359,6 +4118,7 @@ class LabelerApp(MscouponApp):
     def _set_search_buttons(self, running):
         for name, state in (("optimize_btn", "disabled" if running else "normal"),
                             ("sweep_btn", "disabled" if running else "normal"),
+                            ("edge_eval_btn", "disabled" if running else "normal"),
                             ("cancel_search_btn", "normal" if running else "disabled")):
             btn = getattr(self, name, None)
             if btn is not None:
@@ -3464,6 +4224,8 @@ class LabelerApp(MscouponApp):
         expected = self._expected_feature_names()
         if expected is not None and set(expected) != set(names):
             bits.append("⚠ profile mismatch")
+        if self._edge_model is not None and not _is_edge_kind(self._clf_kind):
+            bits.insert(1, "-> edges")
         var.set(" · ".join(bits))
         self._refresh_hints()
 
@@ -3533,6 +4295,7 @@ class LabelerApp(MscouponApp):
         self._refresh_region_modes()
         self._refresh_confusion()
         self._refresh_render()
+        self._refresh_edge_readout()
         self.status_var.set(f"Classified {count} slice(s) in "
                             f"{1e3 * (time.perf_counter() - t0):.0f} ms - "
                             "predictions shown under your labels")
@@ -3575,8 +4338,42 @@ class LabelerApp(MscouponApp):
         keep = (classes >= 0) & (classes < MAX_CLASSES)
         region_proba[fid[ok][:, None], classes[keep][None, :]] = \
             proba[ok][:, keep]
-        self._pred[(si, li)] = (rec.get("commit"), region_class, region_proba)
-        return region_class
+        # The edge model: p(diff) per arc of the RECORD's graph (so the magic
+        # fill and the coloring modes index it without a row mapping), and
+        # neighbour voting when an edge kind is selected. `raw` keeps the base
+        # net's answer so a kind flip re-votes without a forward pass.
+        aux = None
+        final = region_class
+        edge = self._edge_model
+        if edge is not None:
+            arcs = self._record_arcs(rec, np)
+            if arcs is not None and len(arcs.get("a", ())):
+                try:
+                    ia, ib, keep_e = magic_fill.index_arcs(arcs, fid, np)
+                    names = list(self._clf_names)
+                    ext = (mat[:, names.index("ext_filtered")]
+                           if "ext_filtered" in names else None)
+                    sad = arcs.get("saddle")
+                    sad = None if sad is None else np.asarray(sad, np.float64)[keep_e]
+                    pd_rows = edge_model.predict_pdiff(edge, self._clf, mat, ia, ib, sad, ext)
+                    pdiff = np.full(len(arcs["a"]), np.nan, np.float32)
+                    pdiff[keep_e] = pd_rows
+                    spec = self._edge_spec_from_ui()
+                    aux = {"raw": region_class.copy(), "pdiff": pdiff, "keep": keep_e,
+                           "la": np.asarray(arcs["a"]), "lb": np.asarray(arcs["b"]),
+                           "lam": spec.lam, "rounds": spec.rounds, "flips": 0,
+                           "active": False, "source": arcs.get("source")}
+                    if _is_edge_kind(self.model_kind_var.get()):
+                        final, flips = self._vote_entry(region_proba, aux, spec.lam,
+                                                        spec.rounds, np)
+                        aux["flips"], aux["active"] = flips, True
+                except (ValueError, IndexError) as exc:
+                    log(f"edge model unusable on slice {si}:{li}: {exc}")
+                    aux = None
+        entry = ((rec.get("commit"), final, region_proba) if aux is None
+                 else (rec.get("commit"), final, region_proba, aux))
+        self._pred[(si, li)] = entry
+        return final
 
     # -- training-set export --------------------------------------------- #
     def _ensure_slice_record(self, si, li):
@@ -3706,10 +4503,16 @@ class LabelerApp(MscouponApp):
         self._snapshot_active_profile()
         stats = dict(self.profiles[self.active_profile_idx].get("statistics") or {})
         spec = None if self._clf_spec is None else self._clf_spec.to_dict()
+        # v4: the edge model on top (None for plain kinds) and the stack's
+        # settings, so a loaded '-> edges' model can be retrained as is.
+        edge = None if self._edge_model is None else self._edge_model.to_dict()
+        stack = {"custom_hidden": self.custom_hidden_var.get(),
+                 "edge_spec": self._edge_spec_from_ui().to_dict()}
         with open(path, "wb") as f:
-            pickle.dump({"app": "mscoupon-labeler-classifier", "version": 3,
+            pickle.dump({"app": "mscoupon-labeler-classifier", "version": 4,
                          "kind": self._clf_kind, "names": self._clf_names,
-                         "model": self._clf, "statistics": stats, "spec": spec}, f)
+                         "model": self._clf, "statistics": stats, "spec": spec,
+                         "edge": edge, "stack": stack}, f)
         self._record_model(path, stats)
 
     def _record_model(self, path, statistics):
@@ -3718,7 +4521,8 @@ class LabelerApp(MscouponApp):
                  "fingerprint": list(self._clf_names or []),
                  "kind": self._clf_kind,
                  "statistics": dict(statistics or {}),
-                 "spec": None if self._clf_spec is None else self._clf_spec.to_dict()}
+                 "spec": None if self._clf_spec is None else self._clf_spec.to_dict(),
+                 "edge": self._edge_model is not None}
         self.models = [m for m in self.models if m.get("path") != entry["path"]]
         self.models.append(entry)
 
@@ -3771,14 +4575,36 @@ class LabelerApp(MscouponApp):
         spec = doc.get("spec")
         self._clf_spec = (model_search.ModelSpec.from_dict(spec)
                           if isinstance(spec, dict) else None)
-        if self._clf_spec is not None:
+        if self._clf_spec is not None and _base_kind(self._clf_kind) == _TUNED_KIND:
             self._search_spec = self._clf_spec   # Train rebuilds what was loaded
+        # v4: the edge model on top, only when it was fit over these features.
+        self._edge_model = None
+        edge = doc.get("edge")
+        if isinstance(edge, dict):
+            try:
+                em = edge_model.EdgeModel.from_dict(edge)
+                if em.names_hash == edge_model.names_hash(self._clf_names):
+                    self._edge_model = em
+                else:
+                    log("edge model in the pickle was fit over other features - dropped")
+            except Exception as exc:
+                log(f"edge model in the pickle not restored: {exc}")
+        stack = doc.get("stack") or {}
+        if isinstance(stack.get("custom_hidden"), str):
+            try:
+                model_search.parse_sizes(stack["custom_hidden"])
+                self.custom_hidden_var.set(stack["custom_hidden"])
+            except ValueError:
+                pass
+        if isinstance(stack.get("edge_spec"), dict):
+            self._apply_edge_spec(edge_model.EdgeSpec.from_dict(stack["edge_spec"]))
         if self._clf_kind in _MODEL_KINDS:
             self.model_kind_var.set(self._clf_kind)
         self._refresh_model_readout()
         self.classify_btn.config(state="normal")
         self._record_model(path, doc.get("statistics") or {})
         self._refresh_model_strip()
+        self._refresh_edge_readout()
 
     def _export_csv(self):
         """Resolved region -> class table: one row per living MSC region of
@@ -3874,7 +4700,24 @@ class LabelerApp(MscouponApp):
                              "feature_search": feat, "backend": backend,
                              "sweep_sizes": self.sweep_sizes_var.get(),
                              "sweep_trials": self._sweep_settings_trials()}
+        d["neighbours"] = {"custom_hidden": self.custom_hidden_var.get(),
+                           "freeze_base": bool(self.freeze_base_var.get()),
+                           "edge_spec": self._edge_spec_from_ui().to_dict()}
         return d
+
+    def _apply_neighbours_view(self, d):
+        if not isinstance(d, dict):
+            return
+        if isinstance(d.get("custom_hidden"), str):
+            try:
+                model_search.parse_sizes(d["custom_hidden"])
+                self.custom_hidden_var.set(d["custom_hidden"])
+            except ValueError:
+                pass
+        if isinstance(d.get("freeze_base"), bool):
+            self.freeze_base_var.set(d["freeze_base"])
+        if isinstance(d.get("edge_spec"), dict):
+            self._apply_edge_spec(edge_model.EdgeSpec.from_dict(d["edge_spec"]))
 
     def _apply_magic_view(self, magic):
         """Restore the Magic rows from a session view dict, field by field --
@@ -3931,6 +4774,7 @@ class LabelerApp(MscouponApp):
             self.tool_var.set(view["tool"])
         self._apply_magic_view(view.get("magic"))
         self._apply_search_view(view.get("model_search"))
+        self._apply_neighbours_view(view.get("neighbours"))
         # Keep the regions toggle in sync with whatever seg_source restored to.
         self.show_regions_var.set(self.seg_source_var.get() == "msc")
         # The center tab, by name; an unknown or missing value leaves it alone.
@@ -4004,7 +4848,7 @@ def _selftest():
         return False
 
     tabs = [str(app.center.tab(t, "text")) for t in app.center.tabs()]
-    assert tabs == list(_CENTER_TABS) == ["Processing", "View", "Model"], tabs
+    assert tabs == list(_CENTER_TABS) == ["Processing", "View", "Model", "Analysis"], tabs
     assert app.center.nametowidget(app.center.select()) is app.right, \
         "the View tab is selected at start"
     assert app._center_tab_name() == "View"
@@ -4049,7 +4893,7 @@ def _selftest():
     # _make_model builds with.
     for kind in _MODEL_KINDS:
         app.model_kind_var.set(kind)
-        assert app.model_arch_var.get() == _model_description(kind), kind
+        assert app.model_arch_var.get() == app._model_description_now(kind), kind
     assert str(_FOREST_TREES) in _model_description("random forest")
     assert str(_MLP_HIDDEN) in _model_description("dense FC")
     assert str(_DENSE_TOP_N["dense-top-16"]) in _model_description("dense-top-16")
@@ -4516,6 +5360,157 @@ def _selftest():
         app._classify()
         pr = app._pred.get((0, 0))
 
+        # -- "-> edges" kinds: an edge model on top of a dense base --------- #
+        # The two fake slices carry the block raster (ids 0,2 -> class 2 and
+        # 5,9 -> class 1), so pixel adjacency gives four arcs per slice: two
+        # same-class, two crossing. Train fits the custom base, then the edges.
+        kind_before = app.model_kind_var.get()
+        assert _CUSTOM_KIND in _MODEL_KINDS and _CUSTOM_EDGE_KIND in _MODEL_KINDS
+        assert _base_kind(_CUSTOM_EDGE_KIND) == _CUSTOM_KIND
+        assert _edge_kind_of(_TUNED_KIND) == _TUNED_EDGE_KIND and _edge_kind_of("dense FC") is None
+        assert _under(app.edge_eval_btn, app.model_tab) and _under(app.edge_tree, app.model_tab)
+        assert _under(app.edge_readout, app.confusion_holder.master)
+        app.custom_hidden_var.set("4")
+        app.model_kind_var.set(_CUSTOM_EDGE_KIND)
+        assert "not trained yet" in app.model_arch_var.get(), app.model_arch_var.get()
+        assert "not trained" in app.edge_readout_var.get()
+        app._train_classifier()
+        assert app._clf_kind == _CUSTOM_EDGE_KIND and app._clf_spec is not None
+        assert tuple(app._clf_spec.hidden) == (4,)
+        edge = app._edge_model
+        assert edge is not None, app.status_var.get()
+        assert edge.n_edges == 8 and edge.n_diff == 4, (edge.n_edges, edge.n_diff)
+        assert not edge.used_saddle and edge.width == 4 and edge.n_in == 10
+        assert "-> edges" in app.status_var.get(), app.status_var.get()
+        assert "-> edges" in app.model_strip_var.get() and "-> edges" in app.model_hint_var.get()
+        assert "edges: logistic" in app.model_arch_var.get()
+        app._classify()
+        pr = app._pred.get((0, 0))
+        assert len(pr) == 4, "the cache entry grows an aux dict with an edge model"
+        aux = app._pred_aux(pr)
+        assert aux is not None and aux["pdiff"].shape == (4,) and np.isfinite(aux["pdiff"]).all()
+        assert aux["source"] == "pixels" and aux["active"] and aux["raw"].shape == (10,)
+        assert set(int(v) for v in pr[1][[0, 2, 5, 9]]) <= {1, 2}
+        assert int(pr[1][1]) == 0, "a non-living id stays class 0 after voting"
+        assert "voting on" in app.edge_readout_var.get() and "flipped" in app.edge_readout_var.get()
+        # Coloring modes for the edge model.
+        app._refresh_region_modes()
+        modes = list(app.region_mode_combo.cget("values"))
+        assert _MODE_FLIPPED in modes and _MODE_PDIFF in modes, modes
+        for mode in (_MODE_FLIPPED, _MODE_PDIFF):
+            app.region_mode_var.set(mode)
+            vals, mask = app._region_scalar(pr, np)
+            assert vals.shape == (10,) and bool(mask[0]) and not bool(mask[1]), mode
+        app.region_mode_var.set(_MODE_PDIFF)
+        vals, _m = app._region_scalar(pr, np)
+        touching0 = [float(aux["pdiff"][i]) for i in range(4)
+                     if 0 in (int(aux["la"][i]), int(aux["lb"][i]))]
+        assert np.isclose(float(vals[0]), max(touching0))
+        app.region_mode_var.set("label id")
+        # N flips to the base kind: raw predictions, voting off, no forward pass.
+        app._on_edge_key()
+        assert app.model_kind_var.get() == _CUSTOM_KIND
+        pr0 = app._pred.get((0, 0))
+        assert np.array_equal(pr0[1], app._pred_aux(pr0)["raw"]) and not app._pred_aux(pr0)["active"]
+        assert "voting off" in app.edge_readout_var.get()
+        app._on_edge_key()
+        assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND
+        assert app._pred_aux(app._pred[(0, 0)])["active"]
+        # lambda 0 is the base answer even with voting on; the entry re-votes in place.
+        app.edge_lam_var.set("0")
+        app._on_edge_settings_change()
+        pr0 = app._pred[(0, 0)]
+        assert np.array_equal(pr0[1], app._pred_aux(pr0)["raw"]) and app._pred_aux(pr0)["lam"] == 0.0
+        app.edge_lam_var.set("1")
+        app._on_edge_settings_change()
+        # The learned magic metric: the flood reads p(diff) from the cache and
+        # is refused without it.
+        tool = app.viewer.tool if app.viewer is not None else None
+        if tool is not None:
+            app.magic_metric_var.set("learned")
+            tool_before, cls_before = app.tool_var.get(), app.active_class_var.get()
+            app.tool_var.set("magic")
+            app.active_class_var.set(1)
+            assert tool.on_press(_FakeEvent(5, 5)), app.status_var.get()
+            assert tool.magic._s["ladder"].metric == "learned"
+            assert tool.magic._s["ladder"].n_reach == 4
+            assert tool.magic.cancel()
+            saved_pred = app._pred
+            app._pred = {}
+            assert not tool.on_press(_FakeEvent(5, 5))
+            assert "Classify" in app.status_var.get(), app.status_var.get()
+            app._pred = saved_pred
+            app.magic_metric_var.set("mean")
+            app.tool_var.set(tool_before)
+            app.active_class_var.set(cls_before)
+        # Freeze base: Train keeps the base net and refits only the edges.
+        clf_id = id(app._clf)
+        app.freeze_base_var.set(True)
+        app._train_classifier()
+        assert id(app._clf) == clf_id and app._edge_model is not None and app._edge_model is not edge
+        assert "(base frozen)" in app.status_var.get(), app.status_var.get()
+        app.freeze_base_var.set(False)
+        # Pickle v4 carries the edge model; the session record flags it.
+        with tempfile.TemporaryDirectory() as td:
+            p4 = os.path.join(td, "edges.pkl")
+            app._save_classifier_to(p4)
+            assert app.models[-1]["edge"] is True and app.models[-1]["kind"] == _CUSTOM_EDGE_KIND
+            sdoc4 = session.session_doc_from_json(app._session_doc())
+            assert sdoc4["models"][-1]["edge"] is True
+            app._edge_model = None
+            app.model_kind_var.set("dense FC")
+            app._load_classifier_from(p4)
+            assert app._edge_model is not None and app._clf_kind == _CUSTOM_EDGE_KIND
+            assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND
+            assert app.custom_hidden_var.get() == "4"
+        # Evaluate edges runs inline; with two slices every fold is stratified
+        # inside them, so no fold has training edges and all are skipped -- the
+        # report still lands and the buttons come back.
+        app._evaluate_edges(sync=True)
+        assert app._search is None and app.edge_progress_var.get(), app.edge_progress_var.get()
+        assert str(app.edge_eval_btn.cget("state")) == "normal"
+        # The stack settings ride the session view and are validated on the way in.
+        v = app._view_state()["neighbours"]
+        assert v["custom_hidden"] == "4" and v["edge_spec"]["lam"] == 1.0 and v["freeze_base"] is False
+        app._apply_neighbours_view({"custom_hidden": "8-4", "freeze_base": True,
+                                    "edge_spec": {"lam": 0.5, "rounds": 2, "features": ["absdiff"]}})
+        assert app._custom_hidden() == (8, 4) and app.freeze_base_var.get()
+        assert app._edge_spec_from_ui().lam == 0.5 and app._edge_spec_from_ui().features == ("absdiff",)
+        app._apply_neighbours_view({"custom_hidden": "bad!"})
+        assert app.custom_hidden_var.get() == "8-4", "an unreadable ladder is ignored"
+        app.freeze_base_var.set(False)
+        app.custom_hidden_var.set(_DEFAULT_CUSTOM_HIDDEN)
+        app._apply_edge_spec(edge_model.EdgeSpec())
+        # The region list behind a confusion cell, and double-click navigation.
+        app._classify()                                # the pickle load cleared _pred
+        app._refresh_confusion()
+        counts = app._cm_counts["all"]
+        cell = max(counts, key=counts.get)
+        app._on_confusion_open(*cell)
+        assert app._center_tab_name() == "Analysis" and app._cm_cell == cell
+        assert len(app.errors_tree.get_children()) == counts[cell] == len(app._error_rows)
+        assert str(cell[0]) in app.errors_header_var.get()
+        assert all(d["true"] == cell[0] and d["pred"] == cell[1] for d in app._error_rows)
+        first = app._error_rows[0]
+        assert first["area"] >= app._error_rows[-1]["area"], "largest first within a slice"
+        app.errors_tree.selection_set("0")
+        app._on_error_row_open()
+        app.root.update_idletasks()                    # the deferred centring
+        assert app._center_tab_name() == "View"
+        assert app._current() == (first["si"], first["li"])
+        assert app._hover_key == (first["si"], first["li"], first["region"])
+        assert app.status_var.get().startswith(f"region {first['region']}")
+        assert not app._goto_region(7, 7, 0), "an unprimed slice is refused"
+        app._on_confusion_click(*cell)              # toggles the cell off
+        assert app._cm_cell is None and not app.errors_tree.get_children()
+        assert "No confusion cell" in app.errors_header_var.get()
+        # Back to the plain kind: the edge model goes with the base it sat on.
+        app.model_kind_var.set(kind_before)
+        app._train_classifier()
+        app._classify()
+        pr = app._pred.get((0, 0))
+        assert app._edge_model is None and len(pr) == 3
+
         # Confusion matrix: frozen predictions against live labels.
         app._refresh_confusion()
         counts = dict(app._cm_counts["current"])
@@ -4722,7 +5717,8 @@ def _selftest():
         # Size sweep: one fixed-size search per rung, a report row per rung,
         # the best rung installed + saved, any rung installable from the table.
         app.search_timeout_var.set("60")
-        assert _under(app.sweep_tree, app.model_tab) and _under(app.sweep_btn, app.model_tab)
+        assert _under(app.sweep_tree, app.analysis_tab) and _under(app.sweep_btn, app.analysis_tab)
+        assert _under(app.errors_tree, app.analysis_tab)
         assert model_search.parse_sizes(" 64-32, 16x8;4 ") == [(64, 32), (16, 8), (4,)]
         assert model_search.n_params((4,), 2, 3) == (2 + 1) * 4 + (4 + 1) * 3
         app.sweep_sizes_var.set("8-4, 4")
@@ -5208,7 +6204,8 @@ def _selftest():
           "proba cache + coloring modes, confusion matrix + highlight, "
           "persistent outlines + canvas right-click, gesture previews, "
           "magic fill, blobber, hop gain + drag + cosine/proba metrics, "
-          "center notebook + model tab, toolbar hints, optimize network, size sweep")
+          "center notebook + model tab, toolbar hints, optimize network, size sweep, "
+          "edge kinds, analysis tab + region list")
     return 0
 
 

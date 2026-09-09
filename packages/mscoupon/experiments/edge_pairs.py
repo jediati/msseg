@@ -23,6 +23,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.metrics import balanced_accuracy_score, roc_auc_score, log_loss
 
 OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
+os.makedirs(OUT, exist_ok=True)
 root = tk.Tk(); root.withdraw()
 app = LabelerApp(root, autosave=False)
 doc = config_io.read_json_file(config_io.session_path(app="mscoupon-labeler"))

@@ -181,6 +181,19 @@ class SliceCanvas(tk.Frame):
         if self.on_view_changed is not None:
             self.on_view_changed()
 
+    def center_on(self, ix, iy, zoom_to=1.0):
+        """Scroll so image point (ix, iy) sits at the canvas centre, zooming
+        in to at most `zoom_to` image pixels per screen pixel first (None
+        keeps the current zoom) -- the way a region list navigates."""
+        if zoom_to is not None:
+            self.scale = max(min(self.scale, float(zoom_to)), 0.05)
+        w = max(self.canvas.winfo_width(), 1)
+        h = max(self.canvas.winfo_height(), 1)
+        self.view_x = float(ix) - w / 2.0 * self.scale
+        self.view_y = float(iy) - h / 2.0 * self.scale
+        self._schedule()
+        self._view_changed()
+
     def _drag_start(self, e):
         if self.tool is not None and self.tool.on_press(e):
             self._drag = None

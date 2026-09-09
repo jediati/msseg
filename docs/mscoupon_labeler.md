@@ -33,7 +33,8 @@ hidden:
 |---|---|
 | **Processing** | the profile tools (New/Dup/Rename/Delete, Save/Load profile) and the profile being edited, in two columns: filter chain + base channel, MSC parameters + statistics channels |
 | **View** (default) | the slice canvas, hover readout, slice navigation, image/overlay/alpha controls and the persistence entry |
-| **Model** | the classifier kind, a read-only description of its architecture, the **Optimize network** search (trials, time limit, seed, feature-subset toggle, progress line) and, in the lower half, the **Size sweep** report |
+| **Model** | the classifier kind, a read-only description of its architecture, the **Edge model** panel (the `-> edges` kinds) and the **Optimize network** search (trials, time limit, seed, feature-subset toggle, progress line) |
+| **Analysis** | **Predictions vs annotations** (the regions behind a confusion cell; double-click a row to go there) and the **Size sweep** report; a home for plots later |
 
 Two link-labels say what is in effect: the Run section is headed by the
 **selected workflow** as two compact chains --
@@ -181,6 +182,80 @@ interactions, `blobber ring (n)` first and `blobber core (n)` second, so on a
 re-decomposition that merges a ring point's region into a core point's the
 core wins; one undo step removes both.
 
+## Edge models (the `-> edges` kinds)
+
+The region net scores each living region from its statistics row alone.
+Regions tile the slice and touch through saddles, and the edge-pairs
+experiment ([mscoupon_edge_pairs.md](mscoupon_edge_pairs.md)) showed that a
+pair model on the net's own hidden layer tells same-class from
+different-class edges of the region graph better than the net's argmax, and
+that letting the graph vote fixes the isolated flips. Two model kinds stack
+that **edge model** on top of a dense base:
+
+| kind | base | on top |
+|---|---|---|
+| `dense (tuned) -> edges` | the last Optimize / size-sweep winner | the edge model |
+| `custom FC -> edges` | a dense net whose hidden sizes are typed on the Model tab (`base hidden`, default `16-8`) | the edge model |
+
+(`custom FC` on its own is also a kind.) **Train (R)** on an edge kind fits
+the base, then the pair model on every labeled edge -- the status line reports
+both; with **freeze base** on, Train keeps the current base and refits only
+the edges, so edge variants can be tried on one base. **Classify (C)** runs
+the base, scores every arc of each slice's living-region graph with the pair
+model (p(diff) = the probability the edge crosses classes), then runs
+`rounds` of neighbour voting -- `score_i(c) = log P_i(c) + lambda * sum_j
+[log(1 - p_ij) if class_j == c else log p_ij]` -- and the refined classes are
+*the* prediction: the overlay, the confusion matrix, SHIFT-accept, the CSV and
+the training set all see them. **N** flips between the edge kind and its base
+(the cached predictions re-vote in milliseconds, no forward pass), so raw vs
+refined is one keystroke and the confusion matrix is the before/after.
+
+The **Edge model** panel on the Model tab holds the pair model's settings --
+`layer` (last = the narrow layer, best in the experiment; previous = the wider
+one), `model` (balanced logistic, or an MLP 32-16), the pair `features`
+(`|d|`, `product`, and the saddle `barrier`: `saddle - max(ext_a, ext_b)` and
+`|ext_a - ext_b|`, zeros on pixel adjacency), `C`, and the voting `lambda` and
+`rounds` (these two apply at once to cached predictions; the rest wait for
+Train) -- and **Evaluate edges**: a leave-slices-out report that refits the
+base per fold and scores the pair model against the base's own answers
+(`argmax differs`, `1 - sum P_a P_b`) on boundary recall / precision, plus
+region errors before and after voting. It runs on the worker thread like
+Optimize; Cancel stops it after the current fold.
+
+Under Train/Classify the right panel shows the edge readout: how many pairs
+the model was fit on, the share of boundaries, the held-out numbers once
+evaluated, whether voting is on, and how many regions it flipped on this
+slice. Two coloring modes come with an edge model: **flipped by neighbours**
+(regions whose class voting changed) and **boundary p(diff)** (each region's
+max p(diff) over its arcs). The magic fill gains the **`learned`** metric:
+the pair model's p(diff) per arc as the flood's dissimilarity (refused until
+the slice is classified with an edge model).
+
+The edge model rides the classifier pickle (**v4**: `edge`, plus a `stack`
+with the custom hidden sizes and the edge settings), the session's model
+record (`edge: true`) and the session view (`neighbours`). A pickle whose
+edge model was fit over other features loads its base and drops the edges.
+Records without MSC arcs (an older extension) fall back to pixel adjacency,
+where the barrier carries no saddle depth.
+
+## Held-out vs fit check, and finding the errors
+
+Two kinds of error count appear and they are not the same thing. The
+confusion matrix on the right panel (rows = annotated class, columns =
+predicted) compares the **current** model's predictions with the labels it
+was **trained on** -- a fit check, so its off-diagonal counts are small.
+**Evaluate edges** and **Optimize** report **held-out** numbers: every slice
+is scored by models that never saw it (leave-slices-out folds), which is the
+honest estimate and always higher. The report rows say `(held-out)`.
+
+Clicking a confusion cell highlights its regions on the current slice and
+lists them -- every slice, largest first, with the model's probabilities and
+whether neighbour voting changed the class -- on the **Analysis** tab;
+double-clicking the cell opens that tab. Double-clicking a row (or Enter)
+opens the View tab on that slice, centred on the region's seeding extremum
+(zooming in to 1:1 if further out), with the gestures touching it outlined
+and the cell's highlight still on.
+
 ## Classifier and exports
 
 Unchanged by the above: Train/Classify on the per-region statistics table
@@ -232,7 +307,7 @@ space instead and installs the winner as the `dense (tuned)` model:
   reloads its most recent recorded model on restore, and *Load classifier…*
   opens any of them. The log lists the permutation importances of the winner's
   columns.
-* **Size sweep** (the lower half of the Model tab): *how small can the
+* **Size sweep** (the Analysis tab): *how small can the
   network be?* Enter a ladder of architectures (`64-32, 32-16, 16-8, 8-4, 4`;
   layers joined by `-`, rungs by `,`) and the trials to spend per rung, then
   **Sweep sizes**. Each rung is a fixed-size search -- the architecture is

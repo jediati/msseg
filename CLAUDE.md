@@ -267,7 +267,23 @@ script `packages/mscoupon/experiments/edge_pairs.py`): a logistic pair model on 
 than the net's own argmax (97 % / 94 % boundary recall / precision vs 93 % / 88 %),
 and three rounds of neighbour voting cut held-out region errors 115 -> 66. Paths
 forward are listed in the doc (real MSC arcs + saddles, a `learned` magic-fill
-metric, a refine-with-neighbours action, joint training).
+metric, a refine-with-neighbours action, joint training). **Landed** (2026-09-08)
+as `edge_model.py` + the `-> edges` model kinds: `_clf` stays the BASE
+pipeline, `_edge_model` (a balanced logistic on the base net's last hidden
+layer: `|d|`, product, saddle barrier) sits on top; Train fits base then edges
+(`freeze base` keeps the base); `_predict_slice` stores a 4-tuple `(commit,
+final, proba, aux)` with per-arc `pdiff` aligned to the RECORD's arcs and
+`raw`, voting runs in label space (`_vote_entry`), `N` flips kind <-> base
+and re-votes from the cache (`_revote_all`), pickle v4 carries `edge` +
+`stack`, the `learned` magic metric reads `aux["pdiff"]`, coloring modes
+`flipped by neighbours` / `boundary p(diff)`, and `Evaluate edges` reports
+leave-slices-out through the Optimize worker/pump; report rows are marked
+held-out (the confusion matrix is a fit check on the training labels, not
+held-out). An **Analysis** center tab holds the size sweep and the
+predictions-vs-annotations list (`_confusion_cell_rows` / `_fill_error_list`: a
+confusion cell's regions across slices; double-click -> `_goto_region`,
+which uses `SliceCanvas.center_on`). The in-tree pyd was
+refreshed from the build tree so records carry MSC arcs with saddles.
 
 **mscoupon extremum statistics** (`ext_x`, `ext_y`, `ext_base`, `ext_filtered`):
 the per-slice selection chain can also ask about a region's **seeding critical

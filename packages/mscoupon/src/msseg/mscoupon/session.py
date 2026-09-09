@@ -305,7 +305,9 @@ def session_doc_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[s
                            "statistics": _as_dict(md.get("statistics")),
                            # The tuned dense spec (model_search.ModelSpec as a
                            # dict), opaque here; absent for the other kinds.
-                           "spec": _as_dict(md.get("spec")) or None})
+                           "spec": _as_dict(md.get("spec")) or None,
+                           # Whether an edge model rides the pickle (v4).
+                           "edge": bool(md.get("edge"))})
 
     return {
         "app": str(root.get("app") or ""),
