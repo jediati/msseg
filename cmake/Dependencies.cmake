@@ -57,7 +57,7 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(diffg
   GIT_REPOSITORY https://github.com/jediati/diffg.git
-  GIT_TAG 1a06653713cb0c5def3e7f39357c7b7959d9b9e6   # device-resident + JIT GPU filter bank (bit-exact), FilterBankStream
+  GIT_TAG 88d57f5ef18ad6e84340564c99d59e4a6ec6047c   # + large-sigma pyramid path: sigma > 16 stays on the GPU bank (radius cap 64)
 )
 FetchContent_Declare(msceer
   GIT_REPOSITORY https://github.com/sci-visus/MSCEER.git
