@@ -6,7 +6,7 @@ Git ground truth
 
 Repository: https://github.com/jediati/diffg.git
 Branch: main
-Commit: e06a0eaf8e5cd3ff15fec518af8dd7dc1eaefaaf
+Commit: 88d57f5ef18ad6e84340564c99d59e4a6ec6047c
 
 This project builds a pure C++ static library target named diffg and an alias
 target named diffg::diffg. It requires CMake 3.20 or newer and C++17.
@@ -36,7 +36,7 @@ Use the exact commit above for reproducible builds.
     FetchContent_Declare(
         diffg
         GIT_REPOSITORY https://github.com/jediati/diffg.git
-        GIT_TAG        e06a0eaf8e5cd3ff15fec518af8dd7dc1eaefaaf
+        GIT_TAG        88d57f5ef18ad6e84340564c99d59e4a6ec6047c
     )
 
     FetchContent_MakeAvailable(diffg)
@@ -107,6 +107,294 @@ Usage notes
       #include "diffg/image.hpp"
       #include "diffg/blur.hpp"
       #include "diffg/differentiator.hpp"
+      #include "diffg/filter_bank.hpp"
+      #include "diffg/multi_image.hpp"
+      #include "diffg/morphology.hpp"
+      #include "diffg/labeling.hpp"
+      #include "diffg/label_ops.hpp"
 
 - Link only to diffg::diffg from the consuming target. The include directory
   and C++17 requirement are propagated by the CMake target.
+
+
+Batched multi-filter bank
+-------------------------
+
+    #include "diffg/filter_bank.hpp"
+
+A separable filter is a triple of 1-D kernels applied along x, y and z. Two
+filters that share a 1-D kernel on a given axis can share that axis pass, so a
+list of requests collapses into a kernel trie:
+
+    input --(unique kx)--> x-nodes --(unique ky)--> xy-nodes --(unique kz)--> terms
+
+Each level's sibling set is applied to one shared tap window. The window is
+gathered once at the widest support in the batch, with boundary conditions
+resolved, and then every kernel reads only the sub-window it actually needs.
+Nothing is zero-padded, so no kernel pays for a wider neighbour's support, and
+after the gather every tap is a cache hit. The results are bit-identical to
+computing each filter on its own with derivative().
+
+    #include "diffg/filter_bank.hpp"
+    #include "diffg/multi_image.hpp"
+
+    std::vector<diffg::FilterRequest> requests{
+        diffg::gaussian_filter(1.0),
+        diffg::edges_filter(1.0),
+        diffg::gaussian_filter(2.0),
+        diffg::hessian_filter(1.5),
+    };
+
+    diffg::FilterBankOptions options;
+    options.execution.threads = 8;
+
+    const auto bank = diffg::apply_filter_bank(
+        input.view(), requests, diffg::OutputShape::MultiChannel, options);
+
+    for (std::size_t c = 0; c < bank.channel_count(); ++c) {
+        diffg::ImageView<const float> response = bank.stacked.channel(c);
+        // bank.channels[c].name identifies it, e.g. "hessian_s1.5_eig0".
+    }
+
+Available kinds: Gaussian, DerivativeTerm, GradientComponents,
+GradientMagnitude, Laplacian, HessianEigenvalues, Edges, and the two
+cross-channel kinds ChannelGradientMagnitude and DiZenzoEigenvalues (see
+"Multi-channel input" below).
+
+Morphological and labeling operations are deliberately absent FROM THE BANK.
+Min and max are not linear, so they cannot share a tap window's dot products,
+and a min over radius 6 is not derivable from a min over radius 3 the way a
+narrow linear kernel is just a wide one with zero tails. They are available as
+their own composable chain -- see "Label chain" below.
+
+Output shape:
+
+- OutputShape::MultiChannel fills bank.stacked, a MultiImage<float>. It is
+  planar (channel-slowest), so channel(c) is an ordinary contiguous volume with
+  the same layout as Image<float>.
+- OutputShape::SeparateImages fills bank.images with one standalone
+  Image<float> per channel.
+
+Neither shape costs an extra copy; the pipeline writes into whichever buffers
+were allocated. bank.channel_data(c) reads either shape uniformly.
+
+Memory in 3D: output planes are produced in z-slabs, so the intermediates stay
+bounded at roughly
+
+    xy_nodes * width * height * (slab_depth + 2 * max_z_radius) floats
+
+rather than several full volumes. FilterBankOptions::slab_depth defaults to the
+largest slab fitting slab_memory_budget.
+
+From Python:
+
+    result = diffg_py.filter_bank(
+        image,
+        [("gaussian", 1.0),
+         {"kind": "edges", "sigma": 1.0, "low_threshold": 0.05},
+         ("gaussian", 2.0),
+         {"kind": "derivative", "sigma": 1.5, "order": (1, 0, 0)}],
+        shape="channels",   # or "separate"
+        threads=8)
+
+    result["data"]   # (C, D, H, W) array, or a list when shape="separate"
+    result["names"]  # one name per channel
+
+
+Multi-channel input (RGB, RGBA, any C channels)
+-----------------------------------------------
+
+Colour images should not be reduced to gray before differentiating: the
+derivative of a channel mix is not the mix of derivatives, and isoluminant
+edges vanish. Instead the bank and the structure tensor accept a planar
+multi-channel view and reduce across channels AFTER the per-channel Gaussian
+derivatives. diffg does no colour-space work: channels are just channels.
+
+    #include "diffg/multi_image.hpp"
+
+    diffg::MultiImage<float> rgb(dims, /*channels=*/3);
+    // fill rgb.channel_data(c) ... planar: c*W*H*D + ((z*H)+y)*W + x
+
+    std::vector<diffg::FilterRequest> requests{
+        diffg::gaussian_filter(1.0),                    // per channel
+        diffg::channel_gradient_magnitude_filter(1.0),  // cross-channel
+        diffg::dizenzo_filter(1.0),                     // cross-channel
+    };
+    const auto bank = diffg::apply_filter_bank(rgb.view(), requests);
+
+MultiImageView<const float> (data, dims, channels, spacing) is the non-owning
+input type; MultiImage::view() produces one, and
+MultiImageView<const float>(image.view()) wraps a single Image as one channel.
+
+The kernel trie is built once and the pass sequence is replayed per input
+channel. Per-channel kinds then emit their channels once per input channel,
+channel-major, with a _c<i> infix before the slot suffix:
+
+    channel_in_request = input_channel * k + slot   (k = channels per input)
+    name               = gaussian_s1_c0, grad_s1.5_c1_y, hessian_s2_c2_eig0,
+                         my_smooth_c1 ...
+
+ChannelInfo::input_channel names the source channel. With ONE input channel
+nothing changes: names carry no infix, and layout, stats and values are
+byte-identical to the scalar overload.
+
+Cross-channel kinds emit once, without the infix:
+
+- ChannelGradientMagnitude ("chgradmag_s1"): sqrt(sum_c |grad_c|^2). The
+  per-channel squared norms are summed sequentially from channel 0 in float,
+  then rooted, so one channel is exactly GradientMagnitude.
+- DiZenzoEigenvalues ("dizenzo_s1_eig0", "_eig1", "_eig2" in 3D): eigenvalues
+  of S = sum_c grad_c grad_c^T, descending by value (S is positive
+  semi-definite, so sort_by_absolute_value is ignored). Entries are summed
+  sequentially from channel 0's product. eig0 is the colour edge strength; no
+  integration blur is applied here.
+
+Both share their gradient terms with GradientMagnitude / GradientComponents /
+Edges at the same sigma.
+
+Memory: FilterBankStats::unique_* and scratch_term_channels describe the plan
+for one channel; the scratch actually allocated is
+scratch_term_channels * input_channels full volumes, and per-channel outputs
+grow linearly with the channel count.
+
+Alpha: a 4-channel input is four channels. If alpha is a mask, drop it first
+(or feed it to the label chain); differentiating it makes every alpha edge a
+colour edge.
+
+Colour structure tensor: structure_eigenvalues also takes a
+MultiImageView<const float>. Per-channel gradient outer products are summed
+(sequentially, channel 0 first) BEFORE the integration blur, then the eigen
+decomposition runs as usual. One channel is bit-identical to the scalar call.
+
+Not supported: FilterBankStream and the CUDA bank reject the cross-channel
+kinds and take single-channel input only.
+
+From Python, the channel axis is explicit and never inferred from the shape
+(a (H, W, 3) array is a 3D volume unless you say otherwise):
+
+    rgb = np.asarray(Image.open("photo.png"))          # (H, W, 3) uint8
+    result = diffg_py.filter_bank(
+        rgb,
+        [("gaussian", 1.0), ("channel_gradient_magnitude", 1.0), ("dizenzo", 1.0)],
+        channel_axis=-1)   # -1: (H, W, C) / (D, H, W, C);  0: (C, H, W) / (C, D, H, W)
+
+    result["names"]          # ['gaussian_s1_c0', 'gaussian_s1_c1', 'gaussian_s1_c2',
+                             #  'chgradmag_s1', 'dizenzo_s1_eig0', 'dizenzo_s1_eig1']
+    result["input_channel"]  # source channel per output
+    diffg_py.structure_eigenvalues(rgb, 1.0, 1.5, channel_axis=-1)
+
+Any dtype is cast to float32 as-is (uint8 stays 0..255, no gamma). Use
+rgb[..., :3] to drop alpha.
+
+
+Large sigma
+-----------
+
+A Gaussian derivative at sigma 64 is a 385-tap kernel per axis, and that kernel
+is not buying accuracy. At truncate 3.0 it carries its own truncation error,
+which grows with sigma, so measured against a truncate-8 reference the direct
+kernel and the alternative below sit in the same error band at every sigma --
+the direct one just costs 4-9x more.
+
+Derivatives compose across scale, so above FilterBankOptions::cutoff_sigma
+(16.0) the bank splits sigma^2 = sigma_pre^2 + sigma_s^2, pre-smooths to
+sigma_pre with a Gaussian pyramid, and applies a small exact derivative kernel
+at sigma_s. One pre-smoothed image is shared by every request at that sigma, and
+sigmas needing the same pyramid depth share the whole blur-and-decimate cascade.
+
+Measured on this machine, 1024x1024, blur + gradient magnitude + laplacian at
+one sigma:
+
+    sigma   1 thread            8 threads
+    32      648 -> 65 ms  10x   96 -> 31 ms  3.1x
+    64     1371 -> 70 ms  20x  180 -> 28 ms  6.4x
+
+Nothing below the cutoff changes: those requests are bit-identical to before.
+
+The cost is one extra full-resolution float buffer per distinct large sigma,
+plus a padded pyramid of roughly 1.4 images. In 3D the reformulation is not
+applied at all yet -- see the note below.
+
+It is an approximation of the same Gaussian, not the same arithmetic, so it is
+NOT bit-exact against the full-support kernel. To get the old numbers exactly:
+
+    diffg::FilterBankOptions options;
+    options.large_sigma = diffg::LargeSigmaPolicy::Direct;
+
+From Python, pass large_sigma=False. cutoff_sigma, residual_sigma,
+pyramid_sigma and min_coarse_sigma are exposed on both sides.
+
+Restrictions, each of which falls back to the direct kernel rather than
+degrading quality:
+
+- 3D. The slab loop reads the input plane by plane, so a base would have to be
+  a fully materialized volume. This is where the reformulation would help most:
+  at sigma 64 the slab halo is 2*192 planes, which exceeds slab_memory_budget
+  and drives compute_slab_depth down to a single plane, so every output plane
+  re-runs the x and y passes over 385 source planes.
+- Boundaries other than Mirror. Whole-sample mirror extension commutes with
+  convolution by a symmetric kernel, which makes the two-stage result exact at
+  the border; Clamp and Zero have no such identity.
+- A sigma large on one axis but not the other, and images small enough that the
+  pyramid halo would dominate (padded area above 16x the image -- around
+  200x200 at sigma 64).
+
+FilterBankStream always uses the direct kernel: a pre-smoothed base is exactly
+the full-image intermediate it exists to avoid. Its bit-exactness contract is
+therefore against apply_filter_bank with LargeSigmaPolicy::Direct.
+
+On the GPU the same reformulation runs device-side and is bit-exact with the
+CPU. It also removes a trap: the GPU bank's tap slot caps kernel radius at 64,
+so sigma above 21.33 could not run there at all, and used to fail as a silent
+nullptr that took every other channel in the request list with it. See
+gpu/README.md.
+
+
+Label chain: remap -> mask -> morphology -> connected components
+---------------------------------------------------------------
+
+The non-linear half of the library, in diffg/label_ops.hpp, diffg/morphology.hpp
+and diffg/labeling.hpp. 2D and 3D.
+
+    #include "diffg/label_ops.hpp"
+
+    // Select a set of label ids straight into a {0,255} mask -- the lookup and
+    // the threshold are fused, so no intermediate label raster is built.
+    const std::int32_t keep[] = {3, 7, 11};
+    const std::vector<unsigned char> table =
+        diffg::build_selection_table(keep, 3);
+
+    diffg::LabelPipelineOptions pipeline;
+    pipeline.morph = diffg::MorphOp::Open;   // None/Erode/Dilate/Open/Close
+    pipeline.radius = 2;
+    pipeline.connectivity = diffg::Connectivity::Face;
+
+    diffg::Image<std::int32_t> components =
+        diffg::label_pipeline(labels.view(), table.data(), table.size(),
+                              pipeline, exec);
+
+The steps are also callable individually: remap_labels (dense int32 LUT),
+labels_to_mask, morphology / morphology_mask (op carried as data), and
+label_mask.
+
+Lookup rule, shared by remap_labels and labels_to_mask: an id below zero, or
+past the end of the table, takes the out_of_range value. So a table only has to
+cover the ids you care about.
+
+Connectivity on label_mask is Face (4-connected in 2D, 6-connected in 3D) by
+default, which is the historical behaviour, or Full (8- / 26-connected). It is
+a trailing defaulted argument, so existing calls are unaffected:
+
+    diffg::label_mask(mask.view(), exec);                            // Face
+    diffg::label_mask(mask.view(), exec, diffg::Connectivity::Full); // 8/26
+
+Components are numbered densely from 1, in ascending order of each component's
+first voxel in row-major order. That ordering is part of the contract, not an
+accident of the implementation: the GPU backend reproduces these label values
+bit-for-bit by relying on it.
+
+On the GPU (gpu/api.h, target diffg_gpu), the whole chain runs device-resident
+via gpu_label_pipeline_run over a GpuRaster, bit-exact with label_pipeline. If
+your program already holds the label raster on device, wrap it with
+gpu_raster_borrow -- the chain is otherwise dominated by moving the raster
+across PCIe rather than by the work. See gpu/README.md for the measured table.
