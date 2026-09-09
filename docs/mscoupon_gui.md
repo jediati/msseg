@@ -56,13 +56,14 @@ parameters that produced it have just been replaced; click *Run* again.
    `input.files` list) so `mscoupon --config config_N.json` reproduces the output.
 
 **Right panel — view & refine (one slice at a time)**
-- **Renderer** — a grayscale background channel + toggleable overlays
+- **Renderer** — a grayscale (or, for a colour slice, RGB) background channel + toggleable overlays
   (segmentation, mask), with min/max brightness/contrast and an overlay-alpha
   slider; zoom (wheel) and pan (drag). The **Image** dropdown offers every
   measurement channel, not just `base` and `filtered`, so a threshold on
   `max_edges_s0.7` can be looked at on the raster it is thresholding. A derived
   channel is computed for the displayed slice on demand and memoised — holding
   a twelve-channel stack for every primed slice would dominate memory.
+  A colour slice adds `color` (the RGB composite) and `color_c<i>` (one plane).
   The dropdown also works on a **preview** (nothing primed yet): `filtered` runs
   the filter chain on the raw slice, `base` runs the base chain, and a derived
   name computes that scale-space response — through the same calls priming
@@ -143,9 +144,23 @@ single-source C++ evaluator (`mscoupon::row_passes`, exposed as
 
 ```jsonc
 {
-  "input":  { "folder": "...", "files": ["slice_0000.tiff", ...] },
+  "input":  { "folder": "...", "files": ["slice_0000.tiff", ...],
+              // colour (multi-sample) TIFFs: how the planes are read. `alpha`
+              // drop|keep (4 samples = RGBA, 2 = gray+alpha); `default_method`
+              // is the conversion a chain without a leading `color` stage gets;
+              // `channels` declares the plane count the statistics schema is
+              // resolved for (3 when a colour source is named and it is absent)
+              "color": { "alpha": "drop", "default_method": "luminance", "channels": 3 } },
   "output": { "folder": "..." },
-  "filters": [ { "operation": "blur", "params": { "sigma": 1.0 } }, ... ],
+  // A `color` stage is valid at index 0 only: it reduces the input planes to
+  // the scalar every later stage runs on. Methods: pick {channel}, luminance,
+  // weighted {weights}, mean, max, min, hsv {component}, optical_density {i0,
+  // stain|weights|channels, eps}, chgradmag {sigma}, dizenzo {sigma, eigen},
+  // structure {smoothing_sigma, integration_sigma, eigen}. Each chain picks its
+  // own, so the topology field may run on colour edges while `base_filters`
+  // reads optical density.
+  "filters": [ { "operation": "color", "params": { "method": "dizenzo", "sigma": 1.5 } },
+               { "operation": "blur", "params": { "sigma": 1.0 } }, ... ],
   // base channel chain (statistics + pixel thresholds read from its output),
   // typically a single `normalize` stage
   "base_filters": [ { "operation": "normalize", "params": { "method": "gmm" } } ],
@@ -161,16 +176,26 @@ single-source C++ evaluator (`mscoupon::row_passes`, exposed as
   // object is a derived scale-space channel measured on `base`. `sigmas` is a
   // cross-product, and `hessian` yields two channels per sigma
   // (`hessian_largest_s1.5`, `hessian_smallest_s1.5`).
+  // "color" (a bare string) measures the raw input planes (color_c0, ...);
+  // `source: "color"` computes a derived kind per plane (blur_c0_s1.5, ...);
+  // `chgradmag` / `dizenzo` reduce across the planes and imply that source.
   "statistics": {
-    "channels": [ "base",
+    "channels": [ "base", "color",
                   { "kind": "blur",    "sigmas": [0.7, 1.5, 3.0] },
+                  { "kind": "blur",    "sigmas": [1.5], "source": "color" },
                   { "kind": "edges",   "sigmas": [0.7, 1.5, 3.0] },
                   { "kind": "hessian", "sigmas": [0.7, 1.5, 3.0],
-                    "sort_by_absolute_value": true } ],
+                    "sort_by_absolute_value": true },
+                  { "kind": "dizenzo", "sigmas": [1.5] } ],
     "reductions": ["mean", "min", "max"],
     "extremum": true,
     "relevance": { "enabled": true,
-                   "low_percentile": 1.0, "high_percentile": 99.0 }
+                   "low_percentile": 1.0, "high_percentile": 99.0 },
+    // per-region histograms: K bins over a FIXED range per channel (a name or
+    // "*"), so the bins add across slices; opt-in per channel, base by default.
+    // Projected as hist00_base .. hist15_base (bin fractions) after ext_filtered.
+    "histogram": { "bins": 16, "channels": ["base", "blur_s1.5"],
+                   "ranges": { "*": [0, 1], "blur_s1.5": [0, 1] } }
   },
   "feature_filters": [ { "field": "area", "op": "ge", "value": 50 },
                        { "field": "max_edges_s0.7", "op": "lt", "value": 0.02 },
@@ -234,9 +259,23 @@ hierarchy), so priming stays fast on data with long separatrices
 (`ComputeOptions.buildArcGeometry=false`; `Msc2D::arcGeometry()` returns
 connectivity with empty polylines).
 
+## Colour input
+
+Multi-sample TIFFs (RGB, RGBA) load as planar planes through the CLI's own
+TinyTIFF reader (`read_tiff_planes`; chunky and planar files alike), so the GUI
+sees exactly what a batch run will. The **1b. Colour input** block sets the
+alpha policy and the default colour->scalar method, and shows the plane count
+of the slice on screen; the conversion itself is a `color` card at the head of
+a chain (`2.` / `3.`), one per chain. The statistics panel's **color planes**
+toggle measures the raw planes, each derived row has a **source** picker
+(`base` | `color`), and `chgradmag` / `dizenzo` are colour-only. The
+**histogram** row (bins, channels, ranges, **measure**) adds the per-region
+bins. See `CLAUDE.md` ("mscoupon colour input", "mscoupon histograms") for the
+rules and the schema.
+
 ## Caveat: TIFF decoding
 
-The GUI reads TIFFs via Pillow / `large_image` (handles compressed formats), but
-the C++ CLI reads via TinyTIFF, which cannot decode Deflate-compressed TIFFs. A
-sequence viewable in the GUI may therefore need re-saving as uncompressed for the
-CLI run.
+Both the GUI and the CLI read through TinyTIFF first; the GUI falls back to
+Pillow / `large_image` for what TinyTIFF cannot decode (Deflate-compressed
+files), so a sequence viewable in the GUI may still need re-saving as
+uncompressed for the CLI run.

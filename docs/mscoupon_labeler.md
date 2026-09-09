@@ -22,7 +22,10 @@ which divide the height through draggable sashes) and Run, pinned to the
 bottom so it is always visible. Clicking a TIFF in the file list or an
 unprimed row of a sequence previews it; the Image dropdown then computes the
 chosen channel (filter chain, base chain, or a derived scale-space response)
-on that preview, so a profile can be judged before any Run. The **right**
+on that preview, so a profile can be judged before any Run. A colour TIFF
+previews as RGB, with `color` / `color_c<i>` entries beside the channels; its
+chains start with a `color` card (see [mscoupon_gui.md](mscoupon_gui.md),
+"Colour input"). The **right**
 pane is annotation management (classes, tools, the
 Magic rows, the per-class interaction lists, Save/Load annotations) and the
 classifier (Train/Classify, the model strip, the confusion matrix, exports,
@@ -109,7 +112,8 @@ Release paints; Escape abandons.
 |---|---|---|
 | `mean` (default) | \|Δmean\| over the chosen channels, each z-scored by that column's spread on the slice | `mean_<channel>` |
 | `bhattacharyya` | Gaussian overlap from mean and std per channel | `mean_`, `std_` |
-| `cosine` | `1 − cos` between the regions' whole statistics rows: every column except ids and positions, each z-scored over the slice. Ignores the channel list. | any statistics |
+| `histogram` | Hellinger distance between the regions' per-channel histograms (the concatenated bin fractions, scaled so the row sums to one) over the chosen channels that carry bins | `statistics.histogram` |
+| `cosine` | `1 − cos` between the regions' whole statistics rows: every column except ids, positions and histogram bins, each z-scored over the slice. Ignores the channel list. | any statistics |
 | `proba` | total variation (half the L1) between the classifier's class-probability vectors; a region the model never scored is at distance 1, so it joins last. Ignores the channel list. The press is refused until the slice has been classified at the current commit. | a Classify |
 | `barrier` | saddle height above the seed's extremum: the persistence-style flood anchored at a point | MSC region arcs (`ext_filtered`) |
 
@@ -263,6 +267,14 @@ Unchanged by the above: Train/Classify on the per-region statistics table
 export (one row per living region, class 0 kept as negatives), and the
 image training set (`train/` raw TIFFs + `labels/` per-pixel class masks,
 annotations winning over predictions).
+
+Colour statistics (`mean_color_c0`, `mean_dizenzo_largest_s1.5`, ...) and
+histogram bins (`hist00_base`, ...) are ordinary columns of that table, so
+they enter every model by name; a channel's bins stand or fall together with
+its other reductions in the Optimize feature-subset search. Switching either
+on changes the field set, so a model saved under the old profile is refused by
+the compatibility gate ("profile adds: ...") until retrained -- by design, a
+bin must mean the same thing the model learned it as.
 
 ## Optimize network (the `dense (tuned)` kind)
 

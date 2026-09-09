@@ -394,3 +394,59 @@ per-slice means weights by slice count, not area); `per_slice` reductions instea
 run *across* slices, which is the only way `area`/`bbox_w/h` mean anything under
 mean/min/max/std. `assembly.py` mirrors all of it so the GUI's 3D assembly agrees
 with the CLI.
+
+**mscoupon colour input** (RGB/RGBA TIFFs, CLI and GUI alike): a TIFF's samples
+load as planar float32 planes (`msseg::read_tiff_planes` -> `InputSlice`;
+TinyTIFF decodes chunky and planar files one sample at a time; 4 samples read
+as RGBA and 2 as gray+alpha, the alpha dropped unless `input.color.alpha` is
+`keep` -- TinyTIFF exposes no ExtraSamples, so alpha is inferred from the
+count). Each chain reduces the planes to its scalar through a leading `color`
+stage (`libs/core/msseg/filter/color_stage.cpp`): `pick`, `luminance`
+(Rec.709), `weighted`, `mean`/`max`/`min`, `hsv`, `optical_density` (`i0` =
+`"max"` | number | per-plane; an optional unit `stain` vector, `weights` or
+`channels` projection; default the total OD), and diffg's multi-channel
+`chgradmag`, `dizenzo` and `structure`. It is the ONLY stage that consumes
+planes, so it is valid at index 0 only, and each chain picks its own -- the
+topology field can run on Di Zenzo edge strength while statistics read OD. A
+multi-plane input whose chain has none gets `input.color.default_method`
+(luminance). One plane and no colour stage is the scalar chain exactly
+(byte-identical outputs, gated on two grayscale slices with normalize +
+derived channels + matching). The GUI loads through the same reader
+(`common.load_slice`, Pillow fallback for compressed files), renders a planar
+base as RGB, offers `color` / `color_c<i>` in the Image dropdown, and a `color`
+card at the head of a chain with per-method rows; the profile carries
+`input.color` and the params JSON gets `input.color.channels` from the slice on
+screen. **Colour statistics sources**: `statistics.channels[]` takes the bare
+string `"color"` (the raw planes, `color_c0..`) and `source: "color"` on a
+derived request -- per-channel kinds then emit one response per plane
+(`blur_c0_s1.5`, `hessian_largest_c1_s1.5`, plane-major to match diffg's bank
+order) and the cross-channel kinds `chgradmag` / `dizenzo` reduce over the
+planes (they require that source). The plane count is a declared config fact
+(`input.color.channels`, 3 when a colour source is named but nothing is
+declared) so the schema resolves with no raster in hand; every loaded slice is
+checked against it. `build_stat_channels` runs a second bank traversal over the
+planes; colour-sourced specs stay on the CPU statistics path (diffg's GPU bank
+is single-channel). Per-channel kinds on colour multiply the derived bank by C,
+so the GUI keeps a slice's planes in the file's integer dtype.
+
+**mscoupon histograms** (`statistics.histogram`, the first vector statistic):
+`{"bins": 16, "channels": ["base"], "ranges": {"*": [0, 1]}}` adds K
+equal-width bins over a FIXED range per channel (a name or `"*"`), opt-in per
+channel because the counts live per base manifold (a 3232² slice can have ~1e6).
+The range is fixed by config rather than measured per slice on purpose: the
+bins must add across slices (the matcher and `assembly.py` merge bin-wise with
+`np.add.at`) and a bin must mean the same thing on every slice a classifier is
+trained over; out-of-range values clamp into the end bins so the counts always
+sum to the area, NaN is skipped. Counts are a uint32 side table of
+`ChannelStats` (add / saturating merge / append / clear), projected as
+`hist<kk>_<channel>` (reduction `hist<kk>`, zero-padded) AFTER the extremum
+block as bin fractions, so every previous column order is a prefix and
+`global_segments.csv` picks them up through the schema. The GUI panel's
+"measure" fills the `"*"` range from the slice on screen; the summary reads
+`+16h×2`. Downstream: the classifier's per-channel feature groups keep a
+channel's bins together (`model_search.feature_groups`), the magic fill gains a
+`histogram` metric (Hellinger over the concatenated bin fractions) and `cosine`
+leaves the bins out, and switching histograms on widens the field set so saved
+models are invalidated by the compat gate, as designed. Histogram specs stay on
+the CPU statistics path. Gradient-orientation histograms are designed, not
+built: `docs/design_orientation_histograms.md`.

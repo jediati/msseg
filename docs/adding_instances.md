@@ -248,6 +248,19 @@ touch GInt. Model calling sequences on the local MSCEER checkout:
 
 ---
 
+### Multi-channel (colour) input
+
+The chain has a second entry point, `msseg::apply_filter_chain(
+MultiImageView<const float> planes, chain, default_color_method)`, fed the
+input's planar planes (`msseg::InputSlice`, from `read_tiff_planes`). A leading
+`color` stage (`filter/color_stage.hpp`) -- explicit, or synthesized from the
+default -- reduces them to the scalar the rest of the chain runs on; one plane
+and no colour stage is the scalar overload exactly. `build_stat_channels` and
+`Msc2DPipeline::build` take the planes as an optional last argument so
+colour-sourced statistics channels (`source: "color"`, `chgradmag`, `dizenzo`)
+can be measured. An instance that only ever sees grayscale keeps calling the
+scalar overloads.
+
 ## Python bindings pattern
 
 Follow MSCEER's `msc_py` style and the existing modules
