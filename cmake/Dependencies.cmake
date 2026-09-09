@@ -8,7 +8,6 @@
 # Pair with -DFETCHCONTENT_FULLY_DISCONNECTED=ON (see the `hpc` preset).
 # ---------------------------------------------------------------------------
 include(FetchContent)
-include(${CMAKE_CURRENT_LIST_DIR}/PatchMsceer.cmake)
 
 # Honor a local dependency mirror for offline builds by pointing CMake's native
 # per-dependency source override at MSSEG_DEPS_DIR/<name> when it exists.
@@ -62,7 +61,7 @@ FetchContent_Declare(diffg
 )
 FetchContent_Declare(msceer
   GIT_REPOSITORY https://github.com/sci-visus/MSCEER.git
-  GIT_TAG 7cb470381f88d2b3ed5e6d9ac22e2e36e8093a28   # + livingRegionArcs(): living-region adjacency at the current persistence
+  GIT_TAG 309ddde9b7f5a1a1db143711a4eab15d2317223a   # + DigitizeSegmentInternal returns a value (GCC segfault in every 2D MSC build)
 )
 FetchContent_Declare(tinytiff
   GIT_REPOSITORY https://github.com/jkriege2/TinyTIFF.git
@@ -82,7 +81,6 @@ FetchContent_GetProperties(msceer)
 if(NOT msceer_POPULATED)
   FetchContent_Populate(msceer)
 endif()
-msseg_patch_msceer("${msceer_SOURCE_DIR}")
 list(APPEND CMAKE_MODULE_PATH "${msceer_SOURCE_DIR}/cmake")
 add_subdirectory(${msceer_SOURCE_DIR} ${msceer_BINARY_DIR} EXCLUDE_FROM_ALL)
 
