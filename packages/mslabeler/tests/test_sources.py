@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from msseg.labeler import pyramid
 from msseg.labeler.sources import ArrayImageSource, ArrayLabelLayer
 
 
@@ -159,10 +160,13 @@ def test_canvas_public_surface(canvas_factory):
     assert not sc.has_base and sc._base is None
 
 
-def test_pyramid_source_needs_large_image():
+def test_pyramid_source_is_re_exported_and_refuses_an_unreadable_path():
+    """One import site for both base-image implementations; the failure to open
+    is a RuntimeError whatever backends are installed (see test_pyramid)."""
     from msseg.labeler import sources
-    if sources.HAVE_LARGE_IMAGE:
-        pytest.skip("large_image present: exercised by the GUI, not here")
+    from msseg.labeler.pyramid import PyramidImageSource
+    assert sources.PyramidImageSource is PyramidImageSource
+    assert sources.HAVE_PYRAMID == bool(pyramid.backends_available())
     with pytest.raises(RuntimeError):
         sources.PyramidImageSource("nope.tiff")
 

@@ -18,8 +18,14 @@ classify = ["scikit-learn>=1.7"]
 optimize = ["scikit-learn>=1.7", "optuna>=4"]
 # GPU dense nets (`torch_mlp`); install a CUDA wheel from download.pytorch.org.
 torch = ["torch>=2.7"]
-# Pyramidal (tiled) base-image rendering in the canvas.
-pyramid = ["large-image[tiff,tifffile]"]
+# Pyramidal (tiled) base-image rendering in the canvas. ANY ONE of these is
+# enough -- `pyramid.py` tries the backends in order and takes the first that
+# opens the file. OpenSlide is the default because it brings its own decoders,
+# so it reads a JPEG-tiled whole-slide TIFF with nothing else installed;
+# tifffile needs imagecodecs for exactly that case.
+pyramid = ["openslide-python"]
+pyramid-largeimage = ["large-image[tiff,tifffile]"]
+pyramid-tifffile = ["tifffile", "zarr", "imagecodecs"]
 
 [tool.hatch.build.targets.wheel]
 # PEP 420 namespace: ship msseg/labeler/ with no top-level msseg/__init__.py.

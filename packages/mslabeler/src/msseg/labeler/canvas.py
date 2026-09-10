@@ -4,7 +4,7 @@ Shows one item at a time: a base image with brightness/contrast, plus
 alpha-composited overlay layers (a filter field, a segmentation, a mask, the
 labeler's class layers). The base is any ``ImageSource``: an in-memory array
 (``ArrayImageSource``, exact float windowing) or a tiled pyramid served by
-level (``PyramidImageSource`` over ``large_image``), read only over the
+level (``PyramidImageSource`` over a tiled pyramid), read only over the
 viewport at the level nearest the current zoom. Region overlays are
 ``LabelLayer``s recoloured through a LUT at render time; a layer that can hand
 over its whole raster (``full()``) is gathered exactly onto the viewport grid,
@@ -12,7 +12,7 @@ one that cannot is asked for a crop at the best level and resized nearest.
 
 Coordinates ``view_x``/``view_y`` and ``scale`` are in full-resolution base
 pixels (scale = base px per screen px), so overlays and annotations map
-trivially. Requires numpy + Pillow; ``large_image`` is optional.
+trivially. Requires numpy + Pillow; a pyramid backend is optional.
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from PIL import Image, ImageTk
 
 from .perf import FrameProfiler
 from .sources import (ArrayImageSource, ArrayLabelLayer, PyramidImageSource,
-                      HAVE_LARGE_IMAGE as _HAVE_LARGE_IMAGE, level_index_vectors)
+                      HAVE_PYRAMID as _HAVE_PYRAMID, level_index_vectors)
 
 class SliceCanvas(tk.Frame):
     def __init__(self, master, **kwargs):
@@ -127,14 +127,14 @@ class SliceCanvas(tk.Frame):
         return self.source is not None
 
     # Legacy views kept for callers (and the selftests) that read them: the
-    # in-memory array, and the raw large_image source behind the pyramid.
+    # in-memory array, and the reader backend behind the pyramid.
     @property
     def _base(self):
         return None if self._array_src is None else self._array_src.array
 
     @property
     def _source(self):
-        return None if self._pyramid_src is None else self._pyramid_src._src
+        return None if self._pyramid_src is None else getattr(self._pyramid_src, "be", None)
 
     def set_source(self, source, path=None):
         """Make `source` (an ImageSource) the base. A ``native`` source (values
@@ -156,7 +156,7 @@ class SliceCanvas(tk.Frame):
 
     def set_base(self, array=None, path=None, reset_array=False):
         """Set the base image from an in-memory array and/or a file path
-        (the path is opened pyramidally by large_image when available). The
+        (the path is opened pyramidally when a backend is available). The
         pyramid is cached by path so repeated renders of the same slice
         (e.g. dragging the persistence slider) don't re-open the file.
         reset_array=True drops a previously-set in-memory array, so a
@@ -167,7 +167,7 @@ class SliceCanvas(tk.Frame):
         if path != self._source_path:
             self._pyramid_src = None
             self._source_path = path
-            if path and _HAVE_LARGE_IMAGE:
+            if path and _HAVE_PYRAMID:
                 try:
                     self._pyramid_src = PyramidImageSource(str(path))
                 except Exception:
@@ -178,7 +178,8 @@ class SliceCanvas(tk.Frame):
 
     @property
     def base_is_rgb(self):
-        return self._array_src is not None and self._array_src.channels == 3
+        src = self.source
+        return src is not None and src.channels == 3
 
     @staticmethod
     def _as_layer(o):

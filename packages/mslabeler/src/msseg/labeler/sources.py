@@ -2,26 +2,27 @@
 
 ``ArrayImageSource`` wraps an in-memory raster (the coupon viewer's case): one
 level, native float values, so the canvas windows in the data's own range.
-``PyramidImageSource`` wraps a tiled pyramid through ``large_image`` and serves
-display-scaled 8-bit regions at the level nearest the requested scale -- the
-shape a whole-slide labeler's base image takes. ``ArrayLabelLayer`` serves a
-full-resolution int32 region raster by level-space crop, and hands the whole
-raster to callers that can use it (``full()``), which is how the canvas keeps
-its exact viewport gather for in-memory labels.
+``PyramidImageSource`` -- the whole-slide case, over a tiled pyramid -- lives
+in ``pyramid.py`` and is re-exported here, so both base-image implementations
+are importable from one place. ``ArrayLabelLayer`` serves a full-resolution
+int32 region raster by level-space crop, and hands the whole raster to callers
+that can use it (``full()``), which is how the canvas keeps its exact viewport
+gather for in-memory labels.
 """
 from __future__ import annotations
 
-import io
 from typing import Optional, Tuple
 
 import numpy as np
 
-try:  # optional pyramidal backend
-    import large_image
-    HAVE_LARGE_IMAGE = True
-except Exception:  # pragma: no cover
-    large_image = None
-    HAVE_LARGE_IMAGE = False
+from .pyramid import PyramidImageSource, backends_available
+
+# True when ANY pyramidal backend (OpenSlide, large_image, tifffile + zarr)
+# is importable -- which reader it is, is pyramid.py's business.
+HAVE_PYRAMID = bool(backends_available())
+
+__all__ = ["ArrayImageSource", "PyramidImageSource", "ArrayLabelLayer",
+           "level_index_vectors", "HAVE_PYRAMID"]
 
 
 def level_index_vectors(np_, level_scale, x, y, w, h, full_h, full_w):
@@ -75,59 +76,6 @@ class ArrayImageSource:
 
     def read_region(self, level: int, x: int, y: int, w: int, h: int):
         return self.array[y:y + h, x:x + w]
-
-
-class PyramidImageSource:
-    """ImageSource over a tiled/pyramidal file via ``large_image``. Level 0 is
-    full resolution and level k is downsampled by 2**k (the reverse of
-    large_image's own numbering). Regions come back display-scaled uint8
-    (``native`` is False), so the canvas windows them in [0, 1] fraction space."""
-    native = False
-
-    def __init__(self, path: str):
-        if not HAVE_LARGE_IMAGE:
-            raise RuntimeError("large_image is not installed")
-        self.path = str(path)
-        self._src = large_image.open(self.path)
-        md = self._src.getMetadata()
-        self._w, self._h = int(md["sizeX"]), int(md["sizeY"])
-        self._levels = max(1, int(md.get("levels") or 1))
-
-    @property
-    def levels(self) -> int:
-        return self._levels
-
-    @property
-    def channels(self) -> int:
-        return 1                          # served as grayscale (convert("L"))
-
-    def level_shape(self, level: int) -> Tuple[int, int]:
-        s = self.level_scale(level)
-        return max(1, int(round(self._h / s))), max(1, int(round(self._w / s)))
-
-    def level_scale(self, level: int) -> float:
-        return float(2 ** int(level))
-
-    def best_level(self, scale: float) -> int:
-        """The coarsest level whose pixels are still finer than `scale`
-        full-res px per screen px (never coarser than the screen)."""
-        level = 0
-        while level + 1 < self._levels and self.level_scale(level + 1) <= max(scale, 1.0):
-            level += 1
-        return level
-
-    def value_range(self) -> Tuple[float, float]:
-        return (0.0, 1.0)
-
-    def read_region(self, level: int, x: int, y: int, w: int, h: int):
-        s = self.level_scale(level)
-        png, _ = self._src.getRegion(
-            region={"left": int(x * s), "top": int(y * s), "right": int((x + w) * s),
-                    "bottom": int((y + h) * s), "units": "base_pixels"},
-            output={"maxWidth": int(w), "maxHeight": int(h)}, encoding="PNG")
-        from PIL import Image
-        im = Image.open(io.BytesIO(png)).convert("L").resize((int(w), int(h)))
-        return np.asarray(im, dtype=np.uint8)
 
 
 class ArrayLabelLayer:

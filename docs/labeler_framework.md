@@ -33,7 +33,8 @@ Extras: `classify` (scikit-learn), `optimize` (+ optuna), `torch`, `pyramid`
 | `model_search.py`, `edge_model.py`, `torch_mlp.py` | the dense-net search, the pair model + voting, the GPU MLP | no |
 | `table.py` | `FeatureTable` (the columnar per-region table) | no |
 | `session_doc.py` | the session document (folders, sequences, profiles, view) and the session-file I/O | no |
-| `sources.py` | `ArrayImageSource`, `PyramidImageSource`, `ArrayLabelLayer` | no |
+| `sources.py` | `ArrayImageSource`, `ArrayLabelLayer` (+ `PyramidImageSource` re-exported) | no |
+| `pyramid.py` | `PyramidImageSource` over a tiled pyramid: the OpenSlide / large_image / tifffile backends, the tile LRU | no |
 | `canvas.py` | `SliceCanvas`: zoom/pan, an `ImageSource` base, `LabelLayer` overlays through LUTs, the transient preview layer, the HUD | yes |
 | `widgets.py` | `ScrollFrame`, `jump_scale`, `scrolled_listbox`, tooltips | yes |
 | `shell.py` | `ViewerShell`: window, session browser, profiles, navigation, pump, session flow | yes |
@@ -76,7 +77,7 @@ state first (the base constructor calls the overridden builders), then chains.
 |---|---|---|
 | `ItemCatalogue` | `keys()`, `key_of(*index)`, `index_of(key)`, `label(key)`, `group_of(key)`, `tree()` | `adapters.SequenceCatalogue`: items are slices, key = `"folder/basename"` (what `annotations.json` has always stored), address = `(si, li)`, group = the flat slice index (leave-slices-out CV) |
 | `RegionProvider` | `commit`, `keys()`, `record(key)`, `ensure_record(key)`, `request(key)`, `pending()`, `poll()`, `arcs(key, np)`, `label_layer(key)` | `adapters.EngineRegionProvider` over `ComputeEngine`: cached per-slice records, synchronous compute through `ComputeEngine.ensure_slice`, MSC arcs or a cached pixel-adjacency fallback |
-| `ImageSource` | `levels`, `channels`, `level_shape`, `level_scale`, `best_level(scale)`, `value_range()`, `read_region(level, x, y, w, h)` | `sources.ArrayImageSource` (one level, native floats) and `sources.PyramidImageSource` (large_image, level k = 1/2^k, display-scaled uint8) |
+| `ImageSource` | `levels`, `channels`, `level_shape`, `level_scale`, `best_level(scale)`, `value_range()`, `read_region(level, x, y, w, h)` | `sources.ArrayImageSource` (one level, native floats) and `pyramid.PyramidImageSource` (a tiled pyramid: the file's own levels and dtype, colour kept, reads assembled from a byte-budgeted tile LRU) |
 | `LabelLayer` | `shape`, `n_ids`, `rev`, `crop(level, x, y, w, h)`, `id_at(x, y)`, `full()` | `sources.ArrayLabelLayer` over the record's int32 raster |
 
 A `RegionRecord` is `{commit, labels (int32 raster, -1 = background), stats
@@ -151,11 +152,14 @@ integration tests of the shells.
 
 A whole-slide labeler would implement the seams like this:
 
-* **`ImageSource`** over the slide's tiled pyramid (`large_image`, OpenSlide,
-  tifffile's zarr store): `levels` = the pyramid depth, `read_region` reads a
-  tile-aligned window at a level, `best_level` picks the level nearest the
-  canvas zoom. The canvas already draws such a source; nothing full-resolution
-  is ever materialised.
+* **`ImageSource`** over the slide's tiled pyramid -- `pyramid.PyramidImageSource`
+  already is this: `levels` = the pyramid depth, `read_region` assembles a
+  window at a level from cached tiles, `best_level` picks the level nearest the
+  canvas zoom. Nothing full-resolution is ever materialised. `level_scale` is
+  the file's true downsample, not `2**k`: levels floor their dimensions, so a
+  deep level of a 90 000-row slide is 515.6x. A rect running off a level is
+  zero-filled rather than clipped, which is what lets a halo'd ROI read across
+  an edge.
 * **`ItemCatalogue`** over slides and their ROIs: an item is one ROI (key e.g.
   `"slide.svs#roi3"`, stable across sessions because it is what
   `annotations.json` stores); `group_of` returns the slide, so cross-validation
