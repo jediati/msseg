@@ -342,6 +342,52 @@ def touched_ids(interaction, labels, np):
     return set(int(v) for v in vals if v >= 0)
 
 
+class Placement:
+    """Where an item's region raster sits in the image the canvas draws.
+
+    Gestures arrive in image coordinates. For an item that IS the image -- a
+    coupon slice -- those are already raster indices and this is the identity.
+    For an item that covers part of a larger image, or covers it at a coarser
+    resolution (a whole-slide ROI at level 0, an overview at 1/16), a raster
+    index is ``(image - origin) / scale``, and indexing the raster with an image
+    coordinate is out of bounds rather than merely wrong -- which is the good
+    news, because it fails loudly.
+
+    Only the drawing tools need this: they rasterize a gesture against the ids
+    to preview and to seed. What a gesture STORES stays in image coordinates
+    (that is the geometry annotations.json keeps, and it must survive a change
+    of level), and resolution goes through ``touched_ids_over``, which asks the
+    layer instead.
+    """
+
+    __slots__ = ("ox", "oy", "scale")
+
+    def __init__(self, origin=(0, 0), scale=1.0):
+        self.ox, self.oy = float(origin[0]), float(origin[1])
+        self.scale = float(scale) or 1.0
+
+    @property
+    def identity(self):
+        return (self.ox, self.oy, self.scale) == (0.0, 0.0, 1.0)
+
+    def to_raster(self, x, y):
+        """Image point -> raster coordinates (floats; the caller rounds)."""
+        return (float(x) - self.ox) / self.scale, (float(y) - self.oy) / self.scale
+
+    def to_image(self, x, y):
+        """Raster coordinates -> image point."""
+        return float(x) * self.scale + self.ox, float(y) * self.scale + self.oy
+
+    def points_to_raster(self, pts):
+        return [self.to_raster(x, y) for x, y in pts]
+
+    def __repr__(self):
+        return f"Placement(origin=({self.ox:g}, {self.oy:g}), scale={self.scale:g})"
+
+
+IDENTITY = Placement()
+
+
 def gesture_bbox(interaction, np, pad=1):
     """(x, y, w, h) covering a gesture's points, or None when it has none.
 

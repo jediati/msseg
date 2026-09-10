@@ -172,7 +172,8 @@ class AnalysisPanelMixin:
         pt = None
         if rec is not None and rec.get("labels") is not None:
             import numpy as np
-            res = _extremum_points(rec["labels"], [int(region)], rec.get("stats"), np)
+            res = _extremum_points(rec["labels"], [int(region)], rec.get("stats"), np,
+                                   self.FIELDS, self._region_placement())
             pt = res.get(int(region)) if isinstance(res, dict) else (res[0] if res else None)
             if pt is not None and (pt[0] is None or pt[1] is None):
                 pt = None

@@ -143,7 +143,7 @@ def run_selftest():
     # -- render + hover --------------------------------------------------- #
     app._goto_slice(0)
     app._refresh_render()
-    overlays = app._seg_overlays(item.key, rec, __import__("numpy"),
+    overlays = app._seg_overlays(0, 0, rec, None, __import__("numpy"),
                                  __import__("msseg.viz", fromlist=["min_colors"]).min_colors)
     assert overlays and overlays[0]["lut"].shape[0] == layer.n_ids, \
         "the LUT must be sized from the layer's declared id count"
@@ -185,3 +185,121 @@ def run_selftest():
 
 if __name__ == "__main__":
     sys.exit(run_selftest())
+
+
+def run_labeler_selftest():
+    """``mspath-labeler --selftest``: the annotation layer over a placed item.
+
+    The point of interest is the one the coupon labeler cannot exercise: the
+    canvas draws in slide coordinates while the region raster is the item's, so
+    every gesture, preview and training row has to cross that gap. A whole
+    level-4-ish overview is used precisely because its scale is not 1 -- an
+    identity placement would pass a level-0 test and fail here.
+    """
+    import numpy as np
+    import tkinter as tk
+
+    from msseg.labeler.pyramid import backends_available
+    from msseg.labeler.labeling import touched_ids_over
+    from .labeler import LabelerApp
+
+    if not backends_available():
+        print("selftest SKIPPED: no pyramid backend installed")
+        return 0
+
+    tmp = tempfile.mkdtemp(prefix="mspath-labeler-selftest-")
+    slide, folder, origin = _pick_slide(tmp)
+    print(f"[mspath] labeler selftest slide ({origin}): {slide}")
+    try:
+        root = tk.Tk()
+    except Exception as exc:
+        print(f"selftest SKIPPED: no display ({exc})")
+        return 0
+    root.withdraw()
+    app = LabelerApp(root, autosave=False)
+
+    app._add_folder_path(folder)
+    app.file_list.selection_clear(0, "end")
+    app.file_list.selection_set(app.all_files.index(slide))
+    app._make_subsequence()
+    src = app.engine.source(app._item_at(0, 0).slide)
+    deepest = max(0, src.levels - 3)
+    app.level_var.set(deepest)
+    app._on_level_change()
+
+    item = app._item_at(0, 0)
+    profile = app._profile_for_compute()
+    app.engine.prime_item(item, profile, halo=0)
+    rec = app.engine.ensure_record(item.key, profile)
+    app._rebuild_flat_slices()
+    app._goto_slice(0)
+    assert rec is not None and rec["stats"].n_rows >= 2, rec
+
+    # -- the placement is the item's, not the identity -------------------- #
+    place = app._region_placement()
+    assert place.scale == rec["scale"] and (place.ox, place.oy) == tuple(rec["origin"])
+    if rec["scale"] > 1:
+        assert not place.identity, "a coarse item must not claim an identity placement"
+    lh, lw = rec["labels"].shape[:2]
+    # a slide point well past the raster's own extent still maps inside it
+    far_x = int((lw - 1) * rec["scale"])
+    rx, ry = place.to_raster(far_x + rec["origin"][0], rec["origin"][1])
+    assert 0 <= int(rx) < lw and 0 <= int(ry) < lh, (rx, ry)
+
+    # -- a gesture in SLIDE coordinates paints the regions under it ------- #
+    layer = app.regions.label_layer(item.key)
+    stats = rec["stats"]
+    fid = stats.column("feature_id").astype(int)
+    ex = stats.column("ext_x"); ey = stats.column("ext_y")
+    target = int(fid[0])
+    px, py = float(ex[0]), float(ey[0])
+    assert layer.id_at(int(px), int(py)) == target, "the extremum is in slide coordinates"
+
+    app.active_class_var.set(1)
+    app._commit_interaction("taps", [(px, py)])
+    assert len(app.store.interactions) == 1
+    it = app.store.interactions[0]
+    assert it.slice_key == item.key, it.slice_key
+    assert touched_ids_over(it, layer, np) == {target}, "the gesture missed its region"
+
+    # the class LUT resolves the same way the commit did
+    entry = app._labels_cache_for(0, 0, rec, np)
+    region_class = entry[5]
+    assert region_class is not None and region_class[target] == 1, \
+        "the class layer disagrees with the gesture"
+    assert entry[4][1] == 1, entry[4][:3]
+
+    # -- a box over the whole item paints every region -------------------- #
+    x0, y0 = rec["origin"]
+    x1 = x0 + lw * rec["scale"]; y1 = y0 + lh * rec["scale"]
+    app.active_class_var.set(2)
+    app._commit_interaction("box", [(float(x0), float(y0)), (float(x1), float(y1))])
+    entry = app._labels_cache_for(0, 0, rec, np)
+    counts = entry[4]
+    assert counts[2] >= max(1, stats.n_rows - 1), (counts[:3], stats.n_rows)
+
+    # -- a training row carries the drawn class --------------------------- #
+    from msseg.labeler.training import TrainingSetBuilder
+    builder = TrainingSetBuilder(app.FIELDS)
+    cls = builder.row_classes(app.store.for_slice(item.key), rec["labels"], fid, np, layer)
+    assert (cls > 0).any(), "no training row picked up a label"
+    assert int(cls[0]) == 2, "the later gesture must win on a region both touch"
+
+    # -- the model is pinned to the level --------------------------------- #
+    assert app._feature_scope() == f"L{deepest}"
+    names = app._expected_feature_names()
+    assert names and "mean_base" in names and "ext_x" not in names
+    assert app._check_model_compat(names, "selftest", f"L{deepest}") is None
+    other = app._check_model_compat(names, "selftest", "L99")
+    assert other and "L99" in other, other
+
+    # -- undo puts it back ------------------------------------------------ #
+    app._undo()
+    assert len(app.store.interactions) == 1
+    app._undo()
+    assert not app.store.interactions
+
+    root.destroy()
+    print("labeler selftest OK: placement, slide-coordinate gestures, class layer, "
+          "box over the item, training rows, level-scoped compat gate, undo")
+    return 0

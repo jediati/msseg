@@ -198,7 +198,9 @@ class ClassifierMixin:
         items = ((key, rec, table, self.catalogue.group_of(key), f"{si}:{li}")
                  for si, li, key, rec, table in slices)
         try:
-            return self._training_builder.labeled_set(items, self.store, np)
+            return self._training_builder.labeled_set(
+                items, self.store, np,
+                layer_of=lambda key, rec: self.regions.label_layer(key))
         except TrainingProblem as problem:
             self.status_var.set(str(problem))
             return None
@@ -247,7 +249,8 @@ class ClassifierMixin:
                  for si, li, key, rec, table in slices)
         try:
             return self._training_builder.edge_set(
-                items, self.store, names, lambda key, rec: self.regions.arcs(key, np), np)
+                items, self.store, names, lambda key, rec: self.regions.arcs(key, np), np,
+                layer_of=lambda key, rec: self.regions.label_layer(key))
         except TrainingProblem as problem:
             self.status_var.set(str(problem))
             return None

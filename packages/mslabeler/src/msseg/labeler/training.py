@@ -54,18 +54,26 @@ class TrainingSetBuilder:
         return mat
 
     @staticmethod
-    def row_classes(interactions, labels, fids, np):
+    def row_classes(interactions, labels, fids, np, layer=None):
         """Per-row class (0 = unlabeled): the gestures resolved against the
-        current raster, gathered by each row's region id."""
-        rc = resolve_slice(interactions, labels, np)
+        current decomposition, gathered by each row's region id.
+
+        `layer` is the item's ``LabelLayer`` when the gestures' coordinates are
+        not the raster's indices; `labels` then only sizes the result."""
+        rc = resolve_slice(interactions, labels, np, layer)
         fid = np.asarray(fids).astype(int)
         ok = (fid >= 0) & (fid < len(rc))
         cls = np.zeros(len(fid), int)
         cls[ok] = rc[fid[ok]]
         return cls
 
-    def labeled_set(self, items, store, np, id_field: Optional[str] = None):
-        """``(X, y, groups, names)`` over every labeled region of every item."""
+    def labeled_set(self, items, store, np, id_field: Optional[str] = None,
+                    layer_of=None):
+        """``(X, y, groups, names)`` over every labeled region of every item.
+
+        `layer_of(key, rec)` supplies the item's ``LabelLayer`` when its region
+        ids are not addressed by the gestures' own coordinates (the whole-slide
+        case); the same shape as `edge_set`'s `arcs_of`."""
         id_field = id_field or self.conv.id_field
         X, y, g, names = [], [], [], None
         for key, rec, table, group, label in items:
@@ -76,7 +84,8 @@ class TrainingSetBuilder:
             if mat is None or fids is None:
                 raise TrainingProblem(
                     f"Training stopped: incomplete statistics on slice {label}.")
-            cls = self.row_classes(store.for_slice(key), rec["labels"], fids, np)
+            cls = self.row_classes(store.for_slice(key), rec["labels"], fids, np,
+                                   None if layer_of is None else layer_of(key, rec))
             m = cls > 0
             if m.any():
                 X.append(mat[m])
@@ -93,7 +102,8 @@ class TrainingSetBuilder:
         return X, y, g, names
 
     def edge_set(self, items, store, names: Sequence[str], arcs_of: Callable[[Any], Any], np,
-                 id_field: Optional[str] = None, ext_field: Optional[str] = None):
+                 id_field: Optional[str] = None, ext_field: Optional[str] = None,
+                 layer_of=None):
         """Every region of every item (class 0 = unlabeled) with its group and
         extremum value, plus the region-graph edges as global row pairs:
         ``(X, cls, groups, ext | None, edges, names)``. ``arcs_of(key, record)``
@@ -108,7 +118,8 @@ class TrainingSetBuilder:
             fids = table.column(id_field)
             if mat is None or fids is None:
                 raise TrainingProblem(f"Edges stopped: incomplete statistics on slice {label}.")
-            c = self.row_classes(store.for_slice(key), rec["labels"], fids, np)
+            c = self.row_classes(store.for_slice(key), rec["labels"], fids, np,
+                                 None if layer_of is None else layer_of(key, rec))
             fid = np.asarray(fids).astype(int)
             X.append(mat); cls.append(c); grp.append(np.full(len(c), group))
             if ext_col is not None:

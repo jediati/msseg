@@ -163,6 +163,7 @@ class DrawController:
         self._pv = {"labels": labels,
                     "K": int(labels.max()) + 1 if labels.size else 1,
                     "ids": set(), "shown": None, "pred": pred,
+                    "place": app._region_placement(),
                     "rgba": app.store.rgba(int(app.active_class_var.get()))}
         app._begin_preview()
 
@@ -173,7 +174,10 @@ class DrawController:
         import numpy as np
         labels = pv["labels"]
         h, w = labels.shape
-        pts = self._pts
+        # The gesture is in image coordinates; the raster is the item's. For a
+        # coupon slice these are the same numbers and this is a no-op.
+        place = pv["place"]
+        pts = self._pts if place.identity else place.points_to_raster(self._pts)
         tool = self._tool()
         if tool == "squiggle":
             # Incremental and exact: only the newest segment is rasterized.
@@ -182,7 +186,7 @@ class DrawController:
             if len(ys):
                 pv["ids"].update(int(v) for v in np.unique(labels[ys, xs]) if v >= 0)
         elif tool == "box":
-            pv["ids"] = self._slab_ids(labels, pts[0], pts[-1], np)
+            pv["ids"] = self._slab_ids(labels, pts[0], pts[-1], np)   # already raster
         elif len(pts) >= 3:                     # polygon
             ids = set()
             pm = polygon_mask(pts, w, h, np)
@@ -353,7 +357,10 @@ class MagicFillController:
         labels = rec["labels"]
         h, w = labels.shape
         x, y = v.view_x + e.x * v.scale, v.view_y + e.y * v.scale
-        ix, iy = int(round(x)), int(round(y))
+        # The press is an image point; the seed is a raster index.
+        place = app._region_placement()
+        rx, ry = place.to_raster(x, y)
+        ix, iy = int(round(rx)), int(round(ry))
         if not (0 <= ix < w and 0 <= iy < h):
             return False
         seed = int(labels[iy, ix])
@@ -520,11 +527,19 @@ class MagicFillController:
             v.set_hud(*s["hud"])       # give the canvas HUD back to the engine
 
 
-def _extremum_points(labels, ids, table, np, conv=fields.DEFAULT):
-    """One image point per region id: its seeding extremum (`conv.extremum_xy`
+def _extremum_points(labels, ids, table, np, conv=fields.DEFAULT, place=None):
+    """One IMAGE point per region id: its seeding extremum (`conv.extremum_xy`
     from the feature table) when that pixel really carries the id, else the
     region's first pixel in raster order. Both lookups are vectorised -- the
-    fallback is one pass over the raster, not one per region."""
+    fallback is one pass over the raster, not one per region.
+
+    In and out are image coordinates -- the table's positional columns are in
+    them, and the result is stored as a gesture's geometry -- while the raster
+    lookups in between are in the item's own indices; `place` is the map
+    (identity when the item is the image).
+    """
+    from .labeling import IDENTITY
+    place = place or IDENTITY
     h, w = labels.shape
     pts = {}
     if table is not None and ids and conv.extremum_xy is not None:
@@ -539,9 +554,11 @@ def _extremum_points(labels, ids, table, np, conv=fields.DEFAULT):
                 r = int(row_of[i]) if 0 <= i < K else -1
                 if r < 0:
                     continue
-                x, y = int(round(float(ex[r]))), int(round(float(ey[r])))
-                if 0 <= x < w and 0 <= y < h and int(labels[y, x]) == i:
-                    pts[i] = (float(x), float(y))
+                x, y = float(ex[r]), float(ey[r])
+                rx, ry = place.to_raster(x, y)
+                cx, cy = int(round(rx)), int(round(ry))
+                if 0 <= cx < w and 0 <= cy < h and int(labels[cy, cx]) == i:
+                    pts[i] = (float(round(x)), float(round(y)))
     missing = [i for i in ids if i not in pts]
     if missing:
         flat = labels.ravel()
@@ -552,5 +569,5 @@ def _extremum_points(labels, ids, table, np, conv=fields.DEFAULT):
             vals, idx = vals[order], idx[order]
             first = np.r_[True, vals[1:] != vals[:-1]]
             for val, pos in zip(vals[first].tolist(), idx[first].tolist()):
-                pts[int(val)] = (float(pos % w), float(pos // w))
+                pts[int(val)] = place.to_image(pos % w, pos // w)
     return [pts[i] for i in ids if i in pts]

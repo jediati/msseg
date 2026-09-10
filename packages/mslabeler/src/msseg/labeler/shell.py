@@ -248,6 +248,34 @@ class ViewerShell:
     def _update_busy(self):
         """Refresh the busy/stale indication (the app's)."""
 
+    def _feature_scope(self):
+        """An opaque string naming WHAT the active profile measures on, or None
+        when the app has no such distinction.
+
+        Feature names say what was measured, never what it was measured on: a
+        whole-slide labeler produces the same `mean_blur_s1.5` at pyramid level
+        4 and at level 0, and a sigma is in pixels, so the level-4 number
+        describes a neighbourhood sixteen times wider -- both perfectly
+        plausible. An app in more than one such regime returns a string for the
+        current one (mspath: the level) and the compatibility gate refuses a
+        model from another. An app with one regime returns None, which is the
+        old behaviour exactly.
+
+        It lives HERE, beside the other two placement hooks, rather than on
+        AnnotationShell -- a labeler is ``class L(AnnotationShell, MyViewer)``,
+        so a default on the shell's annotation half would shadow the viewer's
+        override and silently disable the gate.
+        """
+        return None
+
+    def _region_placement(self):
+        """Where the current item's region raster sits in the drawn image, as a
+        ``labeling.Placement``. The default is the identity: the item IS the
+        image, so an image coordinate is already a raster index. An app whose
+        items cover part of a larger image overrides it (see mspath)."""
+        from .labeling import IDENTITY
+        return IDENTITY
+
     def _region_overlay(self, labels, lut, np, visible=True):
         """One overlay dict for a raster of the CURRENT item's region ids.
 

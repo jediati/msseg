@@ -279,7 +279,10 @@ class ViewControlsMixin:
         if slice_key is not None:
             its = self.store.for_slice(slice_key)
             if its:
-                sets = touched_sets(its, rec["labels"], np)
+                # Through the LAYER, not the raster: the gestures are in image
+                # coordinates and the layer is what knows where the ids sit.
+                sets = touched_sets(its, rec["labels"], np,
+                                    self.regions.label_layer(slice_key))
                 touch = {it.uid: ids for it, ids in sets}
                 region_class = resolve_sets(sets, rec["labels"], np)
                 lut = class_lut(region_class, np, self._class_colors_rgba(np))

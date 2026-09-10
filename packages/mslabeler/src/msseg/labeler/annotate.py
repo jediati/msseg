@@ -376,7 +376,8 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
             ids = [int(i) for i in ids]
             if not ids or not (1 <= int(cls) < self.store.n_classes):
                 continue
-            pts = _extremum_points(labels, ids, table, np)
+            pts = _extremum_points(labels, ids, table, np, self.FIELDS,
+                                   self._region_placement())
             if not pts:
                 continue
             if not added:
@@ -867,22 +868,6 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
     def _expected_feature_names(self):
         """The feature names the ACTIVE profile produces, or None to skip the
         compatibility gate (the app knows its statistics schema)."""
-        return None
-
-    def _feature_scope(self):
-        """An opaque string naming WHAT the active profile measures on, or None
-        when the app has no such distinction.
-
-        Feature names say what was measured, never what it was measured on.
-        A whole-slide labeler produces the same `mean_blur_s1.5` at pyramid
-        level 4 and at level 0, but a sigma is in pixels, so the level-4 number
-        describes a neighbourhood sixteen times wider -- and both look
-        perfectly plausible. An app that can be in more than one such regime
-        returns a string for the current one (mspath: the level), and the
-        compatibility gate refuses a model trained in another. The coupon
-        labeler has one regime and returns None, which is the old behaviour
-        exactly.
-        """
         return None
 
     def _feature_schema_now(self):

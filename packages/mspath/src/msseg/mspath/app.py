@@ -379,7 +379,9 @@ class MsPathApp(ViewerShell):
 
     def _build_run_section(self):
         parent = self._processing_parent("run")
-        frame = ttk.LabelFrame(parent, text="5. Run")
+        # `run_frame` is part of the shell's contract, not decoration: the
+        # workflow hint packs itself above this section's first child.
+        self.run_frame = frame = ttk.LabelFrame(parent, text="5. Run")
         frame.pack(fill="x", padx=4, pady=4)
         ttk.Label(frame, text="Primes the overview of every listed slide.",
                   foreground="#666").pack(anchor="w", padx=6, pady=(2, 0))
@@ -625,12 +627,14 @@ class MsPathApp(ViewerShell):
                               n_ids=int(lut.shape[0]))
         return {"layer": layer, "lut": lut, "visible": bool(visible)}
 
-    def _seg_overlays(self, key, rec, np, min_colors):
-        """Overlay list for one item (a subclass hook: the labeler appends its
-        class layer here)."""
+    def _seg_overlays(self, si, li, rec, data, np, min_colors):
+        """Overlay list for one item. The framework's signature -- the labeler
+        mixin chains to it -- even though `data` (the coupon 3D assembly) has
+        no counterpart here."""
         if not self.regions_var.get() or rec is None:
             return []
-        layer = self.regions.label_layer(key)
+        key = self.catalogue.key_of(si, li)
+        layer = self.regions.label_layer(key) if key else None
         if layer is None:
             return []
         return [self._region_overlay(rec["labels"],
@@ -658,7 +662,7 @@ class MsPathApp(ViewerShell):
             return
         key = item.key
         rec = self.engine.record(key)
-        overlays = self._seg_overlays(key, rec, np, min_colors)
+        overlays = self._seg_overlays(cur[0], cur[1], rec, None, np, min_colors)
 
         first = not self.viewer.has_base
         self.viewer.set_source(src, path=self.engine.paths.get(item.slide))
