@@ -117,6 +117,8 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self.show_overlay_var = tk.BooleanVar(master=root, value=True)
         self.active_class_var = tk.IntVar(master=root, value=0)
         self._class_swatches = {}       # class_id -> arm/color swatch button
+        self._class_lists = {}          # class_id -> ScrollFrame of its rows
+        self._row_widgets = {}          # interaction uid -> row record
         self.active_class_var.trace_add("write", self._refresh_class_arm)
         self.tool_var = tk.StringVar(master=root, value="squiggle")
         # Magic-fill options (metric / compare mode / measurement channels);

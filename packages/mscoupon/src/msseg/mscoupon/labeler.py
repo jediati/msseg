@@ -579,14 +579,51 @@ def _selftest():
     app.active_class_var.set(1)
     app._commit_interaction("box", [(3.0, 3.0), (16.0, 16.0)])      # all 4 -> 1
     app.active_class_var.set(2)
+    # A commit must DIFF the panels, not rebuild them: destroying and
+    # recreating the class frames, lists, swatches and confusion cells is what
+    # flashed the whole right pane black on every gesture release (and, through
+    # the paned window's re-layout, the panes beside it).
+    keep = (dict(app._class_panels), dict(app._class_swatches),
+            dict(app._class_lists), dict(app._cm_cells["all"]),
+            dict(app._row_widgets))
     app._commit_interaction("squiggle", [(3.0, 5.0), (15.0, 5.0)])  # {0,2} -> 2
     assert [it.uid for it in app.store.interactions] == [1, 2]
+    assert all(app._class_panels[k] is w for k, w in keep[0].items())
+    assert all(app._class_swatches[k] is w for k, w in keep[1].items())
+    assert all(app._class_lists[k] is w for k, w in keep[2].items())
+    assert all(app._cm_cells["all"][c] is w for c, w in keep[3].items()), \
+        "the confusion grid must not be rebuilt for a count change"
+    assert all(app._row_widgets[u] is r for u, r in keep[4].items()), \
+        "existing interaction rows survive a commit"
+    assert set(app._row_widgets) - set(keep[4]) == {2}, "exactly one row added"
+    assert [w for w in app._class_lists[2].inner.pack_slaves()] == \
+        [app._row_widgets[2]["frame"]]
+    # ...but a structural change (more classes, a new colour) still rebuilds.
+    was = app._class_color_hex(1)
+    app.store.set_color(1, "#0b0b0b")
+    app._rebuild_class_panels()
+    assert app._class_panels[1] is not keep[0][1], "a colour change rebuilds"
+    app.store.set_color(1, was)          # restored directly: no history entry
+    app._rebuild_class_panels()
     assert app.store.interactions[0].slice_key == "data/s0.tiff", \
         "slice identity is folder-qualified"
-    # The sequence tree's columns track priming + per-slice annotations.
+    # The sequence tree's columns track priming + per-slice annotations, and
+    # a count change updates the cells IN PLACE -- a delete-and-reinsert
+    # repaints the left pane and drops the selection on every commit.
     app._refresh_subseq_list()
     assert tuple(app.subseq_list.item("q0:0", "values")) == ("Y", "2")
     assert tuple(app.subseq_list.item("q0", "values")) == ("Y", "2")
+    app.subseq_list.selection_set("q0:0")
+    app._commit_interaction("squiggle", [(4.0, 6.0)])
+    assert tuple(app.subseq_list.item("q0:0", "values")) == ("Y", "3")
+    assert app.subseq_list.selection() == ("q0:0",), "selection survives a commit"
+    app._delete_interaction(app.store.interactions[-1].uid)
+    assert tuple(app.subseq_list.item("q0:0", "values")) == ("Y", "2")
+    # A sequence whose files changed still forces the full rebuild.
+    app.subsequences[0]["files"] = [os.path.join(data_dir, "s9.tiff")]
+    assert not app._update_subseq_values()
+    app.subsequences[0]["files"] = files
+    app._refresh_subseq_list()
 
     # The class panels list ON-SLICE interactions only (they swap with the
     # slice); the titles carry ALL-slice annot/region totals.
@@ -1829,7 +1866,8 @@ def _selftest():
           "persistent outlines + canvas right-click, gesture previews, "
           "magic fill, blobber, hop gain + drag + cosine/proba metrics, "
           "center notebook + model tab, toolbar hints, optimize network, size sweep, "
-          "edge kinds, analysis tab + region list")
+          "edge kinds, analysis tab + region list, panel diffing (no rebuild "
+          "on a commit)")
     return 0
 
 

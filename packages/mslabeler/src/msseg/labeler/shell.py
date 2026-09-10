@@ -601,7 +601,15 @@ class ViewerShell:
         """Repaint the sequence tree from self.subsequences, which is the only
         writer: one top-level row per sequence, its TIFFs as children, with
         per-slice "msc" (primed) and "annot" (labeler interaction count)
-        columns."""
+        columns.
+
+        Tries an in-place update first. This runs on every annotation commit
+        (the "annot" column counts interactions) and delete-and-reinsert
+        repaints the whole tree, flickers the left pane and drops the
+        selection -- while the rows themselves almost never change, only their
+        two values do."""
+        if self._update_subseq_values():
+            return
         tree = self.subseq_list
         open_seqs = {iid for iid in tree.get_children()
                      if tree.item(iid, "open")}
@@ -620,6 +628,46 @@ class ViewerShell:
                 tree.insert(iid, "end", iid=f"q{si}:{li}",
                             text=os.path.basename(path),
                             values=(msc, str(annot) if annot else ""))
+
+    def _update_subseq_values(self):
+        """Rewrite the tree's "msc"/"annot" values in place, or return False if
+        the rows no longer match self.subsequences (a sequence was added,
+        removed, renamed or re-filed -- then the caller rebuilds).
+
+        `tree.set` only touches the one cell, so an unchanged value costs
+        nothing on screen and the selection, scroll position and expanded rows
+        all survive."""
+        tree = self.subseq_list
+        seq_iids = list(tree.get_children())
+        if seq_iids != [f"q{si}" for si in range(len(self.subsequences))]:
+            return False
+        for si, s in enumerate(self.subsequences):
+            iid = f"q{si}"
+            files = s.get("files") or []
+            if list(tree.get_children(iid)) != [f"q{si}:{li}" for li in range(len(files))]:
+                return False
+            if tree.item(iid, "text") != self._sequence_row_text(s):
+                return False
+            marks = [(self._slice_msc_mark(si, li), self._annotation_count(si, li))
+                     for li in range(len(files))]
+            seq_msc = "Y" if marks and all(m[0] == "Y" for m in marks) else ""
+            seq_annot = sum(m[1] for m in marks)
+            self._set_row_values(iid, seq_msc, str(seq_annot) if seq_annot else "")
+            for li, (msc, annot) in enumerate(marks):
+                child = f"q{si}:{li}"
+                # A sequence can swap a file without changing its length, so
+                # the row's own name is checked, not just the count of rows.
+                if tree.item(child, "text") != os.path.basename(files[li]):
+                    return False
+                self._set_row_values(child, msc, str(annot) if annot else "")
+        return True
+
+    def _set_row_values(self, iid, msc, annot):
+        tree = self.subseq_list
+        if tree.set(iid, "msc") != msc:
+            tree.set(iid, "msc", msc)
+        if tree.set(iid, "annot") != annot:
+            tree.set(iid, "annot", annot)
 
     def _annotation_count(self, si, li):
         """Interactions on one slice; the labeler overrides this (the viewer

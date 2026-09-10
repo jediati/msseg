@@ -227,20 +227,47 @@ class ClassPanelMixin:
         self._rebuild_class_panels()
         self._refresh_render()
 
+    def _class_panel_signature(self):
+        """What the panels' STRUCTURE depends on: how many class subpanels
+        there are and what colour each one's swatch and outlines are. Adding,
+        deleting or moving an interaction changes neither."""
+        return (int(self.store.n_classes),
+                tuple(self._class_color_hex(k)
+                      for k in range(1, self.store.n_classes)))
+
     def _rebuild_class_panels(self):
-        """Full repaint from the store (interaction counts are small). Also
-        repaints the sequence tree, whose "annot" column counts per-slice
-        interactions.
+        """Bring the class panels in line with the store -- the single "labels
+        changed" signal, called from eleven places. Also repaints the sequence
+        tree, whose "annot" column counts per-slice interactions.
+
+        It DIFFS; it does not rebuild. Destroying the holder's children and
+        recreating every frame, ScrollFrame, swatch, tooltip and row is what a
+        commit used to cost: Tk erases the destroyed area at once and the
+        rebuild repaints it top-down, so *releasing a gesture flashed the whole
+        right pane black and filled it back in from the top*. Nothing about
+        that work was needed -- the structure depends only on the class count
+        and the class colours (see _class_panel_signature), which a commit does
+        not touch, and the row set changes by exactly one.
 
         The subpanels split the holder's height equally (uniform grid rows);
         each one scrolls its own interaction list, so a class with many
         gestures never pushes the others off screen."""
+        sig = self._class_panel_signature()
+        if sig != getattr(self, "_class_panel_sig", None):
+            self._build_class_frames()
+            self._class_panel_sig = sig
+        self._sync_interaction_rows()
+        self._after_class_panels()
+
+    def _build_class_frames(self):
+        """(Re)create the per-class subpanels. Only on a structural change."""
         for w in list(self.classes_holder.winfo_children()):
             w.destroy()
         self._class_panels = {}
-        visible = self._visible_interactions()
         self._class_title_labels = {}
         self._class_swatches = {}
+        self._class_lists = {}
+        self._row_widgets = {}           # uid -> row record (see _sync_...)
         for k in range(1, self.store.n_classes):
             frame = ttk.LabelFrame(self.classes_holder)
             self.classes_holder.rowconfigure(k - 1, weight=1, uniform="cls")
@@ -271,13 +298,62 @@ class ClassPanelMixin:
             # Small minimum height: the grid's equal weights own the real size.
             lst.canvas.configure(height=48)
             lst.pack(side="top", fill="both", expand=True, padx=2, pady=(0, 2))
-            for it in visible:
-                if it.class_id == k:
-                    self._build_interaction_row(lst.inner, it)
+            self._class_lists[k] = lst
         # Rows past the last class keep their weight otherwise, so a later
         # regrow would hand a stale row a share of the height.
         for k in range(self.store.n_classes - 1, MAX_CLASSES):
             self.classes_holder.rowconfigure(k, weight=0, uniform="")
+
+    # Pack options for one interaction row; shared by creation and reordering.
+    _ROW_PACK = {"side": "top", "fill": "x", "padx": 4, "pady": 0}
+
+    def _sync_interaction_rows(self):
+        """Make each class list hold exactly the visible interactions of that
+        class, in order, touching as few widgets as possible: a commit creates
+        ONE row and leaves every other widget alone.
+
+        A row cannot be reparented in Tk, so an interaction that changed class
+        is destroyed and rebuilt -- the only case that flickers, and it moves
+        one row rather than the pane."""
+        rows = self._row_widgets
+        visible = self._visible_interactions()
+        # Out-of-range classes are dropped, exactly as the full rebuild's
+        # `range(1, n_classes)` loop dropped them: a shrunk class count can
+        # leave an interaction pointing past the last panel.
+        want = {it.uid for it in visible
+                if 1 <= int(it.class_id) < self.store.n_classes}
+        for uid in [u for u in rows if u not in want]:
+            rows.pop(uid)["frame"].destroy()
+        for k in range(1, self.store.n_classes):
+            lst = self._class_lists.get(k)
+            if lst is None:
+                continue
+            order = []
+            for it in visible:
+                if it.class_id != k:
+                    continue
+                row = rows.get(it.uid)
+                if row is not None and row["class"] != k:
+                    rows.pop(it.uid)["frame"].destroy()
+                    row = None
+                if row is None:
+                    row = rows[it.uid] = self._build_interaction_row(lst.inner, it)
+                else:
+                    self._update_interaction_row(row, it)
+                order.append(row["frame"])
+            # Pack order is creation order, so an appended gesture is already
+            # right; only a class move or an undo can disturb it. Chaining each
+            # row after its predecessor fixes the whole list without unmapping
+            # anything (order[0] ends up first because every other row is
+            # explicitly placed after one of them).
+            if lst.inner.pack_slaves() != order:
+                for i, w in enumerate(order):
+                    if i == 0:
+                        w.pack_configure(**self._ROW_PACK)
+                    else:
+                        w.pack_configure(after=order[i - 1], **self._ROW_PACK)
+
+    def _after_class_panels(self):
         self._update_class_titles()
         self._refresh_class_arm()
         # The matrix tracks exactly what the panels do -- class count, class
@@ -315,10 +391,21 @@ class ClassPanelMixin:
     # Confusion matrix (frozen predictions vs. live labels)
     # ------------------------------------------------------------------ #
     def _rebuild_confusion_grid(self):
-        """Lay out synchronized all-slice and current-slice matrix grids."""
+        """Lay out synchronized all-slice and current-slice matrix grids.
+
+        Only when the LAYOUT changed. The grid's shape and its header colours
+        are the class count and the class colours -- the same signature the
+        subpanels use -- while the counts in the cells are written in place by
+        _refresh_confusion, which runs right after this on the same signal. A
+        commit changes only the counts, so rebuilding here just made the ML
+        panel flash black along with the annotation panel."""
         holder = getattr(self, "confusion_holder", None)
         if holder is None:
             return
+        sig = self._class_panel_signature()
+        if sig == getattr(self, "_cm_grid_sig", None) and getattr(self, "_cm_cells", None):
+            return
+        self._cm_grid_sig = sig
         for w in list(holder.winfo_children()):
             w.destroy()
         self._cm_cells = {}
@@ -509,19 +596,12 @@ class ClassPanelMixin:
         self._rebuild_class_panels()
         self._refresh_render()
 
-    def _build_interaction_row(self, parent, it):
-        # Plain-tk widgets so the rows share the list's white background.
-        row = tk.Frame(parent, background="white")
-        row.pack(fill="x", padx=4, pady=0)
-        # Delete on the LEFT: a narrow pane truncates the label, and a
-        # right-packed ✕ is the first thing to disappear with it.
-        tk.Button(row, text="✕", width=2, relief="flat", background="white",
-                  activebackground="#ddd", padx=0, pady=0,
-                  command=lambda uid=it.uid: self._delete_interaction(uid)
-                  ).pack(side="left")
-        # The rows normally all belong to the current slice, so the key is
-        # noise -- except when it is NOT this slice's (nothing on screen, so
-        # _visible_interactions lists everything) or failed to bind at all.
+    def _interaction_row_text(self, it):
+        """The row's label. The rows normally all belong to the current slice,
+        so the key is noise -- except when it is NOT this slice's (nothing on
+        screen, so _visible_interactions lists everything) or failed to bind at
+        all. Depends on the current slice, so a surviving row can need it
+        rewritten even though the interaction did not change."""
         cur = self._current()
         cur_key = self._slice_key(*cur) if cur is not None else None
         if not it.bound:
@@ -537,8 +617,30 @@ class ClassPanelMixin:
                 name += f" {it.meta['part']}"    # blobber: core / ring
             if it.meta.get("n_regions") is not None:
                 name += f" ({it.meta['n_regions']})"
-        lbl = tk.Label(row, text=f"#{it.uid} {name}{where}",
-                       foreground=("#000" if it.bound else "#888"),
+        return f"#{it.uid} {name}{where}"
+
+    def _update_interaction_row(self, row, it):
+        """Refresh a surviving row in place (text and bound-ness only -- the
+        uid its callbacks close over cannot change)."""
+        text, fg = self._interaction_row_text(it), ("#000" if it.bound else "#888")
+        if (text, fg) != (row["text"], row["fg"]):
+            row["label"].configure(text=text, foreground=fg)
+            row["text"], row["fg"] = text, fg
+
+    def _build_interaction_row(self, parent, it):
+        """One interaction row, as a record ``{frame, label, class, text, fg}``
+        so _sync_interaction_rows can keep it instead of rebuilding it."""
+        # Plain-tk widgets so the rows share the list's white background.
+        row = tk.Frame(parent, background="white")
+        row.pack(**self._ROW_PACK)
+        # Delete on the LEFT: a narrow pane truncates the label, and a
+        # right-packed ✕ is the first thing to disappear with it.
+        tk.Button(row, text="✕", width=2, relief="flat", background="white",
+                  activebackground="#ddd", padx=0, pady=0,
+                  command=lambda uid=it.uid: self._delete_interaction(uid)
+                  ).pack(side="left")
+        text, fg = self._interaction_row_text(it), ("#000" if it.bound else "#888")
+        lbl = tk.Label(row, text=text, foreground=fg,
                        background="white", anchor="w", cursor="hand2")
         lbl.pack(side="left", fill="x", expand=True)
         # Drag a row onto another class's subpanel to reassign it; a stationary
@@ -551,6 +653,8 @@ class ClassPanelMixin:
         lbl.bind("<Button-3>", lambda e, uid=it.uid: self._row_menu(e, uid))
         lbl.bind("<Enter>", lambda e, uid=it.uid: self._show_interaction_geometry(uid))
         lbl.bind("<Leave>", lambda e: self._hide_interaction_geometry())
+        return {"frame": row, "label": lbl, "class": int(it.class_id),
+                "text": text, "fg": fg}
 
     # -- row drag-and-drop between class subpanels ---------------------- #
     def _panel_under_pointer(self, e):
@@ -727,28 +831,38 @@ class ClassPanelMixin:
             return
         for it in self._visible_interactions():
             self._draw_interaction_geometry(it, tags=("draw", "ipersist"))
+        # Every one of these is a Tk canvas item that the next window redraw
+        # has to walk -- a magic fill commits one tap per region, so the count
+        # is worth seeing beside the frame time (see labeler/perf.py).
+        v.perf.set("annot_items", len(v.canvas.find_withtag("ipersist")))
 
     def _redraw_hover_geometry(self):
         """Re-project whatever hover geometry is on screen after a zoom/pan
-        (the items are drawn in screen coordinates)."""
-        self._refresh_annotation_layer()
+        (the items are drawn in screen coordinates). Runs once per motion
+        event, NOT once per painted frame, so its cost is charged to the
+        profiler's between-frames bucket (see labeler/perf.py)."""
         v = self.viewer
-        if v is None or (self._hover_uid is None and self._hover_key is None):
+        if v is None:
             return
-        v.canvas.delete("ihover")
-        if self._hover_uid is not None:
-            self._draw_interaction_geometry(self.store.get(self._hover_uid))
+        with v.perf.span("annot.persist"):
+            self._refresh_annotation_layer()
+        if self._hover_uid is None and self._hover_key is None:
             return
-        si, li, region = self._hover_key
-        rec = self.regions.record(self.catalogue.key_of(si, li))
-        if rec is None or rec.get("labels") is None:
-            return
-        import numpy as np
-        touch = self._touch_map_for(si, li, rec, np)
-        for it in self.store.for_slice(self._slice_key(si, li)):
-            ids = touch.get(it.uid)
-            if ids and region in ids:
-                self._draw_interaction_geometry(it)
+        with v.perf.span("annot.hover"):
+            v.canvas.delete("ihover")
+            if self._hover_uid is not None:
+                self._draw_interaction_geometry(self.store.get(self._hover_uid))
+                return
+            si, li, region = self._hover_key
+            rec = self.regions.record(self.catalogue.key_of(si, li))
+            if rec is None or rec.get("labels") is None:
+                return
+            import numpy as np
+            touch = self._touch_map_for(si, li, rec, np)
+            for it in self.store.for_slice(self._slice_key(si, li)):
+                ids = touch.get(it.uid)
+                if ids and region in ids:
+                    self._draw_interaction_geometry(it)
 
     def _on_hover(self, ix, iy=None):
         """Show image values/probabilities and highlight annotations for a region."""

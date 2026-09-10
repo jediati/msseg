@@ -378,3 +378,74 @@ space instead and installs the winner as the `dense (tuned)` model:
   re-searching (before any search it builds the baseline). The spec rides the
   classifier pickle (v3, `spec`; v1/v2 pickles still load) and the session's
   model record, so a loaded tuned model is described and retrainable.
+
+## Profiling a slow pan (Ctrl+P)
+
+The `[mscoupon] canvas.render …` line measures only the numpy/PIL composite --
+the part of a frame that happens *inside* `SliceCanvas.render`. That is not
+what a drag costs. Press **Ctrl+P** (or start the app with
+`MSSEG_CANVAS_PROFILE=1`) to turn on the frame profiler
+(`msseg/labeler/perf.py`), which accounts for the whole pan tick:
+
+```
+[perf] canvas #26 out=900x640 crop=246x175 scale=0.2732 src=in-memory items=1 lvl=0
+[perf]   frame 73.8 ms: base.read 0.0 | base.window 0.2 | base.resize 2.9 | base.rgb 1.9
+                      | ov.gather 6.4 (2x) | ov.lut 14.5 (2x) | ov.blend 38.4 (2x)
+                      | photo 4.1 | canvas 3.5 | paint 1.3
+[perf]   between frames 11.7 ms: view_cb 6.1 (106x) | annot.hover 4.3 (106x) | ...
+[perf]   events=106 coalesced=105 latency(evt->pixels)=932 ms gap=933 ms (1.1 fps)
+```
+
+Read it in three parts:
+
+* **`frame`** -- segments of one `render()`, in order. `base.*` is the source
+  read + window + resample (a `src=pyramid` frame pays a file read and a PNG
+  decode *per frame* in `base.read`; a zoomed-OUT frame pays `base.window` over
+  the whole crop, which can be 12 Mpx). `ov.gather`/`ov.crop` fetches each
+  region layer over the viewport, `ov.lut` looks up its colours, `ov.blend`
+  composites -- all three are canvas-sized whatever the zoom, so they do *not*
+  shrink when you zoom in. `photo` is `ImageTk.PhotoImage`, `canvas` the item
+  bookkeeping, and `paint` the Tk window redraw, which `create_image` only
+  queues and which profiling forces so it can be timed.
+* **`between frames`** -- work paid *outside* any frame, with how many times it
+  was paid. `view_cb` is `on_view_changed`, spent in `annot.persist`/
+  `annot.hover` re-projecting annotation outlines; `tool.move` is a drawing
+  tool's per-tick work and `hover` the value readout. These run once per
+  **motion event**, and motion events outnumber painted frames.
+* **the tail** -- `events` motion events since the last frame, `coalesced`
+  repaints cancelled by the debounce before they ran, `deadline` repaints let
+  through by the anti-starvation deadline, `latency(evt->pixels)` from the
+  oldest unserved repaint request to the finished paint, `gap` between painted
+  frames (the honest fps), and `annot_items` / `items`, how many Tk canvas
+  items the paint has to walk.
+
+Releasing the button prints a per-gesture summary (duration, frames, fps,
+events, coalesced repaints, worst frame, and the per-frame average of every
+segment), so a whole drag is one line to compare against another zoom level.
+
+### What it found, and the two fixes that came out of it
+
+The trace above is a real 2 fps drag at scale 0.27, and it says the paint was
+never the problem (1.3 ms) and neither were the annotations (`annot.persist`
+0.0). Two things were:
+
+* **The repaint was starving on its own debounce.** `_schedule` re-armed a
+  15 ms timer on every motion event, and events arrive every ~9 ms while the
+  mouse moves, so the timer never expired: 179 events, 174 repaints cancelled,
+  **5 frames in 1.85 s**, with 80 % of the drag spent rendering nothing. A
+  repaint may now be coalesced but never postponed more than
+  `SliceCanvas._MAX_DEFER_MS` (30 ms) past the first request that asked for it;
+  past the deadline the armed job is left to fire instead of being re-armed.
+* **The overlay composite was five full-size float temporaries per layer.**
+  `a = ov[:,:,3:4]/255 * alpha; rgb = rgb*(1-a) + ov[:,:,:3]*a` allocated
+  ~25 MB per overlay per frame and read the RGBA block twice with a stride.
+  Every step of it depends only on the region id, so it now folds into the LUT
+  (`_blend_luts`: premultiplied colour + `1-a`, both 3 wide so the gathers are
+  contiguous and the multiply does not broadcast), leaving two gathers and an
+  in-place multiply-add. It is exact -- the same float32 ops on the same
+  values, once per LUT row instead of once per pixel -- so the composite stays
+  bit-identical to the reference in `tests/test_sources.py`.
+
+Together, at that zoom: the frame went 76 ms -> 40 ms and the drag 2.7 fps ->
+~13 fps. Still open (it shows up zoomed *out*, not in): `base.window` clips the
+full 12 Mpx crop before the resample throws most of it away.

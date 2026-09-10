@@ -165,3 +165,56 @@ def test_pyramid_source_needs_large_image():
         pytest.skip("large_image present: exercised by the GUI, not here")
     with pytest.raises(RuntimeError):
         sources.PyramidImageSource("nope.tiff")
+
+
+def test_blend_luts_fold_the_per_pixel_alpha_exactly(canvas_factory):
+    """The premultiplied LUTs must reproduce the per-pixel float32 arithmetic
+    they replace, value for value -- that is what keeps the composite
+    bit-identical to the reference above."""
+    make, _captured = canvas_factory
+    sc = make()
+    lut = np.array([[10, 20, 30, 255], [40, 50, 60, 0], [70, 80, 90, 128]], np.uint8)
+    premul, one_minus = sc._blend_luts(lut, 0.6)
+    a = lut[:, 3].astype(np.float32) / 255.0
+    a = a * 0.6
+    assert np.array_equal(premul[:3], lut[:, :3].astype(np.float32) * a[:, None])
+    # 3 wide so the gather is contiguous and the multiply does not broadcast
+    assert premul.shape == one_minus.shape == (4, 3)
+    assert np.array_equal(one_minus[:3], np.repeat((1 - a)[:, None], 3, 1))
+    # the appended row is what a background id (-1) reaches by negative wrap
+    assert not premul[-1].any() and np.array_equal(one_minus[-1], np.ones(3, np.float32))
+    # cached per (LUT, alpha): a region LUT has a row per region
+    assert sc._blend_luts(lut, 0.6)[0] is premul
+    assert sc._blend_luts(lut, 0.3)[0] is not premul
+    # bounded, most-recently-used kept: the stable overlay LUT survives a
+    # gesture handing over a fresh preview LUT on every drag tick
+    for _ in range(sc._LUT_CACHE_MAX + 2):
+        sc._blend_luts(lut.copy(), 0.6)
+        assert sc._blend_luts(lut, 0.6)[0] is premul
+    assert len(sc._lut_cache) <= sc._LUT_CACHE_MAX
+
+
+def test_repaint_deadline_keeps_a_drag_from_starving_the_render(canvas_factory):
+    """Motion events arrive faster than the debounce, so re-arming the timer on
+    every one of them means it never fires. Past _MAX_DEFER_MS the armed job
+    must be left alone; a completed render restarts the clock."""
+    make, _captured = canvas_factory
+    sc = make()
+    log = []
+    sc.after = lambda ms, fn: (log.append(("arm", ms)), f"job{len(log)}")[1]
+    sc.after_cancel = lambda job: log.append(("cancel", job))
+
+    sc._MAX_DEFER_MS = 1e9                       # never reached: coalesce freely
+    for _ in range(4):
+        sc._schedule()
+    assert [k for k, _ in log] == ["arm", "cancel", "arm", "cancel", "arm", "cancel", "arm"]
+
+    sc._job = sc._pending_since = None
+    log.clear()
+    sc._MAX_DEFER_MS = 0                         # every later request is overdue
+    for _ in range(4):
+        sc._schedule()
+    assert [k for k, _ in log] == ["arm"] and sc._job is not None
+
+    sc.render()                                  # no base: returns after the reset
+    assert sc._job is None and sc._pending_since is None

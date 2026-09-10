@@ -22,6 +22,7 @@ import tkinter as tk
 import numpy as np
 from PIL import Image, ImageTk
 
+from .perf import FrameProfiler
 from .sources import (ArrayImageSource, ArrayLabelLayer, PyramidImageSource,
                       HAVE_LARGE_IMAGE as _HAVE_LARGE_IMAGE, level_index_vectors)
 
@@ -53,6 +54,7 @@ class SliceCanvas(tk.Frame):
         self.view_y = 0.0
         self._photo = None
         self._job = None
+        self._pending_since = None   # when the oldest unserved repaint was asked for
         self._drag = None
         self.on_hover = None         # optional callback(ix, iy) | callback(None)
         # Optional drawing-tool controller with on_press/on_move/on_release(e)
@@ -80,6 +82,12 @@ class SliceCanvas(tk.Frame):
         self._hud_text = ""
         self._hud_job = None
         self._hud_phase = 0
+        # Where a drag's milliseconds actually go (see perf.py). Off unless
+        # MSSEG_CANVAS_PROFILE=1; Ctrl+P toggles it live.
+        self.perf = FrameProfiler("canvas")
+        self._painting = False       # guard: the forced paint re-enters the loop
+        self._perf_level = 0         # pyramid level the last frame read from
+        self._lut_cache = {}         # (id(lut), alpha) -> derived blend LUTs
 
         self.canvas.bind("<Configure>", lambda e: self._schedule())
         self.canvas.bind("<MouseWheel>", self._on_wheel)
@@ -91,13 +99,21 @@ class SliceCanvas(tk.Frame):
         # Middle-drag and right-drag always pan, so a drawing tool on button 1
         # never locks navigation out.
         self.canvas.bind("<ButtonPress-2>", self._pan_start)
-        self.canvas.bind("<B2-Motion>", self._pan_move)
-        self.canvas.bind("<ButtonRelease-2>", lambda e: setattr(self, "_drag", None))
+        self.canvas.bind("<B2-Motion>", self._pan_drag)
+        self.canvas.bind("<ButtonRelease-2>", self._pan_end)
         self.canvas.bind("<ButtonPress-3>", self._context_press)
-        self.canvas.bind("<B3-Motion>", self._pan_move)
+        self.canvas.bind("<B3-Motion>", self._pan_drag)
         self.canvas.bind("<ButtonRelease-3>", self._context_release)
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Leave>", self._on_leave)
+        # Ctrl+P anywhere in the window: turn the frame profiler on/off without
+        # restarting the app (bound on the toplevel because the canvas rarely
+        # holds focus -- the pointer is what is over it, not the keyboard).
+        try:
+            self.winfo_toplevel().bind("<Control-p>", self._toggle_profile, add="+")
+            self.winfo_toplevel().bind("<Control-P>", self._toggle_profile, add="+")
+        except Exception:       # pragma: no cover - headless/odd master
+            pass
 
     # -- content ------------------------------------------------------- #
     @property
@@ -232,7 +248,12 @@ class SliceCanvas(tk.Frame):
         self._view_changed()
 
     # -- interaction --------------------------------------------------- #
+    def _toggle_profile(self, _e=None):
+        self.perf.set_enabled(not self.perf.enabled)
+        return "break"
+
     def _on_wheel(self, e):
+        self.perf.event("wheel")
         self._zoom(e.x, e.y, 1 / 1.25 if e.delta > 0 else 1.25)
 
     def _zoom(self, sx, sy, factor):
@@ -246,8 +267,13 @@ class SliceCanvas(tk.Frame):
         self._view_changed()
 
     def _view_changed(self):
+        # Timed into the profiler's between-frames bucket: this callback runs
+        # once per motion event (the labeler re-projects every screen-space
+        # annotation item here), so with the repaint debounced it can cost
+        # several times a frame without appearing in render()'s own timings.
         if self.on_view_changed is not None:
-            self.on_view_changed()
+            with self.perf.span("view_cb"):
+                self.on_view_changed()
 
     def center_on(self, ix, iy, zoom_to=1.0):
         """Scroll so image point (ix, iy) sits at the canvas centre, zooming
@@ -263,20 +289,31 @@ class SliceCanvas(tk.Frame):
         self._view_changed()
 
     def _drag_start(self, e):
-        if self.tool is not None and self.tool.on_press(e):
-            self._drag = None
-            return
+        if self.tool is not None:
+            t0 = time.perf_counter()
+            claimed = self.tool.on_press(e)
+            if claimed:
+                self._drag = None
+                self.perf.gesture("tool")
+                self.perf.add("tool.press", 1e3 * (time.perf_counter() - t0))
+                return
         self._pan_start(e)
 
     def _drag_move(self, e):
-        if self.tool is not None and self.tool.on_move(e):
-            return
+        self.perf.event("drag")
+        if self.tool is not None:
+            with self.perf.span("tool.move"):
+                claimed = self.tool.on_move(e)
+            if claimed:
+                return
         self._pan_move(e)
 
     def _drag_end(self, e):
         if self.tool is not None:
-            self.tool.on_release(e)
+            with self.perf.span("tool.release"):
+                self.tool.on_release(e)
         self._drag = None
+        self.perf.end_gesture()
 
     # A right-press starts a pan optimistically; only a release close enough
     # to the press counts as a click. Same click-vs-drag threshold idiom the
@@ -290,6 +327,7 @@ class SliceCanvas(tk.Frame):
     def _context_release(self, e):
         press, self._ctx_press = self._ctx_press, None
         self._drag = None
+        self.perf.end_gesture()
         if press is None or self.on_context is None:
             return
         if abs(e.x - press[0]) + abs(e.y - press[1]) <= self._CLICK_SLOP_PX:
@@ -297,6 +335,17 @@ class SliceCanvas(tk.Frame):
 
     def _pan_start(self, e):
         self._drag = (e.x, e.y, self.view_x, self.view_y)
+        self.perf.gesture("pan")
+
+    def _pan_end(self, _e=None):
+        self._drag = None
+        self.perf.end_gesture()
+
+    def _pan_drag(self, e):
+        """Middle/right-button pan tick (button 1 arrives via _drag_move, which
+        counts the event itself before offering it to the drawing tool)."""
+        self.perf.event("pan")
+        self._pan_move(e)
 
     def _pan_move(self, e):
         if not self._drag:
@@ -317,10 +366,14 @@ class SliceCanvas(tk.Frame):
         if self.on_hover is None:
             return
         ix, iy = self.screen_to_image(e.x, e.y)
-        if 0 <= ix < self.image_width and 0 <= iy < self.image_height:
-            self.on_hover(ix, iy)
-        else:
-            self.on_hover(None)
+        # Charged to the next frame: hover does not fire while a button is
+        # down (Tk sends B<n>-Motion then), but it competes with the repaint
+        # for the same event loop the moment the button comes up.
+        with self.perf.span("hover"):
+            if 0 <= ix < self.image_width and 0 <= iy < self.image_height:
+                self.on_hover(ix, iy)
+            else:
+                self.on_hover(None)
 
     def _on_leave(self, _e):
         if self.on_hover is not None:
@@ -374,10 +427,36 @@ class SliceCanvas(tk.Frame):
             self._hud_job = self.after(120, self._hud_tick)   # animate only when busy
 
     # -- rendering ----------------------------------------------------- #
+    # Derived blend LUTs kept for this many (LUT, alpha) pairs: a region LUT is
+    # ~4 MB per derived table at 363k regions, and the live set is the two or
+    # three overlays plus a gesture's transient.
+    _LUT_CACHE_MAX = 4
+
+    _DEBOUNCE_MS = 15
+    # ...but a repaint may never be postponed by more than this past the first
+    # request that asked for it. Coalescing a burst of motion events into one
+    # frame is right; letting the burst defer the frame indefinitely is not --
+    # events arrive every ~9 ms during a drag, so a plainly re-armed 15 ms
+    # timer never expires and the canvas repaints only when the pointer pauses.
+    # (Measured on a 76 ms frame: 179 events, 174 repaints cancelled, 5 frames
+    # in 1.85 s = 2.7 fps, with 80% of the drag spent rendering nothing.) Past
+    # the deadline the already-armed job is left alone rather than re-armed, so
+    # the worst case is deadline + debounce and there is no cancel storm.
+    _MAX_DEFER_MS = 30
+
     def _schedule(self):
+        now = time.perf_counter()
+        if self._pending_since is None:
+            self._pending_since = now
+        elif self._job is not None and \
+                1e3 * (now - self._pending_since) >= self._MAX_DEFER_MS:
+            self.perf.count("deadline")
+            return                       # let the armed repaint through
         if self._job is not None:
             self.after_cancel(self._job)
-        self._job = self.after(15, self.render)
+            self.perf.coalesced()
+        self.perf.request()
+        self._job = self.after(self._DEBOUNCE_MS, self.render)
 
     def invalidate(self):
         """Repaint soon (debounced): the public way to say a layer changed."""
@@ -394,30 +473,44 @@ class SliceCanvas(tk.Frame):
             # Native values: window in the data's own range, then resample.
             # An in-memory array has one level, so this is the exact crop; a
             # native pyramid would be read at the level nearest the zoom.
-            level = src.best_level(self.scale)
+            level = self._perf_level = src.best_level(self.scale)
             sc = src.level_scale(level)
             crop = src.read_region(level, int(left / sc), int(top / sc),
                                    max(1, int(round((right - left) / sc))),
                                    max(1, int(round((bottom - top) / sc))))
+            self.perf.mark("base.read")
+            self.perf.count("base.src_px", int(crop.shape[0]) * int(crop.shape[1]))
             norm = np.clip((crop - lo) / span, 0, 1)
+            self.perf.mark("base.window")
             if norm.ndim == 3:
                 im = Image.fromarray((norm * 255).astype(np.uint8), "RGB")
                 im = im.resize((out_w, out_h), Image.BILINEAR)
-                return np.asarray(im, dtype=np.uint8)
+                out = np.asarray(im, dtype=np.uint8)
+                self.perf.mark("base.resize")
+                return out
             im = Image.fromarray(norm.astype(np.float32))
             im = im.resize((out_w, out_h), Image.BILINEAR)
-            return (np.asarray(im, dtype=np.float32) * 255).astype(np.uint8)
+            out = (np.asarray(im, dtype=np.float32) * 255).astype(np.uint8)
+            self.perf.mark("base.resize")
+            return out
         # Display-scaled source (the pyramid): its 8-bit output does not match
         # the native range, so window in normalized [0,1] fraction space.
-        level = src.best_level(self.scale)
+        level = self._perf_level = src.best_level(self.scale)
         sc = src.level_scale(level)
         g = src.read_region(level, int(left / sc), int(top / sc),
                             max(1, int(round((right - left) / sc))),
                             max(1, int(round((bottom - top) / sc))))
+        # A pyramid read is a file read + a PNG decode, and it happens on every
+        # frame: expect this to dominate when there is no in-memory array.
+        self.perf.mark("base.read")
+        self.perf.count("base.src_px", int(np.size(g)))
         im = Image.fromarray(np.asarray(g, dtype=np.uint8)).resize((out_w, out_h))
+        self.perf.mark("base.resize")
         g = np.asarray(im, dtype=np.float32) / 255.0
         g = np.clip((g - self._vmin) / ((self._vmax - self._vmin) or 1.0), 0, 1)
-        return (g * 255).astype(np.uint8)
+        out = (g * 255).astype(np.uint8)
+        self.perf.mark("base.window")
+        return out
 
     def _label_region(self, layer, left, top, right, bottom, out_w, out_h, cache):
         """(out_h, out_w) region ids of `layer` over the viewport. A layer that
@@ -431,7 +524,12 @@ class SliceCanvas(tk.Frame):
                                       .astype(np.intp), top, bottom - 1)
                 cache["xs"] = np.clip((left + (np.arange(out_w) + 0.5) * (right - left) / out_w)
                                       .astype(np.intp), left, right - 1)
-            return full[cache["ys"]][:, cache["xs"]]
+            # NB the row gather materialises (out_h x full_width) before the
+            # column gather narrows it -- independent of the zoom, so a heavy
+            # "ov.gather" that does not shrink when zoomed in is this.
+            out = full[cache["ys"]][:, cache["xs"]]
+            self.perf.mark("ov.gather")
+            return out
         level = 0
         sc = 1.0
         while 2.0 ** (level + 1) <= max(self.scale, 1.0):
@@ -440,11 +538,56 @@ class SliceCanvas(tk.Frame):
         sub = layer.crop(level, int(left / sc), int(top / sc),
                          max(1, int(round((right - left) / sc))),
                          max(1, int(round((bottom - top) / sc))))
+        self.perf.mark("ov.crop")
         im = Image.fromarray(np.asarray(sub, dtype=np.int32)).resize((out_w, out_h), Image.NEAREST)
-        return np.asarray(im, dtype=np.int32)
+        out = np.asarray(im, dtype=np.int32)
+        self.perf.mark("ov.resize")
+        return out
+
+    def _blend_luts(self, lut, alpha):
+        """``(premultiplied colour, 1 - alpha)`` float32 LUTs for `lut` at
+        overlay alpha `alpha`, with a transparent row appended so a background
+        id (-1) selects it by numpy's negative-index wrap.
+
+        The per-pixel composite used to be
+        ``a = ov[:,:,3:4]/255 * alpha; rgb = rgb*(1-a) + ov[:,:,:3]*a`` over a
+        float32 copy of the gathered RGBA block: five full-size temporaries and
+        two STRIDED reads of a 4-channel array, ~26 ms per overlay on a
+        900x640 viewport. Every one of those scalar steps depends only on the
+        region id, so folding them into the LUT -- once per LUT row instead of
+        once per pixel -- leaves two contiguous gathers and an in-place
+        multiply-add. It is exact, not an approximation: the same float32
+        operations on the same values, so the composite is bit-identical.
+
+        Both come back 3 wide, so the gathers land on CONTIGUOUS (h, w, 3)
+        arrays: numpy's multiply against a broadcast (h, w, 1) weight is 15x
+        slower than against a real (h, w, 3) one (5.4 ms vs 0.35 ms at this
+        size), far more than the wider gather costs.
+
+        Cached per (LUT identity, alpha), most-recently-used kept: a region LUT
+        has a row per region -- 363k of them on a real slice -- so rebuilding
+        it every frame would cost as much as it saves, and a magic-fill drag
+        hands over a fresh preview LUT on every tick."""
+        key = (id(lut), float(alpha))
+        hit = self._lut_cache.pop(key, None)
+        if hit is not None and hit[0] is lut:
+            self._lut_cache[key] = hit        # touch: keep it over the transient
+            return hit[1], hit[2]
+        while len(self._lut_cache) >= self._LUT_CACHE_MAX:
+            self._lut_cache.pop(next(iter(self._lut_cache)))
+        a = lut[:, 3].astype(np.float32) / 255.0
+        if alpha != 1.0:                      # a transient layer keeps its own
+            a = a * alpha
+        n = lut.shape[0]
+        premul = np.zeros((n + 1, 3), np.float32)
+        premul[:n] = lut[:, :3].astype(np.float32) * a[:, None]
+        one_minus = np.ones((n + 1, 3), np.float32)
+        one_minus[:n] = (1 - a)[:, None]
+        self._lut_cache[key] = (lut, premul, one_minus)
+        return premul, one_minus
 
     def render(self):
-        self._job = None
+        self._job = self._pending_since = None
         cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
         if cw <= 1 or ch <= 1 or self.source is None:
             return
@@ -456,11 +599,23 @@ class SliceCanvas(tk.Frame):
         out_w = max(1, int((right - left) / self.scale))
         out_h = max(1, int((bottom - top) / self.scale))
 
+        perf = self.perf
+        src_kind = "in-memory" if self._array_src is not None else "pyramid"
+        with perf.frame(out=f"{out_w}x{out_h}", crop=f"{right - left}x{bottom - top}",
+                        scale=f"{self.scale:.4g}", src=src_kind,
+                        items=len(self.canvas.find_all()) if perf.enabled else 0) as fr:
+            self._render_body(left, top, right, bottom, out_w, out_h)
+            if fr is not None:          # known only once the base has been read
+                fr.info["lvl"] = self._perf_level
+
+    def _render_body(self, left, top, right, bottom, out_w, out_h):
+        perf = self.perf
         t0 = time.perf_counter()
         gray = self._base_region(left, top, right, bottom, out_w, out_h)
         # A colour base already comes back as (out_h, out_w, 3).
         rgb = (gray.astype(np.float32) if gray.ndim == 3
                else np.dstack([gray, gray, gray]).astype(np.float32))
+        perf.mark("base.rgb")
         t_base = time.perf_counter()
 
         n_ov = 0
@@ -482,19 +637,31 @@ class SliceCanvas(tk.Frame):
                 crop = rgba[top:bottom, left:right]
                 im = Image.fromarray(crop, mode="RGBA").resize((out_w, out_h), Image.NEAREST)
                 ov = np.asarray(im, dtype=np.float32)
+                a = ov[:, :, 3:4] / 255.0
+                if not transient:
+                    a = a * self._alpha
+                weight, colour = 1 - a, ov[:, :, :3] * a
+                perf.mark("ov.rgba")
             else:  # "label": recolor the region layer through the LUT at render time
                 layer, lut = entry[1], entry[2]
                 if layer is None or lut is None:
                     continue
                 sub = self._label_region(layer, left, top, right, bottom, out_w, out_h,
                                          index_cache)   # (out_h, out_w) region ids
-                ov = lut[np.where(sub >= 0, sub, 0)].astype(np.float32)
-                ov[sub < 0] = 0                               # background -> transparent
-            a = ov[:, :, 3:4] / 255.0
-            if not transient:
-                a = a * self._alpha
-            rgb = rgb * (1 - a) + ov[:, :, :3] * a
+                if sub.dtype.kind == "i":
+                    # Any background id, not just -1, must land on the LUT's
+                    # transparent row (which -1 reaches by negative wrap).
+                    np.maximum(sub, -1, out=sub)
+                premul, one_minus = self._blend_luts(lut, 1.0 if transient else self._alpha)
+                weight, colour = one_minus[sub], premul[sub]
+                perf.mark("ov.lut")
+            # rgb = rgb * (1 - a) + colour, in place: the arrays are 900x640x3
+            # floats and each temporary is another 7 MB through the cache.
+            np.multiply(rgb, weight, out=rgb)
+            np.add(rgb, colour, out=rgb)
+            perf.mark("ov.blend")
             n_ov += 1
+        perf.count("overlays", n_ov)
         t_ov = time.perf_counter()
 
         # Blit at the region's true screen position (image = view + screen*scale),
@@ -503,19 +670,39 @@ class SliceCanvas(tk.Frame):
         screen_x = int(round((left - self.view_x) / self.scale))
         screen_y = int(round((top - self.view_y) / self.scale))
         self._photo = ImageTk.PhotoImage(Image.fromarray(rgb.astype(np.uint8), mode="RGB"))
+        perf.mark("photo")
         self.canvas.delete("view")
         self.canvas.create_image(screen_x, screen_y, anchor="nw", image=self._photo, tags="view")
         if self._hud_mode is not None:
             self.canvas.tag_raise("hud")   # keep the HUD above the freshly-blitted image
         self.canvas.tag_raise("draw")      # tool rubber-band items (no-op when unused)
+        perf.mark("canvas")
         t_blit = time.perf_counter()
 
+        # create_image only QUEUES a redraw -- Tk copies the photo to the window
+        # from the event loop's idle phase, after render() has returned, and
+        # redraws every canvas item overlapping it while it is there. That cost
+        # is the gap between "canvas.render 100 ms" and 1-2 fps on screen, so
+        # while profiling we force the paint here and time it. (Only then: the
+        # forced flush changes when work happens, and the guard keeps a
+        # <Configure> fired from inside it from re-entering.)
+        if perf.enabled and not self._painting:
+            self._painting = True
+            try:
+                self.canvas.update_idletasks()
+            finally:
+                self._painting = False
+            perf.mark("paint")
+
         # Only log slow frames (the first fit / a heavy composite) so live
-        # pan/zoom doesn't flood the terminal.
+        # pan/zoom doesn't flood the terminal. NB this covers the composite
+        # ONLY -- not the Tk paint above, nor the per-event work between
+        # frames; turn the profiler on (Ctrl+P) for the whole picture.
         total_ms = 1e3 * (t_blit - t0)
-        if total_ms >= 50.0:
+        if total_ms >= 50.0 and not perf.enabled:
             src = "in-memory" if self._array_src is not None else "pyramid"
             print(f"[mscoupon]   canvas.render {out_w}x{out_h} via {src}: "
                   f"base={1e3 * (t_base - t0):.0f}ms "
                   f"overlays({n_ov})={1e3 * (t_ov - t_base):.0f}ms "
-                  f"blit={1e3 * (t_blit - t_ov):.0f}ms total={total_ms:.0f}ms", flush=True)
+                  f"blit={1e3 * (t_blit - t_ov):.0f}ms "
+                  f"composite={total_ms:.0f}ms (excludes the Tk paint)", flush=True)
