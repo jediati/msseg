@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "msseg-mspath"
+version = "0.1.0"
+description = "MSSeg whole-slide (pathology) viewer and labeler: Morse-Smale region decomposition of gigapixel tiled-pyramid slides, per ROI."
+requires-python = ">=3.9"
+# Pure Python. The compiled 2D pipeline is msseg-mscoupon's -- mspath drives
+# the SAME extension (prime_slice / filter_slice / feature_schema) rather than
+# building a second copy of libs/core, so a collaborator needs no compiler.
+# The pyramid extra is what makes a slide readable at all.
+dependencies = [
+    "numpy",
+    "pillow",
+    "msseg-labeler",
+    "msseg-viz",
+    "msseg-mscoupon",
+    "openslide-python",
+]
+
+[project.optional-dependencies]
+classify = ["msseg-labeler[classify]"]
+optimize = ["msseg-labeler[optimize]"]
+torch = ["msseg-labeler[torch]"]
+
+[project.scripts]
+mspath-gui = "msseg.mspath.app:main"
+
+[tool.hatch.build.targets.wheel]
+# PEP 420 namespace: ship msseg/mspath/ with no top-level msseg/__init__.py.
+packages = ["src/msseg"]
