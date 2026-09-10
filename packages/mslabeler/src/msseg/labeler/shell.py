@@ -248,6 +248,21 @@ class ViewerShell:
     def _update_busy(self):
         """Refresh the busy/stale indication (the app's)."""
 
+    def _region_overlay(self, labels, lut, np, visible=True):
+        """One overlay dict for a raster of the CURRENT item's region ids.
+
+        Every region layer -- the id colouring, the class layer, the
+        predictions, a confusion highlight, a gesture preview -- goes through
+        here, because where that raster sits is the app's business, not the
+        caller's. For an in-memory item the raster IS the image and the default
+        hands it over as it stands. For an item that covers part of a larger
+        image (a whole-slide ROI, or a coarse pyramid level of one) the app
+        overrides this to wrap the raster in a ``LabelLayer`` that places it,
+        so the canvas can compose it in the image's coordinates instead of
+        drawing it at the origin at 1:1.
+        """
+        return {"labels": labels, "lut": lut, "visible": bool(visible)}
+
     def _refresh_render(self):
         """Repaint the canvas for the current item (the app's)."""
 

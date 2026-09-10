@@ -221,9 +221,8 @@ class ViewControlsMixin:
             # stacking them would just muddy both.
             values, mask = scalar
             overlays = [o for o in overlays if "lut" not in o]
-            overlays.append({"labels": rec["labels"],
-                             "lut": scalar_lut(values, np, _SCALAR_ALPHA, mask),
-                             "visible": True})
+            overlays.append(self._region_overlay(
+                rec["labels"], scalar_lut(values, np, _SCALAR_ALPHA, mask), np))
         else:
             # The inherited region overlay is orientation, not the point: fade
             # it under the class layer (copy first -- _id_lut results may be
@@ -242,13 +241,11 @@ class ViewControlsMixin:
                                      self._class_colors_rgba(np)).copy()
                     plut[:, 3] = (plut[:, 3].astype(np.uint16)
                                   * _PRED_ALPHA // 255).astype(np.uint8)
-                    overlays.append({"labels": rec["labels"], "lut": plut,
-                                     "visible": True})
+                    overlays.append(self._region_overlay(rec["labels"], plut, np))
             if self.show_gt_var.get():
                 lut = self._class_lut_for(si, li, rec, np)
                 if lut is not None:
-                    overlays.append({"labels": rec["labels"], "lut": lut,
-                                     "visible": True})
+                    overlays.append(self._region_overlay(rec["labels"], lut, np))
             # A selected confusion cell outranks everything: it is a question
             # about WHERE those regions are, so it goes on top, opaque.
             hits = self._confusion_hits()
@@ -259,8 +256,7 @@ class ViewControlsMixin:
                 ids = [r for r in hits if r < K]
                 if ids:
                     hl[ids] = (255, 255, 255, 255)
-                    overlays.append({"labels": rec["labels"], "lut": hl,
-                                     "visible": True})
+                    overlays.append(self._region_overlay(rec["labels"], hl, np))
         return overlays
 
     def _labels_cache_for(self, si, li, rec, np):

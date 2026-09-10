@@ -28,11 +28,21 @@ class ClassifierMixin:
     # ------------------------------------------------------------------ #
     # Classifier: train on the labeled regions, predict every region
     # ------------------------------------------------------------------ #
-    def _all_stat_slices(self, action):
-        """Materialize and return current records for every primed slice.
+    def _stream_stat_slices(self, action):
+        """Yield ``(si, li, key, rec, table)`` for every primed item, one at a
+        time.
 
-        Model operations are stack-wide and must never silently degrade to the
-        subset visited by the lazy viewer. None means the operation must abort.
+        Same contract as ``_all_stat_slices`` -- model operations are
+        stack-wide and must never silently degrade to the subset the lazy
+        viewer happened to visit -- but the records are not all held alive at
+        once. That is the difference between a stack of coupon slices and a
+        session of whole-slide items: each record carries a label raster and a
+        statistics table, and every consumer here (the training set, the edge
+        set, classification) walks them exactly once.
+
+        None when the operation must abort before it starts; ``TrainingProblem``
+        when an item cannot be computed part-way through, which is what the
+        callers already handle.
         """
         keys = self.regions.keys()
         if not keys:
@@ -41,24 +51,36 @@ class ClassifierMixin:
         if self.regions.pending():
             self.status_var.set("Busy computing - try again in a moment.")
             return None
+        return self._stat_slice_iter(action, list(keys))
+
+    def _stat_slice_iter(self, action, keys):
         total = len(keys)
-        out = []
         self._compute_badge(f"{action} 0/{total}")
         try:
-            for key in keys:
+            for n, key in enumerate(keys, start=1):
                 si, li = self.catalogue.index_of(key)
-                self._compute_badge(f"{action} {len(out) + 1}/{total}")
+                self._compute_badge(f"{action} {n}/{total}")
                 rec = self._ensure_slice_record(si, li)
                 table = None if rec is None else rec.get("stats")
                 if (rec is None or rec.get("labels") is None
                         or getattr(table, "values", None) is None):
-                    self.status_var.set(
+                    raise TrainingProblem(
                         f"{action} stopped: could not compute slice {si}:{li}.")
-                    return None
-                out.append((si, li, key, rec, table))
+                yield si, li, key, rec, table
         finally:
             self._clear_compute_badge()
-        return out
+
+    def _all_stat_slices(self, action):
+        """``_stream_stat_slices`` drained into a list, for a caller that needs
+        random access (the edge-pairs experiment). None means abort."""
+        stream = self._stream_stat_slices(action)
+        if stream is None:
+            return None
+        try:
+            return list(stream)
+        except TrainingProblem as problem:
+            self.status_var.set(str(problem))
+            return None
 
     def _iter_stat_slices(self):
         """Cached current records only; callers needing completeness use
@@ -170,11 +192,11 @@ class ClassifierMixin:
                                 "pip install scikit-learn to enable training")
             return None
         import numpy as np
-        slices = self._all_stat_slices("Preparing training")
+        slices = self._stream_stat_slices("Preparing training")
         if slices is None:
             return None
-        items = [(key, rec, table, self.catalogue.group_of(key), f"{si}:{li}")
-                 for si, li, key, rec, table in slices]
+        items = ((key, rec, table, self.catalogue.group_of(key), f"{si}:{li}")
+                 for si, li, key, rec, table in slices)
         try:
             return self._training_builder.labeled_set(items, self.store, np)
         except TrainingProblem as problem:
@@ -189,6 +211,10 @@ class ClassifierMixin:
         self._clf_names = names
         self._clf_kind = kind
         self._clf_spec = spec
+        # A model belongs to the regime it was fitted in, and is stamped here
+        # rather than at save time: it must be refused the moment the profile
+        # moves, not only after a round trip through a pickle.
+        self._clf_scope = self._feature_scope()
         self._edge_model = edge
         self._pred.clear()               # predictions belong to the old model
         if not preserve_view:
@@ -214,11 +240,11 @@ class ClassifierMixin:
         thread only (records, the store); returns copies the worker may keep.
         None (with the reason in the status bar) when a slice lacks stats."""
         import numpy as np
-        slices = self._all_stat_slices("Gathering edges")
+        slices = self._stream_stat_slices("Gathering edges")
         if slices is None:
             return None
-        items = [(key, rec, table, self.catalogue.group_of(key), f"{si}:{li}")
-                 for si, li, key, rec, table in slices]
+        items = ((key, rec, table, self.catalogue.group_of(key), f"{si}:{li}")
+                 for si, li, key, rec, table in slices)
         try:
             return self._training_builder.edge_set(
                 items, self.store, names, lambda key, rec: self.regions.arcs(key, np), np)
@@ -893,10 +919,12 @@ class ClassifierMixin:
     def _clear_compute_badge(self):
         self._update_busy()      # restores busy/stale/none per engine state
 
-    def _check_model_compat(self, names, context):
-        """None when `names` matches the active profile's statistics schema;
-        else a blocking message naming the exact mismatch. Compared as SETS:
-        the feature matrix is assembled by name, so order never matters."""
+    def _check_model_compat(self, names, context, scope=None):
+        """None when `names` matches the active profile's statistics schema AND
+        the model's scope is the profile's; else a blocking message naming the
+        exact mismatch. Names are compared as SETS: the feature matrix is
+        assembled by name, so order never matters. `scope` defaults to the
+        loaded model's (see `_feature_scope`)."""
         expected = self._expected_feature_names()
         if expected is None:
             self._log(f"model compatibility check skipped ({context}): "
@@ -905,7 +933,10 @@ class ClassifierMixin:
         prof = "?"
         if 0 <= self.active_profile_idx < len(self.profiles):
             prof = self.profiles[self.active_profile_idx]["name"]
-        return model_bundle.compat_message(names, expected, prof, context)
+        if scope is None:
+            scope = getattr(self, "_clf_scope", None)
+        return model_bundle.compat_message(names, expected, prof, context,
+                                           scope, self._feature_scope())
 
     def _classify(self):
         """Predict a class for EVERY region of every computed slice and show
@@ -921,11 +952,10 @@ class ClassifierMixin:
             self.status_var.set(msg)
             return
         import numpy as np
-        slices = self._all_stat_slices("Preparing classification")
+        slices = self._stream_stat_slices("Preparing classification")
         if slices is None:
             return
         count = 0
-        self._compute_badge("Classifying")
         t0 = time.perf_counter()
         try:
             for si, li, key, rec, table in slices:
@@ -936,6 +966,10 @@ class ClassifierMixin:
                         f"slice {si}:{li}.")
                     return
                 count += 1
+        except TrainingProblem as problem:
+            self._pred.clear()
+            self.status_var.set(str(problem))
+            return
         finally:
             self._clear_compute_badge()
         self._refresh_region_modes()
@@ -1066,7 +1100,7 @@ class ClassifierMixin:
         entry = model_bundle.model_record_entry(
             path, self._clf_names, self._clf_kind, statistics,
             None if self._clf_spec is None else self._clf_spec.to_dict(),
-            self._edge_model is not None)
+            self._edge_model is not None, getattr(self, "_clf_scope", None))
         self.models = [m for m in self.models if m.get("path") != entry["path"]]
         self.models.append(entry)
 
@@ -1093,7 +1127,7 @@ class ClassifierMixin:
         # wrong thing), before anything is installed. Interactively -- and only
         # for a v2 pickle, which carries the statistics it was trained under --
         # the user is first offered a profile built from those statistics.
-        msg = self._check_model_compat(doc.names, "load")
+        msg = self._check_model_compat(doc.names, "load", doc.scope)
         if msg and interactive and doc.statistics:
             if not messagebox.askyesno(
                     self.APP_TITLE,
@@ -1103,12 +1137,13 @@ class ClassifierMixin:
             self._profile_from_model(path, doc.statistics)
             # The new profile can still miss: feature_fields may resolve
             # differently here than in the build that saved the pickle.
-            msg = self._check_model_compat(doc.names, "load")
+            msg = self._check_model_compat(doc.names, "load", doc.scope)
         if msg:
             raise ValueError(msg)
         self._pred.clear()               # predictions belong to the old model
         self._clf = doc.model
         self._clf_names = list(doc.names)
+        self._clf_scope = doc.scope
         self._clf_kind = doc.kind
         self._clf_spec = (model_search.ModelSpec.from_dict(doc.spec)
                           if doc.spec is not None else None)

@@ -342,22 +342,78 @@ def touched_ids(interaction, labels, np):
     return set(int(v) for v in vals if v >= 0)
 
 
-def touched_sets(interactions, labels, np):
+def gesture_bbox(interaction, np, pad=1):
+    """(x, y, w, h) covering a gesture's points, or None when it has none.
+
+    `pad` widens it by a pixel on every side so a click, a horizontal squiggle
+    or a zero-area box still names a rect with something in it.
+    """
+    pts = interaction.points
+    if not pts:
+        return None
+    xs = [int(np.floor(x)) for x, _ in pts]
+    ys = [int(np.floor(y)) for _, y in pts]
+    x0, x1 = min(xs) - pad, max(xs) + pad
+    y0, y1 = min(ys) - pad, max(ys) + pad
+    return x0, y0, x1 - x0 + 1, y1 - y0 + 1
+
+
+def shifted(interaction, dx, dy):
+    """The same gesture with its points moved by (dx, dy)."""
+    return Interaction(interaction.uid, interaction.slice_key, interaction.si,
+                       interaction.li, interaction.tool,
+                       [(x + dx, y + dy) for x, y in interaction.points],
+                       interaction.class_id, interaction.meta)
+
+
+def touched_ids_over(interaction, layer, np):
+    """``touched_ids`` against a ``LabelLayer``, materialising only the
+    gesture's own bounding box.
+
+    ``touched_ids`` needs a raster, and for an in-memory item there is one --
+    ``layer.full()`` hands it over and this is exactly the old call. For a
+    layer that has no full raster to give (a whole-slide item, where the ids
+    live on part of a 4-gigapixel canvas) the gesture's bbox is cropped instead
+    and the points are shifted into it, which is the same answer over a rect
+    the size of the gesture rather than the size of the slide.
+    """
+    full = layer.full()
+    if full is not None:
+        return touched_ids(interaction, full, np)
+    box = gesture_bbox(interaction, np)
+    if box is None:
+        return set()
+    x, y, w, h = box
+    ih, iw = layer.shape
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(iw, x + w), min(ih, y + h)
+    if x1 <= x0 or y1 <= y0:
+        return set()
+    sub = layer.crop(0, x0, y0, x1 - x0, y1 - y0)
+    return touched_ids(shifted(interaction, -x0, -y0), sub, np)
+
+
+def touched_sets(interactions, labels, np, layer=None):
     """[(interaction, touched region-id set)] in creation (= resolution) order.
 
     The per-interaction sets are what resolution consumes, and callers that
     also need the reverse question (which interactions touch region r?) get it
-    from the same single rasterization pass."""
+    from the same single rasterization pass. Pass `layer` when the item's ids
+    are served by a ``LabelLayer`` rather than held as one raster; `labels` is
+    then only used to size the result."""
+    if layer is not None:
+        return [(it, touched_ids_over(it, layer, np))
+                for it in sorted(interactions, key=lambda it: it.uid)]
     return [(it, touched_ids(it, labels, np))
             for it in sorted(interactions, key=lambda it: it.uid)]
 
 
-def resolve_slice(interactions, labels, np):
+def resolve_slice(interactions, labels, np, layer=None):
     """region_class: uint8 array sized labels.max()+1, 0 = unlabeled.
 
     Interactions apply in creation (uid) order, so a later gesture paints over
     an earlier one on any region both touch."""
-    return resolve_sets(touched_sets(interactions, labels, np), labels, np)
+    return resolve_sets(touched_sets(interactions, labels, np, layer), labels, np)
 
 
 def resolve_sets(sets, labels, np):

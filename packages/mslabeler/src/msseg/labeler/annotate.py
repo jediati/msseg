@@ -61,6 +61,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         # predicted region->class arrays keyed by the commit they were made at.
         self._clf = None
         self._clf_names = None
+        self._clf_scope = None          # the regime it was fitted in (see _feature_scope)
         self._clf_kind = "dense FC"
         self.model_kind_var = tk.StringVar(master=root, value="dense FC")
         # "dense (tuned)": the spec the CURRENT model was built from (rides its
@@ -341,8 +342,8 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         if v is None:
             return
         import numpy as np
-        v.set_transient({"labels": labels,
-                         "lut": preview_lut(K, ids, colors, np, emphasize=emphasize)})
+        v.set_transient(self._region_overlay(
+            labels, preview_lut(K, ids, colors, np, emphasize=emphasize), np))
         v.invalidate()
 
     def _end_preview(self):
@@ -747,7 +748,8 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         # The in-memory model is not in the document (a plain Train writes
         # no pickle): stash it so the apply's pickle reload cannot replace it.
         self._new_session_stash = ((self._clf, self._clf_names, self._clf_kind,
-                                    self._clf_spec, self._edge_model, self._search_spec)
+                                    self._clf_spec, self._edge_model, self._search_spec,
+                                    self._clf_scope)
                                    if keep_model else None)
         return doc
 
@@ -757,7 +759,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         if keep.get("model", True):
             if stash is not None and stash[0] is not None:
                 (self._clf, self._clf_names, self._clf_kind, self._clf_spec,
-                 self._edge_model, self._search_spec) = stash
+                 self._edge_model, self._search_spec, self._clf_scope) = stash
                 self.classify_btn.config(state="normal")
         else:
             self._reset_model_selection()
@@ -774,6 +776,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         """No model, the default kind, default edge / search settings."""
         self._clf = None
         self._clf_names = None
+        self._clf_scope = None
         self._clf_kind = "dense FC"
         self._clf_spec = None
         self._edge_model = None
@@ -864,6 +867,22 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
     def _expected_feature_names(self):
         """The feature names the ACTIVE profile produces, or None to skip the
         compatibility gate (the app knows its statistics schema)."""
+        return None
+
+    def _feature_scope(self):
+        """An opaque string naming WHAT the active profile measures on, or None
+        when the app has no such distinction.
+
+        Feature names say what was measured, never what it was measured on.
+        A whole-slide labeler produces the same `mean_blur_s1.5` at pyramid
+        level 4 and at level 0, but a sigma is in pixels, so the level-4 number
+        describes a neighbourhood sixteen times wider -- and both look
+        perfectly plausible. An app that can be in more than one such regime
+        returns a string for the current one (mspath: the level), and the
+        compatibility gate refuses a model trained in another. The coupon
+        labeler has one regime and returns None, which is the old behaviour
+        exactly.
+        """
         return None
 
     def _feature_schema_now(self):

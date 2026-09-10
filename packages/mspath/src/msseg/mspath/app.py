@@ -47,6 +47,7 @@ from msseg.mscoupon.config_io import (FILTER_OPERATIONS, FILTER_SCHEMA, COLOR_ME
 from .adapters import SlideCatalogue, SlideRegionProvider
 from .common import list_slides, log
 from .engine import SlideEngine
+from .sources import RoiLabelLayer
 from .items import overview, parse_key, slide_id
 
 # The level a slide's overview is taken at. 4 (1/16) puts a 90 000 x 47 040
@@ -282,6 +283,18 @@ class MsPathApp(ViewerShell):
             return max(0, int(self.level_var.get()))
         except Exception:
             return DEFAULT_OVERVIEW_LEVEL
+
+    def _feature_scope(self):
+        """A model is valid at ONE pyramid level.
+
+        Every derived channel's sigma is in pixels, so `mean_blur_s1.5` at
+        level 4 measures a neighbourhood sixteen times wider than at level 0 --
+        and the feature NAMES are identical, so nothing else would catch a
+        model being applied at the wrong resolution. Declaring the level as the
+        scope makes the compatibility gate refuse it (see
+        `msseg.labeler.bundle.compat_message`).
+        """
+        return f"L{self._overview_level()}"
 
     def _halo(self):
         try:
@@ -584,6 +597,34 @@ class MsPathApp(ViewerShell):
     # ------------------------------------------------------------------ #
     # Render
     # ------------------------------------------------------------------ #
+    def _region_overlay(self, labels, lut, np, visible=True):
+        """Place a region raster on the slide.
+
+        An item's raster is its own -- 2048 square at level 0, or a whole level
+        4 at 1/16 -- and the canvas draws in slide pixels, so handing the raster
+        over as the framework's default does would draw it at the slide's origin
+        at 1:1. Wrapping it in the item's ``RoiLabelLayer`` is what makes the
+        class layer, the predictions and a gesture preview land where the
+        regions actually are.
+
+        The LUT's length is the id count: it was built for exactly these ids,
+        and asking the raster for its maximum on every overlay of every frame is
+        the image-sized work the layer exists to avoid.
+        """
+        cur = self._current()
+        item = self._item_at(*cur) if cur is not None else None
+        rec = self.engine.record(item.key) if item is not None else None
+        if rec is None or labels is None:
+            return super()._region_overlay(labels, lut, np, visible)
+        try:
+            slide_shape = self.engine.source(item.slide).level_shape(0)
+        except Exception:
+            slide_shape = None
+        layer = RoiLabelLayer(labels, origin=rec["origin"], scale=rec["scale"],
+                              slide_shape=slide_shape, rev=int(rec["commit"]),
+                              n_ids=int(lut.shape[0]))
+        return {"layer": layer, "lut": lut, "visible": bool(visible)}
+
     def _seg_overlays(self, key, rec, np, min_colors):
         """Overlay list for one item (a subclass hook: the labeler appends its
         class layer here)."""
@@ -592,8 +633,8 @@ class MsPathApp(ViewerShell):
         layer = self.regions.label_layer(key)
         if layer is None:
             return []
-        return [{"layer": layer, "lut": _id_lut(layer.n_ids, min_colors, np),
-                 "visible": True}]
+        return [self._region_overlay(rec["labels"],
+                                     _id_lut(layer.n_ids, min_colors, np), np)]
 
     def _refresh_render(self):
         self._update_persist_label()

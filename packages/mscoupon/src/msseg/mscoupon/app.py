@@ -1902,14 +1902,14 @@ class MscouponApp(ViewerShell):
         elif src == "global" and data is not None:
             raster = data["global_labels"][li]
         if raster is not None:
-            overlays.append({"labels": raster, "lut": _id_lut(raster, min_colors, np),
-                             "visible": True})
+            overlays.append(self._region_overlay(
+                raster, _id_lut(raster, min_colors, np), np))
         if self.mask_var.get() and data is not None:
             glob = data["global_labels"][li]                 # -1 bg, >=0 = kept feature
             K = int(glob.max()) + 1 if glob.size else 1
             mlut = np.zeros((max(K, 1), 4), np.uint8)
             mlut[:, 0] = 255; mlut[:, 1] = 255; mlut[:, 3] = 255   # yellow where global>=0
-            overlays.append({"labels": glob, "lut": mlut, "visible": True})
+            overlays.append(self._region_overlay(glob, mlut, np))
         return overlays
 
     def _refresh_render(self):

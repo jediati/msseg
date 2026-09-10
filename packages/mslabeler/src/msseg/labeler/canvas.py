@@ -192,7 +192,10 @@ class SliceCanvas(tk.Frame):
 
     def set_overlays(self, overlays):
         """overlays: list of dicts, either a pre-colored RGBA layer
-        ``{"rgba": HxWx4 uint8, "visible": bool}`` (e.g. the filtered field) or a
+        ``{"rgba": HxWx4 uint8, "visible": bool}`` -- FULL-IMAGE and resident,
+        so it suits a derived field of an in-memory image and not a layer that
+        covers part of a gigapixel one; a placed overlay goes through the
+        region path below, whose LabelLayer knows where it sits -- or a
         region layer ``{"labels": HxW int | "layer": LabelLayer, "lut": (K,4) uint8,
         "visible": bool}`` recolored at render time over the viewport
         (segmentation / mask). Stored as tagged tuples: ``("rgba", rgba, vis)`` or
