@@ -55,7 +55,15 @@ parameters that produced it have just been replaced; click *Run* again.
    Types: `blur, derivative, laplacian, zero_crossings, hessian_eigenvalues,
    structure_eigenvalues, edges, erode, dilate, open, close, label_components`.
 3. **MSC parameters** — max persistence %, ascending/descending 2-manifold,
-   optional accurate gradient (slower/more memory), per-slice min area gate.
+   optional accurate gradient (slower/more memory), **GPU gradient** (CUDA;
+   bit-identical), **simplification** and the per-slice min area gate. The last
+   two are independent axes and easy to confuse: the GPU flag only decides
+   *where the discrete gradient is computed*, while simplification decides
+   *what is built on top of it* — `merge forest` (the default: MSCEER's
+   extremum merge forest, no MSC built while priming, much faster) or
+   `MSC hierarchy`. They differ only in that the forest also merges away corner
+   minima, which the MSC keeps alive at every persistence. `MSSEG_SIMPLIFICATION`
+   overrides the profile at run time, and the `RUN:` banner prints both.
 4. **Run with selected** — discards prior runs; per slice, runs the filter chain
    and primes the MSC base decomposition + statistics tree (threaded).
 5. **Export config.json** — writes one config per subsequence (an explicit

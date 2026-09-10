@@ -488,7 +488,7 @@ def _selftest():
     # model, each a click away from its tab.
     app._refresh_hints()
     assert app.workflow_hint_var.get().splitlines() == \
-        ["topo field: base→msc(asc, 10%)", "stats: base→1ch×4"], app.workflow_hint_var.get()
+        ["topo field: base→msc(asc, 10%, mf)", "stats: base→1ch×4"], app.workflow_hint_var.get()
     assert app.model_hint_var.get() == "model: dense FC · not trained"
     app._on_filter_op_change(0, "blur"); app.filter_cards[0]["params"]["sigma"] = 1.5
     app._on_filter_op_change(1, "edges"); app.filter_cards[1]["params"]["sigma"] = 0.7
@@ -497,7 +497,7 @@ def _selftest():
     app.filter_cards = [app._new_filter_card()]
     app._rebuild_filter_cards()
     app._refresh_hints()
-    assert app.workflow_hint_var.get().splitlines()[0] == "topo field: base→msc(asc, 10%)"
+    assert app.workflow_hint_var.get().splitlines()[0] == "topo field: base→msc(asc, 10%, mf)"
     app._show_center_tab("Processing")
     assert app._center_tab_name() == "Processing"
     app._show_center_tab("Model")

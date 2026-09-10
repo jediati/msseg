@@ -53,6 +53,20 @@ def color_input_from_json(doc: Any) -> Dict[str, Any]:
             "channels": max(0, _as_int(col.get("channels"), 0))}
 
 
+# How persistence simplification is represented when a profile does not say:
+# "merge_forest" (MSCEER's extremum merge forest -- no MSC is built during
+# priming) or "msc" (the Morse-Smale complex + cancellation hierarchy). One
+# name for every Python-side default and read fallback, because the last time
+# this was a literal per site the GUI kept one that said "msc" and, since the
+# GUI's value is written into the params JSON unconditionally, it overrode the
+# C++ defaults and then baked itself into every saved session.
+# Mirrors msseg::Msc2DParams::simplification and mscoupon::Config, which cannot
+# be imported from here; `MSSEG_SIMPLIFICATION` overrides all of them at run time.
+DEFAULT_SIMPLIFICATION = "merge_forest"
+
+SIMPLIFICATIONS = ("merge_forest", "msc")
+
+
 def default_profile(name: str = "default", relevance: bool = True) -> Dict[str, Any]:
     return {
         "name": str(name),
@@ -61,7 +75,8 @@ def default_profile(name: str = "default", relevance: bool = True) -> Dict[str, 
         "base_filters": [],
         "msc": {"manifold": "ascending", "persistence_percent": 10.0,
                 "accurate": False, "extremum_sample_radius": 0,
-                "use_gpu_gradient": False, "simplification": "merge_forest"},
+                "use_gpu_gradient": False,
+                "simplification": DEFAULT_SIMPLIFICATION},
         "statistics": config_io.statistics_to_json(
             [{"kind": "base"}], list(config_io.STAT_REDUCTIONS), True, 0,
             relevance),
@@ -91,6 +106,15 @@ def profile_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[str, 
         _note(notes, f"profile {out['name']}: unknown manifold {manifold!r} - "
                      "using ascending")
         manifold = "ascending"
+    # Validated like the manifold, and for the same reason: an unrecognised
+    # name reaches C++ as a plain string, compares unequal to "merge_forest"
+    # and silently selects the MSC hierarchy -- a typo would cost a slower
+    # prime with nothing anywhere saying why.
+    simplification = str(msc.get("simplification") or DEFAULT_SIMPLIFICATION)
+    if simplification not in SIMPLIFICATIONS:
+        _note(notes, f"profile {out['name']}: unknown simplification "
+                     f"{simplification!r} - using {DEFAULT_SIMPLIFICATION}")
+        simplification = DEFAULT_SIMPLIFICATION
     pct = _opt_float(msc.get("persistence_percent"))
     out["msc"] = {
         "manifold": manifold,
@@ -100,7 +124,7 @@ def profile_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[str, 
                          or msc.get("accurate_descending")),
         "extremum_sample_radius": max(0, _as_int(msc.get("extremum_sample_radius"), 0)),
         "use_gpu_gradient": bool(msc.get("use_gpu_gradient")),
-        "simplification": str(msc.get("simplification") or "merge_forest"),
+        "simplification": simplification,
     }
 
     stats = config_io.statistics_from_json(root.get("statistics"), notes)
@@ -363,7 +387,7 @@ def msc_code(msc: Dict[str, Any]) -> str:
     except (TypeError, ValueError):
         pct = "?%"
     args = [manifold, pct]
-    if str(msc.get("simplification") or "msc") == "merge_forest":
+    if str(msc.get("simplification") or DEFAULT_SIMPLIFICATION) == "merge_forest":
         args.append("mf")
     return f"msc({', '.join(args)})"
 

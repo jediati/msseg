@@ -264,10 +264,13 @@ def test_profile_summary_compact_chain():
         ["mean", "max"], True, 0, False)
     assert session.profile_summary(p) == ("topo field: base→b(1.5)→e(0.7)→msc(dsc, 2.5%)\n"
                                           "stats: base→norm(gmm)→5ch×2")
-    assert session.msc_code({}) == "msc(asc, 10%)"
+    # an unspecified simplification is the DEFAULT one, not "msc": every other
+    # default and read fallback resolves it that way, so the summary must too
+    assert session.msc_code({}) == "msc(asc, 10%, mf)"
+    assert session.msc_code({"simplification": "msc"}) == "msc(asc, 10%)"
     assert session.stats_width(p["statistics"]) == "5ch×2"
     assert session.stage_code({"operation": "erode", "params": {"radius": 2}}) == "ero(2)"
     assert session.stage_code({"operation": "blur", "params": {}}) == "b"
     assert session.stage_code({"operation": "none"}) == ""
     assert session.chain_text([]) == "base"
-    assert session.profile_summary({}).startswith("topo field: base→msc(asc, 10%)\nstats: base→")
+    assert session.profile_summary({}).startswith("topo field: base→msc(asc, 10%, mf)\nstats: base→")

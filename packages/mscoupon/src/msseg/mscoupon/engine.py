@@ -30,6 +30,7 @@ import threading
 import time
 
 from .common import log, FeatureTable
+from .session import DEFAULT_SIMPLIFICATION
 
 
 def color_planes(p, li, np):
@@ -207,11 +208,24 @@ class ComputeEngine:
                 + (f" ({n_reused} sequence(s) reused)" if n_reused else ""))
             log(f"  filters: {[f['operation'] for f in filters] or ['(none)']}")
             log(f"  base_filters: {[f['operation'] for f in base_filters] or ['(none)']}")
+            # simplification and use_gpu_gradient belong here as much as the
+            # rest: they decide whether the prime builds an MSC + cancellation
+            # hierarchy or a merge forest, and on which device the discrete
+            # gradient runs -- the two biggest terms in a slice's prime time.
+            # Without them the banner cannot be told apart from a run using the
+            # other of each, which is how a stale profile pinned to the MSC
+            # hierarchy sat unnoticed behind a GPU checkbox.
             log(f"  msc: manifold={msc.get('manifold')} "
                 f"persistence_percent={msc.get('persistence_percent')} "
                 f"accurate={msc.get('accurate_ascending')} "
+                f"simplification={msc.get('simplification', DEFAULT_SIMPLIFICATION)} "
+                f"gpu_gradient={bool(msc.get('use_gpu_gradient'))} "
                 f"algorithm={msc.get('compute_algorithm', 'serial')} "
                 f"requested_parallelism={msc.get('requested_parallelism', 0)}")
+            env_simp = os.environ.get("MSSEG_SIMPLIFICATION", "").strip()
+            if env_simp:      # the runtime kill-switch wins over the profile
+                log(f"  NOTE: MSSEG_SIMPLIFICATION={env_simp!r} overrides "
+                    f"msc.simplification for this run")
             # Concurrency picture: priming still walks slices serially in ONE daemon
             # worker thread, but each slice's MSC (discrete gradient / partitioned
             # construction / manifold labeling) runs cores/slice-way parallel inside

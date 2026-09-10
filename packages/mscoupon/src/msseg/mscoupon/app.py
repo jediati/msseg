@@ -201,10 +201,14 @@ class MscouponApp(ViewerShell):
         self.manifold_var = tk.StringVar(value="ascending")
         self.accurate_var = tk.BooleanVar(value=False)
         self.gpu_var = tk.BooleanVar(value=False)   # msc.use_gpu_gradient
-        # msc.simplification: "msc" (cancellation hierarchy) | "merge_forest"
-        # (extremum network). No panel control yet -- it round-trips through
-        # profiles so a saved/loaded config keeps whatever it was set to.
-        self.simplification_var = tk.StringVar(value="msc")
+        # msc.simplification: "merge_forest" (extremum network, the default
+        # since 2026-09-02) | "msc" (the cancellation hierarchy). The default
+        # lives in FOUR places that cannot import each other -- Msc2DParams,
+        # mscoupon::Config, session.default_profile and this var -- and this
+        # one WINS, because _profile_from_ui writes it into the params JSON
+        # unconditionally. It was the one missed when the default flipped, so a
+        # GUI-saved session pinned "msc" over every other default.
+        self.simplification_var = tk.StringVar(value=session.DEFAULT_SIMPLIFICATION)
         self.ext_radius_var = tk.StringVar(value="0")
         self.min_area_var = tk.StringVar(value="")
         self.connectivity_var = tk.IntVar(value=6)
@@ -687,6 +691,22 @@ class MscouponApp(ViewerShell):
                         variable=self.accurate_var).pack(anchor="w", padx=4)
         ttk.Checkbutton(c, text="GPU gradient (CUDA; bit-identical results)",
                         variable=self.gpu_var).pack(anchor="w", padx=4)
+        # Simplification is a SEPARATE axis from the GPU gradient (which only
+        # decides where the discrete gradient is computed): this picks what is
+        # built on top of it. Visible because the two were easy to confuse
+        # while this one had no control at all -- a profile could sit on the
+        # slower branch for weeks with nothing on screen or in the log saying so.
+        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
+        ttk.Label(row, text="Simplification:").pack(side="left")
+        ttk.Radiobutton(row, text="merge forest", variable=self.simplification_var,
+                        value="merge_forest").pack(side="left", padx=4)
+        ttk.Radiobutton(row, text="MSC hierarchy", variable=self.simplification_var,
+                        value="msc").pack(side="left", padx=4)
+        ttk.Label(c, text="merge forest: no MSC is built while priming (much faster); "
+                          "differs from the MSC only in that it also merges away\n"
+                          "corner minima, which the MSC keeps alive at every "
+                          "persistence. MSC arcs are still built on demand.",
+                  foreground="#666").pack(anchor="w", padx=4)
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="ext sample radius:").pack(side="left")
         ttk.Entry(row, textvariable=self.ext_radius_var, width=8).pack(side="left", padx=4)
@@ -1445,7 +1465,8 @@ class MscouponApp(ViewerShell):
             setvar(self.manifold_var, msc["manifold"])
         setvar(self.accurate_var, bool(msc.get("accurate")))
         setvar(self.gpu_var, bool(msc.get("use_gpu_gradient")))
-        setvar(self.simplification_var, str(msc.get("simplification") or "msc"))
+        setvar(self.simplification_var,
+               str(msc.get("simplification") or session.DEFAULT_SIMPLIFICATION))
         setvar(self.ext_radius_var, str(int(msc.get("extremum_sample_radius") or 0)))
         sel = profile.get("selection") or {}
         min_area = sel.get("min_area")
