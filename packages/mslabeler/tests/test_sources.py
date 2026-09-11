@@ -287,3 +287,24 @@ def test_the_source_kind_names_what_is_being_read(canvas_factory):
         levels = 6
     sc.set_source(_Pyramid(base))
     assert sc._source_kind() == "pyramid"
+
+
+def test_a_fit_before_the_canvas_has_a_size_waits_for_one(canvas_factory):
+    """At construction the canvas is 1x1; a fit then is image_width pixels per
+    screen pixel -- the whole image in one dot -- and nothing corrects it once
+    the window maps. The slide labeler fits on load and showed nothing."""
+    make, _captured = canvas_factory
+    base, *_ = scene()
+    sc = make(cw=1, ch=1)                       # not laid out yet
+    sc.set_base(array=base)
+    sc.fit()
+    assert sc._fit_pending and sc.scale == 1.0, "a 1x1 fit must not set a zoom"
+    sc.canvas.winfo_width = lambda: 400
+    sc.canvas.winfo_height = lambda: 300
+    sc._fit_when_sized()                        # what <Configure> delivers
+    assert not sc._fit_pending
+    assert sc.scale == pytest.approx(1.0) and (sc.view_x, sc.view_y) == (0.0, 0.0)
+    # and a fit on a sized canvas is immediate, as it always was
+    sc.canvas.winfo_width = lambda: 200
+    sc.fit()
+    assert sc.scale == pytest.approx(2.0) and not sc._fit_pending

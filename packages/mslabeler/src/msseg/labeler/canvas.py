@@ -45,6 +45,7 @@ class SliceCanvas(tk.Frame):
         self.image_height = 1
 
         self._overlays = []          # tagged: ("rgba",rgba,vis) | ("label",layer,lut,vis)
+        self._fit_pending = False    # a fit() asked for before the canvas had a size
         self._vmin = 0.0             # window fractions of [base_min, base_max]
         self._vmax = 1.0
         self._alpha = 0.5
@@ -243,13 +244,29 @@ class SliceCanvas(tk.Frame):
         return self._hud_mode, self._hud_text
 
     def fit(self):
-        w = max(self.canvas.winfo_width(), 1)
-        h = max(self.canvas.winfo_height(), 1)
+        """Zoom to show the whole image.
+
+        Before the window is mapped the canvas is 1x1, and a fit computed
+        then is image_width pixels per screen pixel -- the whole image in one
+        dot, and every later navigation renders at that zoom. So a fit asked
+        for before the canvas has a size waits for its first real size.
+        """
+        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if w <= 1 or h <= 1:
+            if not self._fit_pending:
+                self._fit_pending = True
+                self.canvas.bind("<Configure>", self._fit_when_sized, add="+")
+            return
+        self._fit_pending = False
         self.scale = max(self.image_width / w, self.image_height / h, 1e-6)
         self.view_x = (self.image_width - w * self.scale) / 2
         self.view_y = (self.image_height - h * self.scale) / 2
         self._schedule()
         self._view_changed()
+
+    def _fit_when_sized(self, _event=None):
+        if self._fit_pending and self.canvas.winfo_width() > 1                 and self.canvas.winfo_height() > 1:
+            self.fit()
 
     # -- interaction --------------------------------------------------- #
     def _toggle_profile(self, _e=None):
