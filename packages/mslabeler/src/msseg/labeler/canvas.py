@@ -544,9 +544,25 @@ class SliceCanvas(tk.Frame):
                          max(1, int(round((bottom - top) / sc))))
         self.perf.mark("ov.crop")
         im = Image.fromarray(np.asarray(sub, dtype=np.int32)).resize((out_w, out_h), Image.NEAREST)
-        out = np.asarray(im, dtype=np.int32)
+        # np.array, not asarray: a PIL-backed buffer is READ-ONLY, and the
+        # composite clamps background ids in place. The gather path above
+        # returns a fresh array (fancy indexing copies), so only this branch
+        # could hand back something unwritable -- and only a layer with no full
+        # raster to give reaches it, which nothing did before mspath.
+        out = np.array(im, dtype=np.int32)
         self.perf.mark("ov.resize")
         return out
+
+    def _source_kind(self):
+        """What the base is actually being read from, for the timing lines.
+
+        Not "which slot is filled": a native pyramid takes the array slot (it
+        serves the data's own values), so asking that reported "in-memory" for
+        a 4-gigapixel slide being read a tile at a time."""
+        src = self.source
+        if src is None:
+            return "none"
+        return "pyramid" if getattr(src, "levels", 1) > 1 else "in-memory"
 
     def _blend_luts(self, lut, alpha):
         """``(premultiplied colour, 1 - alpha)`` float32 LUTs for `lut` at
@@ -604,7 +620,7 @@ class SliceCanvas(tk.Frame):
         out_h = max(1, int((bottom - top) / self.scale))
 
         perf = self.perf
-        src_kind = "in-memory" if self._array_src is not None else "pyramid"
+        src_kind = self._source_kind()
         with perf.frame(out=f"{out_w}x{out_h}", crop=f"{right - left}x{bottom - top}",
                         scale=f"{self.scale:.4g}", src=src_kind,
                         items=len(self.canvas.find_all()) if perf.enabled else 0) as fr:
@@ -704,7 +720,7 @@ class SliceCanvas(tk.Frame):
         # frames; turn the profiler on (Ctrl+P) for the whole picture.
         total_ms = 1e3 * (t_blit - t0)
         if total_ms >= 50.0 and not perf.enabled:
-            src = "in-memory" if self._array_src is not None else "pyramid"
+            src = self._source_kind()
             print(f"[mscoupon]   canvas.render {out_w}x{out_h} via {src}: "
                   f"base={1e3 * (t_base - t0):.0f}ms "
                   f"overlays({n_ov})={1e3 * (t_ov - t_base):.0f}ms "

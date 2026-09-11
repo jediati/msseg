@@ -222,3 +222,68 @@ def test_repaint_deadline_keeps_a_drag_from_starving_the_render(canvas_factory):
 
     sc.render()                                  # no base: returns after the reset
     assert sc._job is None and sc._pending_since is None
+
+
+class _CropOnlyLayer:
+    """A LabelLayer that will not hand over a full raster -- the whole-slide
+    case, where the ids cover part of an image far too large to materialise."""
+
+    def __init__(self, labels):
+        self._inner = ArrayLabelLayer(labels)
+
+    shape = property(lambda self: self._inner.shape)
+    n_ids = property(lambda self: self._inner.n_ids)
+    rev = property(lambda self: self._inner.rev)
+
+    def crop(self, level, x, y, w, h):
+        return self._inner.crop(level, x, y, w, h)
+
+    def id_at(self, x, y):
+        return self._inner.id_at(x, y)
+
+    def full(self):
+        return None
+
+
+@pytest.mark.parametrize("view", [(1.0, 0.0, 0.0), (0.5, 40.0, 30.0), (3.0, -20.0, -10.0)])
+def test_a_crop_only_layer_renders(canvas_factory, view):
+    """The crop branch of _label_region resizes through PIL, whose buffer is
+    READ-ONLY -- and the composite clamps background ids in place. Nothing in
+    the tree took that branch until a layer with no full raster existed, so the
+    first render of one raised `output array is read-only`."""
+    make, captured = canvas_factory
+    base, labels, lut, _rgba, tl = scene()
+    sc = make()
+    sc.set_base(array=base)
+    sc.set_overlays([{"layer": _CropOnlyLayer(labels), "lut": lut, "visible": True}])
+    sc.set_transient({"layer": _CropOnlyLayer(labels), "lut": tl})
+    sc.scale, sc.view_x, sc.view_y = view
+    captured.clear()
+    sc.render()                                  # must not raise
+    assert captured and captured[-1].shape[2] == 3
+
+
+def test_the_crop_branch_hands_back_a_writable_array(canvas_factory):
+    make, _captured = canvas_factory
+    _base, labels, *_ = scene()
+    sc = make()
+    out = sc._label_region(_CropOnlyLayer(labels), 0, 0, 200, 150, 100, 75, {})
+    assert out.flags.writeable, "the composite writes into this"
+    assert out.dtype == np.int32
+
+
+def test_the_source_kind_names_what_is_being_read(canvas_factory):
+    """A NATIVE pyramid takes the array slot, so "which slot is filled" was
+    reporting a gigapixel slide as in-memory."""
+    make, _captured = canvas_factory
+    base, *_ = scene()
+    sc = make()
+    assert sc._source_kind() == "none"
+    sc.set_base(array=base)
+    assert sc._source_kind() == "in-memory"
+
+    class _Pyramid(ArrayImageSource):
+        native = True
+        levels = 6
+    sc.set_source(_Pyramid(base))
+    assert sc._source_kind() == "pyramid"
