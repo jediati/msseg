@@ -42,7 +42,8 @@ from msseg.labeler.annotate import AnnotationShell
 from msseg.labeler.labeling import Placement
 from msseg.mscoupon import session as coupon_session
 
-from .app import MsPathApp
+from . import propose
+from .app import MAX_ROI_PX, MsPathApp
 from .common import log
 
 
@@ -134,6 +135,91 @@ class LabelerApp(AnnotationShell, MsPathApp):
         self._refresh_profile_combo()
         self._apply_profile_to_ui(prof, lambda v, x: v.set(x), [])
         return prof
+
+    # ------------------------------------------------------------------ #
+    # Where to look next
+    # ------------------------------------------------------------------ #
+    def _build_roi_section(self):
+        """The viewer's ROI controls, plus the one a model makes possible."""
+        super()._build_roi_section()
+        import tkinter.ttk as ttk
+        frame = self.roi_hint_parent
+        row = ttk.Frame(frame); row.pack(fill="x", padx=4, pady=(0, 3))
+        ttk.Button(row, text="Propose from model",
+                   command=self._propose_rois).pack(side="left", padx=4)
+        ttk.Label(row, text="count:").pack(side="left")
+        ttk.Spinbox(row, from_=1, to=64, width=4,
+                    textvariable=self.propose_count_var).pack(side="left", padx=(2, 8))
+        ttk.Label(row, text="size:").pack(side="left")
+        ttk.Spinbox(row, from_=256, to=4096, increment=256, width=6,
+                    textvariable=self.propose_size_var).pack(side="left", padx=2)
+        ttk.Combobox(row, textvariable=self.propose_method_var, width=11,
+                     state="readonly", values=list(propose.METHODS)).pack(side="left",
+                                                                          padx=4)
+
+    def _init_variables(self):
+        super()._init_variables()
+        self.propose_count_var = tk.IntVar(value=8)
+        self.propose_size_var = tk.IntVar(value=2048)
+        self.propose_method_var = tk.StringVar(value="entropy")
+        self.propose_edges_var = tk.DoubleVar(value=0.0)
+
+    def _propose_rois(self):
+        """Cut ROIs where the classifier is least sure about the overview.
+
+        The overview is one prime over the whole slide, so once it is
+        classified the model has an opinion everywhere -- and where that
+        opinion is weakest is where a full-resolution look is worth its
+        seconds. This is the loop HistomicsML runs; what it does NOT do is
+        move any label down a level, because the coarse and fine
+        decompositions of the same tissue are not nested.
+        """
+        import numpy as np
+        cur = self._current()
+        if cur is None:
+            self.status_var.set("Open a slide first.")
+            return
+        si = cur[0]
+        item = self._item_at(si, 0)                      # propose from the OVERVIEW
+        if item is None:
+            return
+        key = item.key
+        rec = self.engine.record(key)
+        pred = self._pred.get(key)
+        if rec is None:
+            self.status_var.set("Run first - the overview has no regions yet.")
+            return
+        if pred is None or pred[0] != rec.get("commit"):
+            self.status_var.set("Classify the overview first (its predictions are "
+                                "what the proposal ranks).")
+            return
+        proba = pred[2]
+        if proba is None:
+            self.status_var.set("This model reports no probabilities to rank by.")
+            return
+        aux = pred[3] if len(pred) > 3 else None
+        weight = float(self.propose_edges_var.get() or 0.0)
+        arcs = self.regions.arcs(key, np) if weight > 0 else None
+        pdiff = (aux or {}).get("pdiff") if weight > 0 else None
+
+        src = self.engine.source(item.slide)
+        level = max(0, int(self.roi_level_var.get()))
+        rois = propose.propose(
+            rec["stats"], proba, np, self.FIELDS, arcs=arcs, pdiff=pdiff,
+            method=self.propose_method_var.get(), boundary_weight=weight,
+            count=int(self.propose_count_var.get()),
+            level=level, size=int(self.propose_size_var.get()),
+            level_scale=src.level_scale(level), slide_shape=src.level_shape(0),
+            min_area=4.0, max_px=MAX_ROI_PX)
+        added = 0
+        for r in rois:
+            if self._add_roi(si, r["level"], r["x"], r["y"], r["w"], r["h"]) is not None:
+                added += 1
+                log(f"  proposed ROI at region {r['region']} "
+                    f"(score {r['score']:.3f}): L{r['level']} "
+                    f"({r['x']},{r['y']}) {r['w']}x{r['h']}")
+        self.status_var.set(propose.summarise(rois[:added],
+                                              self.propose_method_var.get()))
 
     # ------------------------------------------------------------------ #
     # Export: annotations -> per-pixel masks

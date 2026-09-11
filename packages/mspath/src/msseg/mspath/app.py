@@ -480,6 +480,9 @@ class MsPathApp(ViewerShell):
         self.roi_hint = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.roi_hint, foreground="#666").pack(
             anchor="w", padx=6, pady=(0, 3))
+        # The labeler adds a row here (proposing ROIs needs a model, which the
+        # viewer has not got), so the frame is part of the hook's contract.
+        self.roi_hint_parent = frame
 
     def _add_roi_from_view(self):
         """Cut an ROI from what is on screen, at the ROI level.

@@ -255,6 +255,12 @@ def run_labeler_selftest():
     from msseg.labeler.labeling import touched_ids_over
     from .labeler import LabelerApp
 
+    def pytest_approx(v, tol=1e-9):
+        class _A:
+            def __eq__(self, other):
+                return abs(float(other) - float(v)) <= tol
+        return _A()
+
     if not backends_available():
         print("selftest SKIPPED: no pyramid backend installed")
         return 0
@@ -345,13 +351,61 @@ def run_labeler_selftest():
     other = app._check_model_compat(names, "selftest", "L99")
     assert other and "L99" in other, other
 
+    # -- the loop: classify the overview, then propose where to look ------ #
+    # Needs at least two classes with labels; the box above painted class 2
+    # over everything, so give a couple of regions back to class 1.
+    from msseg.mspath import propose as PR
+    ids_by_area = np.argsort(-np.asarray(stats.column("area")))[:3]
+    app.active_class_var.set(1)
+    app._commit_interaction("taps", [(float(ex[i]), float(ey[i])) for i in ids_by_area])
+    app._train_classifier()          # returns None on success; the model is the result
+    if app._clf is None:
+        print(f"[mspath] (classifier unavailable: {app.status_var.get()!r} "
+              f"- skipping the proposal loop)")
+    else:
+        app._classify()
+        pred = app._pred.get(item.key)
+        assert pred is not None and pred[0] == rec["commit"], "the overview is not classified"
+        # indexed by REGION ID, not by table row: that is the space a LUT
+        # indexes, and it is what propose.candidates gathers through
+        assert pred[2] is not None and pred[2].shape[0] > int(fid.max()),             "the probability matrix must span the region-id space"
+
+        before = len(app._rois_of(0))
+        app.roi_level_var.set(max(0, deepest - 2))
+        app.propose_count_var.set(3)
+        app.propose_size_var.set(256)
+        app._propose_rois()
+        added = len(app._rois_of(0)) - before
+        assert added >= 1, "the proposal added nothing"
+        assert "proposed" in app.status_var.get(), app.status_var.get()
+
+        # every proposal is a real item, inside the slide, at the asked level
+        sh0, sw0 = src.level_shape(0)
+        for r in app._rois_of(0)[before:]:
+            assert r["level"] == app.roi_level_var.get()
+            assert 0 <= r["x"] and r["x"] + r["w"] <= sw0
+            assert 0 <= r["y"] and r["y"] + r["h"] <= sh0
+        keys = [app._item_at(0, li).key for li in range(1, 1 + len(app._rois_of(0)))]
+        assert len(set(keys)) == len(keys), "a proposal duplicated an existing item"
+
+        # and the ranking is the uncertainty, not the order of the table
+        scores = PR.region_scores(pred[2], np, "entropy")
+        cands = PR.candidates(rec["stats"], scores, np, app.FIELDS, min_area=4.0)
+        assert cands and cands[0][0] >= cands[-1][0]
+        # every candidate is a real region of the table, scored by its own id
+        assert {c[3] for c in cands} <= set(fid.tolist())
+        assert cands[0][0] == pytest_approx(scores[cands[0][3]])
+
     # -- undo puts it back ------------------------------------------------ #
+    n = len(app.store.interactions)
     app._undo()
-    assert len(app.store.interactions) == 1
-    app._undo()
+    assert len(app.store.interactions) == n - 1
+    while app.store.interactions:
+        app._undo()
     assert not app.store.interactions
 
     root.destroy()
     print("labeler selftest OK: placement, slide-coordinate gestures, class layer, "
-          "box over the item, training rows, level-scoped compat gate, undo")
+          "box over the item, training rows, level-scoped compat gate, "
+          "classify + propose ROIs, undo")
     return 0
