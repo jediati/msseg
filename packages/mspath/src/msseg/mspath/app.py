@@ -47,7 +47,7 @@ from msseg.mscoupon.config_io import (FILTER_OPERATIONS, FILTER_SCHEMA, COLOR_ME
 from .adapters import SlideCatalogue, SlideRegionProvider
 from .common import list_slides, log
 from .engine import SlideEngine
-from .sources import RoiLabelLayer
+from .sources import PlacedImageSource, RoiLabelLayer
 from .items import overview, parse_key, roi as roi_item, slide_id
 
 # The level a slide's overview is taken at. 4 (1/16) puts a 90 000 x 47 040
@@ -609,9 +609,41 @@ class MsPathApp(ViewerShell):
         ttk.Label(chan, textvariable=getattr(self, "level_hint", tk.StringVar()),
                   foreground="#666").pack(side="left", padx=8)
 
+    CHANNELS = ("slide", "base", "filtered")
+
     def _after_layout(self):
         self._update_level_hint()
         self._update_roi_hint()
+        # The shell offers base|filtered, which for a coupon slice are the two
+        # rasters there are. A slide has a third thing to look at -- itself --
+        # and it is the default: the scalar channels only exist once an item
+        # is primed.
+        combo = getattr(self, "background_combo", None)
+        if combo is not None:
+            combo.config(values=list(self.CHANNELS))
+        if self.background_var.get() not in self.CHANNELS:
+            self.background_var.set("slide")
+
+    def _channel_source(self, key, channel, slide_src):
+        """The ImageSource for `channel` on the current item: the pyramid for
+        "slide"; for "base" / "filtered" the primed item's scalar raster placed
+        on the slide, or the pyramid again with a note when nothing is primed.
+
+        Cached on the Primed record per channel, because building the source
+        measures the raster's range and a repaint must not scan 16 Mpx."""
+        if channel == "slide":
+            return slide_src, None
+        p = self.engine.primed.get(key)
+        raster = None if p is None else getattr(p, channel, None)
+        if raster is None:
+            return slide_src, f"{channel}: Run first - nothing is primed for this item."
+        cache = p.channel_sources
+        src = cache.get(channel)
+        if src is None:
+            src = cache[channel] = PlacedImageSource(
+                raster, origin=p.origin, scale=p.scale,
+                slide_shape=slide_src.level_shape(0), path=None)
+        return src, None
 
     # ------------------------------------------------------------------ #
     # Parameters
@@ -762,6 +794,16 @@ class MsPathApp(ViewerShell):
         except Exception as exc:
             hint.set(f"({type(exc).__name__}: {exc})")
 
+    def _rebuild_flat_slices_keeping_current(self):
+        cur = self._current()
+        key = self.catalogue.key_of(*cur) if cur is not None else None
+        self._rebuild_flat_slices()
+        if key is not None:
+            idx = self.catalogue.index_of(key)
+            if idx is not None and idx in self.flat_slices:
+                self.slice_var.set(self.flat_slices.index(idx))
+                self._sync_slice_combo()
+
     def _run(self):
         if not self.subsequences:
             self.status_var.set("Add a folder and make a slide list first.")
@@ -823,7 +865,12 @@ class MsPathApp(ViewerShell):
             self._run_active = False
             self.run_btn.config(state="normal")
             self._set_load_enabled(True)
-            self._rebuild_flat_slices()
+            # The shell's rebuild resets the navigation to item 0. For a coupon
+            # run that is the first slice of a fresh stack; here it is the
+            # overview, and the item that was just primed on demand -- the ROI
+            # the user navigated to -- would be dropped before its regions were
+            # ever computed. Keep the current key across the rebuild.
+            self._rebuild_flat_slices_keeping_current()
             self._refresh_subseq_list()
             self.status_var.set("Primed.")
             cur = self._current()
@@ -929,14 +976,18 @@ class MsPathApp(ViewerShell):
         rec = self.engine.record(key)
         overlays = self._seg_overlays(cur[0], cur[1], rec, None, np, min_colors)
 
+        channel = self.background_var.get() or "slide"
+        shown, note = self._channel_source(key, channel, src)
+        if note:
+            self.status_var.set(note)
         first = not self.viewer.has_base
-        self.viewer.set_source(src, path=self.engine.paths.get(item.slide))
-        lo, hi = src.value_range()
-        span = (hi - lo) or 1.0
+        self.viewer.set_source(shown, path=self.engine.paths.get(item.slide))
         self.viewer.set_window(float(self.vmin_var.get()), float(self.vmax_var.get()))
         self.viewer.set_overlays(overlays)
         self.viewer.set_alpha(self.alpha_var.get())
-        self._hover_ctx = {"key": key, "rec": rec, "src": src}
+        self._hover_ctx = {"key": key, "rec": rec, "src": src,
+                           "channel": channel if shown is not src else "slide",
+                           "shown": shown}
         if first:
             self.viewer.fit()
         else:
@@ -978,6 +1029,10 @@ class MsPathApp(ViewerShell):
             self.hover_var.set("")
             return
         parts = [f"({int(ix)}, {int(iy)})"]
+        shown = ctx.get("shown")
+        if ctx.get("channel", "slide") != "slide" and hasattr(shown, "value_at"):
+            v = shown.value_at(int(ix), int(iy))
+            parts.append(f"{ctx['channel']}={v:.4g}" if v is not None else f"{ctx['channel']}=-")
         rec = ctx.get("rec")
         if rec is not None:
             layer = self.regions.label_layer(ctx["key"])

@@ -152,17 +152,45 @@ def run_selftest():
     app._on_hover(int(ext["ext_x"]), int(ext["ext_y"]))
     assert "region" in app.hover_var.get(), app.hover_var.get()
 
-    # -- persistence is a select, not a prime ----------------------------- #
+    # -- persistence is a select, not a prime, and the slider is LIVE ------ #
     before = app.engine.commit_id
     n_before = rec["stats"].n_rows
+    abs_before = app.engine.persistence_abs[deepest]
     app.persist_var.set(min(40.0, float(app.persist_var.get()) + 20.0))
     app._on_persistence_change()
     assert app.engine.commit_id > before, "a threshold change must bump the commit"
     rec2 = app.engine.record(item.key)
     assert rec2 is not None and rec2 is not rec, "the record was not recomputed"
-    assert rec2["stats"].n_rows <= n_before, "more persistence must not add regions"
-    # the pin is per level and set once
-    assert set(app.engine.persistence_abs) == {deepest}, app.engine.persistence_abs
+    # Not merely "no more regions": the threshold itself must have moved. The
+    # first version cached the absolute per level, which left the slider doing
+    # nothing while this assertion (<=) still passed.
+    assert app.engine.persistence_abs[deepest] > abs_before, "the slider did not move the threshold"
+    assert rec2["stats"].n_rows < n_before, "a 3x threshold must merge regions away"
+    # the REFERENCE range is what stays pinned per level
+    assert set(app.engine.level_range) == {deepest}, app.engine.level_range
+    app.persist_var.set(10.0); app._on_persistence_change()
+    assert app.engine.record(item.key)["stats"].n_rows == n_before, "and back again"
+
+    # -- the Image dropdown shows the primed channels, placed on the slide -- #
+    from .sources import PlacedImageSource
+    assert list(app.background_combo.cget("values")) == list(app.CHANNELS)
+    for channel in ("filtered", "base"):
+        app.background_var.set(channel)
+        app._refresh_render()
+        shown = app.viewer.source
+        assert isinstance(shown, PlacedImageSource), f"{channel}: {shown!r} is not the channel"
+        assert shown.level_shape(0) == tuple(src.level_shape(0)), "placed on the whole slide"
+        assert shown.scale == rec["scale"] and (shown.ox, shown.oy) == tuple(rec["origin"])
+        lo, hi = shown.value_range()
+        assert hi > lo, f"{channel} has no range -- a blank raster"
+        r0 = rec["stats"].row_of_feature(int(rec["stats"].column("feature_id")[0]))
+        app._on_hover(int(r0["ext_x"]), int(r0["ext_y"]))
+        assert f"{channel}=" in app.hover_var.get(), app.hover_var.get()
+    app.background_var.set("slide")
+    app._refresh_render()
+    # the ENGINE's pyramid, not the preview's: same file, a different handle
+    back = app.viewer.source
+    assert back is app.engine.source(item.slide) and back.path == src.path,         "slide shows the pyramid again"
 
     # -- profiles + session round-trip ------------------------------------ #
     p = app._profile_from_ui()
@@ -203,18 +231,60 @@ def run_selftest():
     assert big["w"] * big["h"] <= app_mod.MAX_ROI_PX + 1, big
     assert big["w"] < sw, "a whole-slide ROI at level 0 must be capped"
 
-    # priming the ROI keeps the thresholds already pinned for other levels
-    pins_before = dict(app.engine.persistence_abs)
-    app.engine.prime_item(roi, app._profile_for_compute(), halo=app._halo())
-    rrec = app.engine.ensure_record(roi.key, app._profile_for_compute())
-    assert rrec is not None and rrec["stats"].n_rows >= 1
+    # Adding an ROI navigated to it, and navigating to an unprimed item primes
+    # it ON THE WORKER -- the real on-demand path. Drive it the way the pump
+    # would: wait for the worker, drain its events through the shell. (An
+    # earlier version of this test primed the ROI synchronously here as well,
+    # which ran two primes of one item on two threads over pipelines that are
+    # not re-entrant, and left the worker's "done" undrained so pending_work()
+    # stayed True for the rest of the test.)
+    pins_before = dict(app.engine.level_range)
+    assert app.engine._worker is not None and app.engine.pending_work(),         "no on-demand prime started"
+
+    def settle(limit=6):
+        """Run the pump by hand until the engine is idle. Draining one prime's
+        events can start the next -- the primed handler primes whatever is on
+        screen if it is not yet -- so this loops, as the real pump does."""
+        for _ in range(limit):
+            if not app.engine.pending_work():
+                return
+            w = app.engine._worker
+            if w is not None:
+                w.join(timeout=120)
+                assert not w.is_alive(), "a prime did not finish"
+            for ev in app.engine.poll():
+                app._handle_event(ev)
+        assert not app.engine.pending_work(), "the engine never went idle"
+
+    settle()
+    # Only the item ON SCREEN is selected after a prime, and the second
+    # _add_roi moved the view to `big`. Go back to `roi`: its pipeline is live,
+    # so this is the inline select, not another prime.
+    app._goto_slice(app.flat_slices.index((0, 1)))
+    settle()
+    rrec = app.engine.record(roi.key)
+    assert rrec is not None and rrec["stats"].n_rows >= 1, "the on-demand prime produced no record"
     for level, v in pins_before.items():
-        assert app.engine.persistence_abs[level] == v, "an added ROI re-pinned a level"
+        assert app.engine.level_range[level] == v, "an added ROI re-pinned a level"
     # its labels are the ROI's own, placed on the slide
     assert rrec["origin"] == (roi.rect[0], roi.rect[1]), rrec["origin"]
     rlayer = app.engine.label_layer(roi.key)
     assert rlayer.shape == tuple(src.level_shape(0))
     assert rlayer.id_at(roi.rect[0] - 5, roi.rect[1] - 5) == -1, "outside the ROI is background"
+
+    # -- a "primed" event must not throw away the item being looked at ----- #
+    # The shell's flat rebuild resets navigation to item 0 (the overview).
+    # Before this was caught, an ROI primed on demand was dropped from view
+    # before its regions were ever computed -- the log showed the prime and
+    # then never a region count.
+    app._goto_slice(app.flat_slices.index((0, 1)))
+    settle()
+    assert app._current() == (0, 1)
+    app.engine.commit_selection()                 # its record is now stale
+    assert app.engine.record(roi.key) is None
+    app._handle_compute_event(("primed",))
+    assert app._current() == (0, 1), "the primed event moved the view back to the overview"
+    assert app.engine.record(roi.key) is not None, "the ROI's regions were never computed"
 
     app._remove_roi_at(0, 2)
     assert len(app._rois_of(0)) == 1
@@ -231,7 +301,8 @@ def run_selftest():
     root.destroy()
     print("selftest OK: pyramid preview, slide->sequence, overview item + key round-trip, "
           "prime + record, slide-coordinate positions, label layer, render + hover, "
-          "persistence select, profile + session round-trip")
+          "live persistence slider, channel dropdown (slide/base/filtered), ROI tier, "
+          "primed event keeps the current item, profile + session round-trip")
     return 0
 
 

@@ -110,3 +110,93 @@ class RoiLabelLayer:
         x, y, w, h = self.slide_rect()
         return (f"RoiLabelLayer({self.labels.shape[1]}x{self.labels.shape[0]} @1/{self.scale:g} "
                 f"-> slide ({x},{y}) {w}x{h}, {self._n_ids} ids, rev {self._rev})")
+
+
+class PlacedImageSource:
+    """``ImageSource`` over one item's scalar raster -- its base channel or its
+    topology field -- placed on the slide.
+
+    The canvas draws in slide coordinates, and a 2940 x 5625 overview raster
+    handed over as a plain array would land at the slide's origin at 1:1. So
+    this serves it the way the pyramid is served: a ladder of power-of-two
+    levels of the WHOLE slide, each read answered by sampling the raster under
+    the requested level pixels and filling the rest with the raster's minimum.
+    The ladder matters for more than placement: a view that fits the slide asks
+    for the slide's width in level pixels, and at level 0 that is 47 040 by
+    90 000 -- four gigapixels for one frame.
+    """
+    native = True
+
+    def __init__(self, raster, origin=(0, 0), scale=1.0, slide_shape=None, path=None):
+        self.raster = np.asarray(raster, dtype=np.float32)
+        self.ox, self.oy = int(origin[0]), int(origin[1])
+        self.scale = float(scale) or 1.0
+        lh, lw = (int(v) for v in self.raster.shape[:2])
+        self._shape = (tuple(int(v) for v in slide_shape) if slide_shape is not None
+                       else (int(round(self.oy + lh * self.scale)),
+                             int(round(self.ox + lw * self.scale))))
+        self.path = path
+        finite = self.raster[np.isfinite(self.raster)]
+        self._range = ((float(finite.min()), float(finite.max())) if finite.size
+                       else (0.0, 1.0))
+        # as many levels as it takes for the top one to be a thumbnail
+        top = max(self._shape)
+        self._levels = 1
+        while top / (2 ** self._levels) > 256 and self._levels < 16:
+            self._levels += 1
+        self._levels += 1
+
+    @property
+    def levels(self) -> int:
+        return self._levels
+
+    @property
+    def channels(self) -> int:
+        return 1
+
+    def level_shape(self, level: int):
+        s = self.level_scale(level)
+        return max(1, int(self._shape[0] / s)), max(1, int(self._shape[1] / s))
+
+    def level_scale(self, level: int) -> float:
+        return float(2 ** max(0, min(int(level), self._levels - 1)))
+
+    def best_level(self, scale: float) -> int:
+        level = 0
+        while level + 1 < self._levels and self.level_scale(level + 1) <= max(scale, 1.0):
+            level += 1
+        return level
+
+    def value_range(self):
+        return self._range
+
+    def read_region(self, level: int, x: int, y: int, w: int, h: int):
+        w = max(1, int(w)); h = max(1, int(h))
+        s = self.level_scale(level)
+        sx = (int(x) + np.arange(w) + 0.5) * s
+        sy = (int(y) + np.arange(h) + 0.5) * s
+        cx = np.floor((sx - self.ox) / self.scale).astype(np.intp)
+        cy = np.floor((sy - self.oy) / self.scale).astype(np.intp)
+        lh, lw = self.raster.shape[:2]
+        okx = (cx >= 0) & (cx < lw)
+        oky = (cy >= 0) & (cy < lh)
+        out = np.full((h, w), self._range[0], np.float32)
+        if okx.any() and oky.any():
+            block = self.raster[np.clip(cy, 0, lh - 1)][:, np.clip(cx, 0, lw - 1)]
+            np.copyto(out, block, where=oky[:, None] & okx[None, :])
+        # A NaN (a filter's undefined pixel, or a raster that is nothing but)
+        # would reach the canvas's window as NaN and paint garbage; the
+        # range's floor is what "no value" looks like everywhere else here.
+        if not np.isfinite(out).all():
+            out = np.nan_to_num(out, nan=self._range[0], posinf=self._range[1],
+                                neginf=self._range[0])
+        return out
+
+    def value_at(self, x: int, y: int):
+        """The raster value under a SLIDE point, or None outside the item."""
+        cx = int((int(x) - self.ox) // self.scale)
+        cy = int((int(y) - self.oy) // self.scale)
+        lh, lw = self.raster.shape[:2]
+        if 0 <= cx < lw and 0 <= cy < lh:
+            return float(self.raster[cy, cx])
+        return None

@@ -107,6 +107,21 @@ def test_a_percentage_is_pinned_once_per_level():
     assert eng.resolve_persistence(second, profile(10.0)) == pytest.approx(0.2)
 
 
+def test_the_slider_moves_the_threshold_but_not_the_reference():
+    """The pin is the RANGE; the threshold is derived from the current
+    percentage every time. The first version cached the threshold, which
+    made the persistence slider do nothing."""
+    eng = E.SlideEngine()
+    first = primed(level=4, value_range=2.0)
+    assert eng.resolve_persistence(first, profile(10.0)) == pytest.approx(0.2)
+    assert eng.resolve_persistence(first, profile(25.0)) == pytest.approx(0.5)
+    # a later item at the level still resolves against the FIRST range
+    later = primed(level=4, value_range=50.0)
+    assert eng.resolve_persistence(later, profile(25.0)) == pytest.approx(0.5)
+    assert eng.level_range == {4: 2.0}
+    assert eng.persistence_abs[4] == pytest.approx(0.5), "the readout follows the slider"
+
+
 def test_levels_do_not_share_a_pin():
     """A sigma is in pixels, so the topology field at level 4 is not the field
     at level 0; a threshold carried across collapses one of them."""
@@ -121,7 +136,7 @@ def test_an_explicit_absolute_wins_and_pins_nothing():
     eng = E.SlideEngine()
     assert eng.resolve_persistence(primed(value_range=2.0),
                                    profile(10.0, absolute=0.75)) == 0.75
-    assert eng.persistence_abs == {}
+    assert eng.persistence_abs == {} and eng.level_range == {}
 
 
 def test_reset_forgets_the_pins():
@@ -129,7 +144,7 @@ def test_reset_forgets_the_pins():
     eng.resolve_persistence(primed(), profile(10.0))
     before = eng.commit_id
     eng.reset()
-    assert eng.persistence_abs == {} and eng.commit_id > before
+    assert eng.persistence_abs == {} and eng.level_range == {} and eng.commit_id > before
 
 
 # --------------------------------------------------------------------------- #

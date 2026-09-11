@@ -113,3 +113,63 @@ def test_background_ids_survive_the_crop():
     got = lay.crop(0, 0, 0, 8, 8)
     assert (got[2:5, 2:5] == -1).all()
     assert got.dtype == np.int32
+
+
+# --------------------------------------------------------------------------- #
+# PlacedImageSource: a scalar channel of one item, drawn on the whole slide
+# --------------------------------------------------------------------------- #
+from msseg.mspath.sources import PlacedImageSource  # noqa: E402
+
+
+def raster(h=8, w=8):
+    return np.arange(h * w, dtype=np.float32).reshape(h, w)
+
+
+def test_placed_source_spans_the_slide_not_the_item():
+    src = PlacedImageSource(raster(), origin=(100, 200), scale=16.0, slide_shape=(4000, 3000))
+    assert src.native and src.channels == 1
+    assert src.level_shape(0) == (4000, 3000)
+    assert src.value_range() == (0.0, 63.0)
+    # a ladder deep enough that the top level is a thumbnail, never one level
+    assert src.levels > 1 and max(src.level_shape(src.levels - 1)) <= 256 * 2
+
+
+def test_placed_source_samples_under_each_level_pixel():
+    r = raster()
+    src = PlacedImageSource(r, origin=(0, 0), scale=2.0, slide_shape=(16, 16))
+    got = src.read_region(0, 0, 0, 16, 16)
+    assert got.shape == (16, 16)
+    # slide pixel (3, 5) sits over raster pixel (1, 2)
+    assert got[5, 3] == r[2, 1]
+    # at level 1 a level pixel is 2 slide pixels = 1 raster pixel
+    assert np.array_equal(src.read_region(1, 0, 0, 8, 8), r)
+
+
+def test_outside_the_item_is_the_rasters_minimum_not_zero():
+    r = raster() + 10.0
+    src = PlacedImageSource(r, origin=(100, 100), scale=1.0, slide_shape=(500, 500))
+    got = src.read_region(0, 90, 90, 20, 20)
+    assert (got[:10, :] == 10.0).all() and (got[:, :10] == 10.0).all()
+    assert np.array_equal(got[10:18, 10:18], r)
+    assert (src.read_region(0, 0, 0, 4, 4) == 10.0).all()
+
+
+def test_value_at_is_in_slide_coordinates():
+    r = raster()
+    src = PlacedImageSource(r, origin=(100, 200), scale=4.0, slide_shape=(1000, 1000))
+    assert src.value_at(100, 200) == r[0, 0]
+    assert src.value_at(107, 203) == r[0, 1]
+    assert src.value_at(99, 200) is None and src.value_at(5000, 5000) is None
+
+
+def test_a_blank_raster_still_has_a_usable_range():
+    src = PlacedImageSource(np.full((4, 4), np.nan, np.float32), slide_shape=(8, 8))
+    assert src.value_range() == (0.0, 1.0)
+    assert np.isfinite(src.read_region(0, 0, 0, 8, 8)).all()
+
+
+def test_best_level_never_coarser_than_the_screen():
+    src = PlacedImageSource(raster(), scale=16.0, slide_shape=(90000, 47040))
+    assert src.best_level(1.0) == 0
+    assert src.level_scale(src.best_level(16.0)) <= 16.0
+    assert src.level_scale(src.best_level(1e9)) == src.level_scale(src.levels - 1)

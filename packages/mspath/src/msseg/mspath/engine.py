@@ -66,11 +66,12 @@ class Primed:
     """One item's live compute state."""
 
     __slots__ = ("item", "pipe", "base", "filtered", "origin", "scale", "level",
-                 "shape", "value_range", "halo")
+                 "shape", "value_range", "halo", "channel_sources")
 
     def __init__(self, item, pipe, base, filtered, origin, scale, level, shape, halo=0):
         self.item = item
         self.halo = int(halo)
+        self.channel_sources = {}         # channel -> PlacedImageSource (display cache)
         self.pipe = pipe
         self.base = base
         self.filtered = filtered
@@ -109,7 +110,12 @@ class SlideEngine:
         self.primed = {}           # ItemKey -> Primed
         self.slices = {}           # ItemKey -> record
         self.commit_id = 1
-        self.persistence_abs = {}        # level -> threshold in field units
+        # level -> the REFERENCE value range the percentage resolves against,
+        # taken from the first item primed at that level. What is pinned is the
+        # range, not the threshold: the slider must stay live, and every item
+        # at a level must read the same percentage as the same threshold.
+        self.level_range = {}
+        self.persistence_abs = {}        # level -> the threshold last resolved (readout)
         self.work_q = queue.Queue()
         self._order = []                 # LRU of live keys, oldest first
         self._worker = None
@@ -249,14 +255,18 @@ class SlideEngine:
         absolute = msc.get("persistence_absolute")
         if absolute is not None:
             return float(absolute)
-        hit = self.persistence_abs.get(int(p.level))
-        if hit is None:
-            pct = float(msc.get("persistence_percent", 10.0) or 0.0)
-            hit = p.value_range * pct / 100.0
-            self.persistence_abs[int(p.level)] = hit
-            log(f"persistence at level {p.level} pinned to {hit:.6g} "
-                f"({pct:g}% of {p.item.key}'s range {p.value_range:.6g}) "
-                f"-- every item at this level now shares it")
+        level = int(p.level)
+        ref = self.level_range.get(level)
+        if ref is None:
+            ref = self.level_range[level] = float(p.value_range)
+            log(f"level {level}: persistence % now resolves against "
+                f"{p.item.key}'s range {ref:.6g} -- every item at this level shares it")
+        # Derived from the CURRENT percentage every time. The first version of
+        # this cached the threshold itself, which pinned the level correctly
+        # and also made the persistence slider do nothing at all.
+        pct = float(msc.get("persistence_percent", 10.0) or 0.0)
+        hit = ref * pct / 100.0
+        self.persistence_abs[level] = hit
         return hit
 
     def record(self, key):
@@ -363,6 +373,7 @@ class SlideEngine:
         self.primed.clear()
         self.slices.clear()
         self._order = []
+        self.level_range = {}
         self.persistence_abs = {}
         self.commit_id += 1
 
@@ -404,6 +415,7 @@ class SlideEngine:
             return False
         self._busy = True
         if reset_pins:
+            self.level_range = {}
             self.persistence_abs = {}
         self._worker = threading.Thread(target=self._run_worker, name="mspath-prime",
                                         args=(list(items), dict(profile), int(halo)),
