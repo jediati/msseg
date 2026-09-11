@@ -391,13 +391,20 @@ class SlideEngine:
             out.append(ev)
         return out
 
-    def start_run(self, items, profile, halo=0):
+    def start_run(self, items, profile, halo=0, reset_pins=True):
         """Prime `items` in order on one worker thread. Serial on purpose: the
-        pipelines are stateful and each one is most of a gigabyte."""
+        pipelines are stateful and each one is most of a gigabyte.
+
+        `reset_pins` False keeps the per-level thresholds already resolved --
+        which is what priming ONE more ROI into an existing session must do.
+        Re-resolving them would silently re-threshold every item primed before
+        it, against whatever range this one happened to have.
+        """
         if self._busy:
             return False
         self._busy = True
-        self.persistence_abs = {}
+        if reset_pins:
+            self.persistence_abs = {}
         self._worker = threading.Thread(target=self._run_worker, name="mspath-prime",
                                         args=(list(items), dict(profile), int(halo)),
                                         daemon=True)
@@ -408,7 +415,9 @@ class SlideEngine:
         try:
             total = len(items)
             for n, item in enumerate(items, start=1):
-                self.prime_item(item, profile, halo=halo)
+                # The overview is a whole level: there is nothing beyond its
+                # edges to borrow, so it takes no halo whatever the profile says.
+                self.prime_item(item, profile, halo=0 if item.is_overview else halo)
                 self.work_q.put(("progress", (n, total)))
                 self.work_q.put(("item_done", item.key))
             self.work_q.put(("done",))

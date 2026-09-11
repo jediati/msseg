@@ -59,6 +59,7 @@ def run_selftest():
 
     from msseg.labeler.pyramid import backends_available
     from . import items as I
+    from . import app as app_mod
     from .app import MsPathApp
 
     if not backends_available():
@@ -170,11 +171,62 @@ def run_selftest():
     app._apply_profile_to_ui(p, lambda v, x: v.set(x), [])
     assert app.level_var.get() == deepest and app.halo_var.get() == p["slide"]["halo"]
 
+    # -- the ROI tier ------------------------------------------------------ #
+    # A slide's items are its overview and whatever has been cut from it.
+    assert app._enumerate_items.__self__ is app
+    assert list(app._enumerate_items()) == [(0, 0)], "a fresh slide has one item"
+    sh0, sw = src.level_shape(0)
+    roi_level = max(0, deepest - 2)
+    app.roi_level_var.set(roi_level)
+    side = int(256 * src.level_scale(roi_level))       # 256 px AT the roi level
+    added = app._add_roi(0, roi_level, sw // 4, sh0 // 4, side, side)
+    assert added is not None and len(app._rois_of(0)) == 1, app._rois_of(0)
+
+    # a rect that is nothing at its own level is refused, not silently kept:
+    # a 1x1 raster would pin that level's threshold for everything after it
+    assert app._add_roi(0, roi_level, 0, 0, 4, 4) is None
+    assert len(app._rois_of(0)) == 1, "a degenerate ROI was accepted"
+    assert list(app._enumerate_items()) == [(0, 0), (0, 1)]
+    roi = app._item_at(0, 1)
+    assert roi is not None and not roi.is_overview and roi.level == app.roi_level_var.get()
+    assert I.parse_key(roi.key) == roi
+    assert app.catalogue.index_of(roi.key) == (0, 1)
+    # the overview and the ROI are different items of the SAME slide, so they
+    # share a cross-validation group
+    assert app.catalogue.group_of(roi.key) == app.catalogue.group_of(item.key)
+    rows = app._sequence_item_labels(0)
+    assert len(rows) == 2 and rows[0].startswith("overview"), rows
+
+    # an ROI is capped rather than allowed to be a half-hour of compute
+    app._add_roi(0, 0, 0, 0, sw, sh0)
+    big = app._rois_of(0)[-1]
+    assert big["w"] * big["h"] <= app_mod.MAX_ROI_PX + 1, big
+    assert big["w"] < sw, "a whole-slide ROI at level 0 must be capped"
+
+    # priming the ROI keeps the thresholds already pinned for other levels
+    pins_before = dict(app.engine.persistence_abs)
+    app.engine.prime_item(roi, app._profile_for_compute(), halo=app._halo())
+    rrec = app.engine.ensure_record(roi.key, app._profile_for_compute())
+    assert rrec is not None and rrec["stats"].n_rows >= 1
+    for level, v in pins_before.items():
+        assert app.engine.persistence_abs[level] == v, "an added ROI re-pinned a level"
+    # its labels are the ROI's own, placed on the slide
+    assert rrec["origin"] == (roi.rect[0], roi.rect[1]), rrec["origin"]
+    rlayer = app.engine.label_layer(roi.key)
+    assert rlayer.shape == tuple(src.level_shape(0))
+    assert rlayer.id_at(roi.rect[0] - 5, roi.rect[1] - 5) == -1, "outside the ROI is background"
+
+    app._remove_roi_at(0, 2)
+    assert len(app._rois_of(0)) == 1
+
     doc = app._session_doc()
+    assert doc["sequences"][0]["rois"], "ROI geometry did not reach the session document"
     app2 = MsPathApp(tk.Toplevel(root), autosave=False)
     app2._apply_session_doc(doc, source="selftest")
     assert len(app2.subsequences) == 1, app2.subsequences
     assert app2._item_at(0, 0).key == item.key, "the item key did not survive the session"
+    assert len(app2._rois_of(0)) == 1, "the ROI did not survive the session"
+    assert app2._item_at(0, 1).key == roi.key, "the ROI's key did not survive the session"
 
     root.destroy()
     print("selftest OK: pyramid preview, slide->sequence, overview item + key round-trip, "

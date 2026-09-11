@@ -48,7 +48,7 @@ from .adapters import SlideCatalogue, SlideRegionProvider
 from .common import list_slides, log
 from .engine import SlideEngine
 from .sources import RoiLabelLayer
-from .items import overview, parse_key, slide_id
+from .items import overview, parse_key, roi as roi_item, slide_id
 
 # The level a slide's overview is taken at. 4 (1/16) puts a 90 000 x 47 040
 # slide at 5625 x 2940 = 16.5 Mpx, which primes in ~9 s and ~1 GB -- the size
@@ -62,6 +62,41 @@ DEFAULT_OVERVIEW_LEVEL = 4
 # experiments/roi_bench.py -- and note that is far more than the filter kernels
 # need, because a basin near the cut can drain to an extremum outside it).
 DEFAULT_HALO = 64
+
+# The largest ROI worth offering, measured rather than guessed
+# (experiments/roi_bench.py): 4096^2 is 8.7 s and ~1.9 GB peak, 8192^2 is 35 s
+# and 7.2 GB. Past this an "ROI" stops being something you wait for.
+MAX_ROI_PX = 4096 * 4096
+
+# The smallest ROI worth computing, in pixels AT ITS OWN LEVEL. A rect that is
+# a few hundred slide pixels is nothing at all once a coarse level has divided
+# it by 32, and a 1x1 raster produces one region and a meaningless value range
+# -- which then PINS that level's persistence threshold for everything after it.
+MIN_ROI_SIDE = 32
+
+
+def _clean_rois(raw, notes=None):
+    """ROI records from a session document, dropping anything unusable -- a
+    half-written rect must not become an item whose key names nowhere."""
+    out = []
+    for r in (raw or []):
+        try:
+            rec = {"level": int(r["level"]), "x": int(r["x"]), "y": int(r["y"]),
+                   "w": int(r["w"]), "h": int(r["h"])}
+        except (TypeError, KeyError, ValueError):
+            if notes is not None:
+                notes.append(f"unusable ROI dropped: {r!r}")
+            continue
+        if rec["w"] > 0 and rec["h"] > 0 and rec["level"] >= 0:
+            out.append(rec)
+        elif notes is not None:
+            notes.append(f"empty ROI dropped: {rec}")
+    return out
+
+
+def _roi_row_text(item):
+    x, y, w, h = item.rect
+    return f"L{item.level} {w}x{h} @({x},{y})"
 
 
 def _id_lut(n_ids, min_colors, np):
@@ -133,6 +168,7 @@ class MsPathApp(ViewerShell):
         self.level_var = tk.IntVar(value=DEFAULT_OVERVIEW_LEVEL)
         self.halo_var = tk.IntVar(value=DEFAULT_HALO)
         self.regions_var = tk.BooleanVar(value=True)
+        self.roi_level_var = tk.IntVar(value=0)
 
     # ------------------------------------------------------------------ #
     # Data-model factories (copied from the coupon viewer -- the card model
@@ -302,22 +338,58 @@ class MsPathApp(ViewerShell):
         except Exception:
             return DEFAULT_HALO
 
-    def _item_at(self, si, li):
-        """The Item at a shell address. A sequence is one slide and (for now)
-        carries exactly its overview, so `li` is always 0."""
+    def _slide_of(self, si):
+        """(slide id, path) for sequence `si`, registered with the engine."""
         try:
             s = self.subsequences[si]
-            path = s["files"][li]
+            path = s["files"][0]
         except (IndexError, KeyError, TypeError):
-            return None
+            return None, None
         sid = slide_id(s.get("folder", ""), path)
         self.engine.register(sid, path)
-        return overview(sid, self._overview_level())
+        return sid, path
+
+    def _rois_of(self, si):
+        """The sequence's ROI records, ``[{level, x, y, w, h}]``. Stored on the
+        sequence beside its file because an ROI belongs to a slide, and it
+        rides the session document there (see `_session_doc`)."""
+        try:
+            return self.subsequences[si].setdefault("rois", [])
+        except (IndexError, KeyError, TypeError, AttributeError):
+            return []
+
+    def _item_at(self, si, li):
+        """The Item at a shell address.
+
+        A sequence is one slide, and its items are the overview at index 0 and
+        its ROIs after it. Index 0 is the overview rather than the first ROI so
+        that a slide always has one item -- the tier that is computable before
+        anyone has decided where to look.
+        """
+        sid, _path = self._slide_of(si)
+        if sid is None:
+            return None
+        if li <= 0:
+            return overview(sid, self._overview_level())
+        rois = self._rois_of(si)
+        if li - 1 >= len(rois):
+            return None
+        r = rois[li - 1]
+        return roi_item(sid, int(r["level"]), int(r["x"]), int(r["y"]),
+                        int(r["w"]), int(r["h"]))
 
     def _enumerate_items(self):
-        for si, s in enumerate(self.subsequences):
-            for li in range(len(s.get("files") or [])):
+        for si, _s in enumerate(self.subsequences):
+            for li in range(1 + len(self._rois_of(si))):
                 yield (si, li)
+
+    def _sequence_item_labels(self, si):
+        out = []
+        for li in range(1 + len(self._rois_of(si))):
+            item = self._item_at(si, li)
+            out.append("overview L%d" % item.level if item is not None and item.is_overview
+                       else (_roi_row_text(item) if item is not None else "?"))
+        return out
 
     def _slice_msc_mark(self, si, li):
         key = self.catalogue.key_of(si, li)
@@ -349,6 +421,9 @@ class MsPathApp(ViewerShell):
         ttk.Label(slide, textvariable=self.level_hint, foreground="#666").pack(
             anchor="w", padx=6)
 
+        self._build_roi_section()
+
+        parent = self._processing_parent("filters")
         topo = ttk.LabelFrame(parent, text="2. Topology field (the MSC runs on this)")
         topo.pack(fill="x", padx=4, pady=4)
         self.filters_frame = ttk.Frame(topo); self.filters_frame.pack(fill="x")
@@ -388,6 +463,132 @@ class MsPathApp(ViewerShell):
         self.run_btn = ttk.Button(frame, text="Run", command=self._run)
         self.run_btn.pack(fill="x", padx=6, pady=4)
 
+    def _build_roi_section(self):
+        parent = self._processing_parent("roi")
+        frame = ttk.LabelFrame(parent, text="1b. Regions of interest")
+        frame.pack(fill="x", padx=4, pady=4)
+        ttk.Label(frame, text="Full-resolution work happens in ROIs: the whole slide "
+                              "cannot be\nsegmented at level 0 at all.",
+                  foreground="#666").pack(anchor="w", padx=6, pady=(2, 0))
+        row = ttk.Frame(frame); row.pack(fill="x", padx=4, pady=2)
+        ttk.Label(row, text="level:").pack(side="left")
+        ttk.Spinbox(row, from_=0, to=9, width=4,
+                    textvariable=self.roi_level_var).pack(side="left", padx=4)
+        ttk.Button(row, text="Add from view",
+                   command=self._add_roi_from_view).pack(side="left", padx=4)
+        ttk.Button(row, text="Remove", command=self._remove_roi).pack(side="left")
+        self.roi_hint = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.roi_hint, foreground="#666").pack(
+            anchor="w", padx=6, pady=(0, 3))
+
+    def _add_roi_from_view(self):
+        """Cut an ROI from what is on screen, at the ROI level.
+
+        The viewport is the selection: it is already the rect the user chose by
+        navigating there, and it needs no new canvas tool to express. Clamped
+        to the slide and capped at MAX_ROI_PX -- a request for a quarter of a
+        slide at level 0 is a request for half an hour of compute.
+        """
+        cur = self._current()
+        si = cur[0] if cur is not None else (0 if self.subsequences else None)
+        if si is None:
+            self.status_var.set("Add a slide first.")
+            return
+        sid, _path = self._slide_of(si)
+        v = self.viewer
+        if v is None or sid is None:
+            return
+        try:
+            src = self.engine.source(sid)
+        except Exception as exc:
+            self.status_var.set(f"{type(exc).__name__}: {exc}")
+            return
+        sh, sw = src.level_shape(0)
+        cw = max(v.canvas.winfo_width(), 1)
+        ch = max(v.canvas.winfo_height(), 1)
+        x0 = max(0, int(v.view_x)); y0 = max(0, int(v.view_y))
+        x1 = min(sw, int(v.view_x + cw * v.scale))
+        y1 = min(sh, int(v.view_y + ch * v.scale))
+        self._add_roi(si, max(0, int(self.roi_level_var.get())),
+                      x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+
+    def _add_roi(self, si, level, x, y, w, h):
+        """Add one ROI to slide `si`, in slide coordinates. Headless-callable;
+        `_add_roi_from_view` is the UI that computes the rect.
+
+        Refuses a rect that is degenerate at its own level and caps one that is
+        too big; returns the new item, or None."""
+        sid, _path = self._slide_of(si)
+        if sid is None:
+            return None
+        try:
+            src = self.engine.source(sid)
+        except Exception as exc:
+            self.status_var.set(f"{type(exc).__name__}: {exc}")
+            return None
+        level = max(0, min(int(level), src.levels - 1))
+        scale = src.level_scale(level)
+        x, y, w, h = int(x), int(y), max(1, int(w)), max(1, int(h))
+        lw, lh = w / scale, h / scale
+        if min(lw, lh) < MIN_ROI_SIDE:
+            self.status_var.set(
+                f"That rect is {lw:.0f}x{lh:.0f} px at level {level} - too small to "
+                f"segment (minimum {MIN_ROI_SIDE}). Zoom in, or pick a finer level.")
+            return None
+        if lw * lh > MAX_ROI_PX:
+            k = (MAX_ROI_PX / (lw * lh)) ** 0.5
+            nw, nh = max(1, int(w * k)), max(1, int(h * k))
+            x += (w - nw) // 2
+            y += (h - nh) // 2
+            w, h = nw, nh
+            lw, lh = w / scale, h / scale
+            self.status_var.set(
+                f"ROI capped to {lw:.0f}x{lh:.0f} px at level {level} "
+                f"({MAX_ROI_PX / 1e6:.0f} Mpx budget).")
+        self._rois_of(si).append({"level": level, "x": x, "y": y, "w": w, "h": h})
+        self._rebuild_flat_slices()
+        self._refresh_subseq_list()
+        self._update_roi_hint()
+        log(f"ROI added on {sid}: L{level} ({x},{y}) {w}x{h} slide px "
+            f"= {lw:.0f}x{lh:.0f} at the level")
+        item = self._item_at(si, len(self._rois_of(si)))
+        try:
+            self._goto_slice(self.flat_slices.index((si, len(self._rois_of(si)))))
+        except ValueError:
+            pass
+        return item
+
+    def _remove_roi(self):
+        """Drop the ROI on screen. Its annotations are not touched: they are
+        keyed by the item, so re-cutting the same rect at the same level brings
+        them back."""
+        cur = self._current()
+        if cur is None or cur[1] <= 0:
+            self.status_var.set("Select an ROI to remove (the overview stays).")
+            return
+        self._remove_roi_at(*cur)
+
+    def _remove_roi_at(self, si, li):
+        """The removal itself, callable without a selection."""
+        rois = self._rois_of(si)
+        if li - 1 < len(rois):
+            gone = rois.pop(li - 1)
+            log(f"ROI removed: {gone}")
+        self._rebuild_flat_slices()
+        self._refresh_subseq_list()
+        self._update_roi_hint()
+        if (si, 0) in self.flat_slices:
+            self._goto_slice(self.flat_slices.index((si, 0)))
+
+    def _update_roi_hint(self):
+        hint = getattr(self, "roi_hint", None)
+        if hint is None:
+            return
+        n = sum(len(self._rois_of(si)) for si in range(len(self.subsequences)))
+        primed = sum(1 for k in self.regions.keys() if self.engine.record(k) is not None)
+        hint.set(f"{n} ROI(s) over {len(self.subsequences)} slide(s); "
+                 f"{primed} item(s) computed")
+
     def _build_live_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Live")
         frame.pack(side="bottom", fill="x")
@@ -407,6 +608,7 @@ class MsPathApp(ViewerShell):
 
     def _after_layout(self):
         self._update_level_hint()
+        self._update_roi_hint()
 
     # ------------------------------------------------------------------ #
     # Parameters
@@ -471,6 +673,51 @@ class MsPathApp(ViewerShell):
                     ("name", "filters", "base_filters", "msc", "statistics", "slide")})
         return out
 
+    def _session_doc(self):
+        """The shell's document, plus each slide's ROIs.
+
+        `build_session_doc` keeps a sequence's name, folder and files and drops
+        everything else, which is right for a stack of slices. A slide's ROIs
+        are not files -- they are places on one -- so they are re-attached
+        here, and read back in `_session_doc_from_json`. Without this a session
+        would reload with the annotations intact (their keys carry the
+        geometry) and nothing to attach them to.
+        """
+        doc = super()._session_doc()
+        for si, sd in enumerate(doc.get("sequences") or []):
+            rois = self._rois_of(si)
+            if rois:
+                sd["rois"] = [dict(r) for r in rois]
+        return doc
+
+    def _apply_session_doc(self, doc, source="session", notes=None):
+        """The shell's apply, then the ROIs put back.
+
+        Step 4 of the apply rebuilds each sequence as a fresh
+        ``{name, folder, files}`` -- right for a stack of slices, and it drops
+        anything else. So the ROIs are re-attached afterwards, matched by
+        (folder, slide file) rather than by position: a sequence whose folder
+        went missing is skipped, and matching by index would then hand one
+        slide's ROIs to another.
+        """
+        notes = notes if notes is not None else []
+        super()._apply_session_doc(doc, source, notes)
+        wanted = {}
+        for sd in ((doc or {}).get("sequences") or []):
+            files = [f for f in (sd.get("files") or []) if isinstance(f, str)]
+            if not files:
+                continue
+            wanted[(str(sd.get("folder") or ""), os.path.basename(files[0]))] =                 _clean_rois(sd.get("rois"), notes)
+        for s in self.subsequences:
+            files = s.get("files") or []
+            if not files:
+                continue
+            s["rois"] = wanted.get((str(s.get("folder") or ""),
+                                    os.path.basename(files[0])), [])
+        self._rebuild_flat_slices()
+        self._refresh_subseq_list()
+        self._update_roi_hint()
+
     def _run_settings(self):
         return {"overview_level": self._overview_level(), "halo": self._halo()}
 
@@ -529,29 +776,43 @@ class MsPathApp(ViewerShell):
         self._run_active = True
         self.run_btn.config(state="disabled")
         self._set_load_enabled(False)
-        self.status_var.set(f"Priming {len(items_to_prime)} overview(s)…")
-        log(f"RUN: {len(items_to_prime)} overview(s) at level {self._overview_level()}, "
-            f"halo {self._halo()}")
+        self.status_var.set(f"Priming {len(items_to_prime)} item(s)…")
+        n_ov = sum(1 for it in items_to_prime if it.is_overview)
+        log(f"RUN: {n_ov} overview(s) at level {self._overview_level()} + "
+            f"{len(items_to_prime) - n_ov} ROI(s), halo {self._halo()}")
         log(f"  filters: {[f['operation'] for f in profile['filters']] or ['(none)']}")
         log(f"  base_filters: {[f['operation'] for f in profile['base_filters']] or ['(none)']}")
-        if not self.engine.start_run(items_to_prime, profile, halo=0):
+        if not self.engine.start_run(items_to_prime, profile, halo=self._halo()):
             self.status_var.set("A prime is already running.")
             return
         self._ensure_pump()
 
     def _request_item(self, key):
-        """Navigation asked for an item. Everything the overview tier needs is
-        primed by Run, so this only has to select at the current persistence --
-        which is milliseconds -- and is done inline."""
+        """Navigation asked for an item.
+
+        A primed one only needs selecting at the current persistence, which is
+        milliseconds and happens inline. One that is not primed -- an ROI just
+        cut, or one the live-pipeline LRU released -- is primed on the worker,
+        because at 2-9 s it is not something to do on the UI thread.
+        """
         if self.engine.record(key) is not None or self.engine.pending_work():
             return
         p = self.engine.primed.get(key)
-        if p is None or not p.live:
+        if p is not None and p.live:
+            try:
+                self.engine.ensure_record(key, self._profile_for_compute())
+            except Exception as exc:
+                log(f"{key}: {type(exc).__name__}: {exc}")
             return
-        try:
-            self.engine.ensure_record(key, self._profile_for_compute())
-        except Exception as exc:
-            log(f"{key}: {type(exc).__name__}: {exc}")
+        item = parse_key(key)
+        if item is None:
+            return
+        self.status_var.set(f"Priming {item.label()}…")
+        # reset_pins=False: the thresholds already resolved for this session
+        # stay put, or every item primed earlier would silently re-threshold.
+        if self.engine.start_run([item], self._profile_for_compute(),
+                                 halo=self._halo(), reset_pins=False):
+            self._ensure_pump()
 
     def _handle_compute_event(self, ev):
         kind = ev[0]
@@ -568,6 +829,7 @@ class MsPathApp(ViewerShell):
             self._refresh_render()
         elif kind == "item_done":
             self._refresh_subseq_list()
+            self._update_roi_hint()
 
     def _reset_compute(self):
         self.engine.reset()

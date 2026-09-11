@@ -658,18 +658,18 @@ class ViewerShell:
                      if tree.item(iid, "open")}
         tree.delete(*tree.get_children())
         for si, s in enumerate(self.subsequences):
+            rows = self._sequence_item_labels(si)
             marks = [(self._slice_msc_mark(si, li), self._annotation_count(si, li))
-                     for li in range(len(s.get("files") or []))]
+                     for li in range(len(rows))]
             seq_msc = "Y" if marks and all(m[0] == "Y" for m in marks) else ""
             seq_annot = sum(m[1] for m in marks)
             iid = f"q{si}"
             tree.insert("", "end", iid=iid, text=self._sequence_row_text(s),
                         values=(seq_msc, str(seq_annot) if seq_annot else ""),
                         open=iid in open_seqs)
-            for li, path in enumerate(s.get("files") or []):
+            for li, text in enumerate(rows):
                 msc, annot = marks[li]
-                tree.insert(iid, "end", iid=f"q{si}:{li}",
-                            text=os.path.basename(path),
+                tree.insert(iid, "end", iid=f"q{si}:{li}", text=text,
                             values=(msc, str(annot) if annot else ""))
 
     def _update_subseq_values(self):
@@ -686,21 +686,21 @@ class ViewerShell:
             return False
         for si, s in enumerate(self.subsequences):
             iid = f"q{si}"
-            files = s.get("files") or []
-            if list(tree.get_children(iid)) != [f"q{si}:{li}" for li in range(len(files))]:
+            rows = self._sequence_item_labels(si)
+            if list(tree.get_children(iid)) != [f"q{si}:{li}" for li in range(len(rows))]:
                 return False
             if tree.item(iid, "text") != self._sequence_row_text(s):
                 return False
             marks = [(self._slice_msc_mark(si, li), self._annotation_count(si, li))
-                     for li in range(len(files))]
+                     for li in range(len(rows))]
             seq_msc = "Y" if marks and all(m[0] == "Y" for m in marks) else ""
             seq_annot = sum(m[1] for m in marks)
             self._set_row_values(iid, seq_msc, str(seq_annot) if seq_annot else "")
             for li, (msc, annot) in enumerate(marks):
                 child = f"q{si}:{li}"
-                # A sequence can swap a file without changing its length, so
+                # A sequence can swap an item without changing its length, so
                 # the row's own name is checked, not just the count of rows.
-                if tree.item(child, "text") != os.path.basename(files[li]):
+                if tree.item(child, "text") != rows[li]:
                     return False
                 self._set_row_values(child, msc, str(annot) if annot else "")
         return True
@@ -711,6 +711,21 @@ class ViewerShell:
             tree.set(iid, "msc", msc)
         if tree.set(iid, "annot") != annot:
             tree.set(iid, "annot", annot)
+
+    def _sequence_item_labels(self, si):
+        """Row text for each of sequence `si`'s items, in order.
+
+        A sequence's items are its files by default, which is what a stack of
+        slices is. An app whose sequence holds something else -- a slide, whose
+        items are an overview and however many ROIs have been cut from it --
+        overrides this, and the tree, the navigation and the in-place value
+        update all follow without knowing the difference.
+        """
+        try:
+            files = self.subsequences[si].get("files") or []
+        except (IndexError, KeyError, TypeError):
+            return []
+        return [os.path.basename(p) for p in files]
 
     def _annotation_count(self, si, li):
         """Interactions on one slice; the labeler overrides this (the viewer
@@ -732,7 +747,8 @@ class ViewerShell:
             # Not primed (yet): preview the slice as a click in the file list
             # would -- a sequence is browsable before any Run.
             try:
-                path = self.subsequences[si]["files"][li]
+                files = self.subsequences[si]["files"]
+                path = files[li] if li < len(files) else files[0]
             except (IndexError, KeyError, TypeError):
                 return
             self._preview_file(path)
