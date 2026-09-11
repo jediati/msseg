@@ -427,15 +427,26 @@ class SlideEngine:
         return True
 
     def _run_worker(self, items, profile, halo):
-        try:
-            total = len(items)
-            for n, item in enumerate(items, start=1):
+        total = len(items)
+        failed = []
+        for n, item in enumerate(items, start=1):
+            try:
                 # The overview is a whole level: there is nothing beyond its
                 # edges to borrow, so it takes no halo whatever the profile says.
                 self.prime_item(item, profile, halo=0 if item.is_overview else halo)
-                self.work_q.put(("progress", (n, total)))
                 self.work_q.put(("item_done", item.key))
+            except Exception as exc:
+                # One unreadable slide must not take the rest of the run with
+                # it: report it, and go on. It is still an error the user
+                # sees -- as a status line and a log entry, not a modal that
+                # also throws away the items that did prime.
+                msg = f"{type(exc).__name__}: {exc}"
+                log(f"{item.key}: prime FAILED -- {msg}")
+                failed.append((item.key, msg))
+                self.work_q.put(("item_error", item.key, msg))
+            self.work_q.put(("progress", (n, total)))
+        if failed and len(failed) == total:
+            self.work_q.put(("error", RuntimeError(
+                "no item could be primed:\n" + "\n".join(f"{k}: {m}" for k, m in failed))))
+        else:
             self.work_q.put(("done",))
-        except Exception as exc:                      # reported, never swallowed
-            log(f"prime failed: {type(exc).__name__}: {exc}")
-            self.work_q.put(("error", exc))

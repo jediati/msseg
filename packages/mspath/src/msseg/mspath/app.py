@@ -370,7 +370,16 @@ class MsPathApp(ViewerShell):
         if sid is None:
             return None
         if li <= 0:
-            return overview(sid, self._overview_level())
+            # Clamped to the levels the file HAS, in the key itself: a small
+            # image asked for level 6 computes at its top level either way,
+            # and a key that said @6 while @5 computed the same pixels would
+            # let one level change detach every annotation on it.
+            level = self._overview_level()
+            try:
+                level = min(level, self.engine.source(sid).levels - 1)
+            except Exception:
+                pass
+            return overview(sid, max(0, level))
         rois = self._rois_of(si)
         if li - 1 >= len(rois):
             return None
@@ -490,6 +499,11 @@ class MsPathApp(ViewerShell):
         self._rebuild_flat_slices_keeping_current()
         self._refresh_subseq_list()
         self._update_roi_hint()
+        # The first slide of a session goes on screen at once: a session with
+        # slides in it and a blank canvas reads as broken, and there is nothing
+        # to wait for -- the pyramid is the preview.
+        if self.viewer is not None and not self.viewer.has_base and self.flat_slices:
+            self._goto_slice(0)
         return True
 
     def _add_folder_path(self, path):
@@ -950,6 +964,12 @@ class MsPathApp(ViewerShell):
         item = parse_key(key)
         if item is None:
             return
+        if item.is_overview:
+            # Navigating to a slide shows it; Run primes it. An ROI is different
+            # -- it exists because the user asked to look there -- and primes
+            # on demand. Priming an overview on a click would start ten
+            # seconds of compute from a browse.
+            return
         self.status_var.set(f"Priming {item.label()}…")
         # reset_pins=False: the thresholds already resolved for this session
         # stay put, or every item primed earlier would silently re-threshold.
@@ -979,6 +999,11 @@ class MsPathApp(ViewerShell):
         elif kind == "item_done":
             self._refresh_subseq_list()
             self._update_roi_hint()
+            self._update_busy()
+        elif kind == "item_error":
+            _key, msg = ev[1], ev[2]
+            self.status_var.set(f"Could not prime {_key}: {msg.splitlines()[0]}")
+            self._refresh_subseq_list()
             self._update_busy()
 
     def _reset_compute(self):

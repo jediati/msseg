@@ -160,8 +160,9 @@ def test_a_grayscale_backend_is_broadcast_when_channels_says_colour():
 
 def test_backends_available_is_a_subset_of_the_known_names():
     names = P.backends_available()
-    assert set(names) <= {"openslide", "large_image", "tifffile"}
-    assert names == [n for n in ("openslide", "large_image", "tifffile") if n in names]
+    known = ("openslide", "large_image", "tifffile", "array")
+    assert set(names) <= set(known)
+    assert names == [n for n in known if n in names]
 
 
 def test_open_backend_reports_every_failure():
@@ -171,3 +172,58 @@ def test_open_backend_reports_every_failure():
     assert "no pyramid backend could open" in msg
     for name in P.backends_available():
         assert name in msg, "an installed backend's failure must be named"
+
+
+# --------------------------------------------------------------------------- #
+# the in-memory backend: a plain TIFF is a one-level pyramid held whole
+# --------------------------------------------------------------------------- #
+def test_halve_is_a_box_average_in_the_arrays_dtype():
+    a = np.array([[0, 2, 10, 10], [4, 6, 10, 10]], np.uint8)
+    got = P._halve(a)
+    assert got.dtype == np.uint8 and got.tolist() == [[3, 10]]
+    f = P._halve(np.ones((3, 5), np.float32) * 2.5)           # odd edges drop
+    assert f.shape == (1, 2) and f.dtype == np.float32 and (f == 2.5).all()
+    rgb = P._halve(np.full((4, 4, 3), 7, np.uint8))
+    assert rgb.shape == (2, 2, 3) and (rgb == 7).all()
+
+
+def test_a_plain_strip_tiff_opens_through_the_array_backend(tmp_path):
+    """OpenSlide refuses an untiled file and the tifffile store needs zarr;
+    the first real folder had exactly such a file beside the slide, and the
+    whole run died on it."""
+    tifffile = pytest.importorskip("tifffile")
+    rng = np.random.default_rng(1)
+    img = (rng.random((600, 900, 3)) * 255).astype(np.uint8)
+    path = tmp_path / "crop.tiff"
+    tifffile.imwrite(str(path), img, photometric="rgb")     # strips, no pyramid
+    src = P.PyramidImageSource(str(path))
+    assert src.be.name == "array"
+    assert (src.channels, src.level_shape(0), src.level_scale(0)) == (3, (600, 900), 1.0)
+    assert src.levels > 1 and max(src.level_shape(src.levels - 1)) <= 256
+    assert np.array_equal(src.read_region(0, 100, 50, 64, 32), img[50:82, 100:164])
+    assert src.value_range() == (0.0, 255.0)
+    # level 1 is the 2x2 average of level 0, not a decimation
+    l1 = src.read_region(1, 0, 0, 4, 4)
+    want = P._halve(img)[:4, :4]
+    assert np.array_equal(l1, want)
+
+
+def test_a_grayscale_plain_tiff_is_one_channel(tmp_path):
+    tifffile = pytest.importorskip("tifffile")
+    img = np.arange(300 * 400, dtype=np.uint16).reshape(300, 400)
+    path = tmp_path / "gray.tiff"
+    tifffile.imwrite(str(path), img)
+    src = P.PyramidImageSource(str(path))
+    assert src.be.name == "array" and src.channels == 1
+    assert src.read_region(0, 0, 0, 8, 8).shape == (8, 8)
+    assert src.value_range() == (0.0, 65535.0)
+
+
+def test_the_in_memory_budget_is_enforced(tmp_path, monkeypatch):
+    tifffile = pytest.importorskip("tifffile")
+    path = tmp_path / "big.tiff"
+    tifffile.imwrite(str(path), np.zeros((64, 64, 3), np.uint8), photometric="rgb")
+    monkeypatch.setattr(P, "IN_MEMORY_BUDGET", 1000)       # bytes
+    with pytest.raises(RuntimeError) as e:
+        P.open_backend(str(path), backend="array")
+    assert "budget" in str(e.value)

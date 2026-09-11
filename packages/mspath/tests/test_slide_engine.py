@@ -185,3 +185,37 @@ def test_live_budget_reads_the_environment(monkeypatch):
     assert E.live_budget() == E.DEFAULT_LIVE_ITEMS
     monkeypatch.setenv("MSPATH_LIVE_ITEMS", "0")
     assert E.live_budget() == 1, "a budget of zero would release what is on screen"
+
+
+# --------------------------------------------------------------------------- #
+# one unreadable item does not take the run with it
+# --------------------------------------------------------------------------- #
+def test_a_failing_item_is_reported_and_the_rest_still_prime(monkeypatch):
+    eng = E.SlideEngine()
+    good = I.overview("f/a.svs", 4)
+    bad = I.overview("f/broken.tiff", 4)
+    primed = []
+
+    def fake_prime(item, profile, halo=0, quiet=True):
+        if item is bad:
+            raise RuntimeError("no pyramid backend could open it")
+        primed.append(item.key)
+    monkeypatch.setattr(eng, "prime_item", fake_prime)
+    eng._run_worker([good, bad, good], {}, 0)
+    events = eng.poll()
+    kinds = [ev[0] for ev in events]
+    assert primed == [good.key, good.key], "the items after the failure must still prime"
+    assert kinds.count("item_error") == 1 and kinds[-1] == "primed"
+    err = [ev for ev in events if ev[0] == "item_error"][0]
+    assert err[1] == bad.key and "no pyramid backend" in err[2]
+    assert not eng.pending_work()
+
+
+def test_a_run_where_nothing_primes_is_an_error(monkeypatch):
+    eng = E.SlideEngine()
+    bad = I.overview("f/broken.tiff", 4)
+    monkeypatch.setattr(eng, "prime_item",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("nope")))
+    eng._run_worker([bad], {}, 0)
+    kinds = [ev[0] for ev in eng.poll()]
+    assert "error" in kinds and "primed" not in kinds

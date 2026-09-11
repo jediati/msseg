@@ -158,10 +158,76 @@ class _TiffFileBackend(_Backend):
         return arr
 
 
-_BACKENDS = (_OpenSlideBackend, _LargeImageBackend, _TiffFileBackend)
+# The largest image the in-memory backend will decode whole. Above this a
+# file needs a real tiled reader; below it, building the ladder ourselves is
+# cheaper than any of them.
+IN_MEMORY_BUDGET = 512 * (1 << 20)
+
+
+class _ArrayBackend(_Backend):
+    """The last resort: decode the whole image with tifffile and build the
+    level ladder in memory by 2x2 averaging.
+
+    A plain strip TIFF -- an exported crop, a coupon slice, anything that is
+    not tiled and pyramidal -- is refused by OpenSlide and needs ``zarr``
+    under tifffile's store, yet a 38 MB image is trivially held whole. So it
+    is, up to ``IN_MEMORY_BUDGET``: the same ``ImageSource`` contract, served
+    from arrays, and a file the tiled readers cannot open still opens.
+    """
+    name = "array"
+
+    def __init__(self, path):
+        import tifffile
+        with tifffile.TiffFile(str(path)) as tf:
+            page = tf.pages[0]
+            if page.nbytes > IN_MEMORY_BUDGET:
+                raise ValueError(f"{page.nbytes / 1e6:.0f} MB exceeds the in-memory "
+                                 f"budget of {IN_MEMORY_BUDGET / 1e6:.0f} MB")
+            a = page.asarray()
+        if a.ndim == 3 and a.shape[2] > 3:
+            a = a[..., :3]
+        if a.ndim == 3 and a.shape[2] == 2:            # gray + alpha
+            a = a[..., :1]
+        if a.ndim == 3 and a.shape[2] == 1:
+            a = a[..., 0]
+        self.dtype = np.dtype(a.dtype)
+        self.channels = int(a.shape[2]) if a.ndim == 3 else 1
+        self.height, self.width = int(a.shape[0]), int(a.shape[1])
+        self._levels = [np.ascontiguousarray(a)]
+        while max(self._levels[-1].shape[:2]) > 256 and len(self._levels) < 16:
+            self._levels.append(_halve(self._levels[-1]))
+        self.level_count = len(self._levels)
+
+    def close(self):
+        self._levels = []
+
+    def downsample(self, level: int) -> float:
+        return float(self.height) / float(self._levels[level].shape[0])
+
+    def level_dims(self, level: int) -> Tuple[int, int]:
+        sh = self._levels[level].shape
+        return int(sh[1]), int(sh[0])
+
+    def read(self, level, x, y, w, h):
+        return self._levels[level][y:y + h, x:x + w]
+
+
+def _halve(a):
+    """2x2 box average in the array's own dtype (odd edges drop a row/col)."""
+    h, w = (a.shape[0] // 2) * 2, (a.shape[1] // 2) * 2
+    if h < 2 or w < 2:
+        return a[:max(1, h // 2), :max(1, w // 2)]
+    b = a[:h, :w]
+    acc = (b[0::2, 0::2].astype(np.float32) + b[1::2, 0::2] + b[0::2, 1::2] + b[1::2, 1::2]) / 4.0
+    if np.issubdtype(a.dtype, np.integer):
+        return np.rint(acc).astype(a.dtype)
+    return acc.astype(a.dtype)
+
+
+_BACKENDS = (_OpenSlideBackend, _LargeImageBackend, _TiffFileBackend, _ArrayBackend)
 
 _REQUIRES = {"openslide": ("openslide",), "large_image": ("large_image",),
-             "tifffile": ("tifffile", "zarr")}
+             "tifffile": ("tifffile", "zarr"), "array": ("tifffile",)}
 
 
 def backends_available():
