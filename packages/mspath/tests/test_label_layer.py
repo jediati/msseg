@@ -16,6 +16,13 @@ def labels(h=8, w=8):
     return (np.arange(h * w, dtype=np.int32).reshape(h, w))
 
 
+def test_native_level_is_the_ladder_rung_nearest_the_raster():
+    assert RoiLabelLayer(labels(), scale=1.0).native_level == 0
+    assert RoiLabelLayer(labels(), scale=16.0).native_level == 4
+    assert RoiLabelLayer(labels(), scale=128.099).native_level == 7   # floors, never overshoots
+    assert RoiLabelLayer(labels(), scale=0.5).native_level == 0
+
+
 def test_shape_is_the_slide_not_the_item():
     lay = RoiLabelLayer(labels(), origin=(100, 200), scale=1.0, slide_shape=(1000, 900))
     assert lay.shape == (1000, 900)
@@ -173,3 +180,70 @@ def test_best_level_never_coarser_than_the_screen():
     assert src.best_level(1.0) == 0
     assert src.level_scale(src.best_level(16.0)) <= 16.0
     assert src.level_scale(src.best_level(1e9)) == src.level_scale(src.levels - 1)
+
+
+
+# --------------------------------------------------------------------------- #
+# gesture resolution on a placed layer is EXACT, whatever the scale
+# --------------------------------------------------------------------------- #
+from msseg.labeler.labeling import Interaction, touched_ids, touched_ids_over  # noqa: E402
+
+
+def _it(tool, pts, uid=1):
+    return Interaction(uid, "k", 0, 0, tool, pts, 1)
+
+
+def test_crop_raster_is_a_slice_with_background_outside():
+    lab = labels(8, 8)
+    lay = RoiLabelLayer(lab, origin=(1000, 2000), scale=128.099, slide_shape=(90000, 47040))
+    assert lay.placement() == (1000.0, 2000.0, 128.099)
+    assert np.array_equal(lay.crop_raster(2, 3, 4, 2), lab[3:5, 2:6])
+    got = lay.crop_raster(-2, 6, 6, 6)
+    assert got.shape == (6, 6) and (got[:, :2] == -1).all() and (got[2:, :] == -1).all()
+    assert np.array_equal(got[:2, 2:], lab[6:8, 0:4])
+    assert lay.crop_raster(50, 50, 4, 4).shape == (4, 4) and (lay.crop_raster(50, 50, 4, 4) == -1).all()
+
+
+@pytest.mark.parametrize("scale", [1.0, 16.0, 128.099, 515.604])
+def test_a_tap_on_every_regions_extremum_hits_it(scale):
+    """The overview's extrema are mapped into slide coordinates by
+    `x * scale + origin`; resolving a tap there through the canvas ladder's
+    nearest power of two drifts half a pixel over a few hundred and missed.
+    Through the exact placement it cannot."""
+    lab = np.arange(700 * 400, dtype=np.int32).reshape(700, 400)   # one id per pixel
+    origin = (12000, 4000)
+    lay = RoiLabelLayer(lab, origin=origin, scale=scale, slide_shape=(400000, 400000))
+    rng = np.random.default_rng(3)
+    for _ in range(200):
+        ry, rx = int(rng.integers(700)), int(rng.integers(400))
+        px, py = rx * scale + origin[0], ry * scale + origin[1]       # the engine's mapping
+        got = touched_ids_over(_it("taps", [(float(px), float(py))]), lay, np)
+        assert got == {int(lab[ry, rx])}, (scale, rx, ry, got)
+
+
+def test_every_gesture_matches_the_raster_at_an_odd_scale():
+    lab = np.zeros((20, 20), np.int32)
+    for j in range(4):
+        for i in range(4):
+            lab[j * 5:(j + 1) * 5, i * 5:(i + 1) * 5] = j * 4 + i
+    scale, origin = 128.099, (777, 333)
+    lay = RoiLabelLayer(lab, origin=origin, scale=scale, slide_shape=(20000, 20000))
+    gestures = [("taps", [(2.0, 2.0), (7.0, 12.0)]), ("squiggle", [(1.0, 1.0), (18.0, 1.0)]),
+                ("squiggle", [(3.0, 3.0), (16.0, 16.0)]), ("box", [(6.0, 6.0), (13.0, 13.0)]),
+                ("box", [(13.0, 13.0), (6.0, 6.0)]), ("polygon", [(2.0, 2.0), (17.0, 3.0), (9.0, 18.0)])]
+    for tool, pts in gestures:
+        want = touched_ids(_it(tool, pts), lab, np)
+        slide_pts = [(x * scale + origin[0], y * scale + origin[1]) for x, y in pts]
+        assert touched_ids_over(_it(tool, slide_pts), lay, np) == want, tool
+
+
+def test_a_box_over_the_whole_item_reads_only_the_raster():
+    """Seventeen gigabytes on the real slide, before: the bbox at level 0."""
+    lab = labels(20, 20)
+    lay = RoiLabelLayer(lab, origin=(0, 0), scale=128.099, slide_shape=(90000, 47040))
+    calls = []
+    real = lay.crop_raster
+    lay.crop_raster = lambda *a: (calls.append(a), real(*a))[1]
+    got = touched_ids_over(_it("box", [(0.0, 0.0), (89999.0, 47039.0)]), lay, np)
+    assert got == set(int(v) for v in np.unique(lab) if v >= 0)
+    assert calls and all(a[2] * a[3] <= 30 * 30 for a in calls), calls

@@ -399,12 +399,13 @@ class SlideEngine:
                 if ev[0] == "error":
                     out.append(ev)
                     continue
-                out.append(("primed",))
+                out.append(("item_primed",) if getattr(self, "_incremental", False)
+                           else ("primed",))
                 continue
             out.append(ev)
         return out
 
-    def start_run(self, items, profile, halo=0, reset_pins=True):
+    def start_run(self, items, profile, halo=0, reset_pins=True, incremental=False):
         """Prime `items` in order on one worker thread. Serial on purpose: the
         pipelines are stateful and each one is most of a gigabyte.
 
@@ -412,6 +413,12 @@ class SlideEngine:
         which is what priming ONE more ROI into an existing session must do.
         Re-resolving them would silently re-threshold every item primed before
         it, against whatever range this one happened to have.
+
+        `incremental` says the same thing to the UI: the run ends with
+        ("item_primed",) rather than ("primed",). The labeler drops every
+        prediction and class LUT on "primed", which is right when a Run has
+        recomputed everything and wrong when one ROI was added to a session
+        whose other items are exactly as they were.
         """
         if self._busy:
             return False
@@ -420,6 +427,7 @@ class SlideEngine:
             self.level_range = {}
             self.persistence_abs = {}
         self.running_keys = tuple(it.key for it in items)
+        self._incremental = bool(incremental)
         self._worker = threading.Thread(target=self._run_worker, name="mspath-prime",
                                         args=(list(items), dict(profile), int(halo)),
                                         daemon=True)

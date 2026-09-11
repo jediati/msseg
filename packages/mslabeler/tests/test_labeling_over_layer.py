@@ -160,3 +160,68 @@ def test_shifted_keeps_everything_but_the_points():
     assert (out.uid, out.slice_key, out.si, out.li, out.tool, out.class_id) == \
         (7, "key", 3, 4, "box", 5)
     assert out.meta == {"tool": "magic"}
+
+
+
+class CoarseLayer(CropOnlyLayer):
+    """Ids at 1/`scale` of the image, as a whole-slide overview's are."""
+
+    def __init__(self, labels, scale, slide_shape):
+        super().__init__(labels, offset=(0, 0), slide_shape=slide_shape)
+        self.scale = float(scale)
+        self.native_level = int(np.log2(scale))
+        self.max_crop_px = 0
+
+    def crop(self, level, x, y, w, h):
+        self.crops.append((level, x, y, w, h))
+        self.max_crop_px = max(self.max_crop_px, w * h)
+        s = float(2 ** level)
+        lab = self._inner.labels
+        sx = (x + np.arange(w) + 0.5) * s
+        sy = (y + np.arange(h) + 0.5) * s
+        cx = np.floor(sx / self.scale).astype(int)
+        cy = np.floor(sy / self.scale).astype(int)
+        out = np.full((h, w), -1, np.int32)
+        okx = (cx >= 0) & (cx < lab.shape[1]); oky = (cy >= 0) & (cy < lab.shape[0])
+        if okx.any() and oky.any():
+            blk = lab[np.clip(cy, 0, lab.shape[0] - 1)][:, np.clip(cx, 0, lab.shape[1] - 1)]
+            np.copyto(out, blk, where=oky[:, None] & okx[None, :])
+        return out
+
+    def id_at(self, x, y):
+        return self._inner.id_at(int(x // self.scale), int(y // self.scale))
+
+
+def test_a_box_over_a_coarse_item_does_not_crop_the_whole_slide():
+    """A level-7 overview's raster is 20x20; a box over the whole item is the
+    whole slide in image pixels. Cropped at level 0 that is 2560x2560 here and
+    47 040 x 90 000 on the real slide -- seventeen gigabytes to resolve one
+    gesture. The crop must be at the raster's own level."""
+    labels = lab()                                           # 20x20, 4x4 blocks
+    layer = CoarseLayer(labels, scale=128.0, slide_shape=(2560, 2560))
+    it = make("box", [(0.0, 0.0), (2559.0, 2559.0)])
+    got = touched_ids_over(it, layer, np)
+    assert got == touched_ids(make("box", [(0.0, 0.0), (19.0, 19.0)]), labels, np)
+    assert layer.crops and all(lv == 7 for lv, *_ in layer.crops), layer.crops
+    assert layer.max_crop_px <= 21 * 21, f"cropped {layer.max_crop_px} px for a 20x20 raster"
+
+
+def test_coarse_gestures_resolve_like_the_raster_would():
+    """Every tool, on a 1/16 item: the answer must equal touched_ids over the
+    raster with the gesture scaled into raster coordinates -- one sample per
+    raster pixel, which is what a coupon slice gets."""
+    labels = lab()
+    layer = CoarseLayer(labels, scale=16.0, slide_shape=(320, 320))
+    for it in GESTURES:
+        big = shifted(it, 0, 0)
+        big.points = [(x * 16.0, y * 16.0) for x, y in it.points]
+        want = touched_ids(it, labels, np)
+        assert touched_ids_over(big, layer, np) == want, it.tool
+
+
+def test_a_level_zero_layer_is_unchanged_by_the_native_level():
+    labels = lab()
+    layer = CropOnlyLayer(labels)
+    layer.native_level = 0
+    it = make("box", [(6.0, 6.0), (13.0, 13.0)])
+    assert touched_ids_over(it, layer, np) == touched_ids(it, labels, np)

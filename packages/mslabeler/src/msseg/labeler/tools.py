@@ -345,12 +345,11 @@ class MagicFillController:
         if ring:
             ring_cls = self.ring_class(cls)
             if ring_cls is None:
-                app.status_var.set("Blobber needs a second class for the ring "
-                                   "(Classes >= 3).")
+                app._notify("Blobber needs a second class for the ring (Classes >= 3).")
                 return False
         rec = app.regions.record(app.catalogue.key_of(*cur))
         if rec is None or rec.get("labels") is None or rec.get("stats") is None:
-            app.status_var.set("Magic fill needs computed regions - Rerun first.")
+            app._notify("Magic fill needs computed regions - Run first.")
             return False
         import numpy as np
         v = app.viewer
@@ -376,8 +375,7 @@ class MagicFillController:
         if not chans:
             chans = ["base"] if "base" in avail else avail[:1]
         if metric in magic_fill.EDGE_ONLY_METRICS and arcs.get("saddle") is None:
-            app.status_var.set(f"{metric} needs saddle values (MSC region arcs) "
-                               "- using mean")
+            app._notify(f"{metric} needs saddle values (MSC region arcs) - using mean")
             metric = "mean"
         extra = None
         if metric in magic_fill.EXTRA_METRICS:
@@ -387,16 +385,15 @@ class MagicFillController:
             # while tuning, so the press is refused like one on background.
             pr = app._pred.get(app.catalogue.key_of(*cur))
             if pr is None or pr[0] != rec.get("commit"):
-                app.status_var.set(f"{metric} needs predictions at this commit "
-                                   "- Classify first")
+                app._notify(f"{metric} needs predictions at this commit - Classify first")
                 return False
             if metric == "learned":
                 # The edge model's p(diff) per arc, computed against THIS
                 # record's arcs at Classify time.
                 aux = app._pred_aux(pr)
                 if aux is None or aux.get("pdiff") is None:
-                    app.status_var.set("learned needs an edge model at this commit - pick "
-                                       "a '-> edges' kind, Train (R), then Classify")
+                    app._notify("learned needs an edge model at this commit - pick "
+                                "a '-> edges' kind, Train (R), then Classify")
                     return False
                 extra = {"pdiff": aux["pdiff"]}
             else:

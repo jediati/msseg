@@ -219,3 +219,17 @@ def test_a_run_where_nothing_primes_is_an_error(monkeypatch):
     eng._run_worker([bad], {}, 0)
     kinds = [ev[0] for ev in eng.poll()]
     assert "error" in kinds and "primed" not in kinds
+
+
+def test_an_incremental_run_ends_with_item_primed_not_primed(monkeypatch):
+    """The labeler drops every prediction on "primed". One ROI added to a
+    session whose other items are exactly as they were must not do that."""
+    eng = E.SlideEngine()
+    monkeypatch.setattr(eng, "prime_item", lambda *a, **k: None)
+    item = I.roi("f/a.svs", 0, 0, 0, 64, 64)
+    eng._incremental = True
+    eng._run_worker([item], {}, 0)
+    assert [ev[0] for ev in eng.poll()] == ["item_done", "progress", "item_primed"]
+    eng._incremental = False
+    eng._run_worker([item], {}, 0)
+    assert [ev[0] for ev in eng.poll()][-1] == "primed"

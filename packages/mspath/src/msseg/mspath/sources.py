@@ -50,6 +50,13 @@ class RoiLabelLayer:
         return self._shape
 
     @property
+    def native_level(self) -> int:
+        """The canvas ladder level whose pixels are nearest this raster's own:
+        where a gesture should be resolved. floor(log2(scale)), so a 1/16
+        overview is level 4 and a 1/128.1 one is level 7."""
+        return max(0, int(np.floor(np.log2(self.scale)))) if self.scale > 1 else 0
+
+    @property
     def n_ids(self) -> int:
         return self._n_ids
 
@@ -90,6 +97,31 @@ class RoiLabelLayer:
         if 0 <= cx < lw and 0 <= cy < lh:
             return int(self.labels[cy, cx])
         return -1
+
+    # -- exact placement, for gesture resolution --------------------------- #
+    def placement(self):
+        """``(origin_x, origin_y, scale)``: slide point -> raster index is
+        ``(p - origin) / scale``. What `labeling.touched_ids_over` resolves
+        against, so a gesture reads the raster's own grid rather than the
+        canvas ladder's nearest power of two."""
+        return (float(self.ox), float(self.oy), float(self.scale))
+
+    @property
+    def raster_shape(self):
+        return tuple(int(v) for v in self.labels.shape[:2])
+
+    def crop_raster(self, rx: int, ry: int, rw: int, rh: int):
+        """A rect of the raster in ITS OWN indices, ``-1`` outside it. A plain
+        slice with zero-fill at the edges -- no resampling."""
+        lh, lw = self.labels.shape[:2]
+        rw, rh = max(0, int(rw)), max(0, int(rh))
+        out = np.full((rh, rw), -1, np.int32)
+        x0, y0 = max(0, int(rx)), max(0, int(ry))
+        x1, y1 = min(lw, int(rx) + rw), min(lh, int(ry) + rh)
+        if x1 > x0 and y1 > y0:
+            out[y0 - int(ry):y1 - int(ry), x0 - int(rx):x1 - int(rx)] = \
+                self.labels[y0:y1, x0:x1]
+        return out
 
     def full(self):
         """The raster only when it already is the whole slide at level 0 --

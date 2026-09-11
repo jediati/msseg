@@ -248,6 +248,32 @@ class ViewerShell:
     def _update_busy(self):
         """Refresh the busy/stale indication (the app's)."""
 
+    _NOTICE_MS = 3000
+
+    def _notify(self, msg, ms=None):
+        """Tell the user something that stopped an action: the status bar, and
+        the canvas HUD for a few seconds.
+
+        A refused tool press falls through to a pan, so nothing on screen says
+        the press was refused; a line at the bottom of the window is not where
+        the eye is during a drag. The HUD is, so the notice goes there too and
+        `_update_busy` leaves it alone until it expires.
+        """
+        self.status_var.set(msg)
+        v = getattr(self, "viewer", None)
+        if v is None:
+            return
+        ms = self._NOTICE_MS if ms is None else int(ms)
+        self._notice_until = time.monotonic() + ms / 1000.0
+        v.set_hud("stale", msg)
+        try:
+            self.root.after(ms + 20, self._update_busy)
+        except tk.TclError:
+            pass
+
+    def _notice_active(self):
+        return time.monotonic() < getattr(self, "_notice_until", 0.0)
+
     def _feature_scope(self):
         """An opaque string naming WHAT the active profile measures on, or None
         when the app has no such distinction.

@@ -974,13 +974,13 @@ class MsPathApp(ViewerShell):
         # reset_pins=False: the thresholds already resolved for this session
         # stay put, or every item primed earlier would silently re-threshold.
         if self.engine.start_run([item], self._profile_for_compute(),
-                                 halo=self._halo(), reset_pins=False):
+                                 halo=self._halo(), reset_pins=False, incremental=True):
             self._ensure_pump()
             self._update_busy()
 
     def _handle_compute_event(self, ev):
         kind = ev[0]
-        if kind == "primed":
+        if kind in ("primed", "item_primed"):
             self._run_active = False
             self.run_btn.config(state="normal")
             self._set_load_enabled(True)
@@ -1026,6 +1026,8 @@ class MsPathApp(ViewerShell):
             self.viewer.set_hud("busy", "Priming")
         elif self.engine.pending_work() and self._run_active:
             self.viewer.set_hud("busy", "Priming")
+        elif self._notice_active():
+            return                                  # a _notify is still on screen
         else:
             self.viewer.set_hud(None)
 

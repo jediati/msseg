@@ -429,14 +429,60 @@ def touched_ids_over(interaction, layer, np):
     box = gesture_bbox(interaction, np)
     if box is None:
         return set()
+    # A layer that knows exactly where its raster sits resolves on that
+    # raster's own grid: the gesture's points go through the same
+    # (p - origin) / scale the drawing tools use, and the bbox is a plain
+    # slice of the raster. Exact for any scale -- a 1/128.1 overview and the
+    # ladder's 2**7 drift half a pixel apart over 700 pixels, enough for a tap
+    # on a region's extremum to land one raster pixel off -- and it costs a
+    # slice, not a resample.
+    placement = getattr(layer, "placement", None)
+    crop_raster = getattr(layer, "crop_raster", None)
+    if placement is not None and crop_raster is not None:
+        ox, oy, sc = placement()
+        sc = float(sc) or 1.0
+        x, y, w, h = box
+        rx0, ry0 = int(np.floor((x - ox) / sc)), int(np.floor((y - oy) / sc))
+        rx1, ry1 = int(np.ceil((x + w - ox) / sc)), int(np.ceil((y + h - oy) / sc))
+        rshape = getattr(layer, "raster_shape", None)
+        if rshape is not None:                   # never ask for more than there is
+            rx0, ry0 = max(0, rx0), max(0, ry0)
+            rx1, ry1 = min(int(rshape[1]), rx1), min(int(rshape[0]), ry1)
+        if rx1 <= rx0 or ry1 <= ry0:
+            return set()
+        sub = crop_raster(rx0, ry0, rx1 - rx0, ry1 - ry0)
+        if sub is None or sub.size == 0:
+            return set()
+        exact = Interaction(interaction.uid, interaction.slice_key, interaction.si,
+                            interaction.li, interaction.tool,
+                            [((px - ox) / sc - rx0, (py - oy) / sc - ry0)
+                             for px, py in interaction.points],
+                            interaction.class_id, interaction.meta)
+        return touched_ids(exact, sub, np)
+    # Otherwise crop at the RASTER's resolution, not the image's. A layer whose ids live
+    # at 1/128 of the image (a coarse overview) would otherwise be asked for
+    # its bbox at level 0: a box over the whole item is the whole slide,
+    # 47 040 x 90 000 int32 -- seventeen gigabytes to decide which of 33
+    # regions a box touched. At the raster's level the crop is the raster,
+    # and a gesture resolves the way it does on a coupon slice: one sample per
+    # raster pixel, centre-in-box at the edges.
+    level = max(0, int(getattr(layer, "native_level", 0) or 0))
+    s = float(2 ** level)
     x, y, w, h = box
     ih, iw = layer.shape
-    x0, y0 = max(0, x), max(0, y)
-    x1, y1 = min(iw, x + w), min(ih, y + h)
-    if x1 <= x0 or y1 <= y0:
+    lx0, ly0 = max(0, int(np.floor(x / s))), max(0, int(np.floor(y / s)))
+    lx1 = min(int(np.ceil(iw / s)), int(np.ceil((x + w) / s)))
+    ly1 = min(int(np.ceil(ih / s)), int(np.ceil((y + h) / s)))
+    if lx1 <= lx0 or ly1 <= ly0:
         return set()
-    sub = layer.crop(0, x0, y0, x1 - x0, y1 - y0)
-    return touched_ids(shifted(interaction, -x0, -y0), sub, np)
+    sub = layer.crop(level, lx0, ly0, lx1 - lx0, ly1 - ly0)
+    if s == 1.0:
+        return touched_ids(shifted(interaction, -lx0, -ly0), sub, np)
+    scaled = Interaction(interaction.uid, interaction.slice_key, interaction.si,
+                         interaction.li, interaction.tool,
+                         [(px / s - lx0, py / s - ly0) for px, py in interaction.points],
+                         interaction.class_id, interaction.meta)
+    return touched_ids(scaled, sub, np)
 
 
 def touched_sets(interactions, labels, np, layer=None):

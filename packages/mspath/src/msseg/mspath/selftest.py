@@ -43,6 +43,27 @@ def _synthetic_slide(folder, name="synthetic.tiff", w=1024, h=768, levels=4):
     return path
 
 
+def _settle(app, limit=8):
+    """Run the work-queue pump by hand until the engine is idle.
+
+    Draining one prime's events can start the next -- the primed handler
+    primes whatever is on screen if it is not yet -- so this loops, as the
+    real pump does. Every selftest step that can leave a worker running
+    (navigating to an ROI, proposing ROIs) settles before asserting, or the
+    next step's `pending_work()` guard silently changes what it does.
+    """
+    for _ in range(limit):
+        if not app.engine.pending_work():
+            return
+        w = app.engine._worker
+        if w is not None:
+            w.join(timeout=300)
+            assert not w.is_alive(), "a prime did not finish"
+        for ev in app.engine.poll():
+            app._handle_event(ev)
+    assert not app.engine.pending_work(), "the engine never went idle"
+
+
 def _pick_slide(tmp):
     env = os.environ.get(SLIDE_ENV)
     if env and os.path.exists(env):
@@ -262,20 +283,8 @@ def run_selftest():
     pins_before = dict(app.engine.level_range)
     assert app.engine._worker is not None and app.engine.pending_work(),         "no on-demand prime started"
 
-    def settle(limit=6):
-        """Run the pump by hand until the engine is idle. Draining one prime's
-        events can start the next -- the primed handler primes whatever is on
-        screen if it is not yet -- so this loops, as the real pump does."""
-        for _ in range(limit):
-            if not app.engine.pending_work():
-                return
-            w = app.engine._worker
-            if w is not None:
-                w.join(timeout=120)
-                assert not w.is_alive(), "a prime did not finish"
-            for ev in app.engine.poll():
-                app._handle_event(ev)
-        assert not app.engine.pending_work(), "the engine never went idle"
+    def settle():
+        _settle(app)
 
     settle()
     # Only the item ON SCREEN is selected after a prime, and the second
@@ -474,6 +483,7 @@ def run_labeler_selftest():
         added = len(app._rois_of(0)) - before
         assert added >= 1, "the proposal added nothing"
         assert "proposed" in app.status_var.get(), app.status_var.get()
+        _settle(app)          # proposing navigated to a new ROI, which primes on demand
 
         # every proposal is a real item, inside the slide, at the asked level
         sh0, sw0 = src.level_shape(0)
@@ -483,6 +493,46 @@ def run_labeler_selftest():
             assert 0 <= r["y"] and r["y"] + r["h"] <= sh0
         keys = [app._item_at(0, li).key for li in range(1, 1 + len(app._rois_of(0)))]
         assert len(set(keys)) == len(keys), "a proposal duplicated an existing item"
+
+        # -- a refused magic-fill press says so where the eye is -------------- #
+        import types
+        v = app.viewer
+        # proposing navigated to the last ROI it cut; the press is on the
+        # classified OVERVIEW
+        app._goto_slice(app.flat_slices.index((0, 0)))
+        v.set_view(px - 10, py - 10, scale=1.0)
+        e = types.SimpleNamespace(x=10, y=10, state=0)
+        app.tool_var.set("magic"); app.magic_metric_var.set("learned")
+        app.status_var.set("")
+        assert v.tool.on_press(e) is False, "learned without an edge model must be refused"
+        assert "edge model" in app.status_var.get()
+        assert v.hud[0] == "stale" and "edge model" in v.hud[1],             "the refusal must reach the canvas HUD, not only the status bar"
+        app._update_busy()
+        assert v.hud[0] == "stale", "a repaint must not clear a fresh notice"
+        app._notice_until = 0.0
+        app._update_busy()
+        assert v.hud[0] is None, "an expired notice is cleared"
+
+        # -- and proba works once classified, and SURVIVES visiting an ROI ---- #
+        app.magic_metric_var.set("proba")
+        assert v.tool.on_press(e) is True, "proba refused after Classify"
+        v.tool.on_release(e); app._end_preview()
+        pred_before = app._pred.get(item.key)
+        assert pred_before is not None
+        # an on-demand ROI prime is INCREMENTAL: it must not drop the
+        # overview's predictions the way a Run does
+        sh0, sw = src.level_shape(0)
+        new_roi = app._add_roi(0, app.roi_level_var.get(), sw // 3, sh0 // 3,
+                               int(256 * src.level_scale(app.roi_level_var.get())),
+                               int(256 * src.level_scale(app.roi_level_var.get())))
+        assert new_roi is not None
+        _settle(app)
+        assert app.engine.record(new_roi.key) is not None, "the ROI did not prime"
+        assert app._pred.get(item.key) is pred_before,             "an incremental prime wiped the overview's predictions"
+        app._goto_slice(app.flat_slices.index((0, 0)))
+        v.set_view(px - 10, py - 10, scale=1.0)
+        assert v.tool.on_press(e) is True, "proba refused after visiting an ROI"
+        v.tool.on_release(e); app._end_preview()
 
         # and the ranking is the uncertainty, not the order of the table
         scores = PR.region_scores(pred[2], np, "entropy")
@@ -503,5 +553,6 @@ def run_labeler_selftest():
     root.destroy()
     print("labeler selftest OK: placement, slide-coordinate gestures, class layer, "
           "box over the item, training rows, level-scoped compat gate, "
-          "classify + propose ROIs, undo")
+          "classify + propose ROIs, refusal notice on the HUD, "
+          "predictions survive an incremental prime, undo")
     return 0
