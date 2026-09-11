@@ -230,6 +230,25 @@ def run_selftest():
     app._apply_profile_to_ui(p, lambda v, x: v.set(x), [])
     assert app.level_var.get() == deepest and app.halo_var.get() == p["slide"]["halo"]
 
+    # -- the statistics panel is the feature vector, and it is in Processing - #
+    assert app.stats_frame.master is app._processing_parent("stats")
+    base_fields = set(app._stat_channel_names())
+    assert base_fields == {"base"}
+    on, sigmas, _src = app.stat_kind_vars["blur"]
+    on.set(True); sigmas.set("1.5, 3.0"); app._on_stat_spec_change()
+    names = app._stat_channel_names()
+    assert "blur_s1.5" in names and "blur_s3" in names, names
+    assert "channels" in app.stat_summary_var.get()
+    prof = app._profile_from_ui()
+    kinds = [c.get("kind") if isinstance(c, dict) else c for c in prof["statistics"]["channels"]]
+    assert "blur" in kinds, prof["statistics"]
+    # and it round-trips through the profile
+    on.set(False); app._on_stat_spec_change()
+    assert app._stat_channel_names() == ["base"]
+    app._apply_profile_to_ui(prof, lambda v, x: v.set(x), [])
+    assert app.stat_kind_vars["blur"][0].get() and "blur_s3" in app._stat_channel_names()
+    on.set(False); app._on_stat_spec_change()
+
     # -- layout: ROI section in the left pane, Run at the shell's slot ------ #
     assert app.roi_hint_parent.winfo_toplevel() is app.left.winfo_toplevel()
     assert app.roi_hint_parent.master is app._left_section_parent("roi")

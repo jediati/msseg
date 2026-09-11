@@ -40,6 +40,9 @@ except Exception:                                   # headless import
 
 from msseg.labeler.shell import ViewerShell
 from msseg.mscoupon import session as coupon_session
+from msseg.mscoupon import config_io
+from msseg.mscoupon.app import format_hist_ranges, parse_hist_ranges
+from msseg.mscoupon.common import _format_sigmas, _parse_sigmas
 from msseg.mscoupon.config_io import (FILTER_OPERATIONS, FILTER_SCHEMA, COLOR_METHODS,
                                       filter_param_schema, filters_to_json)
 
@@ -169,6 +172,19 @@ class MsPathApp(ViewerShell):
         self.halo_var = tk.IntVar(value=DEFAULT_HALO)
         self.regions_var = tk.BooleanVar(value=True)
         self.roi_level_var = tk.IntVar(value=0)
+        # The statistics spec: which channels a region is measured on, with
+        # which reductions. This IS the classifier's feature vector, so it is
+        # the coupon panel, ported as it stands.
+        self.stat_base_var = tk.BooleanVar(value=True)
+        self.stat_filtered_var = tk.BooleanVar(value=False)
+        self.stat_color_var = tk.BooleanVar(value=False)
+        self.stat_kind_vars = {}       # kind -> (BooleanVar on, StringVar sigmas, StringVar source)
+        self.stat_reduction_vars = {}  # reduction -> BooleanVar
+        self.stat_extremum_var = tk.BooleanVar(value=True)
+        self.hist_on_var = tk.BooleanVar(value=False)
+        self.hist_bins_var = tk.StringVar(value="16")
+        self.hist_channels_var = tk.StringVar(value="base")
+        self.hist_ranges_var = tk.StringVar(value="*: 0, 1")
 
     # ------------------------------------------------------------------ #
     # Data-model factories (copied from the coupon viewer -- the card model
@@ -594,11 +610,221 @@ class MsPathApp(ViewerShell):
                                   "run-to-run nondeterministic)",
                         variable=self.accurate_var).pack(anchor="w", padx=6)
 
+        self._build_statistics_panel()
+
+    # ------------------------------------------------------------------ #
+    # Statistics channels (ported from the coupon viewer: the feature vector)
+    # ------------------------------------------------------------------ #
+    def _build_statistics_panel(self):
+        """Which channels a region is measured on, and with which reductions.
+
+        A derived channel is a Gaussian-derivative response computed on the
+        base raster; naming several sigmas on one row is the cross-product. They
+        are measure-only: the topology field is still `filters`. Sigmas are in
+        PIXELS AT THE ITEM'S LEVEL, which is why a model is pinned to a level.
+        """
+        c = ttk.LabelFrame(self._processing_parent("stats"), text="5. Statistics channels")
+        c.pack(fill="x", padx=4, pady=4)
+        self.stats_frame = c
+
+        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
+        ttk.Checkbutton(row, text="base", variable=self.stat_base_var,
+                        command=self._on_stat_spec_change).pack(side="left")
+        ttk.Checkbutton(row, text="filtered", variable=self.stat_filtered_var,
+                        command=self._on_stat_spec_change).pack(side="left", padx=8)
+        ttk.Checkbutton(row, text="color planes", variable=self.stat_color_var,
+                        command=self._on_stat_spec_change).pack(side="left", padx=8)
+
+        for kind in config_io.DERIVED_CHANNEL_KINDS:
+            row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=1)
+            on = tk.BooleanVar(value=False)
+            sigmas = tk.StringVar(value="0.7, 1.5, 3.0")
+            color_only = kind in config_io.COLOR_ONLY_KINDS
+            ttk.Checkbutton(row, text=kind, variable=on, width=10,
+                            command=self._on_stat_spec_change).pack(side="left")
+            ttk.Label(row, text="sigmas:").pack(side="left")
+            entry = ttk.Entry(row, textvariable=sigmas, width=16)
+            entry.pack(side="left", padx=2)
+            entry.bind("<Return>", lambda e: self._on_stat_spec_change())
+            entry.bind("<FocusOut>", lambda e: self._on_stat_spec_change())
+            source = tk.StringVar(value="color" if color_only else "base")
+            src = ttk.Combobox(row, textvariable=source, values=config_io.STAT_SOURCES,
+                               state="disabled" if color_only else "readonly", width=6)
+            src.pack(side="left", padx=2)
+            src.bind("<<ComboboxSelected>>", lambda e: self._on_stat_spec_change())
+            if kind in config_io.TWO_SLOT_KINDS:
+                ttk.Label(row, text="(largest + smallest)").pack(side="left")
+            self.stat_kind_vars[kind] = (on, sigmas, source)
+
+        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=(4, 2))
+        ttk.Label(row, text="reductions:").pack(side="left")
+        for reduction in config_io.STAT_REDUCTIONS:
+            var = tk.BooleanVar(value=True)
+            self.stat_reduction_vars[reduction] = var
+            ttk.Checkbutton(row, text=reduction, variable=var,
+                            command=self._on_stat_spec_change).pack(side="left", padx=2)
+        ttk.Checkbutton(c, text="seeding extremum (ext_* per channel)",
+                        variable=self.stat_extremum_var,
+                        command=self._on_stat_spec_change).pack(anchor="w", padx=4)
+        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=(4, 1))
+        ttk.Checkbutton(row, text="histogram", variable=self.hist_on_var, width=10,
+                        command=self._on_stat_spec_change).pack(side="left")
+        ttk.Label(row, text="bins:").pack(side="left")
+        for var, width in ((self.hist_bins_var, 4), (self.hist_channels_var, 14)):
+            e = ttk.Entry(row, textvariable=var, width=width); e.pack(side="left", padx=2)
+            e.bind("<Return>", lambda ev: self._on_stat_spec_change())
+            e.bind("<FocusOut>", lambda ev: self._on_stat_spec_change())
+            if var is self.hist_bins_var:
+                ttk.Label(row, text="channels:").pack(side="left")
+        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=1)
+        ttk.Label(row, text="ranges (name: lo, hi; ...):").pack(side="left")
+        e = ttk.Entry(row, textvariable=self.hist_ranges_var, width=22); e.pack(side="left", padx=2)
+        e.bind("<Return>", lambda ev: self._on_stat_spec_change())
+        e.bind("<FocusOut>", lambda ev: self._on_stat_spec_change())
+        ttk.Button(row, text="measure", width=8,
+                   command=self._measure_hist_ranges).pack(side="left", padx=2)
+        self.stat_summary_var = tk.StringVar(value="")
+        ttk.Label(c, textvariable=self.stat_summary_var, foreground="#555",
+                  wraplength=330, justify="left").pack(anchor="w", padx=4, pady=(0, 3))
+        self._refresh_stat_summary()
+
+    def _apply_stat_state(self, state, setvar):
+        """Restore the `statistics` block into the panel's controls. One row per
+        kind, so a config naming a kind twice has its sigma lists merged."""
+        channels = state.get("stat_channels")
+        if channels is None:
+            return
+        setvar(self.stat_base_var, any(c.get("kind") == "base" for c in channels))
+        setvar(self.stat_filtered_var, any(c.get("kind") == "filtered" for c in channels))
+        setvar(self.stat_color_var, any(c.get("kind") == "color" for c in channels))
+        by_kind, by_source = {}, {}
+        for card in channels:
+            kind = card.get("kind")
+            if kind in ("base", "filtered", "color") or kind not in self.stat_kind_vars:
+                continue
+            by_source.setdefault(kind, card.get("source") or "base")
+            for sigma in card.get("sigmas") or []:
+                by_kind.setdefault(kind, [])
+                if sigma not in by_kind[kind]:
+                    by_kind[kind].append(float(sigma))
+        for kind, (on, sigmas, source) in self.stat_kind_vars.items():
+            values = by_kind.get(kind)
+            setvar(on, bool(values))
+            if values:
+                setvar(sigmas, _format_sigmas(sorted(values)))
+            setvar(source, "color" if kind in config_io.COLOR_ONLY_KINDS
+                   else by_source.get(kind, "base"))
+        reductions = state.get("stat_reductions")
+        if reductions is not None:
+            for name, var in self.stat_reduction_vars.items():
+                setvar(var, name in reductions)
+        if state.get("stat_extremum") is not None:
+            setvar(self.stat_extremum_var, bool(state["stat_extremum"]))
+        hist = state.get("stat_histogram")
+        if hist is not None:
+            setvar(self.hist_on_var, bool(hist.get("bins")))
+            if hist.get("bins"):
+                setvar(self.hist_bins_var, str(int(hist["bins"])))
+                setvar(self.hist_channels_var, ", ".join(hist.get("channels") or ["base"]))
+                setvar(self.hist_ranges_var, format_hist_ranges(hist.get("ranges") or {}))
+        self._refresh_stat_summary()
+
+    def _stat_channel_cards(self):
+        """The `statistics.channels[]` model, in slot order."""
+        cards = []
+        if self.stat_base_var.get():
+            cards.append({"kind": "base"})
+        if self.stat_filtered_var.get():
+            cards.append({"kind": "filtered"})
+        if self.stat_color_var.get():
+            cards.append({"kind": "color"})
+        for kind, (on, sigmas, source) in self.stat_kind_vars.items():
+            if not on.get():
+                continue
+            values = _parse_sigmas(sigmas.get())
+            if values:
+                card = {"kind": kind, "sigmas": values}
+                if kind in config_io.COLOR_ONLY_KINDS or source.get() == "color":
+                    card["source"] = "color"
+                cards.append(card)
+        return cards
+
+    def _stat_reductions(self):
+        return [r for r, v in self.stat_reduction_vars.items() if v.get()]
+
+    def _hist_channel_names(self):
+        return [c.strip() for c in self.hist_channels_var.get().replace(";", ",").split(",")
+                if c.strip()]
+
+    def _stat_histogram(self):
+        if not self.hist_on_var.get():
+            return None
+        try:
+            bins = int(float(self.hist_bins_var.get()))
+        except (ValueError, tk.TclError):
+            bins = 16
+        return {"bins": bins, "channels": self._hist_channel_names(),
+                "ranges": parse_hist_ranges(self.hist_ranges_var.get())}
+
+    def _measure_hist_ranges(self):
+        """Fill the "*" range from the item on screen: the min/max over its
+        primed base / filtered rasters (the only channels held per item)."""
+        import numpy as np
+        cur = self._current()
+        key = self.catalogue.key_of(*cur) if cur is not None else None
+        p = self.engine.primed.get(key) if key else None
+        if p is None:
+            self.status_var.set("histogram ranges: prime the item on screen first")
+            return
+        lo, hi = np.inf, -np.inf
+        for name in self._hist_channel_names() or ["base"]:
+            raster = getattr(p, name, None) if name in ("base", "filtered") else None
+            if raster is None:
+                continue
+            r = np.asarray(raster, np.float64)
+            r = r[np.isfinite(r)]
+            if r.size:
+                lo, hi = min(lo, float(r.min())), max(hi, float(r.max()))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            self.status_var.set("histogram ranges: only base / filtered can be measured here")
+            return
+        self.hist_ranges_var.set(f"*: {lo:.6g}, {hi:.6g}")
+        self._on_stat_spec_change()
+
+    def _stat_channel_names(self):
+        try:
+            return [c["name"] for c in config_io.stat_channels(
+                json.dumps(self._profile_for_compute()))]
+        except Exception:
+            return ["base"]
+
+    def _refresh_stat_summary(self):
+        """The resolved channel and field counts: what decides how wide every
+        per-region row is, and therefore what the classifier sees."""
+        var = getattr(self, "stat_summary_var", None)
+        if var is None:
+            return
+        try:
+            params = json.dumps(self._profile_for_compute())
+            n_ch = len(config_io.stat_channels(params))
+            n_fields = len(config_io.query_fields(params))
+        except Exception:
+            n_ch, n_fields = 0, 0
+        var.set(f"{n_ch} channels -> {n_fields} selectable fields")
+
+    def _on_stat_spec_change(self):
+        """The measurement spec changed: anything primed under the old spec
+        measures the wrong things. Nothing is dropped -- the records stay on
+        screen -- but the next Run is what makes the new spec real."""
+        self._refresh_stat_summary()
+        if self.engine.primed:
+            self.status_var.set("Statistics changed - Run again to measure the new channels.")
+
     def _build_run_section(self):
         parent = self._left_section_parent("run")
         # `run_frame` is part of the shell's contract, not decoration: the
         # workflow hint packs itself above this section's first child.
-        self.run_frame = frame = ttk.LabelFrame(parent, text="5. Run")
+        self.run_frame = frame = ttk.LabelFrame(parent, text="6. Run")
         frame.pack(fill="x", padx=4, pady=4)
         ttk.Label(frame, text="Primes the overview of every listed slide.",
                   foreground="#666").pack(anchor="w", padx=6, pady=(2, 0))
@@ -821,9 +1047,9 @@ class MsPathApp(ViewerShell):
                     "persistence_percent": float(self.persist_var.get()),
                     "accurate": bool(self.accurate_var.get()),
                     "simplification": self.simplification_var.get()},
-            "statistics": {"channels": ["base"],
-                           "reductions": ["mean", "min", "max", "std"],
-                           "extremum": True},
+            "statistics": config_io.statistics_to_json(
+                self._stat_channel_cards(), self._stat_reductions(),
+                bool(self.stat_extremum_var.get()), 0, False, self._stat_histogram()),
             "slide": {"overview_level": self._overview_level(), "halo": self._halo()},
         }
 
@@ -839,6 +1065,11 @@ class MsPathApp(ViewerShell):
         sl = profile.get("slide") or {}
         setvar(self.level_var, int(sl.get("overview_level", DEFAULT_OVERVIEW_LEVEL)))
         setvar(self.halo_var, int(sl.get("halo", DEFAULT_HALO)))
+        stats = config_io.statistics_from_json(profile.get("statistics"), notes)
+        self._apply_stat_state({"stat_channels": stats["channels"],
+                                "stat_reductions": stats["reductions"],
+                                "stat_extremum": stats["extremum"],
+                                "stat_histogram": stats.get("histogram")}, setvar)
         self.filter_cards = [dict(c) for c in (profile.get("filters") or [])]
         self.filter_cards.append(self._new_filter_card())
         self.base_cards = [dict(c) for c in (profile.get("base_filters") or [])]
