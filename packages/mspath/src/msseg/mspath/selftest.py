@@ -316,6 +316,23 @@ def run_selftest():
     assert app._current() == (0, 1), "the primed event moved the view back to the overview"
     assert app.engine.record(roi.key) is not None, "the ROI's regions were never computed"
 
+    # -- double-click brings the item into view ---------------------------- #
+    app.viewer.canvas.winfo_width = lambda: 400
+    app.viewer.canvas.winfo_height = lambda: 300
+    app.viewer.set_view(0.0, 0.0, scale=1.0)               # far from the ROI
+    app.subseq_list.selection_set("q0:1")
+    app._on_seq_tree_double()
+    v = app.viewer
+    rx, ry, rw, rh = roi.rect
+    assert app._current() == (0, 1)
+    assert v.view_x <= rx and v.view_y <= ry, "the ROI's origin must be on screen"
+    assert v.view_x + 400 * v.scale >= rx + rw and v.view_y + 300 * v.scale >= ry + rh, \
+        "the ROI's far corner must be on screen"
+    assert v.scale >= max(rw / 400.0, rh / 300.0), "zoomed to fit, not closer"
+    app.subseq_list.selection_set("q0:0")
+    app._on_seq_tree_double()                                # the overview: the slide fits
+    assert v.view_x <= 0 and v.view_y <= 0 and v.scale >= max(sw / 400.0, sh0 / 300.0)
+
     app._remove_roi_at(0, 2)
     assert len(app._rois_of(0)) == 1
 
@@ -339,7 +356,8 @@ def run_selftest():
     print("selftest OK: pyramid preview, slide->sequence, overview item + key round-trip, "
           "prime + record, slide-coordinate positions, label layer, render + hover, "
           "persistence entry, channel dropdown (slide/base/filtered), ROI tier, "
-          "primed event keeps the current item, profile + session round-trip")
+          "primed event keeps the current item, double-click views the item, "
+          "profile + session round-trip")
     return 0
 
 
@@ -463,6 +481,14 @@ def run_labeler_selftest():
     ids_by_area = np.argsort(-np.asarray(stats.column("area")))[:3]
     app.active_class_var.set(1)
     app._commit_interaction("taps", [(float(ex[i]), float(ey[i])) for i in ids_by_area])
+    # An "-> edges" kind first: its pair model groups edges by the catalogue's
+    # group, which here is the slide NAME. int("WSI/a.tiff") took the first
+    # real Train down.
+    app.model_kind_var.set("custom FC -> edges")
+    app._train_classifier()
+    assert app._clf is not None, f"edges kind failed to train: {app.status_var.get()!r}"
+    assert app._edge_model is not None, "no edge model came out of an -> edges kind"
+    app.model_kind_var.set("dense FC")
     app._train_classifier()          # returns None on success; the model is the result
     if app._clf is None:
         print(f"[mspath] (classifier unavailable: {app.status_var.get()!r} "

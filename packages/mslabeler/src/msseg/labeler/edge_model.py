@@ -238,7 +238,22 @@ def gather_edges(slices: Sequence[Tuple[np.ndarray, Optional[Dict[str, Any]],
     A, B, S, K = [], [], [], []
     base = 0
     cls_all = []
+    # A group is whatever the catalogue's group_of returns -- an int for a
+    # coupon slice, a slide NAME for a whole-slide item (so every ROI on a
+    # slide is held out together). Leave-groups-out only needs groups to be
+    # distinct. Ints pass through as they are (the "slice" column has always
+    # carried them verbatim); anything else is numbered in first-seen order
+    # rather than cast, which int("WSI/a.tiff") cannot do.
+    slices = list(slices)
+    raw_groups = [k for _f, _a, _c, k in slices]
+    if all(isinstance(k, (int, np.integer)) for k in raw_groups):
+        group_of = {k: int(k) for k in raw_groups}
+    else:
+        group_of = {}
+        for k in raw_groups:
+            group_of.setdefault(k, len(group_of))
     for fids, arcs, cls, k in slices:
+        k = group_of[k]
         fids = np.asarray(fids, np.intp)
         cls = np.asarray(cls, int)
         cls_all.append(cls)

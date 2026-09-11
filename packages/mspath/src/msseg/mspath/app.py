@@ -452,11 +452,48 @@ class MsPathApp(ViewerShell):
         sb.pack(side="right", fill="y")
         self.subseq_list.pack(side="left", fill="both", expand=True)
         self.subseq_list.bind("<<TreeviewSelect>>", self._on_seq_tree_select)
+        self.subseq_list.bind("<Double-1>", self._on_seq_tree_double)
         row = ttk.Frame(g); row.pack(side="bottom", fill="x", padx=4, pady=2)
         ttk.Button(row, text="Add slides…", command=self._add_slides).pack(
             side="left", fill="x", expand=True)
         ttk.Button(row, text="Remove", command=self._remove_subsequence).pack(
             side="left", padx=(4, 0))
+
+    def _on_seq_tree_double(self, _event=None):
+        """Double-click on a row: go there AND bring it into view. A single
+        click selects the item; the canvas keeps looking wherever it was,
+        which on a 90 000-pixel slide can be nowhere near a 2000-pixel ROI."""
+        sel = self.subseq_list.selection()
+        if not sel or ":" not in sel[0]:
+            return
+        left, li = sel[0].split(":")
+        try:
+            si, li = int(left[1:]), int(li)
+        except ValueError:
+            return
+        if (si, li) in self.flat_slices:
+            idx = self.flat_slices.index((si, li))
+            if idx != int(round(float(self.slice_var.get()))):
+                self._goto_slice(idx)
+        self._view_item(si, li)
+        return "break"
+
+    def _view_item(self, si, li):
+        """Fit the item on the canvas: the whole slide for an overview, the
+        rect for an ROI (with a little margin, so its edge is visible)."""
+        v = self.viewer
+        item = self._item_at(si, li)
+        if v is None or item is None:
+            return
+        if item.rect is None:
+            v.fit()
+            return
+        x, y, w, h = item.rect
+        cw = max(v.canvas.winfo_width(), 1)
+        ch = max(v.canvas.winfo_height(), 1)
+        margin = 1.1
+        scale = max(w * margin / cw, h * margin / ch, 1e-6)
+        v.set_view(x + (w - cw * scale) / 2.0, y + (h - ch * scale) / 2.0, scale=scale)
 
     def _sequence_row_text(self, s):
         files = s.get("files") or []

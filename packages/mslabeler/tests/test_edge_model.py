@@ -249,3 +249,21 @@ def test_evaluate_edges_report_and_stop():
     e1 = em.gather_edges([(f, a, np.where(k >= 3, np.where(c > 0, 1, 0), c), k) for f, a, c, k in per_slice])
     rep3 = em.evaluate_edges(make, X, cls1, grp, e1, ext, em.EdgeSpec(), seed=0)
     assert isinstance(rep3["skipped"], list) and "edge" in rep3
+
+
+
+def test_gather_edges_takes_any_hashable_group():
+    """A whole-slide catalogue groups by slide NAME so every ROI on a slide is
+    held out together; int("WSI/a.tiff") raised on the first Train."""
+    import numpy as np
+    from msseg.labeler import edge_model
+    fids = np.array([0, 1, 2])
+    arcs = {"a": [0, 1], "b": [1, 2], "saddle": [0.5, 0.25]}
+    cls = np.array([1, 2, 0])
+    out = edge_model.gather_edges([(fids, arcs, cls, "WSI/a.tiff"),
+                                   (fids, arcs, cls, "WSI/b.tiff"),
+                                   (fids, arcs, cls, "WSI/a.tiff")])
+    k = out["slice"]
+    assert len(k) == 6
+    assert k[0] == k[4] and k[0] != k[2], "same name, same group; different name, different group"
+    assert k.dtype.kind == "i"
