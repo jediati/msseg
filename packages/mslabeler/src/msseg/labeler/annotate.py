@@ -256,12 +256,23 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         # buttons are packed at the bottom AHEAD of the list in pack order,
         # so a pane dragged short clips list rows rather than the buttons.
         self.session_frame.pack_configure(fill="both", expand=True)
-        for lb in (self.folder_list, self.file_list):
-            lb.master.pack_configure(fill="both", expand=True)
-        self.subseq_list.master.pack_configure(fill="both", expand=True)
-        self.folder_btn_row.pack_configure(side="bottom", before=self.folder_list.master)
-        self.make_seq_btn.pack_configure(side="bottom", before=self.file_list.master)
-        self.seq_btn_row.pack_configure(side="bottom", before=self.subseq_list.master)
+        # Only what the session section actually packed: pack_configure on a
+        # widget that was never packed would PACK it, and an app whose session
+        # browser is a single list of files (mspath) keeps the shell's folder
+        # and file lists as unshown bookkeeping widgets.
+        def packed(w):
+            try:
+                return w.winfo_manager() == "pack"
+            except tk.TclError:
+                return False
+        for lb in (self.folder_list, self.file_list, self.subseq_list):
+            if packed(lb.master):
+                lb.master.pack_configure(fill="both", expand=True)
+        for btn, above in ((self.folder_btn_row, self.folder_list.master),
+                           (self.make_seq_btn, self.file_list.master),
+                           (self.seq_btn_row, self.subseq_list.master)):
+            if packed(btn) and packed(above):
+                btn.pack_configure(side="bottom", before=above)
         self._build_workflow_hint()
 
     def _processing_parent(self, section):

@@ -120,6 +120,7 @@ class SlideEngine:
         self._order = []                 # LRU of live keys, oldest first
         self._worker = None
         self._busy = False
+        self.running_keys = ()           # the keys the worker is priming right now
 
     # ------------------------------------------------------------------ #
     # slides
@@ -394,6 +395,7 @@ class SlideEngine:
                 break
             if ev[0] in ("done", "error"):
                 self._busy = False
+                self.running_keys = ()
                 if ev[0] == "error":
                     out.append(ev)
                     continue
@@ -417,6 +419,7 @@ class SlideEngine:
         if reset_pins:
             self.level_range = {}
             self.persistence_abs = {}
+        self.running_keys = tuple(it.key for it in items)
         self._worker = threading.Thread(target=self._run_worker, name="mspath-prime",
                                         args=(list(items), dict(profile), int(halo)),
                                         daemon=True)

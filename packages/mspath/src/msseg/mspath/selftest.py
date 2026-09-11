@@ -79,21 +79,26 @@ def run_selftest():
     root.withdraw()
     app = MsPathApp(root, autosave=False)
 
-    # -- the session browser -------------------------------------------- #
-    app._add_folder_path(folder)
-    assert app.folders, "the folder was not added"
-    assert slide in app.all_files, f"{os.path.basename(slide)} was not listed"
+    # -- the session browser: a list of slides ---------------------------- #
+    # A slide is added as a FILE; its folder is registered underneath so the
+    # shell's session document keeps working, but no folder or file list is
+    # shown (the shell's ones exist, unpacked, because the shell writes to them).
+    assert app._add_slide_path(slide), "the slide was not added"
+    assert not app._add_slide_path(slide), "adding a slide twice must be a no-op"
+    assert len(app.subsequences) == 1 and app.folders, app.subsequences
+    # the scrolled listboxes pack inside their own holders, which live in one
+    # container that is never packed -- that container is the thing to check
+    assert app._session_hidden.winfo_manager() == "", "the folder/file lists must stay unpacked"
+    for hidden in (app.folder_list, app.file_list):
+        assert hidden.winfo_toplevel() is app.subseq_list.winfo_toplevel()
+        assert app._session_hidden in (hidden.master, hidden.master.master)
+    assert app.subseq_list.winfo_manager() == "pack"
+    assert app._sequence_row_text(app.subsequences[0]) == os.path.basename(slide)
     # a preview needs no Run: the pyramid IS the preview
     app._preview_file(slide)
     assert app.viewer.has_base, "the preview did not reach the canvas"
     src = app.viewer.source
     assert src.levels >= 2 and src.channels == 3, f"unexpected source {src}"
-
-    # -- a slide becomes a sequence -------------------------------------- #
-    app.file_list.selection_clear(0, "end")
-    app.file_list.selection_set(app.all_files.index(slide))
-    app._make_subsequence()
-    assert len(app.subsequences) == 1, app.subsequences
 
     # keep the selftest quick whatever slide it got: a level of a few Mpx
     deepest = max(0, src.levels - 3)
@@ -156,8 +161,10 @@ def run_selftest():
     before = app.engine.commit_id
     n_before = rec["stats"].n_rows
     abs_before = app.engine.persistence_abs[deepest]
-    app.persist_var.set(min(40.0, float(app.persist_var.get()) + 20.0))
+    # the entry is the control (Enter / focus-out), as in the coupon viewer
+    app.persist_live_var.set(f"{min(40.0, float(app.persist_var.get()) + 20.0):g}")
     app._on_persistence_change()
+    assert float(app.persist_var.get()) == 30.0
     assert app.engine.commit_id > before, "a threshold change must bump the commit"
     rec2 = app.engine.record(item.key)
     assert rec2 is not None and rec2 is not rec, "the record was not recomputed"
@@ -168,7 +175,10 @@ def run_selftest():
     assert rec2["stats"].n_rows < n_before, "a 3x threshold must merge regions away"
     # the REFERENCE range is what stays pinned per level
     assert set(app.engine.level_range) == {deepest}, app.engine.level_range
-    app.persist_var.set(10.0); app._on_persistence_change()
+    app.persist_live_var.set("10"); app._on_persistence_change()
+    assert app.persist_label.get().startswith("= "), app.persist_label.get()
+    app.persist_live_var.set("not a number"); app._on_persistence_change()
+    assert float(app.persist_var.get()) == 10.0, "garbage in the entry must change nothing"
     assert app.engine.record(item.key)["stats"].n_rows == n_before, "and back again"
 
     # -- the Image dropdown shows the primed channels, placed on the slide -- #
@@ -198,6 +208,17 @@ def run_selftest():
     app.level_var.set(0); app.halo_var.set(0)
     app._apply_profile_to_ui(p, lambda v, x: v.set(x), [])
     assert app.level_var.get() == deepest and app.halo_var.get() == p["slide"]["halo"]
+
+    # -- layout: ROI section in the left pane, Run at the shell's slot ------ #
+    assert app.roi_hint_parent.winfo_toplevel() is app.left.winfo_toplevel()
+    assert app.roi_hint_parent.master is app._left_section_parent("roi")
+    assert app.run_frame.master is app._left_section_parent("run")
+    assert not hasattr(app, "regions_check"), "no extra regions toggle in the viewer"
+
+    # -- the busy badge follows the engine --------------------------------- #
+    app.viewer.set_hud("busy", "Training")          # what the labeler's badge does
+    app._update_busy()
+    assert app.viewer.hud[0] is None, "an idle engine must take the badge down"
 
     # -- the ROI tier ------------------------------------------------------ #
     # A slide's items are its overview and whatever has been cut from it.
@@ -291,6 +312,13 @@ def run_selftest():
 
     doc = app._session_doc()
     assert doc["sequences"][0]["rois"], "ROI geometry did not reach the session document"
+
+    # a folder on the command line means every slide in it, as one-file sequences
+    app3 = MsPathApp(tk.Toplevel(root), autosave=False, initial=folder)
+    assert len(app3.subsequences) >= 1
+    assert all(len(sq["files"]) == 1 for sq in app3.subsequences)
+    assert any(os.path.normpath(sq["files"][0]) == os.path.normpath(slide)
+               for sq in app3.subsequences), "the folder's slides were not added"
     app2 = MsPathApp(tk.Toplevel(root), autosave=False)
     app2._apply_session_doc(doc, source="selftest")
     assert len(app2.subsequences) == 1, app2.subsequences
@@ -301,7 +329,7 @@ def run_selftest():
     root.destroy()
     print("selftest OK: pyramid preview, slide->sequence, overview item + key round-trip, "
           "prime + record, slide-coordinate positions, label layer, render + hover, "
-          "live persistence slider, channel dropdown (slide/base/filtered), ROI tier, "
+          "persistence entry, channel dropdown (slide/base/filtered), ROI tier, "
           "primed event keeps the current item, profile + session round-trip")
     return 0
 
@@ -347,10 +375,7 @@ def run_labeler_selftest():
     root.withdraw()
     app = LabelerApp(root, autosave=False)
 
-    app._add_folder_path(folder)
-    app.file_list.selection_clear(0, "end")
-    app.file_list.selection_set(app.all_files.index(slide))
-    app._make_subsequence()
+    assert app._add_slide_path(slide)
     src = app.engine.source(app._item_at(0, 0).slide)
     deepest = max(0, src.levels - 3)
     app.level_var.set(deepest)

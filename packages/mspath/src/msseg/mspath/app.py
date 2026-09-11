@@ -39,13 +39,12 @@ except Exception:                                   # headless import
     tk = ttk = messagebox = None
 
 from msseg.labeler.shell import ViewerShell
-from msseg.labeler.widgets import jump_scale
 from msseg.mscoupon import session as coupon_session
 from msseg.mscoupon.config_io import (FILTER_OPERATIONS, FILTER_SCHEMA, COLOR_METHODS,
                                       filter_param_schema, filters_to_json)
 
 from .adapters import SlideCatalogue, SlideRegionProvider
-from .common import list_slides, log
+from .common import SLIDE_EXTENSIONS, list_slides, log
 from .engine import SlideEngine
 from .sources import PlacedImageSource, RoiLabelLayer
 from .items import overview, parse_key, roi as roi_item, slide_id
@@ -162,6 +161,7 @@ class MsPathApp(ViewerShell):
 
     def _init_variables(self):
         self.persist_var = tk.DoubleVar(value=10.0)
+        self.persist_live_var = tk.StringVar(value="10")
         self.manifold_var = tk.StringVar(value="ascending")
         self.simplification_var = tk.StringVar(value=coupon_session.DEFAULT_SIMPLIFICATION)
         self.accurate_var = tk.BooleanVar(value=False)
@@ -405,6 +405,100 @@ class MsPathApp(ViewerShell):
     def _list_files(self, folder):
         return list_slides(folder)
 
+    # ------------------------------------------------------------------ #
+    # Session browser: loaded slides, not folders and sequences
+    # ------------------------------------------------------------------ #
+    # The shell's session is folders -> files -> sequences, which is what a
+    # coupon stack is. A slide session is a list of files. The shell's data
+    # model is kept underneath -- every slide is a one-file sequence in a
+    # registered folder, so the session document, Load/Restore, the tree's
+    # in-place update and navigation all work unchanged -- and only the
+    # browser is replaced: one tree of slides with their items, and an
+    # "Add slides…" that takes files. The folder and file lists still exist,
+    # because the shell writes to them, but they are never packed.
+    def _build_session_section(self):
+        c = ttk.LabelFrame(self._left_section_parent("session"), text="1. Slides")
+        c.pack(fill="x", padx=6, pady=4)
+        self.session_frame = c
+        hidden = self._session_hidden = ttk.Frame(c)     # never packed
+        self.folder_list = self._scrolled_listbox(hidden, height=1, exportselection=False)
+        self.file_list = self._scrolled_listbox(hidden, selectmode="extended", height=1,
+                                                exportselection=False)
+        self.folder_btn_row = ttk.Frame(hidden)
+        self.make_seq_btn = ttk.Button(hidden, text="")
+        self.seq_btn_row = ttk.Frame(hidden)
+
+        g = self._session_group("slides", c)
+        holder = ttk.Frame(g); holder.pack(fill="both", expand=True, padx=4, pady=(2, 0))
+        self.subseq_list = ttk.Treeview(holder, columns=("msc", "annot"), height=8,
+                                        selectmode="browse")
+        self.subseq_list.heading("#0", text="slide / item")
+        self.subseq_list.heading("msc", text="msc")
+        self.subseq_list.heading("annot", text="annot")
+        self.subseq_list.column("#0", width=190, stretch=True)
+        self.subseq_list.column("msc", width=38, anchor="center", stretch=False)
+        self.subseq_list.column("annot", width=44, anchor="center", stretch=False)
+        sb = ttk.Scrollbar(holder, orient="vertical", command=self.subseq_list.yview)
+        self.subseq_list.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.subseq_list.pack(side="left", fill="both", expand=True)
+        self.subseq_list.bind("<<TreeviewSelect>>", self._on_seq_tree_select)
+        row = ttk.Frame(g); row.pack(side="bottom", fill="x", padx=4, pady=2)
+        ttk.Button(row, text="Add slides…", command=self._add_slides).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(row, text="Remove", command=self._remove_subsequence).pack(
+            side="left", padx=(4, 0))
+
+    def _sequence_row_text(self, s):
+        files = s.get("files") or []
+        return os.path.basename(files[0]) if files else str(s.get("name") or "slide")
+
+    def _bind_preview(self):
+        pass                                        # no file list to click
+
+    def _add_slides(self):
+        from tkinter import filedialog
+        paths = filedialog.askopenfilenames(
+            title="Add slides to the session",
+            filetypes=[("Slides", " ".join("*" + e for e in SLIDE_EXTENSIONS)),
+                       ("All files", "*.*")])
+        added = [p for p in paths if self._add_slide_path(p)]
+        if added:
+            self.status_var.set(f"Added {len(added)} slide(s).")
+
+    def _ensure_folder(self, folder):
+        """Register a folder with the shell without adding its slides."""
+        norm = os.path.normpath(folder)
+        for i, f in enumerate(self.folders):
+            if os.path.normpath(f["path"]) == norm:
+                return f["name"]
+        ViewerShell._add_folder_path(self, folder)
+        return self.folders[-1]["name"]
+
+    def _add_slide_path(self, path):
+        """One slide becomes one sequence. Returns True when it was new."""
+        path = os.path.normpath(str(path))
+        if not os.path.isfile(path):
+            self.status_var.set(f"Not a file: {path}")
+            return False
+        for s in self.subsequences:
+            if any(os.path.normpath(f) == path for f in (s.get("files") or [])):
+                return False
+        folder = self._ensure_folder(os.path.dirname(path))
+        self.subsequences.append({"name": os.path.basename(path), "folder": folder,
+                                  "files": [path], "rois": []})
+        self._rebuild_flat_slices_keeping_current()
+        self._refresh_subseq_list()
+        self._update_roi_hint()
+        return True
+
+    def _add_folder_path(self, path):
+        """A folder on the command line means "every slide in it"."""
+        idx = super()._add_folder_path(path)
+        for f in list_slides(path):
+            self._add_slide_path(f)
+        return idx
+
     def _build_processing_sections(self):
         parent = self._processing_parent("filters")
 
@@ -421,9 +515,6 @@ class MsPathApp(ViewerShell):
         ttk.Label(slide, textvariable=self.level_hint, foreground="#666").pack(
             anchor="w", padx=6)
 
-        self._build_roi_section()
-
-        parent = self._processing_parent("filters")
         topo = ttk.LabelFrame(parent, text="2. Topology field (the MSC runs on this)")
         topo.pack(fill="x", padx=4, pady=4)
         self.filters_frame = ttk.Frame(topo); self.filters_frame.pack(fill="x")
@@ -453,7 +544,7 @@ class MsPathApp(ViewerShell):
                         variable=self.accurate_var).pack(anchor="w", padx=6)
 
     def _build_run_section(self):
-        parent = self._processing_parent("run")
+        parent = self._left_section_parent("run")
         # `run_frame` is part of the shell's contract, not decoration: the
         # workflow hint packs itself above this section's first child.
         self.run_frame = frame = ttk.LabelFrame(parent, text="5. Run")
@@ -463,9 +554,13 @@ class MsPathApp(ViewerShell):
         self.run_btn = ttk.Button(frame, text="Run", command=self._run)
         self.run_btn.pack(fill="x", padx=6, pady=4)
 
+    def _build_left(self):
+        super()._build_left()
+        self._build_roi_section()
+
     def _build_roi_section(self):
-        parent = self._processing_parent("roi")
-        frame = ttk.LabelFrame(parent, text="1b. Regions of interest")
+        parent = self._left_section_parent("roi")
+        frame = ttk.LabelFrame(parent, text="2. Regions of interest")
         frame.pack(fill="x", padx=4, pady=4)
         ttk.Label(frame, text="Full-resolution work happens in ROIs: the whole slide "
                               "cannot be\nsegmented at level 0 at all.",
@@ -593,17 +688,19 @@ class MsPathApp(ViewerShell):
                  f"{primed} item(s) computed")
 
     def _build_live_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Live")
-        frame.pack(side="bottom", fill="x")
-        row = ttk.Frame(frame); row.pack(fill="x", padx=4, pady=2)
-        ttk.Label(row, text="persistence %:").pack(side="left")
-        self.persist_label = tk.StringVar(value="10.0%")
-        ttk.Label(row, textvariable=self.persist_label, width=22).pack(side="right")
-        jump_scale(frame, from_=0.0, to=50.0, orient="horizontal",
-                   variable=self.persist_var, command=self._on_persistence_change
-                   ).pack(fill="x", padx=6)
-        ttk.Checkbutton(frame, text="show regions", variable=self.regions_var,
-                        command=self._refresh_render).pack(anchor="w", padx=6)
+        live = ttk.LabelFrame(parent, text="Live parameters")
+        live.pack(side="bottom", fill="x", padx=6, pady=4)
+        # Persistence is a numeric entry committed on Enter / focus-out, as in
+        # the coupon viewer: a select is cheap, but re-resolving on every
+        # slider tick bumps the commit and drops every cache keyed on it.
+        row = ttk.Frame(live); row.pack(fill="x", padx=4, pady=2)
+        ttk.Label(row, text="Persistence %:").pack(side="left")
+        self.persist_entry = ttk.Entry(row, textvariable=self.persist_live_var, width=8)
+        self.persist_entry.pack(side="left", padx=4)
+        self.persist_entry.bind("<Return>", self._on_persistence_change)
+        self.persist_entry.bind("<FocusOut>", self._on_persistence_change)
+        self.persist_label = tk.StringVar(value="")
+        ttk.Label(row, textvariable=self.persist_label).pack(side="left", padx=4)
 
     def _build_segmentation_controls(self, chan):
         ttk.Label(chan, textvariable=getattr(self, "level_hint", tk.StringVar()),
@@ -683,6 +780,7 @@ class MsPathApp(ViewerShell):
         msc = profile.get("msc") or {}
         setvar(self.manifold_var, msc.get("manifold", "ascending"))
         setvar(self.persist_var, float(msc.get("persistence_percent", 10.0) or 10.0))
+        setvar(self.persist_live_var, f"{float(self.persist_var.get()):g}")
         setvar(self.accurate_var, bool(msc.get("accurate")
                                        or msc.get("accurate_ascending")))
         setvar(self.simplification_var,
@@ -858,6 +956,7 @@ class MsPathApp(ViewerShell):
         if self.engine.start_run([item], self._profile_for_compute(),
                                  halo=self._halo(), reset_pins=False):
             self._ensure_pump()
+            self._update_busy()
 
     def _handle_compute_event(self, ev):
         kind = ev[0]
@@ -880,6 +979,7 @@ class MsPathApp(ViewerShell):
         elif kind == "item_done":
             self._refresh_subseq_list()
             self._update_roi_hint()
+            self._update_busy()
 
     def _reset_compute(self):
         self.engine.reset()
@@ -889,12 +989,34 @@ class MsPathApp(ViewerShell):
             self.run_btn.config(state="disabled" if self._run_active else "normal")
 
     def _update_busy(self):
-        pass
+        """The canvas badge: 'Priming' while the item on screen is being
+        primed on the worker, else nothing. The labeler's own badges (Training,
+        Classifying) call back here when they finish, so this is also what
+        takes them down -- with no implementation they stayed up forever."""
+        if self.viewer is None:
+            return
+        cur = self._current()
+        key = self.catalogue.key_of(*cur) if cur is not None else None
+        if key is not None and self.engine.pending_work() and key in self.engine.running_keys:
+            self.viewer.set_hud("busy", "Priming")
+        elif self.engine.pending_work() and self._run_active:
+            self.viewer.set_hud("busy", "Priming")
+        else:
+            self.viewer.set_hud(None)
 
     def _on_persistence_change(self, _event=None):
         """A new threshold is a new parameter generation: records fall stale by
         commit and the visible one is recomputed. Cheap -- the pipelines are
         alive, so this is a select, not a prime."""
+        try:
+            pct = float(self.persist_live_var.get())
+        except (ValueError, tk.TclError):
+            self.status_var.set("Persistence must be a number (percent of the field's range).")
+            return
+        pct = max(0.0, min(100.0, pct))
+        if abs(pct - float(self.persist_var.get())) < 1e-9 and self.engine.slices:
+            return                                  # nothing changed: no commit bump
+        self.persist_var.set(pct)
         self.engine.commit_selection()
         cur = self._current()
         if cur is not None:
@@ -902,11 +1024,11 @@ class MsPathApp(ViewerShell):
         self._refresh_render()
 
     def _update_persist_label(self):
-        pct = float(self.persist_var.get())
-        pins = self.engine.persistence_abs
-        level = self._overview_level()
-        pin = pins.get(level)
-        self.persist_label.set(f"{pct:.1f}%" + (f" = {pin:.4g}" if pin is not None else ""))
+        """The absolute the percentage resolves to for the item on screen."""
+        cur = self._current()
+        item = self._item_at(*cur) if cur is not None else None
+        pin = self.engine.persistence_abs.get(item.level) if item is not None else None
+        self.persist_label.set(f"= {pin:.4g}" if pin is not None else "")
 
     # ------------------------------------------------------------------ #
     # Render
@@ -954,6 +1076,7 @@ class MsPathApp(ViewerShell):
 
     def _refresh_render(self):
         self._update_persist_label()
+        self._update_busy()
         if self.viewer is None:
             return
         cur = self._current()
