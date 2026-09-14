@@ -381,6 +381,8 @@ struct Msc2DPipeline::Impl {
   // every select_persistence() (and by build()).
   std::vector<Msc2DRegionArc> arcs;
   bool arcs_valid = false;
+  // Wall time per phase of the last build(), "total" last.
+  std::vector<Msc2DPhaseTime> build_timings;
 };
 
 namespace {
@@ -619,6 +621,21 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
   impl_->height = height;
   impl_->ascending = ascending;
 
+  // Phase timing, recorded on the pipeline as well as printed (MSSEG_TIME_MSC=0
+  // silences the print). "msc" is the whole of msc.compute() -- gradient,
+  // extrema, forest -- of which MSCEER's own TIMING lines show only the forest.
+  const bool time_phases = time_phases_wanted();
+  impl_->build_timings.clear();
+  const auto t_build = std::chrono::steady_clock::now();
+  auto mark = t_build;
+  auto lap = [&](const char* what) {
+    const auto now = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(now - mark).count();
+    impl_->build_timings.push_back({what, ms});
+    if (time_phases) std::fprintf(stderr, "  [msc2d] build %-11s %8.1f ms\n", what, ms);
+    mark = now;
+  };
+
   // Value range of the filtered field (for percent->absolute persistence).
   float min_v = std::numeric_limits<float>::max();
   float max_v = std::numeric_limits<float>::lowest();
@@ -627,17 +644,20 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
     max_v = std::max(max_v, filtered.data()[i]);
   }
   impl_->value_range = max_v - min_v;
+  lap("value_range");
 
   // Heavy: compute the MSC hierarchy once and keep the engine (impl_->msc) alive
   // for cheap native re-thresholding. compute_with_algorithm caps the cancellation
   // hierarchy at the configured max persistence so setPersistence() spans the range.
   compute_with_algorithm(impl_->msc, filtered.data(), height, width, cfg);
+  lap("msc");
 
   // Base (finest) manifold labeling: at persistence -1 the native base->living
   // remap is the identity, so each labeled pixel carries its BASE extremum node id.
   impl_->msc.setPersistence(-1.0f);
   const GInt::Msc2D::LabelImage base_img =
       ascending ? impl_->msc.ascending2Manifolds() : impl_->msc.descending2Manifolds();
+  lap("base_labels");
 
   // Compact the sparse base extremum node ids to a dense 0..M-1 id space, and
   // stamp the compact base id per pixel.
@@ -658,6 +678,7 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
     impl_->base_labels[i] = compact;
   }
   const std::size_t num_base = impl_->nid_to_compact.size();
+  lap("compact");
 
   // Bridge MSCEER's compact base ids to ours while persistence is still -1:
   // baseToLiving() here maps each base region to its own (uncancelled) extremum
@@ -673,6 +694,7 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
       if (it != impl_->nid_to_compact.end()) impl_->bridge[c] = it->second;
     }
   }
+  lap("bridge");
 
   // Per-base-manifold leaf statistics (one pass over pixels, both images),
   // indexed by compact base id. These are aggregated up to living features on
@@ -712,6 +734,7 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
                     percentile_linear(finite_base, spec.relevance_high_percentile));
     }
   }
+  lap("relevance");
 
   std::vector<Msc2DFeatureStat>& leaf = impl_->leaf_stats;
   auto init_leaves = [&](std::size_t n_ch_init) {
@@ -750,6 +773,7 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
     impl_->channels = resolve_stat_channels(spec);
     init_leaves(impl_->channels.size());
     gpu_done = try_gpu_accumulate(*impl_, base, filtered, spec, ext_radius);
+    lap(gpu_done ? "gpu_stats" : "gpu_tried");
     if (!gpu_done && cfg.use_gpu_stats.value_or(false)) {
       std::fprintf(stderr,
                    "msc2d: msc.use_gpu_stats requested but the GPU accumulation "
@@ -773,6 +797,7 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
     impl_->channels = bank.channels;
     const std::vector<const float*>& chan = bank.data;
     init_leaves(bank.size());
+    lap("stat_bank");
 
     // Pixel attaining the seeding extremum per base manifold. Only the side the
     // manifold direction actually seeds from is tracked -- the other was always
@@ -801,6 +826,7 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
       s.max_x = std::max(s.max_x, x);
       s.max_y = std::max(s.max_y, y);
     }
+    lap("accumulate");
 
     // Seeding extremum per base manifold. A base ascending 2-manifold is the basin
     // of exactly one minimum, and every other vertex in the basin flows down to it,
@@ -826,6 +852,7 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
         impl_->leaf_channels.sample_ext(c, x, y, width, height, ext_radius, chan);
       }
     }
+    lap("extremum");
   }
 
   // A base manifold with no pixels would otherwise carry +/-FLT_MAX sentinels
@@ -842,11 +869,23 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
     persistence = impl_->value_range * (*cfg.persistence_percent / 100.0f);
   }
   select_persistence(persistence);
+  lap("select");
 
   // Priming a long sequence must not accumulate one GPU label context per
   // slice; the active slice lazily re-uploads on its first interactive select.
   release_gpu();
+  lap("release_gpu");
   impl_->arcs_valid = false;
+  {
+    const double total =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_build).count();
+    impl_->build_timings.push_back({"total", total});
+    if (time_phases) std::fprintf(stderr, "  [msc2d] build %-11s %8.1f ms\n", "total", total);
+  }
+}
+
+const std::vector<Msc2DPhaseTime>& Msc2DPipeline::build_timings() const {
+  return impl_->build_timings;
 }
 
 void Msc2DPipeline::release_gpu() {

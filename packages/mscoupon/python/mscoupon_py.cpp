@@ -336,6 +336,14 @@ py::tuple pipeline_region_arcs(msseg::Msc2DPipeline& pipe) {
 // scale-space stack is ~50 fields, so that is hundreds of thousands of Python
 // objects per slider commit; as a block it is one buffer copy. The Python side
 // (assembly.py) is already structure-of-arrays, so this removes a conversion.
+// Phase -> wall ms of the prime, in the order the phases ran, "total" last
+// (a dict keeps insertion order, so the caller can print it as a timeline).
+py::dict pipeline_build_timings(const msseg::Msc2DPipeline& pipe) {
+  py::dict out;
+  for (const auto& t : pipe.build_timings()) out[py::str(t.phase)] = t.ms;
+  return out;
+}
+
 py::tuple pipeline_feature_table(const msseg::Msc2DPipeline& pipe) {
   const mscoupon::FeatureTable table = mscoupon::feature_table(
       pipe.feature_stats(), pipe.feature_channels(), pipe.channels(), pipe.stats());
@@ -683,6 +691,11 @@ PYBIND11_MODULE(mscoupon_py, m) {
       .def("base_relevance_ceiling", &msseg::Msc2DPipeline::base_relevance_ceiling)
       .def("width", &msseg::Msc2DPipeline::width)
       .def("height", &msseg::Msc2DPipeline::height)
+      .def("build_timings", &pipeline_build_timings,
+           "Wall ms per phase of the prime, in the order they ran, 'total' last: "
+           "{'value_range': .., 'msc': .., 'base_labels': .., 'compact': .., 'bridge': .., "
+           "'relevance': .., 'stat_bank': .., 'accumulate': .., 'extremum': .., 'select': .., "
+           "'release_gpu': .., 'total': ..}. Also printed to stderr unless MSSEG_TIME_MSC=0.")
       .def("labels", &pipeline_labels, "Feature id per pixel (int32 h,w) at the current persistence.")
       .def("region_arcs", &pipeline_region_arcs,
            "Living-region adjacency at the current persistence: (a, b, saddle) arrays in the "

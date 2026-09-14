@@ -42,6 +42,28 @@ def color_planes(p, li, np):
     return np.ascontiguousarray(planes[li], dtype=np.float32)
 
 
+def build_timings_brief(pipe):
+    """The prime's phases as one bracketed run of ``phase=ms`` in the order
+    they ran, or "" on an extension that predates ``build_timings()``.
+
+    ``prime=34311ms`` on its own explained nothing: Python can only time the
+    call, and the MSC's stderr lines cover its forest, which summed to two
+    seconds. The pipeline now records where the rest went (the gradient, the
+    channel bank, the per-pixel accumulation), and this puts it on the same
+    line as read/filters/prime so the numbers add up where they are read."""
+    get = getattr(pipe, "build_timings", None)
+    if get is None:
+        return ""
+    try:
+        phases = dict(get())
+    except Exception:
+        return ""
+    phases.pop("total", None)
+    if not phases:
+        return ""
+    return " [" + " ".join(f"{k}={float(v):.0f}" for k, v in phases.items()) + "]"
+
+
 def prime(engine, base, filt, params, color=None):
     """`engine.prime_slice`, handing the colour planes along when the slice has
     them (an extension without the argument only sees scalars)."""
@@ -310,7 +332,8 @@ class ComputeEngine:
                     log(f"  slice timings [thread={threading.current_thread().name!r}]: "
                         f"load={1e3 * (t_load - t_slice):.0f}ms "
                         f"filters={1e3 * (t_filter - t_load):.0f}ms "
-                        f"prime={1e3 * (t_prime - t_filter):.0f}ms "
+                        f"prime={1e3 * (t_prime - t_filter):.0f}ms"
+                        f"{build_timings_brief(pipe)} "
                         f"total={1e3 * (t_prime - t_slice):.0f}ms")
                     base_slices.append(base); filt_slices.append(filt); pipes.append(pipe)
                     norms.append(slice_norms); color_slices.append(color)

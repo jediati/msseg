@@ -168,7 +168,7 @@ class SlideEngine:
         """Read the item, run both chains, prime it. Synchronous; the caller
         decides which thread it is on."""
         from msseg.mscoupon import mscoupon_py as ext
-        from msseg.mscoupon.engine import ComputeEngine, prime
+        from msseg.mscoupon.engine import ComputeEngine, build_timings_brief, prime
         import numpy as np
 
         say = (lambda _m: None) if quiet else log
@@ -203,7 +203,8 @@ class SlideEngine:
         p = Primed(item, pipe, base, filtered, origin, scale, level, (lh, lw), halo)
         log(f"primed {item.key}: {lw}x{lh} @L{level} (halo {halo}) "
             f"read={1e3 * (t_read - t0):.0f}ms filters={1e3 * (t_filter - t_read):.0f}ms "
-            f"prime={1e3 * (t_prime - t_filter):.0f}ms range={p.value_range:.4g}")
+            f"prime={1e3 * (t_prime - t_filter):.0f}ms{build_timings_brief(pipe)} "
+            f"range={p.value_range:.4g}")
         self._install(item.key, p)
         return p
 

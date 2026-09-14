@@ -78,6 +78,12 @@ struct Msc2DRegionArc { int a = -1; int b = -1; float saddle_value = 0.0f; int c
 //
 // Implemented in msc2d.cpp (the GInt firewall TU); this is a PIMPL facade so the
 // MSCEER types never leak into the header.
+// One phase of Msc2DPipeline::build(), with its wall time.
+struct Msc2DPhaseTime {
+  std::string phase;
+  double ms = 0.0;
+};
+
 class Msc2DPipeline {
  public:
   Msc2DPipeline();
@@ -118,6 +124,12 @@ class Msc2DPipeline {
 
   int width() const;
   int height() const;
+  // Wall time per phase of the last build(), in the order they ran, "total"
+  // last. A caller can only time build() as a whole, and the MSC's own stderr
+  // lines cover its forest, not the gradient before it or the statistics
+  // after -- so a 34 s prime whose visible lines summed to 2 s had no
+  // explanation. Also printed, one line per phase, unless MSSEG_TIME_MSC=0.
+  const std::vector<Msc2DPhaseTime>& build_timings() const;
   // Value range (max - min) of the filtered field, for percent->absolute.
   float value_range() const;
   float current_persistence() const;

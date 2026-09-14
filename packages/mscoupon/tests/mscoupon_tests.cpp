@@ -518,6 +518,24 @@ void test_msc2d_pipeline_monotone_and_stats() {
   pipe.build(field, field, cfg);  // base == filtered here (topology on the raw field)
   expect(pipe.width() == w && pipe.height() == h, "pipeline reports image dims");
   expect(pipe.value_range() > 0.0f, "value range is positive");
+  {
+    // The prime's phases are recorded in order, "total" last, and the total
+    // is what the phases add up to -- so a log line built from them explains
+    // the whole of a prime, not just the forest MSCEER prints about.
+    const auto& bt = pipe.build_timings();
+    expect(!bt.empty() && bt.back().phase == "total", "build records its phases, total last");
+    double sum = 0.0;
+    bool has_msc = false, has_accumulate = false;
+    for (std::size_t i = 0; i + 1 < bt.size(); ++i) {
+      sum += bt[i].ms;
+      has_msc = has_msc || bt[i].phase == "msc";
+      has_accumulate = has_accumulate || bt[i].phase == "accumulate";
+      expect(bt[i].ms >= 0.0, "a phase time is non-negative");
+    }
+    expect(has_msc && has_accumulate, "the MSC and the statistics pass are phases");
+    expect(sum <= bt.back().ms + 1.0 && sum >= 0.5 * bt.back().ms - 1.0,
+           "the phases account for the total");
+  }
   std::vector<float> sorted(field.data(), field.data() + field.size());
   std::sort(sorted.begin(), sorted.end());
   const auto percentile = [&](double q) {
