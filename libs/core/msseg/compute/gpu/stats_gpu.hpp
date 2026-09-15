@@ -1,8 +1,11 @@
 #pragma once
 
-// NOTE: the device path reduces sum/sumsq/min/max (+ the extremum sample) over
-// single-plane diffg channels only. Colour-sourced channels and per-region
-// histograms are CPU-only; msc2d.cpp keeps the host loop for those specs.
+// NOTE: the device path reduces sum/sumsq/min/max (+ the extremum sample) and
+// per-region histograms over single-plane rasters: base, filtered, the input's
+// colour planes, and the diffg JIT bank's responses on any of them. The
+// cross-channel colour kinds (chgradmag, dizenzo, structure) reduce over the
+// planes inside diffg's CPU bank and have no device path; msc2d.cpp keeps the
+// host loop for a spec naming one.
 
 // GPU per-region statistics accumulation for the 2D pipeline.
 //
@@ -40,10 +43,20 @@ void destroy(SliceStats* s);  // safe on nullptr
 bool set_labels(SliceStats* s, const int* host_labels, const void* dev_labels, int n_regions);
 
 // Upload a host float raster (width*height); the returned device pointer is
-// owned by the handle and freed on destroy. `slot` is 0 or 1 (two rasters --
-// base and filtered -- is all the pipeline stages need resident at once);
-// re-uploading a slot frees the previous raster. nullptr on failure.
+// owned by the handle and freed on destroy. Slots 0 and 1 are the base and
+// filtered rasters; 2.. hold the input's colour planes (kMaxSlots in all), so
+// a colour-sourced bank has its plane resident. Re-uploading a slot reuses its
+// allocation. nullptr on failure or a slot out of range.
+constexpr int kMaxSlots = 10;
 const void* upload(SliceStats* s, const float* host, int slot);
+
+// Per-region histogram of one device channel: `bins` equal-width bins from
+// `lo` with bin = int((v - lo) * inv_w) clamped into [0, bins), NaN skipped --
+// the rule ChannelStats::add applies, in the same float arithmetic, so the
+// counts are identical. out_counts receives n_regions * bins uint32, region-
+// major. Integer atomics, so the result does not depend on scheduling.
+bool histogram(SliceStats* s, const void* dev_channel, float lo, float inv_w, int bins,
+               std::uint32_t* out_counts);
 
 // Deterministic segmented reduces of one device channel raster over the CSR.
 // Each non-null output receives n_regions values (empty regions get 0 / the

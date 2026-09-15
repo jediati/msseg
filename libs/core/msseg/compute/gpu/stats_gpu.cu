@@ -180,8 +180,11 @@ struct SliceStats {
 
   unsigned int* d_pidx = nullptr;  // sorted by (label, raster index)
   int* d_offsets = nullptr;        // n_regions + 1
-  float* d_raster[2] = {nullptr, nullptr};
+  int* d_labels = nullptr;         // the label raster itself, for per-pixel kernels
+  float* d_raster[kMaxSlots] = {};
   long long* d_arg_ext = nullptr;
+  unsigned int* d_hist = nullptr;  // n_regions * bins scratch for histogram()
+  size_t hist_count = 0;
 
   // Reusable per-region device outputs + CUB temp storage.
   double* d_out_d = nullptr;
@@ -220,9 +223,10 @@ void destroy(SliceStats* s) {
   if (!s) return;
   cudaFree(s->d_pidx);
   cudaFree(s->d_offsets);
-  cudaFree(s->d_raster[0]);
-  cudaFree(s->d_raster[1]);
+  cudaFree(s->d_labels);
+  for (int i = 0; i < kMaxSlots; ++i) cudaFree(s->d_raster[i]);
   cudaFree(s->d_arg_ext);
+  cudaFree(s->d_hist);
   cudaFree(s->d_out_d);
   cudaFree(s->d_out_f);
   cudaFree(s->d_out_i);
@@ -284,8 +288,12 @@ bool set_labels(SliceStats* s, const int* host_labels, const void* dev_labels, i
     ok = false;
   }
   cudaFree(d_keys);
-  cudaFree(d_labels);
-  if (!ok) return false;
+  if (!ok) {
+    cudaFree(d_labels);
+    return false;
+  }
+  cudaFree(s->d_labels);
+  s->d_labels = d_labels;
 
   // Per-region scratch, sized once the region count is known.
   cudaFree(s->d_out_d);
@@ -310,7 +318,7 @@ bool set_labels(SliceStats* s, const int* host_labels, const void* dev_labels, i
 }
 
 const void* upload(SliceStats* s, const float* host, int slot) {
-  if (!s || !host || slot < 0 || slot > 1) return nullptr;
+  if (!s || !host || slot < 0 || slot >= kMaxSlots) return nullptr;
   if (!s->d_raster[slot] &&
       !cuda_ok(cudaMalloc(&s->d_raster[slot], s->n * sizeof(float)), "raster alloc")) {
     return nullptr;
@@ -461,6 +469,50 @@ bool sample_ext(SliceStats* s, const void* dev_channel, int radius, float* out_s
   if (!cuda_ok(cudaGetLastError(), "sample_ext kernel")) return false;
   return cuda_ok(cudaMemcpy(out_sample, s->d_out_f, m * sizeof(float), cudaMemcpyDeviceToHost),
                  "sample_ext download");
+}
+
+namespace {
+
+__global__ void histogram_kernel(const float* ch, const int* labels, long long n, float lo,
+                                 float inv_w, int bins, unsigned int* hist) {
+  const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const int r = labels[i];
+  if (r < 0) return;
+  const float v = ch[i];
+  if (v != v) return;  // NaN: not counted, as on the host
+  // Same expression as ChannelStats::add, in float: a subtract then a
+  // multiply, which no FMA contraction can rewrite, then truncation toward
+  // zero and a clamp into the end bins.
+  int b = static_cast<int>((v - lo) * inv_w);
+  b = b < 0 ? 0 : (b >= bins ? bins - 1 : b);
+  atomicAdd(hist + static_cast<size_t>(r) * bins + b, 1u);
+}
+
+}  // namespace
+
+bool histogram(SliceStats* s, const void* dev_channel, float lo, float inv_w, int bins,
+               std::uint32_t* out_counts) {
+  if (!s || !dev_channel || !out_counts || s->n_regions <= 0 || bins <= 0 || !s->d_labels) {
+    return false;
+  }
+  const size_t count = static_cast<size_t>(s->n_regions) * static_cast<size_t>(bins);
+  if (count > s->hist_count) {
+    cudaFree(s->d_hist);
+    s->d_hist = nullptr;
+    s->hist_count = 0;
+    if (!cuda_ok(cudaMalloc(&s->d_hist, count * sizeof(unsigned int)), "hist alloc")) return false;
+    s->hist_count = count;
+  }
+  if (!cuda_ok(cudaMemset(s->d_hist, 0, count * sizeof(unsigned int)), "hist clear")) return false;
+  const int block = 256;
+  const long long grid = (s->n + block - 1) / block;
+  histogram_kernel<<<static_cast<unsigned int>(grid), block>>>(
+      static_cast<const float*>(dev_channel), s->d_labels, s->n, lo, inv_w, bins, s->d_hist);
+  if (!cuda_ok(cudaGetLastError(), "histogram kernel")) return false;
+  return cuda_ok(cudaMemcpy(out_counts, s->d_hist, count * sizeof(unsigned int),
+                            cudaMemcpyDeviceToHost),
+                 "histogram download");
 }
 
 }  // namespace gpustats

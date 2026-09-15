@@ -101,6 +101,18 @@ class ChannelStats {
                               static_cast<std::size_t>(bins_);
   }
 
+  // The same row, writable: the device accumulation stamps its counts here.
+  std::uint32_t* hist_row(std::size_t region, std::size_t slot) {
+    const int j = slot < hist_index_.size() ? hist_index_[slot] : -1;
+    if (j < 0) return nullptr;
+    return hist_.data() + (region * hist_slots_.size() + static_cast<std::size_t>(j)) *
+                              static_cast<std::size_t>(bins_);
+  }
+  // The bin scale a slot's counts were laid out with (what add() applies), so
+  // another accumulator can bin identically.
+  float hist_lo(std::size_t slot) const { return hist_lo_[hist_index_[slot]]; }
+  float hist_inv_w(std::size_t slot) const { return hist_inv_w_[hist_index_[slot]]; }
+
   std::size_t regions() const { return n_regions_; }
   std::size_t channels() const { return n_channels_; }
   bool empty() const { return n_channels_ == 0 || n_regions_ == 0; }

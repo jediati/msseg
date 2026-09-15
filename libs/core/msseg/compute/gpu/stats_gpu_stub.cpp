@@ -22,6 +22,7 @@ bool geometry(SliceStats*, const void*, bool, int*, int*, int*, int*, int*, floa
   return false;
 }
 bool sample_ext(SliceStats*, const void*, int, float*) { return false; }
+bool histogram(SliceStats*, const void*, float, float, int, std::uint32_t*) { return false; }
 
 }  // namespace gpustats
 }  // namespace msseg

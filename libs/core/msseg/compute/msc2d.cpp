@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -397,22 +398,27 @@ namespace {
 template <typename ImplT>
 bool try_gpu_accumulate(ImplT& impl, const diffg::Image<float>& base,
                         const diffg::Image<float>& filtered, const StatsSpec& spec,
-                        int ext_radius) {
+                        int ext_radius, const diffg::MultiImage<float>* color) {
 #ifndef MSSEG_HAVE_DIFFG_GPU
   (void)impl;
   (void)base;
   (void)filtered;
   (void)spec;
   (void)ext_radius;
+  (void)color;
   return false;
 #else
-  if (!gpustats::available()) return false;
+  const bool time_phases = time_phases_wanted();
+  auto decline = [&](const char* why) {
+    if (time_phases) std::fprintf(stderr, "  [gpu_stats] no device path: %s -> CPU loop\n", why);
+    return false;
+  };
+  if (!gpustats::available()) return decline("no CUDA device");
   const int width = impl.width;
   const int height = impl.height;
   const std::size_t num_base = impl.leaf_stats.size();
   if (num_base == 0) return false;
 
-  const bool time_phases = time_phases_wanted();
   auto mark = std::chrono::steady_clock::now();
   auto lap = [&](const char* what) {
     if (!time_phases) return;
@@ -435,10 +441,14 @@ bool try_gpu_accumulate(ImplT& impl, const diffg::Image<float>& base,
   } sg;
   struct BankGuard {
     diffg_gpu::GpuFilterBank* b = nullptr;
+    BankGuard() = default;
+    BankGuard(const BankGuard&) = delete;
+    BankGuard& operator=(const BankGuard&) = delete;
+    BankGuard(BankGuard&& o) noexcept : b(o.b) { o.b = nullptr; }
     ~BankGuard() {
       if (b) diffg_gpu::gpu_filter_bank_destroy(b);
     }
-  } bg;
+  };
 
   sg.s = gpustats::create(width, height);
   if (!sg.s) return false;
@@ -469,21 +479,55 @@ bool try_gpu_accumulate(ImplT& impl, const diffg::Image<float>& base,
     d_filt = gpustats::upload(sg.s, filtered.data(), 1);
     if (!d_filt) return false;
   }
+
+  // The input's colour planes, one slot each, for the raw-plane channels and
+  // the per-plane banks. A cross-channel kind (chgradmag, dizenzo, structure)
+  // reduces over the planes inside diffg's CPU bank -- it has no device path.
+  const std::vector<ResolvedStatChannel>& channels = impl.channels;
+  int planes_needed = 0;
+  for (const ResolvedStatChannel& c : channels) {
+    if (c.source != "color") continue;
+    if (c.input_channel < 0) return decline("a cross-channel colour kind");
+    planes_needed = std::max(planes_needed, c.input_channel + 1);
+  }
+  std::vector<const void*> d_plane(static_cast<std::size_t>(planes_needed), nullptr);
+  if (planes_needed > 0) {
+    if (color == nullptr || static_cast<int>(color->channels()) < planes_needed) {
+      return decline("colour channels without the planes in hand");
+    }
+    if (planes_needed + 2 > gpustats::kMaxSlots) return decline("more planes than slots");
+    for (int p = 0; p < planes_needed; ++p) {
+      d_plane[static_cast<std::size_t>(p)] =
+          gpustats::upload(sg.s, color->channel_data(static_cast<std::size_t>(p)), 2 + p);
+      if (!d_plane[static_cast<std::size_t>(p)]) return false;
+    }
+  }
   lap("upload");
 
-  // JIT filter bank over the resident base raster for the derived channels.
-  // Requests dedup exactly like build_stat_channels: a hessian entry is one
-  // request covering two consecutive resolved slots.
-  const std::vector<ResolvedStatChannel>& channels = impl.channels;
-  std::vector<diffg_gpu::FilterRequest> reqs;
-  std::vector<int> bank_slot(channels.size(), -1);
-  int next_slot = 0;
+  // JIT filter banks over the resident rasters for the derived channels: one
+  // bank per input (the base raster, or a colour plane), each fed the requests
+  // its channels came from in channel order. Requests dedup exactly like
+  // build_stat_channels: a hessian entry is one request covering consecutive
+  // resolved slots, so a channel continues the previous request when it is
+  // the same (kind, sigma, input) at the next slot.
+  const int n_banks = planes_needed + 1;  // index 0 = base, 1 + p = plane p
+  std::vector<std::vector<diffg_gpu::FilterRequest>> reqs_of(static_cast<std::size_t>(n_banks));
+  std::vector<int> bank_of(channels.size(), -1), bank_slot(channels.size(), -1);
+  std::vector<int> next_slot(static_cast<std::size_t>(n_banks), 0);
+  const ResolvedStatChannel* prev = nullptr;
   for (std::size_t k = 0; k < channels.size(); ++k) {
     const ResolvedStatChannel& c = channels[k];
-    if (c.kind == "base" || c.kind == "filtered") continue;
-    // diffg's GPU bank is single-channel: colour sources stay on the CPU.
-    if (c.kind == "color" || c.source == "color") return false;
-    if (c.slot_in_request == 0) {
+    if (c.kind == "base" || c.kind == "filtered" || c.kind == "color") {
+      prev = nullptr;
+      continue;
+    }
+    const int bank = c.source == "color" ? 1 + c.input_channel : 0;
+    const bool continues = prev != nullptr && prev->kind == c.kind && prev->sigma == c.sigma &&
+                           prev->source == c.source && prev->input_channel == c.input_channel &&
+                           c.slot_in_request == prev->slot_in_request + 1;
+    prev = &c;
+    std::vector<diffg_gpu::FilterRequest>& reqs = reqs_of[static_cast<std::size_t>(bank)];
+    if (!continues) {
       diffg_gpu::FilterRequest r;
       if (c.kind == "blur") {
         r.kind = diffg_gpu::BankFilterKind::Gaussian;
@@ -500,12 +544,21 @@ bool try_gpu_accumulate(ImplT& impl, const diffg::Image<float>& base,
       r.sort_by_absolute_value = c.sort_by_absolute_value;
       reqs.push_back(r);
     }
-    bank_slot[k] = next_slot++;
+    bank_of[k] = bank;
+    bank_slot[k] = next_slot[static_cast<std::size_t>(bank)]++;
   }
-  if (!reqs.empty()) {
-    bg.b = diffg_gpu::gpu_filter_bank_create_jit_device(d_base, width, height, reqs.data(),
-                                                        static_cast<int>(reqs.size()));
-    if (!bg.b || diffg_gpu::gpu_filter_bank_channels(bg.b) != next_slot) return false;
+  std::vector<BankGuard> banks(static_cast<std::size_t>(n_banks));
+  for (int b = 0; b < n_banks; ++b) {
+    const std::vector<diffg_gpu::FilterRequest>& reqs = reqs_of[static_cast<std::size_t>(b)];
+    if (reqs.empty()) continue;
+    const void* d_in = b == 0 ? d_base : d_plane[static_cast<std::size_t>(b - 1)];
+    diffg_gpu::GpuFilterBank*& handle = banks[static_cast<std::size_t>(b)].b;
+    handle = diffg_gpu::gpu_filter_bank_create_jit_device(d_in, width, height, reqs.data(),
+                                                          static_cast<int>(reqs.size()));
+    if (!handle ||
+        diffg_gpu::gpu_filter_bank_channels(handle) != next_slot[static_cast<std::size_t>(b)]) {
+      return false;
+    }
   }
   lap("bank");
 
@@ -538,6 +591,8 @@ bool try_gpu_accumulate(ImplT& impl, const diffg::Image<float>& base,
     mx.resize(num_base);
   }
   if (want_ext) ext_sample.resize(num_base);
+  const int bins = spec.hist.enabled() ? spec.hist.bins : 0;
+  std::vector<std::uint32_t> counts;
   for (std::size_t k = 0; k < channels.size(); ++k) {
     const ResolvedStatChannel& c = channels[k];
     const void* d_ch = nullptr;
@@ -545,10 +600,25 @@ bool try_gpu_accumulate(ImplT& impl, const diffg::Image<float>& base,
       d_ch = d_base;
     } else if (c.kind == "filtered") {
       d_ch = d_filt;
+    } else if (c.kind == "color") {
+      d_ch = d_plane[static_cast<std::size_t>(c.input_channel)];
     } else {
-      d_ch = diffg_gpu::gpu_filter_bank_evaluate_device(bg.b, bank_slot[k]);
+      d_ch = diffg_gpu::gpu_filter_bank_evaluate_device(
+          banks[static_cast<std::size_t>(bank_of[k])].b, bank_slot[k]);
     }
     if (!d_ch) return false;
+    if (bins > 0 && impl.leaf_channels.hist_row(0, k) != nullptr) {
+      counts.resize(num_base * static_cast<std::size_t>(bins));
+      if (!gpustats::histogram(sg.s, d_ch, impl.leaf_channels.hist_lo(k),
+                               impl.leaf_channels.hist_inv_w(k), bins, counts.data())) {
+        return false;
+      }
+      for (std::size_t r = 0; r < num_base; ++r) {
+        std::memcpy(impl.leaf_channels.hist_row(r, k),
+                    counts.data() + r * static_cast<std::size_t>(bins),
+                    static_cast<std::size_t>(bins) * sizeof(std::uint32_t));
+      }
+    }
     if ((want_sums || want_extent) &&
         !gpustats::reduce_channel(sg.s, d_ch, want_sums ? sum.data() : nullptr,
                                   want_sumsq ? sumsq.data() : nullptr,
@@ -762,17 +832,17 @@ void Msc2DPipeline::build(const diffg::Image<float>& base, const diffg::Image<fl
                                                          : cfg.extremum_sample_radius;
 
   // GPU accumulation first: the derived channels never materialize on the host
-  // (diffg JIT bank) and the reduces run over the resident label CSR. Callers
-  // that hand in an external bank already paid for the host rasters, so they
-  // keep the CPU loop. Any failure re-inits the leaves and falls through.
-  // Colour-sourced channels have no device path (diffg's GPU bank takes one
-  // plane), so a spec naming one keeps the CPU loop.
+  // (diffg JIT bank, one per input raster: the base and each colour plane) and
+  // the reduces and histograms run over the resident label CSR. Callers that
+  // hand in an external bank already paid for the host rasters, so they keep
+  // the CPU loop. A spec the device path cannot serve (a cross-channel colour
+  // kind) declines with a line saying so; any failure re-inits the leaves and
+  // falls through.
   bool gpu_done = false;
-  // Histograms have no device reduce either.
-  if (external_bank == nullptr && gpu_stats_wanted(cfg) && !spec.uses_color() && !spec.hist.enabled()) {
+  if (external_bank == nullptr && gpu_stats_wanted(cfg)) {
     impl_->channels = resolve_stat_channels(spec);
     init_leaves(impl_->channels.size());
-    gpu_done = try_gpu_accumulate(*impl_, base, filtered, spec, ext_radius);
+    gpu_done = try_gpu_accumulate(*impl_, base, filtered, spec, ext_radius, color);
     lap(gpu_done ? "gpu_stats" : "gpu_tried");
     if (!gpu_done && cfg.use_gpu_stats.value_or(false)) {
       std::fprintf(stderr,
