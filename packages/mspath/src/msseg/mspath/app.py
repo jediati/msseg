@@ -168,6 +168,7 @@ class MsPathApp(ViewerShell):
         self.manifold_var = tk.StringVar(value="ascending")
         self.simplification_var = tk.StringVar(value=coupon_session.DEFAULT_SIMPLIFICATION)
         self.accurate_var = tk.BooleanVar(value=False)
+        self.gpu_var = tk.BooleanVar(value=False)        # msc.use_gpu_gradient
         self.level_var = tk.IntVar(value=DEFAULT_OVERVIEW_LEVEL)
         self.halo_var = tk.IntVar(value=DEFAULT_HALO)
         self.regions_var = tk.BooleanVar(value=True)
@@ -609,6 +610,11 @@ class MsPathApp(ViewerShell):
         ttk.Checkbutton(msc, text="accurate gradient (slower, ~12x the memory; "
                                   "run-to-run nondeterministic)",
                         variable=self.accurate_var).pack(anchor="w", padx=6)
+        # The discrete gradient on CUDA (bit-identical labels), and with it the
+        # statistics accumulation: a twelve-channel bank over a 16 Mpx ROI is
+        # 2.7-8.5 s on the CPU path and never materializes on the device one.
+        ttk.Checkbutton(msc, text="GPU gradient + statistics (CUDA; bit-identical results)",
+                        variable=self.gpu_var).pack(anchor="w", padx=6)
 
         self._build_statistics_panel()
 
@@ -1046,6 +1052,7 @@ class MsPathApp(ViewerShell):
             "msc": {"manifold": self.manifold_var.get(),
                     "persistence_percent": float(self.persist_var.get()),
                     "accurate": bool(self.accurate_var.get()),
+                    "use_gpu_gradient": bool(self.gpu_var.get()),
                     "simplification": self.simplification_var.get()},
             "statistics": config_io.statistics_to_json(
                 self._stat_channel_cards(), self._stat_reductions(),
@@ -1060,6 +1067,7 @@ class MsPathApp(ViewerShell):
         setvar(self.persist_live_var, f"{float(self.persist_var.get()):g}")
         setvar(self.accurate_var, bool(msc.get("accurate")
                                        or msc.get("accurate_ascending")))
+        setvar(self.gpu_var, bool(msc.get("use_gpu_gradient")))
         setvar(self.simplification_var,
                str(msc.get("simplification") or coupon_session.DEFAULT_SIMPLIFICATION))
         sl = profile.get("slide") or {}

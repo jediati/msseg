@@ -229,6 +229,16 @@ def run_selftest():
     app.level_var.set(0); app.halo_var.set(0)
     app._apply_profile_to_ui(p, lambda v, x: v.set(x), [])
     assert app.level_var.get() == deepest and app.halo_var.get() == p["slide"]["halo"]
+    # the GPU switch is exposed, rides the profile, and reaches the params
+    assert p["msc"]["use_gpu_gradient"] is False
+    app.gpu_var.set(True)
+    assert app._profile_from_ui()["msc"]["use_gpu_gradient"] is True
+    assert app._profile_for_compute()["msc"].get("use_gpu_gradient") is True
+    app.gpu_var.set(False)
+    app._apply_profile_to_ui({**p, "msc": {**p["msc"], "use_gpu_gradient": True}},
+                             lambda v, x: v.set(x), [])
+    assert app.gpu_var.get()
+    app.gpu_var.set(False)
 
     # -- the statistics panel is the feature vector, and it is in Processing - #
     assert app.stats_frame.master is app._processing_parent("stats")
