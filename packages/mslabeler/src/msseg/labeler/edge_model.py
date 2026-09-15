@@ -380,7 +380,6 @@ def fit_edge_model(base_pipeline, X, cls, edges: Dict[str, np.ndarray], ext=None
     or None. Raises ValueError without both same- and different-class pairs."""
     spec = spec or EdgeSpec()
     t0 = time.perf_counter()
-    emb = _layer(embed(base_pipeline, X), spec.layer)
     sel = np.nonzero(edges["both"])[0]
     a, b = edges["a"][sel], edges["b"][sel]
     y = edges["diff"][sel].astype(int)
@@ -388,10 +387,17 @@ def fit_edge_model(base_pipeline, X, cls, edges: Dict[str, np.ndarray], ext=None
         raise ValueError("need labeled edges of both kinds (same-class and "
                          "different-class) - label two touching regions of "
                          "different classes")
+    # Only the rows a labeled pair touches are embedded: on a whole-slide
+    # session that is a few thousand of nearly a million, and the embedding
+    # of the rest is recomputed by whoever needs it (classification, voting).
+    rows = np.unique(np.concatenate([a, b]))
+    emb = _layer(embed(base_pipeline, np.asarray(X)[rows]), spec.layer)
+    a_local = np.searchsorted(rows, a)
+    b_local = np.searchsorted(rows, b)
     sad = edges["saddle"][sel]
     bar = barrier(sad, None if ext is None else np.asarray(ext)[a],
                   None if ext is None else np.asarray(ext)[b], n=len(a))
-    F = pair_features(emb, a, b, bar, spec.features)
+    F = pair_features(emb, a_local, b_local, bar, spec.features)
     est = _fit_pair(_make_pair_estimator(spec), F, y, spec)
     return EdgeModel(model=est, spec=spec, n_in=int(F.shape[1]),
                      names_hash=names_hash(names), net_hash=net_hash(base_pipeline),
