@@ -39,17 +39,42 @@ class TrainingSetBuilder:
         self.conv = conv or DEFAULT
         self.non_feature = frozenset(self.conv.positional if non_feature_fields is None
                                      else non_feature_fields)
+        # Per-item row classes from the last build, keyed by item: the
+        # gestures resolved against the decomposition change only when the
+        # item's annotations or its record do, and a retrain is usually
+        # neither for most items. See `_classes_for`.
+        self._class_memo: dict = {}
 
     def feature_names(self, table) -> List[str]:
         return [n for n in table.names if n not in self.non_feature]
 
     @staticmethod
-    def feature_matrix(table, names: Sequence[str], np):
-        """(n_regions, len(names)) float64, or None if a column is missing."""
-        cols = [table.column(n) for n in names]
-        if any(c is None for c in cols):
-            return None
-        mat = np.stack(cols, axis=1).astype(np.float64)
+    def feature_matrix(table, names: Sequence[str], np, rows=None):
+        """(n_rows, len(names)) float64, or None if a column is missing.
+
+        `rows` (a boolean mask or an index array over the table's rows)
+        restricts the copy to those rows -- the labeled few hundred rather
+        than every region on a slide. A columnar table (``values`` is the
+        (n, f) block) is gathered in one indexing pass; anything else goes
+        column by column through ``column()``."""
+        values = getattr(table, "values", None)
+        tnames = getattr(table, "names", None)
+        if values is not None and tnames is not None and getattr(values, "ndim", 0) == 2:
+            pos = {n: i for i, n in enumerate(tnames)}
+            idx = [pos.get(n) for n in names]
+            if any(i is None for i in idx):
+                return None
+            block = values if rows is None else values[rows]
+            mat = np.asarray(block[:, idx], dtype=np.float64)
+            if mat.base is not None:                     # a view of the table: copy
+                mat = np.array(mat, dtype=np.float64)
+        else:
+            cols = [table.column(n) for n in names]
+            if any(c is None for c in cols):
+                return None
+            if rows is not None:
+                cols = [c[rows] for c in cols]
+            mat = np.stack(cols, axis=1).astype(np.float64)
         mat[~np.isfinite(mat)] = 0.0
         return mat
 
@@ -67,6 +92,41 @@ class TrainingSetBuilder:
         cls[ok] = rc[fid[ok]]
         return cls
 
+    @staticmethod
+    def _annotation_signature(interactions):
+        """What a resolved class vector depends on from the store side: the
+        interactions' identities, classes and shapes. Undo, a repaint or a
+        class change on the item all change it; a retrain after edits
+        elsewhere does not."""
+        return tuple((getattr(it, "uid", None), getattr(it, "class_id", None),
+                      getattr(it, "tool", None), len(getattr(it, "points", ()) or ()),
+                      id(getattr(it, "meta", None)))
+                     for it in interactions)
+
+    def _classes_for(self, key, rec, table, interactions, fids, np, layer):
+        """`row_classes` for the item, memoized on (record, annotations, table).
+
+        The gestures are re-resolved against the raster only when the item's
+        own annotations or its record changed; every other item on a retrain
+        is a dictionary hit. The record is identified by its commit AND its
+        label raster (a re-prime at the same commit is a new raster)."""
+        labels = rec.get("labels")
+        sig = (rec.get("commit"), id(labels), id(table), len(fids),
+               self._annotation_signature(interactions))
+        hit = self._class_memo.get(key)
+        if hit is not None and hit[0] == sig:
+            return hit[1]
+        cls = self.row_classes(interactions, labels, fids, np, layer)
+        self._class_memo[key] = (sig, cls)
+        return cls
+
+    def forget(self, key=None):
+        """Drop the memoized classes for `key` (None: every item)."""
+        if key is None:
+            self._class_memo.clear()
+        else:
+            self._class_memo.pop(key, None)
+
     def labeled_set(self, items, store, np, id_field: Optional[str] = None,
                     layer_of=None):
         """``(X, y, groups, names)`` over every labeled region of every item.
@@ -79,18 +139,27 @@ class TrainingSetBuilder:
         for key, rec, table, group, label in items:
             if names is None:
                 names = self.feature_names(table)
-            mat = self.feature_matrix(table, names, np)
             fids = table.column(id_field)
-            if mat is None or fids is None:
+            if fids is None:
                 raise TrainingProblem(
                     f"Training stopped: incomplete statistics on slice {label}.")
-            cls = self.row_classes(store.for_slice(key), rec["labels"], fids, np,
-                                   None if layer_of is None else layer_of(key, rec))
+            cls = self._classes_for(key, rec, table, store.for_slice(key), fids, np,
+                                    None if layer_of is None else layer_of(key, rec))
             m = cls > 0
-            if m.any():
-                X.append(mat[m])
-                y.append(cls[m])
-                g.append(np.full(int(m.sum()), group))
+            if not m.any():
+                if self.feature_matrix(table, names, np, rows=slice(0, 0)) is None:
+                    raise TrainingProblem(
+                        f"Training stopped: incomplete statistics on slice {label}.")
+                continue
+            # Only the labeled rows are copied out: a slide item has hundreds
+            # of thousands of regions and a few hundred labels.
+            mat = self.feature_matrix(table, names, np, rows=m)
+            if mat is None:
+                raise TrainingProblem(
+                    f"Training stopped: incomplete statistics on slice {label}.")
+            X.append(mat)
+            y.append(cls[m])
+            g.append(np.full(int(m.sum()), group))
         if not X:
             raise TrainingProblem("No labeled regions on computed slices - "
                                   "draw some (and Run/Rerun) first.")
@@ -118,8 +187,8 @@ class TrainingSetBuilder:
             fids = table.column(id_field)
             if mat is None or fids is None:
                 raise TrainingProblem(f"Edges stopped: incomplete statistics on slice {label}.")
-            c = self.row_classes(store.for_slice(key), rec["labels"], fids, np,
-                                 None if layer_of is None else layer_of(key, rec))
+            c = self._classes_for(key, rec, table, store.for_slice(key), fids, np,
+                                  None if layer_of is None else layer_of(key, rec))
             fid = np.asarray(fids).astype(int)
             X.append(mat); cls.append(c); grp.append(np.full(len(c), group))
             if ext_col is not None:

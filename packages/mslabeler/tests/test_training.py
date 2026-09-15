@@ -88,3 +88,65 @@ def test_edge_set_matches_gather_edges():
     # four blocks in a 2x2 grid: 4 adjacencies per item, in global row indices
     assert len(edges["a"]) == 8 and edges["a"].max() < 8
     assert sorted(set(edges["slice"].tolist())) == [10, 11]
+
+
+
+# --------------------------------------------------------------------------- #
+# a retrain repeats the minimum: classes are memoized per item, matrices are
+# cut to the rows that are used
+# --------------------------------------------------------------------------- #
+def test_feature_matrix_rows_subset_and_fast_path_agree():
+    t = table()
+    names = ["mean_base", "std_base"] if "mean_base" in t.names else [n for n in t.names][:2]
+    names = [n for n in NAMES if n not in ("feature_id",)][:2]
+    full = TrainingSetBuilder.feature_matrix(t, names, np)
+    m = np.zeros(t.n_rows, bool); m[::2] = True
+    part = TrainingSetBuilder.feature_matrix(t, names, np, rows=m)
+    assert np.array_equal(part, full[m])
+    idx = np.array([1, 0, 1])
+    assert np.array_equal(TrainingSetBuilder.feature_matrix(t, names, np, rows=idx), full[idx])
+    assert full.flags.owndata or full.base is None or not np.shares_memory(full, t.values)
+
+    class Columnar:                        # no `values`: the column path
+        names = list(t.names)
+
+        def column(self, n):
+            return t.column(n)
+    assert np.array_equal(TrainingSetBuilder.feature_matrix(Columnar(), names, np), full)
+    assert TrainingSetBuilder.feature_matrix(t, names + ["nope"], np) is None
+
+
+def test_row_classes_are_memoized_per_item_until_its_annotations_change():
+    calls = []
+    real = TrainingSetBuilder.row_classes
+
+    class Counting(TrainingSetBuilder):
+        @staticmethod
+        def row_classes(interactions, labels, fids, np_, layer=None):
+            calls.append(1)
+            return real(interactions, labels, fids, np_, layer)
+
+    b = Counting()
+    labels = blocks_raster()
+    store = LabelStore(n_classes=3)
+    store.add("taps", [(3.0, 3.0)], 1, "k1"); store.add("taps", [(15.0, 15.0)], 2, "k1")
+    store.add("taps", [(3.0, 3.0)], 2, "k2"); store.add("taps", [(15.0, 15.0)], 1, "k2")
+    recs = {k: {"labels": labels, "commit": 3} for k in ("k1", "k2")}
+    tabs = {k: table() for k in ("k1", "k2")}
+
+    def items():
+        return [(k, recs[k], tabs[k], 0, k) for k in ("k1", "k2")]
+    X1, y1, _g, _n = b.labeled_set(items(), store, np)
+    assert len(calls) == 2
+    X2, y2, _g, _n = b.labeled_set(items(), store, np)          # retrain, nothing changed
+    assert len(calls) == 2 and np.array_equal(X1, X2) and np.array_equal(y1, y2)
+    store.add("taps", [(15.0, 3.0)], 1, "k2")                   # one item's annotations
+    X3, y3, _g, _n = b.labeled_set(items(), store, np)
+    assert len(calls) == 3 and len(y3) == len(y1) + 1
+    recs["k1"] = {"labels": labels.copy(), "commit": 4}         # one item re-primed
+    b.labeled_set(items(), store, np)
+    assert len(calls) == 4
+    b.forget("k1"); b.labeled_set(items(), store, np)
+    assert len(calls) == 5
+    b.forget(); b.labeled_set(items(), store, np)
+    assert len(calls) == 7
