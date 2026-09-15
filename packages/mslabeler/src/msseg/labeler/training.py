@@ -121,7 +121,9 @@ class TrainingSetBuilder:
         return cls
 
     def forget(self, key=None):
-        """Drop the memoized classes for `key` (None: every item)."""
+        """Drop the memoized classes for `key` (None: every item) and the
+        edge set's rows, which span every item."""
+        self._edge_memo = None
         if key is None:
             self._class_memo.clear()
         else:
@@ -170,30 +172,75 @@ class TrainingSetBuilder:
             raise TrainingProblem("Need labels from at least 2 classes to train.")
         return X, y, g, names
 
+    # The all-rows design matrix and the edge structure of the last edge_set,
+    # kept across retrains. They depend on the records (a commit, a label
+    # raster, a table) and the column names -- not on the annotations -- so an
+    # annotation pass reuses them and only the per-row classes move. Held up
+    # to EDGE_CACHE_BYTES of matrix (a whole-slide session's is ~1 GB, the
+    # records' own tables are as much again); over that, rebuilt each time.
+    EDGE_CACHE_BYTES = 2 << 30
+    _edge_memo = None
+
     def edge_set(self, items, store, names: Sequence[str], arcs_of: Callable[[Any], Any], np,
                  id_field: Optional[str] = None, ext_field: Optional[str] = None,
                  layer_of=None):
         """Every region of every item (class 0 = unlabeled) with its group and
         extremum value, plus the region-graph edges as global row pairs:
         ``(X, cls, groups, ext | None, edges, names)``. ``arcs_of(key, record)``
-        supplies the item's arcs (MSC saddles or pixel adjacency)."""
+        supplies the item's arcs (MSC saddles or pixel adjacency).
+
+        The rows and the edge structure are memoized (see `_edge_memo`): a
+        retrain after an annotation pass re-resolves the classes of the items
+        whose annotations changed and recomputes which edges are labeled;
+        nothing else. A re-prime, a persistence change, a different item
+        list or column set, or arcs that gained their contact lengths since,
+        rebuilds everything."""
         id_field = id_field or self.conv.id_field
         ext_field = ext_field or self.conv.extremum_value_field
         names = list(names)
         ext_col = names.index(ext_field) if ext_field in names else None
-        X, cls, grp, ext, per = [], [], [], [], []
+        items = list(items)
+        sig_parts, cls, per_fids, per_arcs = [], [], [], []
         for key, rec, table, group, label in items:
-            mat = self.feature_matrix(table, names, np)
             fids = table.column(id_field)
-            if mat is None or fids is None:
+            if fids is None:
                 raise TrainingProblem(f"Edges stopped: incomplete statistics on slice {label}.")
+            arcs = arcs_of(key, rec)
+            sig_parts.append((key, id(table), rec.get("commit"), id(rec.get("labels")), group,
+                              id(arcs), None if arcs is None else "length" in arcs))
             c = self._classes_for(key, rec, table, store.for_slice(key), fids, np,
                                   None if layer_of is None else layer_of(key, rec))
-            fid = np.asarray(fids).astype(int)
-            X.append(mat); cls.append(c); grp.append(np.full(len(c), group))
-            if ext_col is not None:
-                ext.append(mat[:, ext_col])
-            per.append((fid, arcs_of(key, rec), c, group))
-        edges = edge_model.gather_edges(per)
-        return (np.concatenate(X), np.concatenate(cls), np.concatenate(grp),
-                np.concatenate(ext) if ext else None, edges, names)
+            cls.append(c)
+            per_fids.append(np.asarray(fids).astype(int))
+            per_arcs.append(arcs)
+        sig = (tuple(sig_parts), tuple(names))
+        cls_all = np.concatenate(cls) if cls else np.zeros(0, int)
+
+        memo = self._edge_memo
+        if memo is not None and memo[0] == sig:
+            _sig, X_all, grp_all, ext_all, edges0 = memo
+        else:
+            X, grp, ext, per = [], [], [], []
+            for (key, rec, table, group, label), fid, arcs, c in zip(items, per_fids, per_arcs, cls):
+                mat = self.feature_matrix(table, names, np)
+                if mat is None:
+                    raise TrainingProblem(f"Edges stopped: incomplete statistics on slice {label}.")
+                X.append(mat); grp.append(np.full(len(c), group))
+                if ext_col is not None:
+                    ext.append(mat[:, ext_col])
+                per.append((fid, arcs, c, group))
+            edges0 = edge_model.gather_edges(per)
+            X_all = np.concatenate(X) if X else np.zeros((0, len(names)))
+            grp_all = np.concatenate(grp) if grp else np.zeros(0, int)
+            ext_all = np.concatenate(ext) if ext else None
+            self._edge_memo = ((sig, X_all, grp_all, ext_all, edges0)
+                               if X_all.nbytes <= self.EDGE_CACHE_BYTES else None)
+        # The labeled-ness of an edge is the only thing here that follows the
+        # annotations: recomputed from the current classes, the same way
+        # gather_edges computes it, into a fresh dict (callers may edit it).
+        a, b = edges0["a"], edges0["b"]
+        edges = dict(edges0)
+        edges["both"] = (cls_all[a] > 0) & (cls_all[b] > 0) if len(a) else np.zeros(0, bool)
+        edges["diff"] = (edges["both"] & (cls_all[a] != cls_all[b]) if len(a)
+                         else np.zeros(0, bool))
+        return X_all, cls_all, grp_all, ext_all, edges, names

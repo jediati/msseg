@@ -150,3 +150,49 @@ def test_row_classes_are_memoized_per_item_until_its_annotations_change():
     assert len(calls) == 5
     b.forget(); b.labeled_set(items(), store, np)
     assert len(calls) == 7
+
+
+
+def test_edge_set_rows_are_memoized_until_a_record_changes():
+    calls = []
+    real = TrainingSetBuilder.feature_matrix
+
+    class Counting(TrainingSetBuilder):
+        @staticmethod
+        def feature_matrix(table, names, np_, rows=None):
+            calls.append(rows is None)
+            return real(table, names, np_, rows)
+
+    b = Counting()
+    store = store_two_classes()
+    its = items(2)
+    names = b.feature_names(its[0][2])
+    arcs = {"a": np.array([0, 2, 5]), "b": np.array([2, 5, 9]), "saddle": np.array([1.0, 2.0, 3.0])}
+    arcs_of = lambda key, rec: arcs
+    first = b.edge_set(its, store, names, arcs_of, np)
+    n_full = calls.count(True)
+    assert n_full == 2
+    again = b.edge_set(its, store, names, arcs_of, np)         # nothing changed: a hit
+    assert calls.count(True) == n_full
+    for x, y in zip(first, again):
+        if isinstance(x, dict):
+            assert x.keys() == y.keys() and all(np.array_equal(x[k], y[k], equal_nan=True) for k in x)
+        elif x is not None:
+            assert np.array_equal(x, y)
+    assert again[4] is not first[4], "callers get their own edges dict"
+
+    store.add("taps", [(15.0, 15.0)], 2, "k0")                  # an annotation pass
+    after = b.edge_set(its, store, names, arcs_of, np)
+    assert calls.count(True) == n_full, "the rows are not rebuilt for an annotation"
+    assert np.array_equal(after[0], first[0]) and not np.array_equal(after[1], first[1])
+    # both/diff follow the classes the way gather_edges computes them
+    ref = TrainingSetBuilder().edge_set(its, store, names, arcs_of, np)[4]
+    assert np.array_equal(after[4]["both"], ref["both"]) and np.array_equal(after[4]["diff"], ref["diff"])
+
+    its[1] = (its[1][0], {"commit": 2, "labels": blocks_raster(), "stats": table(1)},
+              its[1][1]["stats"], its[1][3], its[1][4])           # one item re-primed
+    b.edge_set(its, store, names, arcs_of, np)
+    assert calls.count(True) == n_full + 2, "a changed record rebuilds the rows"
+    b.forget()
+    b.edge_set(its, store, names, arcs_of, np)
+    assert calls.count(True) == n_full + 4
