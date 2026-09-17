@@ -95,6 +95,66 @@ COLOR_METHOD_PARAMS: Dict[str, List[tuple]] = {
 FILTER_OPERATIONS = list(FILTER_SCHEMA.keys())
 
 
+def filter_operations_at(index: int) -> List[str]:
+    """The operations a card at `index` may choose.
+
+    `color` is a frozen alias: a legacy spelling whose placement rule is a rule
+    about the literal operation name, enforced in `msseg::plan_chain`, the C++
+    config parser and here. One function rather than the literal that used to sit
+    in both card UIs -- they are near-identical by copy, so a rule written twice
+    is a rule that drifts once."""
+    if index == 0:
+        return list(FILTER_OPERATIONS)
+    return [o for o in FILTER_OPERATIONS if o != "color"]
+
+
+def chain_plan(chain: Sequence[Any], channels: int = 1,
+               default_method: str = "luminance") -> Dict[str, Any]:
+    """What each stage of `chain` receives and yields, in planes -- the Python
+    mirror of `msseg::plan_chain` (mscoupon_py.chain_plan), for the GUI, which
+    draws cards with no raster and, in a headless selftest, no extension.
+
+    The leading conversion a multi-plane input gets when the chain does not start
+    with `color` is IN `stages`, with ``synthesized`` true and ``index`` -1. That
+    is the point: it has always run, but only inside the runner, where neither
+    the config nor the cards could show it.
+
+    Total, like the rest of this module's readers: a chain being edited is
+    invalid between keystrokes, so a refusal is reported as ``error`` rather than
+    raised. `tests/test_chain_plan.py` holds it to the extension's answer."""
+    stages: List[Dict[str, Any]] = []
+    error: Optional[str] = None
+    cards = [c for c in chain if isinstance(c, dict)]
+
+    for i, card in enumerate(cards[1:], start=1):
+        if card.get("operation") == "color":
+            error = (f"'color' must be the first stage of the chain (found at index {i}): "
+                     "it consumes the input planes, and every later stage runs on a scalar.")
+            break
+
+    channels = max(0, int(channels or 0))
+    leads_with_color = bool(cards) and cards[0].get("operation") == "color"
+    if not leads_with_color and channels > 1:
+        stages.append({"operation": "color", "params": {"method": default_method},
+                       "in": channels, "out": 1, "index": -1, "synthesized": True})
+
+    current = channels if not stages else 1
+    for i, card in enumerate(cards):
+        op = str(card.get("operation") or "none")
+        # `color` takes the stack; `none` passes through; everything else -- core
+        # op or a package's own, like `normalize` -- reads one plane and writes
+        # one. Mirrors msseg::stage_io.
+        out = 1 if op == "color" else current
+        stages.append({"operation": op, "params": dict(card.get("params") or {}),
+                       "in": current, "out": out, "index": i, "synthesized": False})
+        current = out
+
+    return {"stages": stages, "in": channels, "out": current,
+            "color_stage": next((k for k, s in enumerate(stages)
+                                 if s["operation"] == "color"), -1),
+            "error": error}
+
+
 def filter_param_schema(operation: str, params: Any = None) -> List[tuple]:
     """The [(param, kind, default), ...] rows a card renders: the operation's
     schema, plus -- for `color` -- the rows of the method `params` names."""

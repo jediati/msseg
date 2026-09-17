@@ -29,6 +29,7 @@
 #include "mscoupon/query.hpp"
 #include "mscoupon/region_measure.hpp"
 #include "msseg/compute/msc2d.hpp"
+#include "msseg/filter/chain_plan.hpp"
 #include "msseg/filter/color_stage.hpp"
 #include "msseg/filter/filter_stage.hpp"
 #include "msseg/io/tiff_io.hpp"
@@ -254,6 +255,42 @@ FloatArray filter_chain(const FloatArray& image, const std::string& params_json,
     filtered = msseg::apply_filter_chain(slice, chain);
   }
   return to_2d_array<FloatArray>(filtered.data(), filtered.size(), h, w, "the filter chain");
+}
+
+// The chain PLAN: what each stage of `chain_json` receives and yields, in
+// planes, with no raster in hand. The leading colour conversion a multi-plane
+// input gets when the chain does not start with one is IN the list, marked
+// index -1, which is the whole point -- it used to exist only inside the runner.
+py::dict chain_plan_py(const std::string& chain_json, int channels,
+                       const std::string& default_method) {
+  nlohmann::json arr = chain_json.empty() ? nlohmann::json::array() : nlohmann::json::parse(chain_json);
+  if (!arr.is_array()) throw std::runtime_error("chain_plan: expected a JSON array of stages");
+  std::vector<msseg::FilterParams> chain;
+  for (const auto& f : arr) {
+    msseg::FilterParams fp;
+    fp.operation = f.value("operation", fp.operation);
+    if (f.contains("params") && f["params"].is_object()) fp.params = f["params"];
+    chain.push_back(std::move(fp));
+  }
+  const msseg::ChainPlan plan = msseg::plan_chain(chain, static_cast<std::size_t>(channels), default_method);
+
+  py::list stages;
+  for (const msseg::StageRecord& rec : plan.stages) {
+    py::dict d;
+    d["operation"] = rec.stage.operation;
+    d["params"] = py::module_::import("json").attr("loads")(rec.stage.params.dump());
+    d["in"] = static_cast<int>(rec.in_channels);
+    d["out"] = static_cast<int>(rec.out_channels);
+    d["index"] = rec.config_index;
+    d["synthesized"] = rec.synthesized();
+    stages.append(std::move(d));
+  }
+  py::dict out;
+  out["stages"] = std::move(stages);
+  out["in"] = static_cast<int>(plan.in_channels);
+  out["out"] = static_cast<int>(plan.out_channels);
+  out["color_stage"] = plan.color_stage;
+  return out;
 }
 
 // The measurement channels of one slice, as pixels: (names, (C, h, w) float32).
@@ -722,6 +759,13 @@ PYBIND11_MODULE(mscoupon_py, m) {
            "Prefer this over feature_stats() -- it is one buffer copy rather than a dict "
            "per feature, which is what keeps a wide channel set usable on a slider.");
 
+  m.def("chain_plan", &chain_plan_py, py::arg("chain_json"), py::arg("channels") = 1,
+        py::arg("default_method") = std::string("luminance"),
+        "Plan a filter chain over `channels` planes, with no raster: "
+        "{stages: [{operation, params, in, out, index, synthesized}], in, out, color_stage}. "
+        "A multi-plane input whose chain does not start with `color` gets one synthesized at "
+        "the FRONT (index -1) exactly as the runner has always done -- it is simply visible now. "
+        "Raises for `color` after index 0, a method the plane count refuses, and no planes.");
   m.def("prime_slice", &prime_slice, py::arg("base"), py::arg("filtered"),
         py::arg("params_json") = std::string(), py::arg("color") = py::none(),
         "Build a primed Msc2DPipeline over base (original) + filtered (topology field, "

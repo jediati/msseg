@@ -10,6 +10,7 @@
 
 #include "diffg/filter_bank.hpp"
 #include "diffg/structure.hpp"
+#include "msseg/filter/chain_plan.hpp"
 
 namespace msseg {
 namespace {
@@ -311,30 +312,22 @@ diffg::Image<float> apply_color_stage(diffg::MultiImageView<const float> planes,
   throw std::runtime_error("color: unhandled method '" + method + "'.");
 }
 
+// The leading-colour view of a full ChainPlan. Kept because the three runners
+// only ever needed those two facts, and narrowing here means plan_chain can
+// grow without touching them.
 ColorChainPlan plan_color_chain(const std::vector<FilterParams>& chain, std::size_t channels,
                                 const std::string& default_method) {
-  for (std::size_t i = 1; i < chain.size(); ++i) {
-    if (chain[i].operation == kColorOperation) {
-      throw std::runtime_error("'color' must be the FIRST stage of a chain (found at index " +
-                               std::to_string(i) + "): it consumes the input planes, and every later "
-                               "stage runs on a scalar.");
-    }
+  const ChainPlan plan = plan_chain(chain, channels, default_method);
+  ColorChainPlan out;
+  if (plan.color_stage >= 0) {
+    const StageRecord& rec = plan.stages[static_cast<std::size_t>(plan.color_stage)];
+    out.color = rec.stage;
+    // A synthesized stage is not IN the caller's chain, so every config stage is
+    // still ahead; an explicit one is the caller's index 0, so the scalar part
+    // starts at 1.
+    out.first_scalar_stage = rec.synthesized() ? 0 : 1;
   }
-  ColorChainPlan plan;
-  if (!chain.empty() && chain.front().operation == kColorOperation) {
-    plan.color = chain.front();
-    plan.first_scalar_stage = 1;
-  } else if (channels > 1) {
-    FilterParams synthesized;
-    synthesized.operation = kColorOperation;
-    synthesized.params = nlohmann::json{{"method", default_method}};
-    plan.color = synthesized;
-  }
-  if (plan.color.has_value()) {
-    std::string why;
-    if (!color_stage_accepts(*plan.color, channels, &why)) throw std::runtime_error(why);
-  }
-  return plan;
+  return out;
 }
 
 }  // namespace msseg

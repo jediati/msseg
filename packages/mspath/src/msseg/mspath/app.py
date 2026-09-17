@@ -67,6 +67,11 @@ DEFAULT_OVERVIEW_LEVEL = 4
 # need, because a basin near the cut can drain to an extremum outside it).
 DEFAULT_HALO = 64
 
+# A slide read through the pyramid is RGB. Declared rather than measured because
+# the statistics schema, and the chain plan the cards draw, both have to resolve
+# before any raster is in hand.
+SLIDE_PLANES = 3
+
 # The largest ROI worth offering, measured rather than guessed
 # (experiments/roi_bench.py): 4096^2 is 8.7 s and ~1.9 GB peak, 8192^2 is 35 s
 # and 7.2 GB. Past this an "ROI" stops being something you wait for.
@@ -230,8 +235,45 @@ class MsPathApp(ViewerShell):
             if isinstance(w, ttk.Label):            # the chain's explanatory label
                 continue
             w.destroy()
+        # The conversion a slide's RGB planes get when a chain does not start
+        # with one is DERIVED: re-planned every rebuild, never stored in `cards`,
+        # so it reaches neither the profile nor a config. A slide read through
+        # the pyramid is RGB, which is the same 3 _profile_for_compute declares.
+        try:
+            plan = config_io.chain_plan(cards, SLIDE_PLANES, default_color_method(
+                self._profile_from_ui()))
+            head = plan["stages"][0] if plan["stages"] else None
+        except Exception:
+            head = None
+        if head is not None and head["synthesized"]:
+            self._build_auto_color_card(frame, head, chain)
         for idx, card in enumerate(cards):
             self._build_filter_card(idx, card, chain)
+
+    def _build_auto_color_card(self, parent, stage, chain):
+        """Draw the conversion the runner inserts, greyed and read-only.
+
+        Not one of `self.filter_cards`, so not exported, not saved, not editable
+        in place. "Pin" makes it a real card at the head of the chain."""
+        frame = ttk.Frame(parent, relief="groove", borderwidth=1)
+        frame.pack(fill="x", padx=4, pady=2)
+        top = ttk.Frame(frame); top.pack(fill="x")
+        method = str(stage["params"].get("method", "luminance"))
+        ttk.Label(top, text=f"(auto) color / {method}", foreground="#777",
+                  width=22).pack(side="left", padx=2, pady=2)
+        ttk.Label(top, text=f"{stage['in']}→{stage['out']}",
+                  foreground="#777").pack(side="left", padx=2)
+        ttk.Button(top, text="Pin", width=5,
+                   command=lambda c=chain, m=method: self._pin_auto_color(c, m)
+                   ).pack(side="right", padx=2)
+
+    def _pin_auto_color(self, chain, method):
+        """Make the synthesized conversion an ordinary card at index 0."""
+        cards, _frame = self._chain(chain)
+        cards.insert(0, {"operation": "color", "params": {"method": method}})
+        self._set_chain_cards(chain, cards)
+        self._rebuild_filter_cards(chain)
+        self._notify_profile_edit()
 
     def _build_filter_card(self, idx, card, chain="topo"):
         cards, parent = self._chain(chain)
@@ -240,7 +282,7 @@ class MsPathApp(ViewerShell):
         top = ttk.Frame(frame); top.pack(fill="x")
         op_var = tk.StringVar(value=card["operation"])
         # `color` consumes the input planes, so only the head of a chain may be one.
-        ops = FILTER_OPERATIONS if idx == 0 else [o for o in FILTER_OPERATIONS if o != "color"]
+        ops = config_io.filter_operations_at(idx)
         combo = ttk.Combobox(top, textvariable=op_var, values=ops, state="readonly", width=20)
         combo.pack(side="left", padx=2, pady=2)
         combo.bind("<<ComboboxSelected>>",
@@ -1290,7 +1332,7 @@ class MsPathApp(ViewerShell):
         hand.
         """
         return json.loads(coupon_session.profile_params_json(
-            self._profile_from_ui(), 1, 3))
+            self._profile_from_ui(), 1, SLIDE_PLANES))
 
     def _profile_from_ui(self):
         active = self.profiles[self.active_profile_idx]

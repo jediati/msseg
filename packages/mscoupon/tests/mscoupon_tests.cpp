@@ -31,6 +31,7 @@
 #include "diffg/filter_bank.hpp"
 #include "diffg/structure.hpp"
 #include "msseg/compute/msc2d.hpp"
+#include "msseg/filter/chain_plan.hpp"
 #include "msseg/filter/color_stage.hpp"
 #include "msseg/filter/filter_stage.hpp"
 #include "msseg/io/tiff_io.hpp"
@@ -1871,6 +1872,86 @@ void test_color_chain_rules_and_identity() {
          "unknown methods are refused with a reason");
 }
 
+// The chain PLAN: arity threaded through a chain with no raster in hand, and
+// the synthesized colour stage made visible instead of living inside the runner.
+// Every assertion here is a statement about behaviour that already existed --
+// Stage 1 of docs/design_filter_types.md changes nothing but who can see it.
+void test_chain_plan() {
+  const auto color_of = [](const char* method) {
+    msseg::FilterParams f;
+    f.operation = "color";
+    f.params = nlohmann::json{{"method", method}};
+    return f;
+  };
+  msseg::FilterParams blur;
+  blur.operation = "blur";
+  blur.params = nlohmann::json{{"sigma", 1.0}};
+  msseg::FilterParams none_stage;  // operation defaults to "none"
+  msseg::FilterParams normalize;   // an mscoupon op core does not know
+  normalize.operation = "normalize";
+
+  // Signatures. `color` is the one stage that consumes the stack; an operation
+  // core has never heard of reads one plane and writes one, which is what makes
+  // `normalize` fall out correctly without core knowing it exists.
+  expect(msseg::stage_io(color_of("mean")).in == msseg::StageIO::In::Planes &&
+             msseg::stage_io(color_of("mean")).out == msseg::StageIO::Out::One,
+         "color consumes planes and yields one");
+  expect(msseg::stage_io(blur).in == msseg::StageIO::In::Scalar &&
+             msseg::stage_io(blur).out == msseg::StageIO::Out::Same,
+         "blur is scalar -> same");
+  expect(msseg::stage_io(none_stage).in == msseg::StageIO::In::Any, "none passes anything through");
+  expect(msseg::stage_io(normalize).in == msseg::StageIO::In::Scalar,
+         "an operation core does not know is scalar -> same");
+
+  // RGB, no colour stage: the conversion is synthesized AT THE FRONT and is now
+  // a stage of the plan, with the config stages behind it.
+  const msseg::ChainPlan rgb = msseg::plan_chain({blur}, 3, "mean");
+  expect(rgb.stages.size() == 2, "a synthesized conversion is a stage of the plan");
+  expect(rgb.stages[0].synthesized(), "the leading conversion is marked synthesized");
+  expect(rgb.stages[0].stage.operation == "color" &&
+             rgb.stages[0].stage.params.value("method", "") == "mean",
+         "the synthesized stage carries the default method");
+  expect(rgb.stages[0].in_channels == 3 && rgb.stages[0].out_channels == 1, "it reduces 3 -> 1");
+  expect(!rgb.stages[1].synthesized() && rgb.stages[1].config_index == 0,
+         "a config stage keeps its index in the caller's chain");
+  expect(rgb.stages[1].in_channels == 1, "everything after the conversion sees one plane");
+  expect(rgb.in_channels == 3 && rgb.out_channels == 1, "the chain reduces the stack");
+  expect(rgb.color_stage == 0, "the plan names its colour stage");
+
+  // An explicit leading conversion is not synthesized, and one plane needs none.
+  const msseg::ChainPlan explicit_rgb = msseg::plan_chain({color_of("mean"), blur}, 3, "luminance");
+  expect(explicit_rgb.stages.size() == 2 && !explicit_rgb.stages[0].synthesized(),
+         "an explicit colour stage is the caller's own");
+  const msseg::ChainPlan gray = msseg::plan_chain({blur}, 1, "luminance");
+  expect(gray.stages.size() == 1 && gray.color_stage == -1 && gray.out_channels == 1,
+         "one plane plans no conversion");
+
+  // The wrapper the three runners use is a VIEW of the plan, and still says
+  // exactly what it said before.
+  const msseg::ColorChainPlan w_rgb = msseg::plan_color_chain({blur}, 3, "mean");
+  expect(w_rgb.color.has_value() && w_rgb.first_scalar_stage == 0,
+         "a synthesized conversion leaves every config stage ahead");
+  const msseg::ColorChainPlan w_explicit = msseg::plan_color_chain({color_of("mean"), blur}, 3, "x");
+  expect(w_explicit.color.has_value() && w_explicit.first_scalar_stage == 1,
+         "an explicit conversion is the caller's index 0");
+  const msseg::ColorChainPlan w_gray = msseg::plan_color_chain({blur}, 1, "luminance");
+  expect(!w_gray.color.has_value() && w_gray.first_scalar_stage == 0, "one plane converts nothing");
+
+  // Refusals: the frozen-alias placement rule, the method/plane-count check, and
+  // no planes at all.
+  const auto throws = [](const std::vector<msseg::FilterParams>& chain, std::size_t c) {
+    try {
+      msseg::plan_chain(chain, c, "luminance");
+      return false;
+    } catch (const std::exception&) {
+      return true;
+    }
+  };
+  expect(throws({blur, color_of("mean")}, 3), "color after index 0 is rejected by the planner");
+  expect(throws({color_of("luminance")}, 1), "a method the plane count refuses is rejected");
+  expect(throws({blur}, 0), "no input planes is refused rather than read out of bounds");
+}
+
 void write_rgb_tiff(const std::filesystem::path& path, int w, int h, int samples, bool planar) {
   // Sample c of pixel i is c*50 + i, so a plane is recognisable after reading.
   const std::size_t n = static_cast<std::size_t>(w * h);
@@ -2184,6 +2265,7 @@ int main() try {
   RUN(test_base_filters_config);
   RUN(test_color_stage_methods);
   RUN(test_color_chain_rules_and_identity);
+  RUN(test_chain_plan);
   RUN(test_tiff_planes_roundtrip);
   RUN(test_color_stat_channels);
   RUN(test_histogram_stats);
