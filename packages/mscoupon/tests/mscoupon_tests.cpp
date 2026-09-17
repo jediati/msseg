@@ -32,6 +32,7 @@
 #include "diffg/structure.hpp"
 #include "msseg/compute/msc2d.hpp"
 #include "msseg/filter/chain_plan.hpp"
+#include "msseg/filter/plane_stages.hpp"
 #include "msseg/filter/color_stage.hpp"
 #include "msseg/filter/filter_stage.hpp"
 #include "msseg/io/tiff_io.hpp"
@@ -1952,6 +1953,219 @@ void test_chain_plan() {
   expect(throws({blur}, 0), "no input planes is refused rather than read out of bounds");
 }
 
+// The plane stages: `adapt` and `stain_deconvolution`, the two that carry a
+// stack instead of reducing it. The last block is the claim the whole of
+// docs/design_filter_types.md turns on -- that E - lambda*H is ONE row applied
+// to the OD planes, so the register machine it nearly proposed is unnecessary.
+void test_plane_stages() {
+  const auto stage = [](const char* op, nlohmann::json params) {
+    msseg::FilterParams f;
+    f.operation = op;
+    f.params = std::move(params);
+    return f;
+  };
+  // Three pixels, three planes; pixel j carries the j-th basis vector, which
+  // makes the concentrations of a deconvolution literally read out inv(M).
+  diffg::MultiImage<float> basis(diffg::Dimensions{3, 1, 1}, 3);
+  for (std::size_t c = 0; c < 3; ++c) {
+    for (std::size_t i = 0; i < 3; ++i) basis.channel_data(c)[i] = (c == i) ? 1.0f : 0.0f;
+  }
+
+  // --- arity, shared by the planner and the applier ---
+  std::string why;
+  expect(msseg::plane_stage_output_channels(stage("adapt", {{"mode", "select"}, {"channels", {0, 2}}}), 3) == 2,
+         "select yields one plane per named channel");
+  expect(msseg::plane_stage_output_channels(stage("adapt", {{"mode", "select"}, {"channels", {5}}}), 3, &why) < 0 &&
+             !why.empty(),
+         "select refuses a plane out of range, with a reason");
+  expect(msseg::plane_stage_output_channels(
+             stage("adapt", {{"mode", "project"}, {"matrix", {{1, 0, 0}, {0, 1, 0}}}}), 3) == 2,
+         "project yields one plane per matrix row");
+  expect(msseg::plane_stage_output_channels(
+             stage("adapt", {{"mode", "project"}, {"matrix", {{1, 0}}}}), 3, &why) < 0,
+         "a matrix row must match the plane count");
+  expect(msseg::plane_stage_output_channels(stage("stain_deconvolution", {{"preset", "he"}}), 3) == 3,
+         "stain_deconvolution yields three concentrations");
+  expect(msseg::plane_stage_output_channels(stage("stain_deconvolution", {{"preset", "he"}}), 1, &why) < 0,
+         "stain_deconvolution refuses a non-RGB input");
+  expect(msseg::plane_stage_output_channels(stage("stain_deconvolution", {{"preset", "zzz"}}), 3, &why) < 0,
+         "an unknown stain preset is refused");
+
+  // --- select and project ---
+  const auto picked = msseg::apply_plane_stage(basis.view(), stage("adapt", {{"mode", "select"}, {"channels", {2, 0}}}));
+  expect(picked.channels() == 2 && picked.channel_data(0)[2] == 1.0f && picked.channel_data(1)[0] == 1.0f,
+         "select reorders the planes it names");
+  const auto lum = msseg::apply_plane_stage(basis.view(), stage("adapt", {{"mode", "project"}, {"preset", "luminance"}}));
+  expect(lum.channels() == 1 && std::abs(lum.channel_data(0)[1] - 0.7152f) < 1e-6f,
+         "project's luminance preset is the Rec.709 row");
+
+  // --- the composition claim ---
+  // Read inv(M) off the basis image: column j of the concentrations IS inv(M)'s
+  // column j, because the OD fed in was the j-th basis vector.
+  const msseg::FilterParams deconv = stage("stain_deconvolution", {{"preset", "he"}, {"od", false}});
+  const auto minv = msseg::apply_plane_stage(basis.view(), deconv);
+  expect(minv.channels() == 3, "deconvolution of a basis reads out the inverse");
+
+  const double lambda = 0.7;
+  // row[j] = (row_E - lambda*row_H) . inv(M)[:,j]
+  nlohmann::json row = nlohmann::json::array();
+  for (std::size_t j = 0; j < 3; ++j) {
+    row.push_back(static_cast<double>(minv.channel_data(1)[j]) -
+                  lambda * static_cast<double>(minv.channel_data(0)[j]));
+  }
+
+  // A real OD field, deterministic so a failure is reproducible.
+  diffg::MultiImage<float> od(diffg::Dimensions{16, 12, 1}, 3);
+  const std::size_t n = od.channel_stride();
+  for (std::size_t c = 0; c < 3; ++c) {
+    for (std::size_t i = 0; i < n; ++i) {
+      od.channel_data(c)[i] = static_cast<float>(0.13 * static_cast<double>((i * 7 + c * 5) % 23));
+    }
+  }
+  const auto conc = msseg::apply_plane_stage(od.view(), deconv);
+  const auto projected = msseg::apply_plane_stage(
+      od.view(), stage("adapt", {{"mode", "project"}, {"matrix", nlohmann::json::array({row})}}));
+  expect(projected.channels() == 1, "one row yields one plane");
+  double worst = 0.0;
+  for (std::size_t i = 0; i < n; ++i) {
+    const double deconvolved = static_cast<double>(conc.channel_data(1)[i]) -
+                               lambda * static_cast<double>(conc.channel_data(0)[i]);
+    worst = std::max(worst, std::abs(deconvolved - static_cast<double>(projected.channel_data(0)[i])));
+  }
+  if (!(worst < 1e-4)) std::cout << "  worst deviation: " << worst << std::endl;
+  expect(worst < 1e-4, "E - lambda*H is ONE row applied to the OD planes");
+
+  // And the residual axis is real: a colour neither stain explains lands there
+  // rather than being smeared over the two that matter.
+  expect(std::abs(minv.channel_data(2)[0]) + std::abs(minv.channel_data(2)[1]) +
+                 std::abs(minv.channel_data(2)[2]) >
+             1e-6,
+         "the complement axis carries what H and E do not");
+}
+
+// A chain that CARRIES a stack: the Stage 2 payload of
+// docs/design_filter_types.md. Scalar stages still read one plane, so nothing
+// lifts implicitly; what is new is that two stages can pass planes between them.
+void test_plane_carrying_chain() {
+  const auto stage = [](const char* op, nlohmann::json params) {
+    msseg::FilterParams f;
+    f.operation = op;
+    f.params = std::move(params);
+    return f;
+  };
+  // A synthetic RGB slice with structure in every plane.
+  diffg::MultiImage<float> rgb(diffg::Dimensions{20, 16, 1}, 3);
+  const std::size_t n = rgb.channel_stride();
+  for (std::size_t c = 0; c < 3; ++c) {
+    for (std::size_t i = 0; i < n; ++i) {
+      rgb.channel_data(c)[i] = static_cast<float>(40 + ((i * 11 + c * 37) % 180));
+    }
+  }
+
+  // Deconvolve, then keep eosin: the chain holds three planes in the middle.
+  const std::vector<msseg::FilterParams> he_eosin = {
+      stage("stain_deconvolution", {{"preset", "he"}}),
+      stage("adapt", {{"mode", "select"}, {"channels", {1}}})};
+  const auto plan = msseg::plan_chain(he_eosin, 3, "luminance");
+  expect(plan.stages.size() == 2 && plan.stages[0].out_channels == 3 && plan.out_channels == 1,
+         "the plan carries three planes between the two stages");
+  const auto eosin = msseg::apply_filter_chain(rgb.view(), he_eosin);
+  const auto conc = msseg::apply_plane_stage(rgb.view(), he_eosin[0]);
+  bool same = true;
+  for (std::size_t i = 0; i < n; ++i) same = same && eosin.data()[i] == conc.channel_data(1)[i];
+  expect(same, "the chain's output is the eosin concentration plane");
+
+  // A chain that ENDS on a stack is refused by the scalar entry -- an MSC field
+  // is one plane -- and the message names the way out.
+  bool threw = false;
+  std::string msg;
+  try {
+    msseg::apply_filter_chain(rgb.view(), {he_eosin[0]});
+  } catch (const std::exception& e) {
+    threw = true;
+    msg = e.what();
+  }
+  expect(threw && msg.find("adapt") != std::string::npos,
+         "a chain ending on a stack is refused, naming adapt as the reduction");
+
+  // A scalar stage handed a stack is refused by the PLANNER, before any pixel
+  // is touched -- nothing lifts component-wise yet, by design.
+  threw = false;
+  try {
+    msseg::plan_chain({he_eosin[0], stage("blur", {{"sigma", 1.0}})}, 3, "luminance");
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  expect(threw, "a scalar stage cannot be handed a stack");
+
+  // optical_density can hand back its planes, and projecting them by the unit
+  // stain row reproduces what the projecting form computes directly. This is
+  // what makes `adapt{project}` a superset of the `stain` parameter.
+  const auto od_planes = msseg::apply_filter_chain_planes(
+      rgb.view(), {stage("color", {{"method", "optical_density"}, {"output", "planes"}})});
+  expect(od_planes.channels() == 3, "optical_density can keep its planes");
+
+  double sv[3] = {0.65, 0.70, 0.29};
+  const double norm = std::sqrt(sv[0] * sv[0] + sv[1] * sv[1] + sv[2] * sv[2]);
+  for (double& v : sv) v /= norm;
+  const auto direct = msseg::apply_filter_chain(
+      rgb.view(), {stage("color", {{"method", "optical_density"}, {"stain", {0.65, 0.70, 0.29}}})});
+  const auto composed = msseg::apply_filter_chain(
+      rgb.view(), {stage("color", {{"method", "optical_density"}, {"output", "planes"}}),
+                   stage("adapt", {{"mode", "project"},
+                                   {"matrix", nlohmann::json::array({{sv[0], sv[1], sv[2]}})}})});
+  double worst = 0.0;
+  for (std::size_t i = 0; i < n; ++i) {
+    worst = std::max(worst, std::abs(static_cast<double>(direct.data()[i]) -
+                                     static_cast<double>(composed.data()[i])));
+  }
+  if (!(worst < 1e-4)) std::cout << "  worst deviation: " << worst << std::endl;
+  expect(worst < 1e-4, "od planes + adapt{project} reproduces od's own stain projection");
+
+  // mscoupon's own runner carries a single-plane Image2D, so a plane chain is
+  // split: the leading stages that see a stack run in core, and the tail runs
+  // here, because `normalize` is this package's and core cannot apply it. The
+  // boundary is the first stage that receives one plane.
+  msseg::InputSlice slice;
+  slice.planes = diffg::MultiImage<float>(diffg::Dimensions{20, 16, 1}, 3);
+  for (std::size_t c = 0; c < 3; ++c) {
+    for (std::size_t i = 0; i < n; ++i) {
+      slice.planes.channel_data(c)[i] = static_cast<float>(40 + ((i * 11 + c * 37) % 180));
+    }
+  }
+  mscoupon::FilterConfig stain;
+  stain.operation = "stain_deconvolution";
+  stain.params = nlohmann::json{{"preset", "he"}};
+  mscoupon::FilterConfig pick_eosin;
+  pick_eosin.operation = "adapt";
+  pick_eosin.params = nlohmann::json{{"mode", "select"}, {"channels", {1}}};
+
+  const mscoupon::Image2D cli = mscoupon::apply_filter_chain(slice, {stain, pick_eosin}, "luminance", nullptr);
+  const auto core_conc = msseg::apply_plane_stage(slice.view(), he_eosin[0]);
+  bool cli_same = cli.pixels.size() == n;
+  for (std::size_t i = 0; i < n && cli_same; ++i) cli_same = cli.pixels[i] == core_conc.channel_data(1)[i];
+  expect(cli_same, "the CLI chain runs a plane prefix and lands on the same pixels core does");
+
+  // The split's point: a package op in the scalar tail, after a plane prefix.
+  mscoupon::FilterConfig norm_stage;
+  norm_stage.operation = "normalize";
+  norm_stage.params = nlohmann::json{{"method", "histogram"}};
+  std::vector<mscoupon::TwoPoint> measured;
+  const mscoupon::Image2D normalized =
+      mscoupon::apply_filter_chain(slice, {stain, pick_eosin, norm_stage}, "luminance", &measured);
+  expect(measured.size() == 1 && normalized.pixels.size() == n,
+         "a normalize stage still runs, and reports its landmarks, after a plane prefix");
+
+  // A chain that never reduces has nowhere to land in an Image2D, and says so.
+  bool cli_threw = false;
+  try {
+    mscoupon::apply_filter_chain(slice, {stain}, "luminance", nullptr);
+  } catch (const std::exception&) {
+    cli_threw = true;
+  }
+  expect(cli_threw, "a chain that ends on a stack is refused by the Image2D pipeline");
+}
+
 void write_rgb_tiff(const std::filesystem::path& path, int w, int h, int samples, bool planar) {
   // Sample c of pixel i is c*50 + i, so a plane is recognisable after reading.
   const std::size_t n = static_cast<std::size_t>(w * h);
@@ -2266,6 +2480,8 @@ int main() try {
   RUN(test_color_stage_methods);
   RUN(test_color_chain_rules_and_identity);
   RUN(test_chain_plan);
+  RUN(test_plane_stages);
+  RUN(test_plane_carrying_chain);
   RUN(test_tiff_planes_roundtrip);
   RUN(test_color_stat_channels);
   RUN(test_histogram_stats);

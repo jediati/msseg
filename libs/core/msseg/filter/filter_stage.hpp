@@ -32,6 +32,23 @@ diffg::Image<float> apply_filter_chain(diffg::MultiImageView<const float> planes
                                        const std::vector<FilterParams>& filters,
                                        const std::string& default_color_method = "luminance");
 
+// The same chain, allowed to END on a stack.
+//
+// A chain may now carry C planes between two stages -- `optical_density` can
+// hand back its OD planes, `stain_deconvolution` yields concentrations, and
+// `adapt` selects or projects them (docs/design_filter_types.md). Scalar stages
+// still read one plane; `plan_chain` refuses a chain that hands them more, so
+// nothing lifts implicitly.
+//
+// The scalar overload above is this one plus "and the result must be a single
+// plane", which is what a Morse-Smale field is. It keeps a fast path: when no
+// stage of the plan yields more than one plane -- every chain that existed
+// before this -- it runs the old fold with the old number of copies, so those
+// workflows are byte-identical AND no slower.
+diffg::MultiImage<float> apply_filter_chain_planes(
+    diffg::MultiImageView<const float> planes, const std::vector<FilterParams>& filters,
+    const std::string& default_color_method = "luminance");
+
 // The measurement channels a StatsSpec asks for, as pixels.
 //
 // `base` and `filtered` are ALIASED, not copied -- the caller already owns those

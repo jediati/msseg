@@ -17,7 +17,9 @@
 #include "diffg/morphology.hpp"
 #include "diffg/options.hpp"
 #include "diffg/structure.hpp"
+#include "msseg/filter/chain_plan.hpp"
 #include "msseg/filter/color_stage.hpp"
+#include "msseg/filter/plane_stages.hpp"
 #include "msseg/workflow/stat_channels.hpp"
 
 namespace msseg {
@@ -182,20 +184,99 @@ diffg::Image<float> apply_filter_chain(const diffg::Image<float>& input,
   return current;
 }
 
+namespace {
+
+// A chain nothing in it makes wider: the plan's every stage yields one plane.
+// That is every chain that existed before plane stages, and it is worth naming
+// because such a chain can take the original fold -- same values, same number of
+// intermediates, no MultiImage round trip per stage.
+bool stays_scalar(const ChainPlan& plan) {
+  for (const StageRecord& rec : plan.stages) {
+    if (rec.out_channels != 1) return false;
+  }
+  return true;
+}
+
+diffg::Image<float> one_plane(const diffg::MultiImage<float>& stack) {
+  diffg::Image<float> out(stack.dims(), stack.spacing());
+  std::copy(stack.channel_data(0), stack.channel_data(0) + out.size(), out.data());
+  return out;
+}
+
+}  // namespace
+
+diffg::MultiImage<float> apply_filter_chain_planes(diffg::MultiImageView<const float> planes,
+                                                   const std::vector<FilterParams>& filters,
+                                                   const std::string& default_color_method) {
+  const ChainPlan plan = plan_chain(filters, planes.channels(), default_color_method);
+
+  // The caller's planes are read in place until a stage produces something.
+  // Every stage allocates its own output anyway, so copying the input up front
+  // would be one full stack copied for nothing -- which on a slide tile is the
+  // largest allocation in the chain.
+  diffg::MultiImage<float> owned;
+  bool have_owned = false;
+  const auto current = [&]() -> diffg::MultiImageView<const float> {
+    return have_owned ? diffg::MultiImageView<const float>(owned.view()) : planes;
+  };
+
+  for (const StageRecord& rec : plan.stages) {
+    const std::string& op = rec.stage.operation;
+    if (op == "none" || op.empty()) continue;
+    if (op == kColorOperation) {
+      owned = apply_color_stage_multi(current(), rec.stage);
+    } else if (is_plane_operation(op)) {
+      owned = apply_plane_stage(current(), rec.stage);
+    } else {
+      // plan_chain has already refused a scalar stage handed a stack, so this
+      // holds; assert it rather than trust it, since the two could drift.
+      const diffg::MultiImageView<const float> in = current();
+      if (in.channels() != 1) {
+        throw std::runtime_error("'" + op + "' reads one plane, but " +
+                                 std::to_string(in.channels()) + " reach it.");
+      }
+      diffg::Image<float> scalar(in.dims(), in.spacing());
+      std::copy(in.channel_data(0), in.channel_data(0) + scalar.size(), scalar.data());
+      diffg::Image<float> next = apply_filter(scalar, rec.stage);
+      diffg::MultiImage<float> wrapped(next.dims(), 1, next.spacing());
+      std::copy(next.data(), next.data() + next.size(), wrapped.channel_data(0));
+      owned = std::move(wrapped);
+    }
+    have_owned = true;
+  }
+  if (!have_owned) {  // an empty chain: hand back a copy, as the scalar fold does
+    owned = diffg::MultiImage<float>(planes.dims(), planes.channels(), planes.spacing());
+    std::copy(planes.data(), planes.data() + owned.size(), owned.data());
+  }
+  return owned;
+}
+
 diffg::Image<float> apply_filter_chain(diffg::MultiImageView<const float> planes,
                                        const std::vector<FilterParams>& filters,
                                        const std::string& default_color_method) {
-  const ColorChainPlan plan = plan_color_chain(filters, planes.channels(), default_color_method);
+  const ChainPlan plan = plan_chain(filters, planes.channels(), default_color_method);
+  if (!stays_scalar(plan)) {
+    diffg::MultiImage<float> out = apply_filter_chain_planes(planes, filters, default_color_method);
+    if (out.channels() != 1) {
+      throw std::runtime_error(
+          "the chain yields " + std::to_string(out.channels()) +
+          " planes, but the field a Morse-Smale complex runs over is one; reduce them with an "
+          "adapt stage (mode 'select' or 'project').");
+    }
+    return one_plane(out);
+  }
+  // The original fold, unchanged: every pre-existing chain takes this path.
+  const ColorChainPlan color = plan_color_chain(filters, planes.channels(), default_color_method);
   diffg::Image<float> current;
-  if (plan.color.has_value()) {
-    current = apply_color_stage(planes, *plan.color);
+  if (color.color.has_value()) {
+    current = apply_color_stage(planes, *color.color);
   } else {
     // One plane, no colour stage: copy it out and run the scalar chain on the
     // copy, which is what the scalar overload does with its input.
     current = diffg::Image<float>(planes.dims(), planes.spacing());
     std::copy(planes.channel_data(0), planes.channel_data(0) + current.size(), current.data());
   }
-  for (std::size_t i = plan.first_scalar_stage; i < filters.size(); ++i) {
+  for (std::size_t i = color.first_scalar_stage; i < filters.size(); ++i) {
     current = apply_filter(current, filters[i]);
   }
   return current;

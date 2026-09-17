@@ -31,6 +31,7 @@
 #include "msseg/compute/msc2d.hpp"
 #include "msseg/filter/chain_plan.hpp"
 #include "msseg/filter/color_stage.hpp"
+#include "msseg/filter/plane_stages.hpp"
 #include "msseg/filter/filter_stage.hpp"
 #include "msseg/io/tiff_io.hpp"
 #include "msseg/workflow/input_slice.hpp"
@@ -88,6 +89,24 @@ Array to_2d_array(const T* src, std::size_t count, std::size_t h, std::size_t w,
   }
   Array out({static_cast<py::ssize_t>(h), static_cast<py::ssize_t>(w)});
   std::memcpy(out.request().ptr, src, count * sizeof(T));
+  return out;
+}
+
+// A chain result as an array: (h, w) for one plane, planar (C, h, w) for a
+// stack. One plane keeps the old shape, so every existing caller -- and every
+// existing test -- sees exactly what it saw before; only a chain that asks for
+// planes gets three dimensions back.
+FloatArray planes_to_array(const diffg::MultiImage<float>& stack, std::size_t h, std::size_t w) {
+  const std::size_t c = stack.channels();
+  if (c * h * w != stack.size()) {
+    throw std::runtime_error("the filter chain produced " + std::to_string(stack.size()) +
+                             " values, which is not " + std::to_string(c) + " x " +
+                             std::to_string(h) + " x " + std::to_string(w) + ".");
+  }
+  FloatArray out = c == 1 ? FloatArray({static_cast<py::ssize_t>(h), static_cast<py::ssize_t>(w)})
+                          : FloatArray({static_cast<py::ssize_t>(c), static_cast<py::ssize_t>(h),
+                                        static_cast<py::ssize_t>(w)});
+  std::memcpy(out.request().ptr, stack.data(), stack.size() * sizeof(float));
   return out;
 }
 
@@ -200,20 +219,27 @@ FloatArray filter_slice(const FloatArray& image, const std::string& params_json,
   const nlohmann::json cfg = parse_params(params_json);
   const msseg::FilterParams filter = parse_filter(cfg);
 
-  diffg::Image<float> filtered;
-  if (is_planar(image) || filter.operation == msseg::kColorOperation) {
-    // Planes in, or a colour stage: the multi-channel chain entry (one plane +
-    // a one-plane-capable colour method is allowed there too).
+  // Planes in, or a stage that consumes them: the multi-channel entry (one plane
+  // + a one-plane-capable colour method is allowed there too). A plane stage may
+  // hand back a stack, so the result carries its own channel count.
+  if (is_planar(image) || filter.operation == msseg::kColorOperation ||
+      msseg::is_plane_operation(filter.operation)) {
     const diffg::MultiImage<float> planes = to_planes(image, h, w);
     const std::string method = default_color_method(cfg, default_color_method_kw);
-    py::gil_scoped_release release;
-    filtered = msseg::apply_filter_chain(planes.view(), std::vector<msseg::FilterParams>{filter}, method);
-  } else {
+    diffg::MultiImage<float> filtered;
+    {
+      py::gil_scoped_release release;
+      filtered = msseg::apply_filter_chain_planes(planes.view(),
+                                                  std::vector<msseg::FilterParams>{filter}, method);
+    }
+    return planes_to_array(filtered, h, w);
+  }
+  diffg::Image<float> filtered;
+  {
     const diffg::Image<float> slice = to_image(image, h, w);
     py::gil_scoped_release release;
     filtered = msseg::apply_filter(slice, filter);
   }
-
   return to_2d_array<FloatArray>(filtered.data(), filtered.size(), h, w, "the filter stage");
 }
 
@@ -243,13 +269,21 @@ FloatArray filter_chain(const FloatArray& image, const std::string& params_json,
   const nlohmann::json cfg = parse_params(params_json);
   const std::vector<msseg::FilterParams> chain = parse_filter_chain(cfg);
 
-  diffg::Image<float> filtered;
-  if (is_planar(image) || (!chain.empty() && chain.front().operation == msseg::kColorOperation)) {
+  const bool head_takes_planes =
+      !chain.empty() && (chain.front().operation == msseg::kColorOperation ||
+                         msseg::is_plane_operation(chain.front().operation));
+  if (is_planar(image) || head_takes_planes) {
     const diffg::MultiImage<float> planes = to_planes(image, h, w);
     const std::string method = default_color_method(cfg, default_color_method_kw);
-    py::gil_scoped_release release;
-    filtered = msseg::apply_filter_chain(planes.view(), chain, method);
-  } else {
+    diffg::MultiImage<float> filtered;
+    {
+      py::gil_scoped_release release;
+      filtered = msseg::apply_filter_chain_planes(planes.view(), chain, method);
+    }
+    return planes_to_array(filtered, h, w);
+  }
+  diffg::Image<float> filtered;
+  {
     const diffg::Image<float> slice = to_image(image, h, w);
     py::gil_scoped_release release;
     filtered = msseg::apply_filter_chain(slice, chain);

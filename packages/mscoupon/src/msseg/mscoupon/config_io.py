@@ -84,15 +84,92 @@ COLOR_METHOD_PARAMS: Dict[str, List[tuple]] = {
     "pick": [("channel", "int", 0)],
     "weighted": [("weights", "floats", "0.2126, 0.7152, 0.0722")],
     "hsv": [("component", "choice:hue,saturation,value", "value")],
+    # `output: planes` hands back the OD planes instead of a projection of them,
+    # which is what makes a following adapt{project} a superset of `stain`. It
+    # HAS to be a schema row: filters_to_json keeps only the params a colour
+    # method declares, so without it an exported config silently lost the mode
+    # and the next stage met one plane instead of three.
     "optical_density": [("i0", "numstr", "max"), ("stain", "floats", ""),
-                        ("eps", "float", 0.001)],
+                        ("eps", "float", 0.001),
+                        ("output", "choice:scalar,planes", "scalar")],
     "chgradmag": [("sigma", "float", 1.0)],
     "dizenzo": [("sigma", "float", 1.0), ("eigen", "choice:largest,smallest", "largest")],
     "structure": [("smoothing_sigma", "float", 1.0), ("integration_sigma", "float", 2.0),
                   ("eigen", "choice:largest,smallest", "largest")],
 }
 
+# The plane stages (msseg/filter/plane_stages.hpp). They CARRY a stack rather
+# than reduce it, so unlike `color` they are valid at any index the arity works
+# out. `adapt`'s extra rows depend on its mode, the way a colour card's depend on
+# its method -- filter_param_schema dispatches both.
+FILTER_SCHEMA["stain_deconvolution"] = [("preset", "choice:he,hdab,hed", "he"),
+                                        ("i0", "numstr", "max"), ("eps", "float", 0.001)]
+FILTER_SCHEMA["adapt"] = [("mode", "choice:select,project", "select")]
+# `matrix` is a flat list of C numbers = ONE projection row, which is every stain
+# contrast and the case worth typing; C++ accepts a list of rows too, for a
+# multi-plane projection a config can spell but a single entry cannot.
+ADAPT_MODE_PARAMS: Dict[str, List[tuple]] = {
+    "select": [("channels", "floats", "0")],
+    "project": [("matrix", "floats", ""), ("preset", "str", "")],
+}
+
 FILTER_OPERATIONS = list(FILTER_SCHEMA.keys())
+
+
+PLANE_OPERATIONS = ("adapt", "stain_deconvolution")
+
+# The `adapt` modes and `stain_deconvolution` presets core accepts. Mirrors
+# msseg::adapt_modes / msseg::stain_presets.
+ADAPT_MODES = ["select", "project"]
+STAIN_PRESETS = ["he", "hdab", "hed"]
+
+
+def _keeps_planes(card: Any) -> bool:
+    """`optical_density` asked for its OD planes rather than a projection."""
+    p = card.get("params") or {}
+    return p.get("method") == "optical_density" and p.get("output") == "planes"
+
+
+def _consumes_planes(card: Any) -> bool:
+    op = str(card.get("operation") or "")
+    return op == "color" or op in PLANE_OPERATIONS
+
+
+def _stage_out_channels(card: Any, current: int) -> Optional[int]:
+    """Planes out, given planes in -- or None when the stage cannot run on them.
+
+    Mirrors msseg::stage_io + msseg::plane_stage_output_channels. `color` reduces
+    to one unless it keeps its OD planes; `none` and every scalar stage (core's,
+    or a package's like `normalize`) pass one plane through."""
+    op = str(card.get("operation") or "none")
+    p = card.get("params") or {}
+    if op == "color":
+        return current if _keeps_planes(card) else 1
+    if op == "stain_deconvolution":
+        return 3 if current == 3 else None
+    if op == "adapt":
+        mode = p.get("mode", "select")
+        if mode == "select":
+            ch = p.get("channels") or []
+            if not ch or any(not isinstance(c, (int, float)) or c < 0 or int(c) >= current
+                             for c in ch):
+                return None
+            return len(ch)
+        if mode == "project":
+            if p.get("preset"):
+                return 1 if current >= 3 else None
+            rows = p.get("matrix") or []
+            if not rows:
+                return None
+            if all(isinstance(r, (int, float)) for r in rows):   # a flat row
+                return 1 if len(rows) == current else None
+            if any(not isinstance(r, (list, tuple)) or len(r) != current for r in rows):
+                return None
+            return len(rows)
+        return None
+    if op == "none" or not op:
+        return current
+    return current if current == 1 else None
 
 
 def filter_operations_at(index: int) -> List[str]:
@@ -133,18 +210,21 @@ def chain_plan(chain: Sequence[Any], channels: int = 1,
             break
 
     channels = max(0, int(channels or 0))
-    leads_with_color = bool(cards) and cards[0].get("operation") == "color"
-    if not leads_with_color and channels > 1:
+    # A conversion is synthesized only when the chain does not ALREADY consume
+    # the stack. `color` was the only plane-consuming stage when that rule was
+    # written; `adapt` and `stain_deconvolution` consume it too.
+    consumes = bool(cards) and _consumes_planes(cards[0])
+    if not consumes and channels > 1:
         stages.append({"operation": "color", "params": {"method": default_method},
                        "in": channels, "out": 1, "index": -1, "synthesized": True})
 
     current = channels if not stages else 1
     for i, card in enumerate(cards):
         op = str(card.get("operation") or "none")
-        # `color` takes the stack; `none` passes through; everything else -- core
-        # op or a package's own, like `normalize` -- reads one plane and writes
-        # one. Mirrors msseg::stage_io.
-        out = 1 if op == "color" else current
+        out = _stage_out_channels(card, current)
+        if out is None:                       # a refusal; report and stop planning
+            error = error or (f"{op} (stage {i}) cannot run on {current} plane(s).")
+            out = current
         stages.append({"operation": op, "params": dict(card.get("params") or {}),
                        "in": current, "out": out, "index": i, "synthesized": False})
         current = out
@@ -162,6 +242,9 @@ def filter_param_schema(operation: str, params: Any = None) -> List[tuple]:
     if operation == "color":
         method = (params or {}).get("method", "luminance") if isinstance(params, dict) else "luminance"
         rows += COLOR_METHOD_PARAMS.get(str(method), [])
+    elif operation == "adapt":
+        mode = (params or {}).get("mode", "select") if isinstance(params, dict) else "select"
+        rows += ADAPT_MODE_PARAMS.get(str(mode), [])
     return rows
 
 

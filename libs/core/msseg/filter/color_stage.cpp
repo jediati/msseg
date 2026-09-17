@@ -312,6 +312,61 @@ diffg::Image<float> apply_color_stage(diffg::MultiImageView<const float> planes,
   throw std::runtime_error("color: unhandled method '" + method + "'.");
 }
 
+bool color_stage_keeps_planes(const FilterParams& stage) {
+  return method_of(stage) == "optical_density" && stage.params.value("output", "scalar") == "planes";
+}
+
+diffg::MultiImage<float> apply_color_stage_multi(diffg::MultiImageView<const float> planes,
+                                                 const FilterParams& stage) {
+  if (!color_stage_keeps_planes(stage)) {
+    diffg::Image<float> one = apply_color_stage(planes, stage);
+    diffg::MultiImage<float> out(one.dims(), 1, one.spacing());
+    std::copy(one.data(), one.data() + one.size(), out.channel_data(0));
+    return out;
+  }
+  std::string why;
+  if (!color_stage_accepts(stage, planes.channels(), &why)) throw std::runtime_error(why);
+
+  const auto& p = stage.params;
+  const std::size_t C = planes.channels();
+  const std::size_t n = planes.channel_stride();
+  const double eps = get_double(p, "eps", 1e-3);
+
+  // The same white reference the projecting path uses; only the projection is
+  // skipped, so `output: "planes"` followed by an adapt{project} of the stain
+  // row reproduces `stain` exactly.
+  std::vector<double> i0(C, 0.0);
+  if (!has(p, "i0") || p.at("i0").is_string()) {
+    for (std::size_t c = 0; c < C; ++c) {
+      float mx = std::numeric_limits<float>::lowest();
+      for (std::size_t i = 0; i < n; ++i) mx = std::max(mx, planes.channel_data(c)[i]);
+      if (!(mx > 0.0f)) {
+        throw std::runtime_error("color: optical_density i0=\"max\" found no positive value in plane " +
+                                 std::to_string(c) + "; set i0 explicitly.");
+      }
+      i0[c] = mx;
+    }
+  } else if (p.at("i0").is_array()) {
+    i0 = get_doubles(p, "i0");
+  } else {
+    std::fill(i0.begin(), i0.end(), p.at("i0").get<double>());
+  }
+  for (std::size_t c = 0; c < C; ++c) {
+    if (!(i0[c] > 0.0)) throw std::runtime_error("color: optical_density.i0 must be > 0.");
+  }
+
+  const double inv_ln10 = 1.0 / std::log(10.0);
+  diffg::MultiImage<float> out(planes.dims(), C, planes.spacing());
+  for (std::size_t c = 0; c < C; ++c) {
+    const float* in = planes.channel_data(c);
+    float* o = out.channel_data(c);
+    for (std::size_t i = 0; i < n; ++i) {
+      o[i] = static_cast<float>(-std::log(std::max(static_cast<double>(in[i]), eps) / i0[c]) * inv_ln10);
+    }
+  }
+  return out;
+}
+
 // The leading-colour view of a full ChainPlan. Kept because the three runners
 // only ever needed those two facts, and narrowing here means plan_chain can
 // grow without touching them.

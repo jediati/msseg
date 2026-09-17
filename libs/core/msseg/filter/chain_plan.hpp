@@ -24,8 +24,9 @@ struct StageIO {
     Any,     // passes through whatever it is given (`none`)
   };
   enum class Out {
-    Same,  // as many planes as came in
-    One,   // exactly one, whatever came in
+    Same,   // as many planes as came in
+    One,    // exactly one, whatever came in
+    Plane,  // a plane stage: ask plane_stage_output_channels() for the count
   };
   In in = In::Scalar;
   Out out = Out::Same;
@@ -33,7 +34,10 @@ struct StageIO {
 
 // The signature of `stage`.
 //
-// An operation core does not know -- `normalize` is mscoupon's, and a package
+// `adapt` and `stain_deconvolution` report Planes -> Plane: how many planes they
+// yield depends on their own parameters, and `plane_stage_output_channels` is
+// the single place that decides, so a plan and an applier cannot disagree about
+// k. An operation core does not know -- `normalize` is mscoupon's, and a package
 // may add others -- is reported as Scalar -> Same, which is what every such
 // stage has been. Unknown names are NOT rejected here: naming is validated
 // where it always was (`apply_filter` at run time, the package's config parser

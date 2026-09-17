@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <stdexcept>
 
 #include "diffg/image.hpp"
+#include "msseg/filter/chain_plan.hpp"
 #include "msseg/filter/color_stage.hpp"
 #include "msseg/filter/filter_stage.hpp"
 #include "mscoupon/normalize.hpp"
@@ -90,10 +92,50 @@ Image2D apply_filter_chain(const msseg::InputSlice& input, const std::vector<Fil
     p.params = f.params;
     params.push_back(std::move(p));
   }
-  const msseg::ColorChainPlan plan = msseg::plan_color_chain(params, input.channels(), default_color_method);
-  Image2D current = plan.color.has_value() ? from_diffg(msseg::apply_color_stage(input.view(), *plan.color))
-                                           : from_diffg(input.scalar());
-  return run_scalar_chain(std::move(current), filters, plan.first_scalar_stage, normalizers_out);
+  const msseg::ChainPlan plan = msseg::plan_chain(params, input.channels(), default_color_method);
+
+  bool carries_stack = false;
+  for (const msseg::StageRecord& rec : plan.stages) {
+    if (rec.out_channels != 1) carries_stack = true;
+  }
+  if (!carries_stack) {
+    // Every chain that predates the plane stages: the original split, with the
+    // original number of copies. Worth keeping rather than routing through the
+    // planes runner, which would copy the input stack before reducing it.
+    const msseg::ColorChainPlan color =
+        msseg::plan_color_chain(params, input.channels(), default_color_method);
+    Image2D current = color.color.has_value()
+                          ? from_diffg(msseg::apply_color_stage(input.view(), *color.color))
+                          : from_diffg(input.scalar());
+    return run_scalar_chain(std::move(current), filters, color.first_scalar_stage, normalizers_out);
+  }
+
+  // A chain that carries a stack. Core owns the plane carrier, so the leading
+  // run of stages that see more than one plane runs there; the tail is scalar
+  // and runs here, because `normalize` is this package's and core cannot apply
+  // it. The boundary is the first stage that receives a single plane -- which
+  // is also where Image2D, having no channel count, becomes a safe carrier.
+  std::size_t tail = filters.size();
+  for (const msseg::StageRecord& rec : plan.stages) {
+    if (rec.in_channels == 1) {
+      tail = rec.synthesized() ? 0 : static_cast<std::size_t>(rec.config_index);
+      break;
+    }
+  }
+  const std::vector<msseg::FilterParams> prefix(params.begin(), params.begin() + static_cast<std::ptrdiff_t>(tail));
+  const diffg::MultiImage<float> reduced =
+      msseg::apply_filter_chain_planes(input.view(), prefix, default_color_method);
+  if (reduced.channels() != 1) {
+    throw std::runtime_error(
+        "the chain yields " + std::to_string(reduced.channels()) +
+        " planes; this pipeline carries one. Reduce them with an adapt stage (mode 'select' or "
+        "'project').");
+  }
+  Image2D current;
+  current.width = static_cast<int>(reduced.dims().width);
+  current.height = static_cast<int>(reduced.dims().height);
+  current.pixels.assign(reduced.channel_data(0), reduced.channel_data(0) + reduced.channel_stride());
+  return run_scalar_chain(std::move(current), filters, tail, normalizers_out);
 }
 
 }  // namespace mscoupon

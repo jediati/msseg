@@ -27,8 +27,10 @@ and their rings dominate the decomposition. The chain has no way to say "the
 eosin contrast, damped by the hematoxylin", because it cannot carry two planes
 between two stages.
 
-Nothing here is built. §7 says what would be, in what order, and what each step
-collides with.
+This note was written before any of it was built. Stages 1 and 2 of §7 have
+since landed and are marked there; the rest stands as proposal. §7 says what
+each step collides with, and records the two things the build found that the
+design had not.
 
 ## 1. The coercion inventory
 
@@ -369,9 +371,36 @@ Each stage is independently shippable and testable.
 |---|---|---|
 | 0 | this note | — |
 | 1 | `StageIO` + `plan_chain`, **no behaviour change**; `plan_color_chain` becomes a wrapper returning identical results; both card UIs replace the `idx == 0` test with a plan lookup; `(auto)` card display-only | the silence |
-| 2 | the pybind result path learns `(C, h, w)` (the overflow *guard* landed 2026-09-17; *returning* planes has not), then `optical_density{output:"planes"}` + `stain_deconvolution` + `adapt{select, project}`; `run_scalar_chain` carries planes for the pending batch; `normalize` refuses C>1; the three Python mirrors learn `ndim == 3` | **stain deconvolution and `E − λ·H`** |
+| 2 | **landed 2026-09-17**: `plane_stages.cpp` (`adapt{select,project}`, `stain_deconvolution`), `optical_density{output:"planes"}`, `apply_filter_chain_planes`, the pybind result path returning `(C, h, w)`, the mscoupon chain split (plane prefix in core, scalar tail here so `normalize` still measures in Python), the plan-driven Python mirror, and the GUI schema rows | **stain deconvolution and `E − λ·H`** |
 | 3 | `base_c<i>` in `resolve_stat_channels`; a third bank traversal; a plane base through `Msc2DPipeline::build`; the six `pipeline.cpp` sites; GPU declines | **`mean_hematoxylin` as a feature** |
 | 4+ | `FieldKind` + `cast`; component-wise lifting; pin-and-move UI; `adapt{reduce, broadcast}`; the rest of the unary arithmetic; `branch`/`combine`; all-component `hsv`/`dizenzo`/`structure`/`hessian` | deferrable indefinitely |
+
+**What Stage 2 settled.** The composition claim of §5 is no longer an argument:
+`test_plane_stages` reads `inv(M)` off a basis image and checks that
+`E − λ·H` computed by deconvolution equals one `adapt{project}` row on the OD
+planes, and `test_plane_carrying_chain` checks that OD planes plus that row
+reproduce `optical_density`'s own `stain` projection. Both hold to float noise
+through the real API, so registers stay deferred on evidence rather than on
+algebra done in a scratch file.
+
+Three things the build found that this note had not, all of the same shape — a
+rule written when `color` was the only plane-consuming stage:
+
+* `plan_chain` synthesized its conversion whenever a chain did not *start with
+  `color`*, so a leading `stain_deconvolution` got one plane instead of three.
+  The test is now "unless the head already consumes the stack".
+* The Python mirror was wrong for every plane-stage chain — it invented a colour
+  head and reported each stage as 1→1 — **while its parity suite passed**,
+  because the cases predated the stages. That is the argument for extending a
+  parity suite in the same change that extends what it mirrors.
+* `filters_to_json` keeps only the params a colour *method* declares, so
+  `optical_density`'s new `output: "planes"` was dropped on export and the next
+  stage met one plane instead of three. A mode that is not a schema row does not
+  survive a round trip. The default is still dropped, so existing configs stay
+  byte-identical.
+
+The first two were caught by tests written alongside the code; the third only by
+running the whole path end to end, which is the argument for doing that too.
 
 Stated plainly, because it is the useful conclusion: **Stage 1 and Stage 2 are
 the only prerequisites for the nuclei work.** `Field`, `FieldKind`, lifting and

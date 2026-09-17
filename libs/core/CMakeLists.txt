@@ -13,6 +13,7 @@ add_library(msseg_core STATIC
   msseg/filter/filter_stage.cpp
   msseg/filter/color_stage.cpp
   msseg/filter/chain_plan.cpp
+  msseg/filter/plane_stages.cpp
   msseg/compute/msc2d.cpp
   msseg/compute/msc3d.cpp
   msseg/graph/graph_ops.cpp

@@ -55,6 +55,18 @@ bool color_stage_accepts(const FilterParams& stage, std::size_t channels, std::s
 diffg::Image<float> apply_color_stage(diffg::MultiImageView<const float> planes,
                                       const FilterParams& stage);
 
+// True for `optical_density` asked to hand back the OD planes themselves
+// (`output: "planes"`) rather than a projection of them. OD is naturally C->C --
+// the projection was only ever there because the chain could not carry a stack
+// (docs/design_filter_types.md, coercion 9). Every other method still reduces.
+bool color_stage_keeps_planes(const FilterParams& stage);
+
+// The colour stage as a stack: C planes for `optical_density{output: "planes"}`,
+// one plane otherwise. The one-plane result is bit-identical to
+// apply_color_stage, which it calls.
+diffg::MultiImage<float> apply_color_stage_multi(diffg::MultiImageView<const float> planes,
+                                                 const FilterParams& stage);
+
 // The leading part of a chain fed `channels` planes.
 struct ColorChainPlan {
   std::optional<FilterParams> color;   // the stage to run first, explicit or synthesized

@@ -24,8 +24,14 @@ def test_color_card_round_trips_lists_and_keywords():
                       "params": {"method": "optical_density", "i0": 255.0,
                                  "stain": [1.0, 0.5, 0.0], "eps": 0.001}}
     back = config_io.filters_from_json(doc)
+    # `output` joined optical_density's rows when the OD planes became a thing a
+    # chain can carry, so a loaded card now carries its default -- as a card does
+    # for every row of its schema. The EXPORT above is unchanged, because a
+    # default is dropped, which is what keeps existing configs byte-identical.
     assert back[0]["params"] == {"method": "optical_density", "i0": "255",
-                                 "stain": "1, 0.5, 0", "eps": 0.001}
+                                 "stain": "1, 0.5, 0", "eps": 0.001,
+                                 "output": "scalar"}
+    assert "output" not in doc[0]["params"], "a default output must not reach the config"
     # A keyword i0 stays a string; a blank stain is dropped rather than exported.
     kw = config_io.filters_to_json([{"operation": "color",
                                      "params": {"method": "optical_density", "i0": "max",
