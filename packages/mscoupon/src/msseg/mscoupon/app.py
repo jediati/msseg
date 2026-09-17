@@ -42,8 +42,9 @@ from .config_io import (FILTER_SCHEMA, FILTER_OPERATIONS, COLOR_METHODS, QUERY_O
 from .common import (log, natural_key, list_tiffs, _id_lut, FeatureTable, _parse_sigmas, _format_sigmas, group_contiguous)
 from msseg.labeler.widgets import (ScrollFrame, jump_scale, scrolled_listbox, attach_tooltip,
                                    _wheel_delta, _bind_click_to_value)
-from .engine import ComputeEngine
+from .engine import ComputeEngine, preview_job, preview_raster
 from msseg.labeler.shell import ViewerShell
+from msseg.labeler.defaults import _PREVIEW_PUMP_MS
 from . import session
 
 
@@ -54,6 +55,9 @@ from . import session
 # ~42 MB): the base chain (a GMM normalize is ~5 s) and a wide blur (~3.5 s at
 # sigma 64) must survive a few channel switches.
 _PREVIEW_CHAN_BUDGET = 640 * 1024 * 1024
+# ...but once a stack is primed its own per-slice base/filtered rasters are
+# resident too, and the live preview keeps filling this beside them.
+_PREVIEW_CHAN_BUDGET_PRIMED = 256 * 1024 * 1024
 
 
 class _RasterCache:
@@ -217,8 +221,6 @@ class MscouponApp(ViewerShell):
         self.cores_per_slice_var = tk.IntVar(value=max(1, (os.cpu_count() or 2) // 2))  # ~physical cores
         self.concurrent_slices_var = tk.IntVar(value=1)   # slices computed at once
         self.persist_live_var = tk.StringVar(value="10")   # live persistence % (numeric entry)
-        self.vmin_filt_var = tk.DoubleVar(value=0.0)     # filtered window (fractions
-        self.vmax_filt_var = tk.DoubleVar(value=1.0)     #  of the filtered channel's range)
         # Measurement channels (`statistics.channels[]`): the two rasters the
         # pipeline already builds, plus derived scale-space responses measured on
         # the base channel. One card per kind; the sigma list is the cross-product
@@ -255,6 +257,20 @@ class MscouponApp(ViewerShell):
         # scale-space responses), keyed by (path, channel, params): the Image
         # dropdown works before any Run, through the same chains a run applies.
         self._preview_chan_cache = _RasterCache(_PREVIEW_CHAN_BUDGET)
+        # Live preview of the chain (a parameter edit, no Run): the worker the
+        # recompute runs on (built lazily -- the root exists only once the
+        # shell has laid the window out), what the pump is waiting for, the key
+        # of the raster now painted, and the (path, channel, raster) standing
+        # in for a primed view whose chain has since been edited.
+        self._preview_worker = None
+        self._preview_pending = None
+        self._preview_shown_key = None
+        self._preview_override = None
+        self._preview_sync = False       # selftests run the worker inline
+        # The chains the primed stack was built with. A live preview compares
+        # itself against this to know whether it is showing something the
+        # primed overlays still describe.
+        self._primed_chain = None
 
     def _after_layout(self):
         # Offer the profile's channels from the start: a preview (no Run) can
@@ -760,8 +776,48 @@ class MscouponApp(ViewerShell):
             w.destroy()
         if chain == "base":
             self._normalize_readouts = []
+        # The conversion a multi-plane input gets when its chain does not start
+        # with one is DERIVED: re-planned on every rebuild, never stored in
+        # `cards`, so it cannot reach filters_to_json, a session or a config.
+        # Drawing it is the whole of Stage 1 -- it has always run, but only
+        # inside the runner, where nothing could see it.
+        try:
+            plan = config_io.chain_plan(cards, self._current_color_count() or 1,
+                                        self._default_color_method())
+            head = plan["stages"][0] if plan["stages"] else None
+        except Exception:
+            head = None
+        if head is not None and head["synthesized"]:
+            self._build_auto_color_card(frame, head, chain)
         for idx, card in enumerate(cards):
             self._build_filter_card(idx, card, chain)
+
+    def _build_auto_color_card(self, parent, stage, chain):
+        """Draw the conversion the runner inserts, greyed and read-only.
+
+        It is not one of `self.filter_cards`, so it is not exported, not saved
+        and not editable in place. "Pin" makes it a real card at the head of the
+        chain, which is the only way its method becomes editable -- and, later,
+        the only way it becomes movable."""
+        frame = ttk.Frame(parent, relief="groove", borderwidth=1)
+        frame.pack(fill="x", padx=4, pady=2)
+        top = ttk.Frame(frame); top.pack(fill="x")
+        method = str(stage["params"].get("method", "luminance"))
+        ttk.Label(top, text=f"(auto) color / {method}", foreground="#777",
+                  width=22).pack(side="left", padx=2, pady=2)
+        ttk.Label(top, text=f"{stage['in']}→{stage['out']}",
+                  foreground="#777").pack(side="left", padx=2)
+        ttk.Button(top, text="Pin", width=5,
+                   command=lambda c=chain, m=method: self._pin_auto_color(c, m)
+                   ).pack(side="right", padx=2)
+
+    def _pin_auto_color(self, chain, method):
+        """Make the synthesized conversion an ordinary card at index 0."""
+        cards, _frame = self._chain(chain)
+        cards.insert(0, {"operation": "color", "params": {"method": method}})
+        self._set_chain_cards(chain, cards)
+        self._rebuild_filter_cards(chain)
+        self._notify_profile_edit()
 
     def _build_filter_card(self, idx, card, chain="topo"):
         cards, parent = self._chain(chain)
@@ -770,7 +826,7 @@ class MscouponApp(ViewerShell):
         top = ttk.Frame(frame); top.pack(fill="x")
         op_var = tk.StringVar(value=card["operation"])
         # `color` consumes the input planes, so only the head of a chain may be one.
-        ops = FILTER_OPERATIONS if idx == 0 else [o for o in FILTER_OPERATIONS if o != "color"]
+        ops = config_io.filter_operations_at(idx)
         combo = ttk.Combobox(top, textvariable=op_var, values=ops,
                              state="readonly", width=20)
         combo.pack(side="left", padx=2, pady=2)
@@ -809,6 +865,7 @@ class MscouponApp(ViewerShell):
                 return
             c["params"] = {"method": method}
             self._rebuild_filter_cards(ch)
+            self._notify_profile_edit()
         combo.bind("<<ComboboxSelected>>", on_method)
 
     def _build_normalize_readout(self, frame, card):
@@ -847,19 +904,26 @@ class MscouponApp(ViewerShell):
         ttk.Label(row, text=pname, width=16).pack(side="left")
         if pname not in params:
             params[pname] = default
+        # Every commit reports the edit: the live preview repaints the chain's
+        # output, debounced, so a chain is judged by looking at it rather than
+        # by priming. _notify_profile_edit is cheap and idempotent.
+        def _set(p, value):
+            params[p] = value
+            self._notify_profile_edit()
+
         if kind == "bool":
             var = tk.BooleanVar(value=bool(params[pname]))
-            var.trace_add("write", lambda *_: params.__setitem__(pname, var.get()))
+            var.trace_add("write", lambda *_: _set(pname, var.get()))
             ttk.Checkbutton(row, variable=var).pack(side="left")
         elif kind.startswith("choice:"):
             choices = kind.split(":", 1)[1].split(",")
             var = tk.StringVar(value=str(params[pname]))
-            var.trace_add("write", lambda *_: params.__setitem__(pname, var.get()))
+            var.trace_add("write", lambda *_: _set(pname, var.get()))
             ttk.Combobox(row, textvariable=var, values=choices, state="readonly",
                          width=12).pack(side="left")
         elif kind in ("str", "floats", "numstr"):
             var = tk.StringVar(value=str(params[pname]))
-            var.trace_add("write", lambda *_: params.__setitem__(pname, var.get()))
+            var.trace_add("write", lambda *_: _set(pname, var.get()))
             ttk.Entry(row, textvariable=var, width=18 if kind == "floats" else 14).pack(side="left")
         elif kind in ("optfloat", "nullfloat"):
             # Blank means "not set". For optfloat it is dropped on export, so an
@@ -870,10 +934,10 @@ class MscouponApp(ViewerShell):
             def commit_opt(*_, p=pname, v=var):
                 text = v.get().strip()
                 if not text:
-                    params[p] = ""
+                    _set(p, "")
                     return
                 try:
-                    params[p] = float(text)
+                    _set(p, float(text))
                 except ValueError:
                     pass
             var.trace_add("write", commit_opt)
@@ -882,7 +946,7 @@ class MscouponApp(ViewerShell):
             var = tk.StringVar(value=str(params[pname]))
             def commit(*_, p=pname, k=kind, v=var):
                 try:
-                    params[p] = int(v.get()) if k == "int" else float(v.get())
+                    _set(p, int(v.get()) if k == "int" else float(v.get()))
                 except ValueError:
                     pass
             var.trace_add("write", commit)
@@ -897,6 +961,7 @@ class MscouponApp(ViewerShell):
         cards.append(self._new_filter_card())
         self._set_chain_cards(chain, cards)
         self._rebuild_filter_cards(chain)
+        self._notify_profile_edit()
 
     def _remove_filter_card(self, idx, chain="topo"):
         cards, _ = self._chain(chain)
@@ -906,6 +971,7 @@ class MscouponApp(ViewerShell):
             cards.append(self._new_filter_card())
         self._set_chain_cards(chain, cards)
         self._rebuild_filter_cards(chain)
+        self._notify_profile_edit()
 
     def _slice_msc_mark(self, si, li):
         """"Y" when the slice has a primed MSC under the current sequences."""
@@ -948,33 +1014,46 @@ class MscouponApp(ViewerShell):
             return
         self._preview_file(self.all_files[idx])
 
+    def _preview_array(self, path):
+        """The raw slice at `path` from the LRU, reading it when absent; None
+        when it cannot be read (the caller falls back to the pyramid).
+
+        Shared with the live preview, which needs the same pixels and must not
+        re-read a ~40 MB file because a sigma moved."""
+        if not path:
+            return None
+        arr = self._preview_cache.get(path)
+        if arr is not None:
+            self._preview_cache[path] = self._preview_cache.pop(path)   # LRU
+            return arr
+        try:
+            from .common import load_slice
+            arr = load_slice(path, self._color_alpha(), log=log)
+        except Exception as exc:
+            log(f"preview load failed for {os.path.basename(path)}: {exc}")
+            return None
+        self._preview_cache[path] = arr
+        while len(self._preview_cache) > self._PREVIEW_CACHE_MAX:
+            self._preview_cache.pop(next(iter(self._preview_cache)))
+        return arr
+
     def _preview_file(self, path):
         """Show one TIFF without priming: the Image dropdown's channel of it."""
         if self.viewer is None:
             return
-        arr = self._preview_cache.get(path)
+        arr = self._preview_array(path)
         if arr is None:
-            try:
-                from .common import load_slice
-                arr = load_slice(path, self._color_alpha(), log=log)
-            except Exception as exc:
-                # Fall back to the pyramidal path-only source (large_image);
-                # reset_array drops any stale in-memory base first.
-                log(f"preview load failed for {os.path.basename(path)}: {exc}")
-                first = not self.viewer.has_base
-                self.viewer.set_base(array=None, path=path, reset_array=True)
-                self._preview_path = path
-                self.viewer.set_overlays([])
-                self.viewer.set_window(self.vmin_var.get(), self.vmax_var.get())
-                self.viewer.fit() if first else self.viewer.render()
-                self.status_var.set(f"preview: {os.path.basename(path)}")
-                return
-            self._preview_cache[path] = arr
-            while len(self._preview_cache) > self._PREVIEW_CACHE_MAX:
-                self._preview_cache.pop(next(iter(self._preview_cache)))
-        else:
-            # Re-insert for LRU recency.
-            self._preview_cache[path] = self._preview_cache.pop(path)
+            # Fall back to the pyramidal path-only source (large_image);
+            # reset_array drops any stale in-memory base first.
+            first = not self.viewer.has_base
+            self.viewer.set_base(array=None, path=path, reset_array=True)
+            self._preview_path = path
+            self._preview_shown_key = None
+            self.viewer.set_overlays([])
+            self.viewer.set_window(*self._window_for("base"))
+            self.viewer.fit() if first else self.viewer.render()
+            self.status_var.set(f"preview: {os.path.basename(path)}")
+            return
         first = not self.viewer.has_base
         self._preview_path = path
         if self._current_color_count() != getattr(self, "_picker_color_count", 0):
@@ -1010,7 +1089,7 @@ class MscouponApp(ViewerShell):
         arr = self._preview_cache.get(path)
         if arr is None:
             # Path-only (pyramidal) preview: no array to compute channels on.
-            self.viewer.set_window(self.vmin_var.get(), self.vmax_var.get())
+            self.viewer.set_window(*self._window_for("base"))
             self.viewer.fit() if first else self.viewer.render()
             return
         channel = self.background_var.get()
@@ -1018,7 +1097,10 @@ class MscouponApp(ViewerShell):
         # The path doubles as the pyramidal source only for the raw base.
         self.viewer.set_base(array=raster, path=path if raster is arr else None)
         self.viewer.set_overlays([])
-        self.viewer.set_window(self.vmin_var.get(), self.vmax_var.get())
+        # The raw slice stands in for a channel it cannot build: window it as
+        # the original, not under the missing channel's name.
+        shown = channel if raster is not arr else self._original_channel()
+        self.viewer.set_window(*self._window_for(shown))
         if first:
             self.viewer.fit()
         else:
@@ -1026,6 +1108,106 @@ class MscouponApp(ViewerShell):
         # Replaces any "computing …" line _preview_channel left behind.
         shown = "" if raster is arr else f"  [{channel}]"
         self.status_var.set(f"preview: {os.path.basename(path)}{shown}")
+
+    # ------------------------------------------------------------------ #
+    # Preview channels: what the chain produces, before anything is primed
+    # ------------------------------------------------------------------ #
+    def _preview_plan(self, arr, path, channel, params=None):
+        """How to compute `channel` on preview slice `path`, or None when
+        there is nothing to compute (the raw slice already IS the channel, or
+        the name is not one of the spec's).
+
+        The plan carries the CACHE KEY, and that key is also the dependency
+        set: "base" is keyed on `base_filters`, "filtered" on `filters`, a
+        derived channel on its own one-channel spec -- and on `filters` too
+        when the card says it is measured on the filtered field. So "did
+        anything this channel depends on change?" is answered by comparing
+        keys; there is no second dependency table to drift out of step.
+        """
+        if params is None:
+            params = self._params_json()
+        doc = json.loads(params)
+        base_filters = doc.get("base_filters") or []
+        filters = doc.get("filters") or []
+        default_method = self._default_color_method()
+        planar = getattr(arr, "ndim", 2) == 3
+        label = os.path.basename(path or "")
+        keys = {"base": (path, "base", json.dumps({"chain": base_filters,
+                                                   "default": default_method},
+                                                  sort_keys=True)),
+                "filtered": (path, "filtered", json.dumps({"chain": filters,
+                                                           "default": default_method},
+                                                          sort_keys=True))}
+        plan = {"path": path, "keys": keys, "spec_key": None, "planar": planar,
+                "base_filters": base_filters, "filters": filters}
+        if channel in ("", "base"):
+            # A colour slice always goes through its leading colour stage
+            # (explicit or the default), so an empty chain still converts.
+            if not base_filters and not planar:
+                return None
+            plan["key"] = keys["base"]
+            plan["job"] = preview_job("base", base_filters, filters, default_method,
+                                      planar=planar, label=label)
+            return plan
+        if channel == "filtered":
+            if not filters and not planar:
+                return None
+            plan["key"] = keys["filtered"]
+            plan["job"] = preview_job("filtered", base_filters, filters, default_method,
+                                      planar=planar, label=label)
+            return plan
+        try:
+            from msseg import mscoupon as engine
+        except Exception:
+            return None
+        if not hasattr(engine, "stat_channel_images"):
+            return None
+        single = single_channel_params(params, channel)
+        if single is None:
+            return None
+        card = ((json.loads(single).get("statistics") or {}).get("channels") or [{}])[0]
+        source = card.get("source") or "base"
+        # The derived channel depends on the base chain and on its own spec,
+        # and on NOTHING else: a statistics source is base or colour (the core
+        # refuses "filtered"), so the topology chain cannot move it. Which is
+        # why editing `filters` while a derived channel is shown is free.
+        spec = {"base": base_filters, "stat": json.loads(single).get("statistics")}
+        plan["spec_key"] = json.dumps(spec, sort_keys=True)
+        plan["key"] = (path, channel, plan["spec_key"])
+        plan["job"] = preview_job("derived", base_filters, filters, default_method,
+                                  single=single, source=source, planar=planar,
+                                  label=label)
+        return plan
+
+    def _preview_have(self, arr, plan):
+        """Hand the job whatever it needs and the cache already holds. A
+        derived channel is measured on the base and filtered rasters, and
+        both are usually one channel switch old."""
+        job = plan["job"]
+        if job["kind"] != "derived":
+            return
+        for name, chain in (("base", plan["base_filters"]),
+                            ("filtered", plan["filters"])):
+            if not chain and not plan["planar"]:
+                job["have"][name] = arr            # the chain is the identity
+                continue
+            hit = self._preview_chan_cache.get(plan["keys"][name])
+            if hit is not None:
+                job["have"][name] = hit
+
+    def _preview_store(self, plan, out):
+        """File every raster a compute produced and return the one asked for.
+
+        Called on the Tk thread only, whether the compute ran here or on the
+        worker -- _RasterCache is a bare OrderedDict whose reads reorder it,
+        so it must never be touched from two threads."""
+        cache = self._preview_chan_cache
+        for name in ("base", "filtered"):
+            if out.get(name) is not None:
+                cache.put(plan["keys"][name], out[name])
+        for name, raster in out.get("channels") or []:
+            cache.put((plan["path"], name, plan["spec_key"]), raster)
+        return cache.get(plan["key"])
 
     def _preview_channel(self, arr, path, channel):
         """The named channel of a preview slice, computed on the spot.
@@ -1038,98 +1220,36 @@ class MscouponApp(ViewerShell):
         what priming will measure. Any failure (no extension, unknown name)
         falls back to the raw slice.
 
-        Memoised per path under a byte budget, and each entry is keyed on
-        exactly the parameters that produce it: the base chain on
-        `base_filters`, the filtered field on `filters`, a derived channel on
-        its own one-channel spec. Keying everything on the whole params JSON
-        made a sigma edit re-run the base chain's GMM (~5 s at 3232^2), and
-        computing the spec's whole bank for one plane charged every other
-        channel's sigma to each switch. Every step is timed to the log."""
-        params = self._params_json()
+        Memoised per path under a byte budget, on exactly the parameters that
+        produce each raster (see _preview_plan). Keying everything on the
+        whole params JSON made a sigma edit re-run the base chain's GMM (~5 s
+        at 3232^2), and computing the spec's whole bank for one plane charged
+        every other channel's sigma to each switch. Every step is timed to the
+        log.
+
+        This is the SYNCHRONOUS path, kept for the callers that need a raster
+        in hand (the histogram range measurement, the selftests). A parameter
+        edit goes through _launch_preview instead, which runs the same compute
+        on a worker thread.
+        """
         try:
-            import numpy as np
+            import numpy as np                      # noqa: F401
             from msseg import mscoupon as engine
         except Exception:
             return arr
-        doc = json.loads(params)
-        base_filters = doc.get("base_filters") or []
-        filters = doc.get("filters") or []
-        stem = os.path.basename(path)
-        cache = self._preview_chan_cache
-        planar = getattr(arr, "ndim", 2) == 3
-        default_method = self._default_color_method()
         try:
             if channel == "color" or channel.startswith("color_c"):
+                planar = getattr(arr, "ndim", 2) == 3
                 return self._color_plane(arr if planar else None, channel, arr)
-            if channel in ("", "base"):
-                # A colour slice always goes through its leading colour stage
-                # (explicit or the default), so an empty chain still converts.
-                if not base_filters and not planar:
-                    return arr
-                key = (path, "base", json.dumps({"chain": base_filters,
-                                                 "default": default_method}, sort_keys=True))
-                hit = cache.get(key)
-                if hit is not None:
-                    return hit
-                self.status_var.set(f"preview: applying the base chain to {stem}…")
-                self.root.update_idletasks()
-                t0 = time.perf_counter()
-                raster, _ = self.engine._apply_base_chain(arr, base_filters, engine, log,
-                                                          default_method)
-                log(f"preview base chain on {stem}: "
-                    f"{1e3 * (time.perf_counter() - t0):.0f}ms")
-                cache.put(key, raster)
-                return raster
-            if channel == "filtered":
-                if not filters and not planar:
-                    return arr
-                key = (path, "filtered", json.dumps({"chain": filters,
-                                                     "default": default_method}, sort_keys=True))
-                hit = cache.get(key)
-                if hit is not None:
-                    return hit
-                self.status_var.set(f"preview: applying the filter chain to {stem}…")
-                self.root.update_idletasks()
-                t0 = time.perf_counter()
-                cur, rest = self.engine._leading_color(arr, filters, engine, log, default_method)
-                for f in rest:
-                    cur = engine.filter_slice(cur, json.dumps({"filter": f}))
-                raster = np.ascontiguousarray(cur, dtype=np.float32)
-                log(f"preview filter chain on {stem}: "
-                    f"{1e3 * (time.perf_counter() - t0):.0f}ms")
-                cache.put(key, raster)
-                return raster
-            if not hasattr(engine, "stat_channel_images"):
+            plan = self._preview_plan(arr, path, channel)
+            if plan is None:
                 return arr
-            single = single_channel_params(params, channel)
-            if single is None:
-                return arr
-            # The derived channel depends on the base chain too (it is
-            # measured on the base raster), so that rides in the key.
-            spec_key = json.dumps({"base": base_filters,
-                                   "stat": json.loads(single).get("statistics")},
-                                  sort_keys=True)
-            key = (path, channel, spec_key)
-            hit = cache.get(key)
+            hit = self._preview_chan_cache.get(plan["key"])
             if hit is not None:
                 return hit
-            base = self._preview_channel(arr, path, "base")
-            filt = self._preview_channel(arr, path, "filtered")
-            self.status_var.set(f"preview: computing {channel} on {stem}…")
-            self.root.update_idletasks()
-            t0 = time.perf_counter()
-            from .engine import stat_images
-            names, imgs = stat_images(engine, np.asarray(base, dtype=np.float32),
-                                      np.asarray(filt, dtype=np.float32), single,
-                                      np.ascontiguousarray(arr, dtype=np.float32) if planar else None)
-            names = list(names)
-            log(f"preview channel {channel} on {stem}: "
-                f"{1e3 * (time.perf_counter() - t0):.0f}ms ({len(names)} plane(s))")
-            if channel not in names:
-                return arr
-            for k, n in enumerate(names):          # hessian: two planes per sigma
-                cache.put((path, n, spec_key), np.array(imgs[k], copy=True))
-            return cache.get(key)
+            self._preview_have(arr, plan)
+            got = self._preview_store(plan, preview_raster(engine, arr, plan["job"], log))
+            return arr if got is None else got
         except Exception as exc:
             log(f"preview channel '{channel}' unavailable: {exc}")
             return arr
@@ -1138,9 +1258,135 @@ class MscouponApp(ViewerShell):
         """Repaint an active preview. The window sliders, the Image dropdown
         and the parameter panels all call _refresh_render, which early-returns
         while nothing is primed -- this keeps them live for previews too."""
-        if (self.viewer is not None and self._preview_path is not None
-                and not self.primed):
+        if self.viewer is not None and self._preview_path is not None:
             self._render_preview()
+
+    # ------------------------------------------------------------------ #
+    # The live preview: a parameter edit repaints the chain output
+    # ------------------------------------------------------------------ #
+    def _live_preview_slice(self):
+        """(path, raw array) the live preview computes on, or (None, None).
+
+        Before any Run that is the slice being previewed from the file list.
+        Once a stack is primed it is the raw file behind the slice on screen:
+        the primed rasters were built by the chain as it WAS, so a preview of
+        the chain as it is now has to start from the pixels again. Read
+        through the same small LRU, so re-editing a sigma does not re-read the
+        file."""
+        path = self._preview_path
+        if path is None and self.primed:
+            cur = self._current()
+            if cur is not None:
+                try:
+                    path = self.primed[cur[0]]["files"][cur[1]]
+                except (IndexError, KeyError, TypeError):
+                    path = None
+        if path is None:
+            return None, None
+        return path, self._preview_array(path)
+
+    def _launch_preview(self):
+        """A chain parameter settled: repaint the shown channel, off-thread.
+
+        Returns the token submitted, or None when there was nothing to do --
+        which is the common case, because a channel cache key IS its
+        dependency set (_preview_plan), so editing the topology chain while
+        the dropdown shows `base` costs one tuple comparison."""
+        if self.viewer is None:
+            return None
+        path, arr = self._live_preview_slice()
+        if arr is None:
+            self._preview_shown_key = None   # no slice, or a pyramid-only one
+            return None
+        channel = self.background_var.get()
+        plan = self._preview_plan(arr, path, channel)
+        if plan is None:
+            # The raw slice already IS this channel (an empty chain, the
+            # colour planes): repaint from it and drop any override.
+            self._preview_shown_key = None
+            self._clear_preview_override()
+            self._paint_live(path, channel, self._preview_channel(arr, path, channel))
+            return None
+        if plan["key"] == self._preview_shown_key:
+            return None                      # this channel did not move
+        hit = self._preview_chan_cache.get(plan["key"])
+        if hit is not None:                  # retyping the old sigma: instant
+            self._preview_shown_key = plan["key"]
+            self._paint_live(path, channel, hit)
+            return None
+        try:
+            from msseg import mscoupon as ext
+        except Exception:
+            return None
+        self._preview_have(arr, plan)
+        self._preview_token += 1
+        token, job = self._preview_token, plan["job"]
+        self._preview_pending = (path, channel, plan)
+        self.viewer.set_hud("busy", f"Previewing {channel}")
+        self.status_var.set(f"preview: computing {channel} on "
+                            f"{os.path.basename(path)}...")
+        self._worker().submit(token,
+                              lambda stop: preview_raster(ext, arr, job, log, stop),
+                              sync=self._preview_sync)
+        return token
+
+    def _worker(self):
+        if self._preview_worker is None:
+            from msseg.labeler.preview import PreviewWorker
+            self._preview_worker = PreviewWorker(
+                self.root, self._on_preview_result, on_error=self._on_preview_error,
+                log=log, pump_ms=_PREVIEW_PUMP_MS, name="mscoupon-preview")
+        return self._preview_worker
+
+    def _on_preview_result(self, token, out):
+        """A chain recompute landed. Everything that touches a cache or a
+        widget happens HERE, on the Tk thread."""
+        if token != self._preview_token or self._preview_pending is None:
+            return
+        path, channel, plan = self._preview_pending
+        self._preview_pending = None
+        raster = self._preview_store(plan, out or {})
+        if raster is None:                   # stopped, or the channel vanished
+            self._update_busy()
+            return
+        self._preview_shown_key = plan["key"]
+        self._paint_live(path, channel, raster)
+
+    def _on_preview_error(self, token, msg):
+        if token == self._preview_token:
+            self._preview_pending = None
+        log(f"preview failed: {msg}")
+        self.status_var.set(f"preview failed: {msg}")
+        self._update_busy()                  # the canvas keeps the last raster
+
+    def _paint_live(self, path, channel, raster):
+        """Put a live raster on the canvas, keeping zoom and pan.
+
+        `set_base` never touches the viewport -- only fit() and center_on do --
+        and the path key is held constant, so the pyramid behind the slice is
+        not dropped and reopened per keystroke. While a stack is primed this
+        also records an override: the region overlays came from the chain as
+        it was, and boundaries drawn over a differently filtered field are not
+        slightly stale but simply wrong, so they come off."""
+        if self.viewer is None or raster is None:
+            return
+        # `_primed_chain` is None until a prime reports one; "unknown" must not
+        # read as "stale", or a faked stack would hide its own overlays.
+        if (self.primed and self._primed_chain is not None
+                and self._chain_fingerprint() != self._primed_chain):
+            self._preview_override = (path, channel, raster)
+        self.viewer.set_base(array=raster, path=None)
+        self.viewer.set_overlays([])
+        self.viewer.set_window(*self._window_for(channel))
+        self.viewer.render()
+        self._update_busy()
+        self.status_var.set(f"preview: {os.path.basename(path or '')}  [{channel}]")
+
+    def _clear_preview_override(self):
+        """Back to what was primed: the overlays mean something again."""
+        if self._preview_override is not None:
+            self._preview_override = None
+            self._update_busy()
 
     def _build_segmentation_controls(self, chan):
         """The segmentation-source radios and the mask toggle, after the
@@ -1166,19 +1412,15 @@ class MscouponApp(ViewerShell):
         ttk.Label(row, text="Slice:").pack(side="left")
         self._build_slice_nav(row)
 
-        # per-channel windowing: each pair maps 0->1 onto that channel's own min->max
+        # One slider pair for the channel on screen; every channel keeps its
+        # own window (ViewerShell._window_for), so switching channels swaps
+        # the pair rather than sharing it.
         row = ttk.Frame(live); row.pack(fill="x", padx=4, pady=2)
-        ttk.Label(row, text="Base Min/Max:", width=14).pack(side="left")
+        ttk.Label(row, text="Image Min/Max:", width=14).pack(side="left")
         self._scale(row, from_=0.0, to=1.0, variable=self.vmin_var, orient="horizontal",
-                    command=lambda *_: self._refresh_render()).pack(side="left", fill="x", expand=True)
+                    command=self._on_window_change).pack(side="left", fill="x", expand=True)
         self._scale(row, from_=0.0, to=1.0, variable=self.vmax_var, orient="horizontal",
-                    command=lambda *_: self._refresh_render()).pack(side="left", fill="x", expand=True)
-        row = ttk.Frame(live); row.pack(fill="x", padx=4, pady=2)
-        ttk.Label(row, text="Filtered Min/Max:", width=14).pack(side="left")
-        self._scale(row, from_=0.0, to=1.0, variable=self.vmin_filt_var, orient="horizontal",
-                    command=lambda *_: self._refresh_render()).pack(side="left", fill="x", expand=True)
-        self._scale(row, from_=0.0, to=1.0, variable=self.vmax_filt_var, orient="horizontal",
-                    command=lambda *_: self._refresh_render()).pack(side="left", fill="x", expand=True)
+                    command=self._on_window_change).pack(side="left", fill="x", expand=True)
         row = ttk.Frame(live); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="Overlay alpha:").pack(side="left")
         self._scale(row, from_=0.0, to=1.0, variable=self.alpha_var, orient="horizontal",
@@ -1625,8 +1867,16 @@ class MscouponApp(ViewerShell):
             self.run_btn.config(state="normal")
             self._set_load_enabled(True)
             self._chan_cache.clear()      # derived rasters belong to the old run
-            # This priming's parameters are now the reuse fingerprint.
+            # This priming's parameters are now the reuse fingerprint; its
+            # chains are what a live preview compares itself against, and the
+            # primed rasters are the truth again, so any override goes.
             self._primed_fingerprint = getattr(self, "_pending_fingerprint", None)
+            self._primed_chain = self._chain_fingerprint()
+            self._preview_override = None
+            self._preview_shown_key = None
+            # The stack's own base/filtered rasters are resident now, so the
+            # preview cache gives up most of its budget.
+            self._preview_chan_cache.budget = _PREVIEW_CHAN_BUDGET_PRIMED
             self._rebuild_flat_slices()
             self._refresh_subseq_list()   # "msc" column follows the primed set
             self.status_var.set(f"Primed {len(self.primed)} subsequence(s), "
@@ -1832,13 +2082,19 @@ class MscouponApp(ViewerShell):
                 (self._asm_pending is not None and self._asm_pending[1] == si))
 
     def _update_busy(self):
-        """Drive the canvas HUD: an animated 'Recomputing' spinner while an assembly
-        for the current view is in flight, a static 'Out of date' badge when the
-        selection changed but hasn't been rerun, else nothing."""
+        """Drive the canvas HUD, most urgent first: an animated spinner while
+        an assembly or a chain preview is in flight, then the two stale
+        badges -- a live preview of a chain the primed stack was not built
+        with (Run), a selection edit not yet re-assembled (Rerun) -- else
+        nothing."""
         if self.viewer is None:
             return
         if self._is_current_busy():
             self.viewer.set_hud("busy", "Recomputing")
+        elif self._preview_pending is not None:
+            self.viewer.set_hud("busy", f"Previewing {self._preview_pending[1]}")
+        elif self._preview_override is not None:
+            self.viewer.set_hud("stale", "Preview - filters changed, Run to re-prime")
         elif self._selection_dirty:
             self.viewer.set_hud("stale", "Out of date - click Rerun")
         else:
@@ -1866,13 +2122,10 @@ class MscouponApp(ViewerShell):
         self._update_busy()               # clear the spinner if nothing is pending
 
     # -- rendering (reads only cached numpy rasters; never the live pipes) ---- #
-    def _image_window(self, channel):
-        """Window fractions for a displayed channel; tools may unify them."""
-        if channel == "filtered":
-            return self.vmin_filt_var.get(), self.vmax_filt_var.get()
-        if channel in ("", "base"):
-            return self.vmin_var.get(), self.vmax_var.get()
-        return 0.0, 1.0
+    def _original_channel(self):
+        """What F flips back to: the colour planes when the slice on screen
+        has them, else the base channel."""
+        return "color" if self._current_color_count() > 0 else "base"
 
     def _seg_overlays(self, si, li, rec, data, np, min_colors):
         """Build the overlay list for one slice (a subclass hook: the labeler
@@ -1925,6 +2178,11 @@ class MscouponApp(ViewerShell):
         if cur is None or not self.primed:
             self._repreview_if_active()   # window sliders stay live for previews
             return
+        if self._preview_override is not None:
+            # A chain edit since the prime: the live raster is what is true,
+            # and the primed overlays are not about this field at all.
+            self._paint_live(*self._preview_override)
+            return
         try:
             import numpy as np
             from msseg.viz import min_colors
@@ -1948,27 +2206,25 @@ class MscouponApp(ViewerShell):
 
         first = not self.viewer.has_base
         channel = self.background_var.get()
-        image_window = self._image_window(channel)
         if channel == "filtered":
-            self.viewer.set_base(array=filt, path=None)
-            self.viewer.set_window(*image_window)
+            array, path, shown = filt, None, "filtered"
         elif channel in ("", "base"):
-            self.viewer.set_base(array=base, path=p["files"][li])
-            self.viewer.set_window(*image_window)
+            array, path, shown = base, p["files"][li], "base"
         else:
-            # A derived scale-space channel: its range has nothing to do with the
-            # base channel's, so the window opens full rather than reusing either
-            # of the two hand-kept window pairs.
+            # A derived scale-space channel (or the colour planes).
             raster = self._channel_raster(si, li, channel, np)
             if raster is None:
                 # The channel is not available for this slice (nothing primed yet,
                 # or an extension that cannot build it). Show the base rather than
-                # blanking the canvas.
-                self.viewer.set_base(array=base, path=p["files"][li])
-                self.viewer.set_window(*image_window)
+                # blanking the canvas -- windowed as the base, since that is what
+                # is on screen.
+                array, path, shown = base, p["files"][li], "base"
             else:
-                self.viewer.set_base(array=raster, path=None)
-                self.viewer.set_window(*image_window)
+                array, path, shown = raster, None, channel
+        self.viewer.set_base(array=array, path=path)
+        # After set_base: a channel seen for the first time takes its window
+        # from the source now on the canvas.
+        self.viewer.set_window(*self._window_for(shown))
         self.viewer.set_overlays(overlays)
         self.viewer.set_alpha(self.alpha_var.get())
         if first:
@@ -2136,8 +2392,6 @@ class MscouponApp(ViewerShell):
             "persist_live": self.persist_live_var.get(),
             "seg_source": self.seg_source_var.get(),
             "mask": bool(self.mask_var.get()),
-            "vmin_filt": float(self.vmin_filt_var.get()),
-            "vmax_filt": float(self.vmax_filt_var.get()),
         })
         return view
 
@@ -2150,6 +2404,12 @@ class MscouponApp(ViewerShell):
         self.engine.reset()
         self._hover_ctx = None
         self._selection_dirty = False
+        # Nothing is primed, so there is nothing for a preview to be stale
+        # against, and the cache gets its full budget back.
+        self._primed_chain = None
+        self._preview_override = None
+        self._preview_shown_key = None
+        self._preview_chan_cache.budget = _PREVIEW_CHAN_BUDGET
 
     def _settle_controls(self):
         try:
@@ -2165,6 +2425,33 @@ class MscouponApp(ViewerShell):
             for li in range(len(p["pipes"])):
                 yield (si, li)
 
+    # -- removing rows: the primed data goes with them --------------------- #
+    # The primed list is positional and parallel to the sequences, so a
+    # removed sequence or slice is dropped from it at the same index -- when
+    # that entry really is this sequence's (the files match; after an old
+    # remove-without-drop they might not, and then the stale entry is left
+    # for the next Run's reuse check to sort out).
+    def _remove_item_at(self, si, li):
+        if self._slice_msc_mark(si, li) == "Y":
+            self.engine.drop_slice(si, li)
+        super()._remove_item_at(si, li)
+        self._forget_derived()
+
+    def _remove_sequence_at(self, si):
+        try:
+            aligned = self.primed[si]["files"] == self.subsequences[si]["files"]
+        except (IndexError, KeyError, TypeError):
+            aligned = False
+        if aligned:
+            self.engine.drop_sequence(si)
+        super()._remove_sequence_at(si)
+        self._forget_derived()
+
+    def _forget_derived(self):
+        """Caches keyed by (si, li) are meaningless once indices shift."""
+        self._chan_cache.clear()
+        self._hover_ctx = None
+
     def _run_settings(self):
         return {"cores_per_slice": self._cores_per_slice(),
                 "concurrent_slices": self._concurrent_slices()}
@@ -2178,12 +2465,10 @@ class MscouponApp(ViewerShell):
     def _apply_view_state(self, view, setvar, notes):
         if view.get("persist_live") is not None:
             setvar(self.persist_live_var, str(view["persist_live"]))
-        for key, var in (("vmin_filt", self.vmin_filt_var), ("vmax_filt", self.vmax_filt_var)):
-            if view.get(key) is not None:
-                try:
-                    setvar(var, float(view[key]))
-                except (TypeError, ValueError):
-                    notes.append(f"ignored {key}={view[key]!r}")
+        # An older session's separate filtered pair becomes that channel's
+        # window (only when it had been moved off the default).
+        if not isinstance(view.get("windows"), dict):
+            self._seed_window("filtered", view.get("vmin_filt"), view.get("vmax_filt"))
         if view.get("seg_source"):
             setvar(self.seg_source_var, str(view["seg_source"]))
         if view.get("mask") is not None:
@@ -2293,6 +2578,28 @@ def _selftest():
     assert app.filter_cards[-1]["operation"] == "none"
     app.filter_cards[0]["params"]["sigma"] = 2.0
 
+    # The synthesized colour conversion is DERIVED and must stay out of the
+    # config. A blur-only chain on RGB plans a `color` head that is not one of
+    # `filter_cards`, so filters_to_json cannot see it; pinning makes it a real
+    # card, and only then does it export. This is the byte-compat gate the
+    # design note names: an auto card that leaked here would change config bytes
+    # for every colour workflow.
+    exported = [f["operation"] for f in config_io.filters_to_json(app.filter_cards)]
+    assert "color" not in exported, exported
+    plan = config_io.chain_plan(app.filter_cards, 3, "luminance")
+    head = plan["stages"][0]
+    assert head["synthesized"] and head["operation"] == "color", plan
+    assert (head["in"], head["out"]) == (3, 1)
+    assert config_io.chain_plan(app.filter_cards, 1, "luminance")["stages"][0]["operation"] == "blur",         "one plane plans no conversion"
+    app._pin_auto_color("topo", "mean")
+    assert app.filter_cards[0]["operation"] == "color"
+    assert app.filter_cards[0]["params"] == {"method": "mean"}
+    pinned = config_io.filters_to_json(app.filter_cards)
+    assert pinned[0]["operation"] == "color" and pinned[0]["params"]["method"] == "mean", pinned
+    assert not config_io.chain_plan(app.filter_cards, 3, "luminance")["stages"][0]["synthesized"],         "a pinned conversion is the caller's own"
+    app._remove_filter_card(0, "topo")   # back to the blur-only chain
+    assert app.filter_cards[0]["operation"] == "blur", app.filter_cards
+
     # Channels on a PREVIEW (nothing primed): the topology chain and the
     # derived channels are computed on the spot from the raw array through
     # the run's own calls, memoised per (path, channel, params), and an
@@ -2350,6 +2657,74 @@ def _selftest():
         app._refresh_render()                  # the dropdown's path, unprimed
         assert app.viewer._base is not None and app.viewer._base.shape == raw.shape
         assert np.array_equal(app.viewer._base, e), "the preview shows the derived channel"
+        # a channel seen for the first time takes its window from its raster
+        assert app._window_channel == derived[0] and derived[0] in app._channel_windows
+        lo_d, hi_d = app._channel_windows[derived[0]]
+        assert 0.0 <= lo_d < hi_d <= 1.0 and float(app.vmin_var.get()) == lo_d
+        app.background_var.set("filtered")
+        app._refresh_render()
+        app._preview_shown_key = None
+
+        # --- the live preview: an edit repaints, without a Run ------------ #
+        # Run the worker inline so the whole loop is one call, and watch the
+        # token: it moves only when the SHOWN channel depends on what changed.
+        app._preview_sync = True
+        zoom_before = (app.viewer.scale, app.viewer.view_x, app.viewer.view_y)
+        app.viewer.scale = zoom_before[0] * 0.5
+        before = np.array(app.viewer._base, copy=True)
+        app.filter_cards[0]["params"]["sigma"] = 6.0
+        tok = app._launch_preview()
+        assert tok == app._preview_token and tok > 0, "a filter edit recomputes"
+        assert not np.array_equal(app.viewer._base, before), "and repaints"
+        assert app.viewer.scale == zoom_before[0] * 0.5, "zoom survives an edit"
+        assert (app.viewer.view_x, app.viewer.view_y) == zoom_before[1:], "so does pan"
+        assert app._preview_pending is None and app.viewer._hud_mode is None
+        # Nothing moved: no work, no repaint.
+        assert app._launch_preview() is None and app._preview_token == tok
+        # Retyping the old sigma comes back from the cache, still without a
+        # submission.
+        app.filter_cards[0]["params"]["sigma"] = 2.0
+        assert app._launch_preview() is None, "a chain already computed is a cache hit"
+        assert np.array_equal(app.viewer._base, before), "and the old raster returns"
+        # The dependency gate: with `base` shown, the topology chain is free.
+        app.background_var.set("base")
+        app._launch_preview()
+        tok = app._preview_token
+        app.filter_cards[0]["params"]["sigma"] = 9.0
+        assert app._launch_preview() is None and app._preview_token == tok, \
+            "editing the topology chain while `base` is shown costs nothing"
+        # ...but the base chain is not.
+        app.base_cards[0]["operation"] = "blur"
+        app.base_cards[0]["params"] = {"sigma": 1.0}
+        assert app._launch_preview() == tok + 1, "the base chain is what `base` shows"
+        app.base_cards[0]["operation"] = "none"
+        app.base_cards[0]["params"] = {}
+        # The signal itself: a card edit settles into exactly one launch.
+        app.filter_cards[0]["params"]["sigma"] = 2.0
+        app.background_var.set("filtered")
+        app._launch_preview()
+        tok = app._preview_token
+        app._build_param_row(app.filters_frame, app.filter_cards[0]["params"],
+                             "sigma", "float", 2.0)
+        row = app.filters_frame.winfo_children()[-1]
+        entry = [w for w in row.winfo_children() if isinstance(w, ttk.Entry)][0]
+        for text in ("3", "3.", "3.5"):        # typing, keystroke by keystroke
+            entry.delete(0, "end"); entry.insert(0, text)
+        assert app.filter_cards[0]["params"]["sigma"] == 3.5, "the field committed"
+        assert app._preview_edit_after is not None, "one settle timer, not three"
+        assert app._preview_token == tok, "and nothing has run yet"
+        app.root.after_cancel(app._preview_edit_after)
+        app._preview_edit_after = None
+        app._preview_edit_settled()
+        assert app._preview_token == tok + 1, "the settle launches once"
+        # A failing compute keeps the last raster and clears the spinner.
+        shown = np.array(app.viewer._base, copy=True)
+        app._preview_pending = (fake, "filtered", {})
+        app._on_preview_error(app._preview_token, "boom")
+        assert np.array_equal(app.viewer._base, shown) and app.viewer._hud_mode is None
+        assert "boom" in app.status_var.get()
+        app._preview_sync = False
+        app.filter_cards[0]["params"]["sigma"] = 2.0
         app.background_var.set("base")
         app.stat_kind_vars["edges"][0].set(False)
         app._on_stat_spec_change()
@@ -2378,6 +2753,44 @@ def _selftest():
         app.background_var.set("color")
         app._refresh_render()
         assert app.viewer.base_is_rgb and app.viewer._base.shape == (32, 32, 3), "the canvas shows RGB"
+
+        # -- F flips the original (the planes, here) <-> the derived channel
+        # last shown; every channel keeps its own brightness window ---------- #
+        assert app._original_channel() == "color", "a colour slice's original is its planes"
+        lo_c, hi_c = app._channel_windows["color"]
+        assert 0.0 <= lo_c < hi_c <= 1.0 and app._window_channel == "color"
+        app.background_combo.focus_set()
+        app.background_var.set("color_c1"); app._on_image_channel_change()
+        assert not app._typing(), "the dropdown hands the keyboard back"
+        assert app._window_channel == "color_c1" and "color_c1" in app._channel_windows
+        app.vmin_var.set(0.3); app._on_window_change()
+        assert app._channel_windows["color_c1"][0] == 0.3, "the slider edits the channel on screen"
+        app._on_swap_key()
+        assert app.background_var.get() == "color" and app._swap_channel == "color_c1"
+        assert (float(app.vmin_var.get()), float(app.vmax_var.get())) == (lo_c, hi_c),             "the original's own window is back on the sliders"
+        app._on_swap_key()
+        assert app.background_var.get() == "color_c1" and float(app.vmin_var.get()) == 0.3,             "a moved window is kept for its channel"
+        assert "(F: color)" in app.status_var.get(), app.status_var.get()
+        app._on_swap_key()
+        assert app.background_var.get() == "color"
+        # the windows ride the session; an older session's one pair seeds the
+        # base (and the coupon's filtered pair its channel) only when moved
+        vdoc = app._session_doc()["view"]
+        assert vdoc["windows"]["color_c1"][0] == 0.3 and vdoc["swap_channel"] == "color_c1"
+        notes = []
+        app._apply_windows_view({"vmin": 0.2, "vmax": 0.8}, notes)
+        assert app._channel_windows == {"base": (0.2, 0.8)} and app._swap_channel is None
+        app._apply_view_state({"vmin_filt": 0.1, "vmax_filt": 0.9}, lambda v, x: v.set(x), notes)
+        assert app._channel_windows["filtered"] == (0.1, 0.9)
+        app._apply_windows_view({"vmin": 0.0, "vmax": 1.0}, notes)
+        assert app._channel_windows == {}, "the default pair seeds nothing: the percentiles win"
+        app._apply_windows_view({"windows": {"base": [0.1, 0.5], "bad": [1, 0]},
+                                 "swap_channel": "edges_s1"}, notes)
+        assert app._channel_windows == {"base": (0.1, 0.5)} and app._swap_channel == "edges_s1"
+        assert notes and "bad" in notes[-1], notes
+        app._apply_windows_view(vdoc, [])
+        assert app._channel_windows["color_c1"] == (0.3, vdoc["windows"]["color_c1"][1])
+        app._refresh_render()
         app.stat_color_var.set(True)
         app.stat_kind_vars["dizenzo"][0].set(True)
         app.stat_kind_vars["blur"][0].set(True)
@@ -2708,7 +3121,49 @@ def _selftest():
         # An unknown channel must degrade to the base raster, never to None: the
         # renderer would otherwise blank the canvas.
         assert app._channel_raster(0, 0, "no_such_channel", _np) is not None
+
+        # --- a live preview over a primed stack --------------------------- #
+        # An edit after a Run shows the NEW chain, and the primed overlays come
+        # off with it: they describe a different field, so drawing them over
+        # this raster would not be slightly stale but simply wrong. The badge
+        # says which button fixes it, and re-priming clears the whole thing.
+        if have_ext and app.viewer is not None:
+            app.flat_slices = [(0, 0)]
+            app.slice_var.set(0)
+            app._preview_path = None            # browsing a primed slice
+            app._preview_cache[os.path.join(data_dir, "a.tif")] = raw
+            app.primed[0]["files"] = [os.path.join(data_dir, "a.tif")]
+            app._primed_chain = app._chain_fingerprint()
+            app._preview_sync = True
+            app.background_var.set("filtered")
+            app._preview_shown_key = None
+            app._launch_preview()               # the chain as primed
+            assert app._preview_override is None, "the primed chain is not stale"
+            assert app._launch_preview() is None, "and asking again is free"
+            app.filter_cards[0]["operation"] = "blur"
+            app.filter_cards[0]["params"] = {"sigma": 2.5}
+            assert app._launch_preview() == app._preview_token
+            assert app._preview_override is not None, "an edit after a Run overrides"
+            assert app._preview_override[1] == "filtered"
+            assert app.viewer._hud_mode == "stale" and "Run" in app.viewer._hud_text
+            assert app.viewer._overlays == [], "the primed overlays come off"
+            # Every repaint keeps showing the live raster while it stands.
+            app._refresh_render()
+            assert _np.array_equal(app.viewer._base, app._preview_override[2])
+            # A Run clears it: the primed rasters are the truth again, and the
+            # cache steps back to the smaller budget.
+            app._pending_fingerprint = "fp"
+            app._handle_compute_event(("primed",))
+            assert app._preview_override is None and app._preview_shown_key is None
+            assert app._primed_chain == app._chain_fingerprint()
+            assert app._preview_chan_cache.budget == _PREVIEW_CHAN_BUDGET_PRIMED
+            app._preview_sync = False
+            app.filter_cards[0]["operation"] = "blur"
+            app.filter_cards[0]["params"] = {"sigma": 2.0}
+            app._primed_chain = None
+            app.flat_slices = []
         app.primed = saved_primed2
+        app._preview_chan_cache.budget = _PREVIEW_CHAN_BUDGET
 
         # Restore the default spec so nothing below inherits a wide channel set.
         for on, *_rest in app.stat_kind_vars.values():
@@ -2766,7 +3221,8 @@ def _selftest():
         assert app.filter_cards[0]["operation"] == "blur", "v1 filters imported"
         assert float(app.alpha_var.get()) == 0.25
         assert app.persist_live_var.get() == "5"
-    print("selftest OK: session (folders/sequences/preview + preview channels + colour), filters, base chain, "
+    print("selftest OK: session (folders/sequences/preview + preview channels + colour"
+          " + live preview on an edit), filters, base chain, "
           "stat channels, assembly tiers, per-slice selection, pixel trim, "
           "profiles + switch + file round-trip, session v2 round-trip, legacy import")
     # New session: folders, sequences and computed results go; the profiles
