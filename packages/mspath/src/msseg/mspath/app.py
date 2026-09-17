@@ -45,10 +45,12 @@ from msseg.mscoupon.app import format_hist_ranges, parse_hist_ranges
 from msseg.mscoupon.common import _format_sigmas, _parse_sigmas
 from msseg.mscoupon.config_io import (FILTER_OPERATIONS, FILTER_SCHEMA, COLOR_METHODS,
                                       filter_param_schema, filters_to_json)
+from msseg.mscoupon.engine import preview_job, preview_raster
+from msseg.labeler.defaults import _PREVIEW_PUMP_MS
 
 from .adapters import SlideCatalogue, SlideRegionProvider
 from .common import SLIDE_EXTENSIONS, list_slides, log
-from .engine import SlideEngine
+from .engine import SlideEngine, default_color_method
 from .sources import PlacedImageSource, RoiLabelLayer
 from .items import overview, parse_key, roi as roi_item, slide_id
 
@@ -160,6 +162,17 @@ class MsPathApp(ViewerShell):
                            self._new_filter_card()]
         self._normalize_readouts = []
         self._preview_src = None            # the pyramid shown before any Run
+        # Live preview of the chains (an edit, no Run). The READ is what costs
+        # seconds at a deep level, so the array is cached per (item, level,
+        # halo) and a chain edit does NOT invalidate it; the chain output is
+        # cached per (channel, chain) beside it.
+        self._preview_arr = None            # (stamp, arr, geom)
+        self._preview_shown = None          # (item key, channel, chain key, source)
+        self._preview_chan = {}             # (channel, chain key) -> (raster, source)
+        self._preview_worker = None
+        self._preview_pending = None
+        self._preview_sync = False          # selftests run the worker inline
+        self._primed_chain = None           # the chains the primed items used
         self._run_active = False
 
     def _init_variables(self):
@@ -263,6 +276,7 @@ class MsPathApp(ViewerShell):
                 return
             c["params"] = {"method": method}
             self._rebuild_filter_cards(ch)
+            self._notify_profile_edit()
         combo.bind("<<ComboboxSelected>>", on_method)
 
     def _build_param_row(self, parent, params, pname, kind, default):
@@ -270,19 +284,25 @@ class MsPathApp(ViewerShell):
         ttk.Label(row, text=pname, width=16).pack(side="left")
         if pname not in params:
             params[pname] = default
+        # Every commit reports the edit, so the live preview repaints the
+        # chain output (debounced) instead of waiting for a Run.
+        def _set(p, value):
+            params[p] = value
+            self._notify_profile_edit()
+
         if kind == "bool":
             var = tk.BooleanVar(value=bool(params[pname]))
-            var.trace_add("write", lambda *_: params.__setitem__(pname, var.get()))
+            var.trace_add("write", lambda *_: _set(pname, var.get()))
             ttk.Checkbutton(row, variable=var).pack(side="left")
         elif kind.startswith("choice:"):
             choices = kind.split(":", 1)[1].split(",")
             var = tk.StringVar(value=str(params[pname]))
-            var.trace_add("write", lambda *_: params.__setitem__(pname, var.get()))
+            var.trace_add("write", lambda *_: _set(pname, var.get()))
             ttk.Combobox(row, textvariable=var, values=choices, state="readonly",
                          width=12).pack(side="left")
         elif kind in ("str", "floats", "numstr"):
             var = tk.StringVar(value=str(params[pname]))
-            var.trace_add("write", lambda *_: params.__setitem__(pname, var.get()))
+            var.trace_add("write", lambda *_: _set(pname, var.get()))
             ttk.Entry(row, textvariable=var,
                       width=18 if kind == "floats" else 14).pack(side="left")
         elif kind in ("optfloat", "nullfloat"):
@@ -291,10 +311,10 @@ class MsPathApp(ViewerShell):
             def commit_opt(*_, p=pname, v=var):
                 text = v.get().strip()
                 if not text:
-                    params[p] = ""
+                    _set(p, "")
                     return
                 try:
-                    params[p] = float(text)
+                    _set(p, float(text))
                 except ValueError:
                     pass
             var.trace_add("write", commit_opt)
@@ -304,7 +324,7 @@ class MsPathApp(ViewerShell):
 
             def commit(*_, p=pname, k=kind, v=var):
                 try:
-                    params[p] = int(v.get()) if k == "int" else float(v.get())
+                    _set(p, int(v.get()) if k == "int" else float(v.get()))
                 except ValueError:
                     pass
             var.trace_add("write", commit)
@@ -318,6 +338,7 @@ class MsPathApp(ViewerShell):
         cards.append(self._new_filter_card())
         self._set_chain_cards(chain, cards)
         self._rebuild_filter_cards(chain)
+        self._notify_profile_edit()
 
     def _remove_filter_card(self, idx, chain="topo"):
         cards, _ = self._chain(chain)
@@ -327,6 +348,7 @@ class MsPathApp(ViewerShell):
             cards.append(self._new_filter_card())
         self._set_chain_cards(chain, cards)
         self._rebuild_filter_cards(chain)
+        self._notify_profile_edit()
 
     # ------------------------------------------------------------------ #
     # The item model: one slide, one overview
@@ -470,6 +492,7 @@ class MsPathApp(ViewerShell):
         self.subseq_list.pack(side="left", fill="both", expand=True)
         self.subseq_list.bind("<<TreeviewSelect>>", self._on_seq_tree_select)
         self.subseq_list.bind("<Double-1>", self._on_seq_tree_double)
+        self.subseq_list.bind("<Button-3>", self._seq_tree_context)
         row = ttk.Frame(g); row.pack(side="bottom", fill="x", padx=4, pady=2)
         ttk.Button(row, text="Add slides…", command=self._add_slides).pack(
             side="left", fill="x", expand=True)
@@ -515,6 +538,68 @@ class MsPathApp(ViewerShell):
     def _sequence_row_text(self, s):
         files = s.get("files") or []
         return os.path.basename(files[0]) if files else str(s.get("name") or "slide")
+
+    # -- tree rows: slides, their overview and their ROIs ------------------ #
+    ITEM_NOUN = "item"
+
+    def _row_kind(self, si, li):
+        if li is None:
+            return "slide"
+        return "overview" if li == 0 else "ROI"
+
+    def _row_description(self, si, li):
+        name = self._row_name(si, None)
+        if li is None:
+            n = len(self._rois_of(si))
+            return f"slide '{name}' with its overview and {n} ROI(s)"
+        if li == 0:
+            return f"the overview of slide '{name}'"
+        return f"ROI {self._row_name(si, li)} of slide '{name}'"
+
+    def _remove_target(self, si, li):
+        """The overview is the slide: removing it means removing the slide."""
+        return (si, None) if li == 0 else (si, li)
+
+    def _row_owns_key(self, si, li, key):
+        """A slide row owns every key ON the slide -- including an ROI that
+        was cut away earlier and whose annotations were kept for a re-cut;
+        they go with the slide."""
+        if li is None:
+            item = parse_key(key)
+            sid, _path = self._slide_of(si)
+            return item is not None and sid is not None and item.slide == sid
+        return super()._row_owns_key(si, li, key)
+
+    def _goto_row(self, si, li):
+        """Go there AND bring it into view, as a double-click does."""
+        ok = super()._goto_row(si, li)
+        if ok:
+            self._view_item(si, 0 if li is None else li)
+        return ok
+
+    def _remove_item_at(self, si, li):
+        if li <= 0:
+            return                       # the overview goes with its slide
+        key = self.catalogue.key_of(si, li)
+        rois = self._rois_of(si)
+        if li - 1 < len(rois):
+            gone = rois.pop(li - 1)
+            log(f"ROI removed: {gone}")
+        if key is not None:
+            self.engine.forget(key)
+
+    def _remove_sequence_at(self, si):
+        sid, _path = self._slide_of(si)
+        if sid is not None:
+            n = self.engine.forget_slide(sid)
+            log(f"slide removed: {sid} ({n} computed item(s) dropped)")
+        super()._remove_sequence_at(si)
+
+    def _after_rows_removed(self, cur_key, pos):
+        super()._after_rows_removed(cur_key, pos)
+        self._update_roi_hint()
+        if not self.flat_slices and self.viewer is not None:
+            self.viewer.clear()          # its pyramid is closed
 
     def _bind_preview(self):
         pass                                        # no file list to click
@@ -940,26 +1025,18 @@ class MsPathApp(ViewerShell):
         return item
 
     def _remove_roi(self):
-        """Drop the ROI on screen. Its annotations are not touched: they are
-        keyed by the item, so re-cutting the same rect at the same level brings
-        them back."""
+        """Drop the ROI on screen, after asking -- the same path as the tree's
+        context menu, so the labeler takes its annotations with it."""
         cur = self._current()
         if cur is None or cur[1] <= 0:
             self.status_var.set("Select an ROI to remove (the overview stays).")
             return
-        self._remove_roi_at(*cur)
+        self._remove_rows_guarded([cur])
 
     def _remove_roi_at(self, si, li):
-        """The removal itself, callable without a selection."""
-        rois = self._rois_of(si)
-        if li - 1 < len(rois):
-            gone = rois.pop(li - 1)
-            log(f"ROI removed: {gone}")
-        self._rebuild_flat_slices()
-        self._refresh_subseq_list()
-        self._update_roi_hint()
-        if (si, 0) in self.flat_slices:
-            self._goto_slice(self.flat_slices.index((si, 0)))
+        """The removal itself, unguarded (headless callers)."""
+        if li > 0:
+            self._remove_rows([(si, li)])
 
     def _update_roi_hint(self):
         hint = getattr(self, "roi_hint", None)
@@ -991,6 +1068,10 @@ class MsPathApp(ViewerShell):
 
     CHANNELS = ("slide", "base", "filtered")
 
+    def _original_channel(self):
+        """What F flips back to: the slide itself."""
+        return "slide"
+
     def _after_layout(self):
         self._update_level_hint()
         self._update_roi_hint()
@@ -1013,6 +1094,9 @@ class MsPathApp(ViewerShell):
         measures the raster's range and a repaint must not scan 16 Mpx."""
         if channel == "slide":
             return slide_src, None
+        live = self._live_channel_source(key, channel)
+        if live is not None:
+            return live, None
         p = self.engine.primed.get(key)
         raster = None if p is None else getattr(p, channel, None)
         if raster is None:
@@ -1024,6 +1108,170 @@ class MsPathApp(ViewerShell):
                 raster, origin=p.origin, scale=p.scale,
                 slide_shape=slide_src.level_shape(0), path=None)
         return src, None
+
+    # ------------------------------------------------------------------ #
+    # The live preview: a chain edit repaints without a Run
+    # ------------------------------------------------------------------ #
+    _PREVIEW_CHAN_MAX = 4                   # (channel, chain) rasters + sources
+
+    def _preview_chain_key(self, channel):
+        """(cache key, job) for previewing `channel`, or None when the channel
+        is not a chain output.
+
+        The key is the chain that produces it and nothing else, so "does what
+        is on screen still match the panel?" is one tuple comparison."""
+        if channel not in ("base", "filtered"):
+            return None
+        prof = self._profile_from_ui()
+        base_filters = prof.get("base_filters") or []
+        filters = prof.get("filters") or []
+        method = default_color_method(prof)
+        chain = base_filters if channel == "base" else filters
+        key = (channel, json.dumps({"chain": chain, "default": method},
+                                   sort_keys=True))
+        return key, (base_filters, filters, method)
+
+    def _preview_item(self):
+        """(item, raw array, geometry) the live preview computes on.
+
+        The item on screen, read at its own level with the halo -- exactly the
+        pixels a prime would run the chains over, which is what makes the
+        preview honest. Cached, because that read is seconds at a deep level
+        and a sigma edit must not repeat it."""
+        cur = self._current()
+        item = self._item_at(*cur) if cur is not None else None
+        if item is None:
+            return None, None, None
+        stamp = (item.key, int(item.level), self._halo())
+        cached = self._preview_arr
+        if cached is not None and cached[0] == stamp:
+            return item, cached[1], cached[2]
+        try:
+            arr, geom, dt = self.engine.read_item(item, stamp[2])
+        except Exception as exc:
+            log(f"preview read failed for {item.key}: {exc}")
+            return None, None, None
+        log(f"preview read {item.key}: {1e3 * dt:.0f}ms")
+        self._preview_arr = (stamp, arr, geom)
+        return item, arr, geom
+
+    def _live_channel_source(self, key, channel):
+        """The live preview's source for `channel` on item `key`, but only
+        while it still matches the panel; otherwise None, and the primed
+        raster (or the pyramid) answers as before."""
+        shown = self._preview_shown
+        if shown is None or shown[0] != key or shown[1] != channel:
+            return None
+        want = self._preview_chain_key(channel)
+        return shown[3] if want is not None and want[0] == shown[2] else None
+
+    def _launch_preview(self):
+        """A chain parameter settled: recompute the shown channel off-thread.
+
+        Returns the token submitted, or None when there is nothing to do --
+        the slide channel is not a chain output at all, and a channel whose
+        chain did not move is one tuple comparison."""
+        if self.viewer is None:
+            return None
+        channel = self.background_var.get() or "slide"
+        want = self._preview_chain_key(channel)
+        if want is None:
+            return None
+        key, (base_filters, filters, method) = want
+        shown = self._preview_shown
+        if shown is not None and shown[1] == channel and shown[2] == key:
+            return None                     # already on screen
+        item, arr, _geom = self._preview_item()
+        if arr is None:
+            return None
+        hit = self._preview_chan.get(key)
+        if hit is not None:                 # retyping the old sigma: instant
+            self._show_live(item.key, channel, key, hit[1])
+            return None
+        try:
+            from msseg.mscoupon import mscoupon_py as ext
+        except Exception:
+            return None
+        job = preview_job("base" if channel == "base" else "filtered",
+                          base_filters, filters, method,
+                          planar=getattr(arr, "ndim", 2) == 3, label=item.key)
+        self._preview_token += 1
+        token = self._preview_token
+        self._preview_pending = (item, channel, key)
+        self.viewer.set_hud("busy", f"Previewing {channel}")
+        self.status_var.set(f"preview: computing {channel} on {item.key}...")
+        self._worker().submit(token,
+                              lambda stop: preview_raster(ext, arr, job, log, stop),
+                              sync=self._preview_sync)
+        return token
+
+    def _worker(self):
+        if self._preview_worker is None:
+            from msseg.labeler.preview import PreviewWorker
+            self._preview_worker = PreviewWorker(
+                self.root, self._on_preview_result, on_error=self._on_preview_error,
+                log=log, pump_ms=_PREVIEW_PUMP_MS, name="mspath-preview")
+        return self._preview_worker
+
+    def _on_preview_result(self, token, out):
+        """A chain recompute landed. Placing a raster measures its range, so
+        the source is cached with it -- a repaint must not rescan 16 Mpx."""
+        if token != self._preview_token or self._preview_pending is None:
+            return
+        item, channel, key = self._preview_pending
+        self._preview_pending = None
+        raster = (out or {}).get("base" if channel == "base" else "filtered")
+        geom = self._preview_arr[2] if self._preview_arr else None
+        if raster is None or geom is None:      # stopped, or an empty chain
+            self._update_busy()
+            return
+        src = self._place_preview(item, raster, geom)
+        if src is None:
+            self._update_busy()
+            return
+        self._preview_chan[key] = (raster, src)
+        while len(self._preview_chan) > self._PREVIEW_CHAN_MAX:
+            self._preview_chan.pop(next(iter(self._preview_chan)))
+        self._show_live(item.key, channel, key, src)
+
+    def _place_preview(self, item, raster, geom):
+        """Put a preview raster where its item sits on the slide.
+
+        The halo is compute-only -- a prime trims it off the rasters it stores
+        -- so this trims it too, or the picture would sit `halo` pixels up and
+        to the left of the thing it is a picture of."""
+        import numpy as np
+        _level, _lx, _ly, lw, lh, origin, scale = geom
+        halo = self._halo()
+        if halo:
+            raster = np.ascontiguousarray(raster[halo:halo + lh, halo:halo + lw])
+        try:
+            shape = self.engine.source(item.slide).level_shape(0)
+        except Exception as exc:
+            log(f"preview placement failed for {item.key}: {exc}")
+            return None
+        return PlacedImageSource(raster, origin=origin, scale=scale,
+                                 slide_shape=shape, path=None)
+
+    def _show_live(self, item_key, channel, key, src):
+        self._preview_shown = (item_key, channel, key, src)
+        self._refresh_render()
+        self._update_busy()
+        self.status_var.set(f"preview: {item_key}  [{channel}]")
+
+    def _on_preview_error(self, token, msg):
+        if token == self._preview_token:
+            self._preview_pending = None
+        log(f"preview failed: {msg}")
+        self.status_var.set(f"preview failed: {msg}")
+        self._update_busy()                 # the canvas keeps what it has
+
+    def _preview_is_stale(self):
+        """True while the live preview shows a chain the primed items were
+        not built with -- so the region overlays describe a different field."""
+        if self._preview_shown is None or self._primed_chain is None:
+            return False
+        return self._chain_fingerprint() != self._primed_chain
 
     # ------------------------------------------------------------------ #
     # Parameters
@@ -1045,8 +1293,15 @@ class MsPathApp(ViewerShell):
             self._profile_from_ui(), 1, 3))
 
     def _profile_from_ui(self):
+        active = self.profiles[self.active_profile_idx]
         return {
-            "name": self.profiles[self.active_profile_idx].get("name", "default"),
+            "name": active.get("name", "default"),
+            # mspath has no colour-input section, so this block is only ever what
+            # a loaded profile brought with it -- but it has to survive the UI
+            # round trip, or `input.color.default_method` is dropped here and
+            # every reader downstream falls back to luminance. The reader is
+            # total, so a profile without the block gets the default one.
+            "input": {"color": coupon_session.color_input_from_json(active.get("input"))},
             "filters": filters_to_json(self.filter_cards),
             "base_filters": filters_to_json(self.base_cards),
             "msc": {"manifold": self.manifold_var.get(),
@@ -1265,6 +1520,10 @@ class MsPathApp(ViewerShell):
             # overview, and the item that was just primed on demand -- the ROI
             # the user navigated to -- would be dropped before its regions were
             # ever computed. Keep the current key across the rebuild.
+            # The chains these items were primed with: what a live preview
+            # compares itself against. The primed rasters are the truth again.
+            self._primed_chain = self._chain_fingerprint()
+            self._preview_shown = None
             self._rebuild_flat_slices_keeping_current()
             self._refresh_subseq_list()
             self.status_var.set("Primed.")
@@ -1284,6 +1543,12 @@ class MsPathApp(ViewerShell):
 
     def _reset_compute(self):
         self.engine.reset()
+        # Nothing is primed, so there is nothing for a preview to be stale
+        # against; the read cache goes too (a new profile may change the level).
+        self._primed_chain = None
+        self._preview_shown = None
+        self._preview_arr = None
+        self._preview_chan.clear()
 
     def _settle_controls(self):
         if getattr(self, "run_btn", None) is not None:
@@ -1302,8 +1567,12 @@ class MsPathApp(ViewerShell):
             self.viewer.set_hud("busy", "Priming")
         elif self.engine.pending_work() and self._run_active:
             self.viewer.set_hud("busy", "Priming")
+        elif self._preview_pending is not None:
+            self.viewer.set_hud("busy", f"Previewing {self._preview_pending[1]}")
         elif self._notice_active():
             return                                  # a _notify is still on screen
+        elif self._preview_is_stale():
+            self.viewer.set_hud("stale", "Preview - filters changed, Run to re-prime")
         else:
             self.viewer.set_hud(None)
 
@@ -1368,7 +1637,10 @@ class MsPathApp(ViewerShell):
         """Overlay list for one item. The framework's signature -- the labeler
         mixin chains to it -- even though `data` (the coupon 3D assembly) has
         no counterpart here."""
-        if not self.regions_var.get() or rec is None:
+        if not self.regions_var.get() or rec is None or self._preview_is_stale():
+            # A live preview of an edited chain is on screen: the regions came
+            # from a different field, so drawing their boundaries over it
+            # would not be slightly stale but simply wrong.
             return []
         key = self.catalogue.key_of(si, li)
         layer = self.regions.label_layer(key) if key else None
@@ -1408,7 +1680,10 @@ class MsPathApp(ViewerShell):
             self.status_var.set(note)
         first = not self.viewer.has_base
         self.viewer.set_source(shown, path=self.engine.paths.get(item.slide))
-        self.viewer.set_window(float(self.vmin_var.get()), float(self.vmax_var.get()))
+        # Windowed as what is on screen: the slide when the channel fell back
+        # to it, else the channel -- each with its own window, first taken
+        # from the source's percentiles.
+        self.viewer.set_window(*self._window_for(channel if shown is not src else "slide"))
         self.viewer.set_overlays(overlays)
         self.viewer.set_alpha(self.alpha_var.get())
         self._hover_ctx = {"key": key, "rec": rec, "src": src,
@@ -1433,6 +1708,7 @@ class MsPathApp(ViewerShell):
         self._preview_src = src
         self.viewer.set_source(src, path=str(path))
         self.viewer.set_overlays([])
+        self.viewer.set_window(*self._window_for("slide"))
         self.viewer.fit()
         h, w = src.level_shape(0)
         self.status_var.set(f"{os.path.basename(str(path))}: {w} x {h} x {src.channels}, "

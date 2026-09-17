@@ -55,6 +55,20 @@ POSITIONAL = (("min_x", 0), ("max_x", 0), ("ext_x", 0),
               ("min_y", 1), ("max_y", 1), ("ext_y", 1))
 
 
+def default_color_method(profile):
+    """The colour->scalar method a chain without a leading `color` stage gets.
+
+    It lives at ``input.color.default_method`` -- the one place the coupon
+    engine, ``profile_params_json`` and the C++ config parser all read it from.
+    mspath used to spell this ``profile.get("color_method")``, a key nothing has
+    ever written, so the declared method was silently ignored and every such
+    chain converted by luminance. Nothing noticed because mspath always puts an
+    explicit `color` card at index 0; delete that card and the bug surfaced.
+    """
+    from msseg.mscoupon.session import color_input_from_json
+    return color_input_from_json((profile or {}).get("input"))["default_method"]
+
+
 def live_budget():
     try:
         return max(1, int(os.environ.get("MSPATH_LIVE_ITEMS", "") or DEFAULT_LIVE_ITEMS))
@@ -164,6 +178,26 @@ class SlideEngine:
     # ------------------------------------------------------------------ #
     # priming
     # ------------------------------------------------------------------ #
+    def read_item(self, item: Item, halo=0):
+        """The pixels a prime will run its chains over: the item's rect at its
+        own level, padded by the halo, as a (C,H,W) or (H,W) float32 array,
+        plus its geometry.
+
+        Split out of prime_item so a PREVIEW of an edited chain computes on
+        exactly the array a prime would -- and so it can be cached per item
+        and re-used across edits, since the read is seconds at a deep level."""
+        import numpy as np
+
+        src = self.source(item.slide)
+        geom = self.item_geometry(item)
+        level, lx, ly, lw, lh = geom[:5]
+        halo = int(halo)
+        t0 = time.perf_counter()
+        tile = src.read_region(level, lx - halo, ly - halo, lw + 2 * halo, lh + 2 * halo)
+        arr = (np.ascontiguousarray(np.transpose(tile, (2, 0, 1)), dtype=np.float32)
+               if tile.ndim == 3 else np.ascontiguousarray(tile, dtype=np.float32))
+        return arr, geom, time.perf_counter() - t0
+
     def prime_item(self, item: Item, profile, halo=0, quiet=True):
         """Read the item, run both chains, prime it. Synchronous; the caller
         decides which thread it is on."""
@@ -172,24 +206,21 @@ class SlideEngine:
         import numpy as np
 
         say = (lambda _m: None) if quiet else log
-        src = self.source(item.slide)
-        level, lx, ly, lw, lh, origin, scale = self.item_geometry(item)
         halo = int(halo)
 
         t0 = time.perf_counter()
-        tile = src.read_region(level, lx - halo, ly - halo, lw + 2 * halo, lh + 2 * halo)
+        arr, geom, _dt = self.read_item(item, halo)
+        level, lx, ly, lw, lh, origin, scale = geom
         t_read = time.perf_counter()
-        arr = (np.ascontiguousarray(np.transpose(tile, (2, 0, 1)), dtype=np.float32)
-               if tile.ndim == 3 else np.ascontiguousarray(tile, dtype=np.float32))
 
+        method = default_color_method(profile)
         cur, rest = ComputeEngine._leading_color(arr, profile.get("filters") or [], ext, say,
-                                                 profile.get("color_method", "luminance"))
+                                                 method)
         for f in rest:
             cur = ext.filter_slice(cur, json.dumps({"filter": f}))
         filtered = np.ascontiguousarray(cur, dtype=np.float32)
         base, _norms = ComputeEngine._apply_base_chain(
-            arr, profile.get("base_filters") or [], ext, say,
-            profile.get("color_method", "luminance"))
+            arr, profile.get("base_filters") or [], ext, say, method)
         t_filter = time.perf_counter()
 
         planes = arr if arr.ndim == 3 else None
@@ -357,6 +388,39 @@ class SlideEngine:
         return RoiLabelLayer(rec["labels"], origin=rec["origin"], scale=rec["scale"],
                              slide_shape=slide_shape, rev=int(rec["commit"]),
                              n_ids=int(rec["n_ids"]))
+
+    # ------------------------------------------------------------------ #
+    # forgetting
+    # ------------------------------------------------------------------ #
+    def forget(self, key):
+        """Drop one item's primed state and record (it left the session).
+        Not while the worker runs: it may be priming that very key."""
+        if self._busy:
+            raise RuntimeError("cannot forget an item while a prime is running")
+        p = self.primed.pop(key, None)
+        if p is not None:
+            p.release()
+        if key in self._order:
+            self._order.remove(key)
+        self.slices.pop(key, None)
+        return p is not None
+
+    def forget_slide(self, slide):
+        """Drop every item of a slide, then the slide itself: its open
+        pyramid is closed and its path forgotten. Returns the item count."""
+        slide = str(slide)
+        keys = [k for k in set(self.primed) | set(self.slices)
+                if (parse_key(k) or Item("", 0)).slide == slide]
+        for k in keys:
+            self.forget(k)
+        src = self.sources.pop(slide, None)
+        if src is not None:
+            try:
+                src.close()
+            except Exception:
+                pass
+        self.paths.pop(slide, None)
+        return len(keys)
 
     # ------------------------------------------------------------------ #
     # generations
