@@ -68,6 +68,28 @@ diffg::MultiImage<float> to_planes(const FloatArray& image, std::size_t& h, std:
 
 bool is_planar(const FloatArray& image) { return image.request().ndim == 3; }
 
+// Copy a computed buffer out as a fresh (h, w) array.
+//
+// The extent is the INPUT's, but nothing in the core's signatures forces a result
+// to match it: apply_filter_chain returns an Image<float> sized by whatever the
+// chain built. Today every stage is scalar and extent-preserving, so the counts
+// always agree -- but the day one returns planes (docs/design_filter_types.md)
+// the bare memcpy this replaces would have run off the end of `out`, silently.
+// Checking makes that a diagnosable error instead of a heap overflow.
+template <typename Array, typename T>
+Array to_2d_array(const T* src, std::size_t count, std::size_t h, std::size_t w, const char* what) {
+  if (count != h * w) {
+    throw std::runtime_error(std::string(what) + " produced " + std::to_string(count) +
+                             " values, but the (" + std::to_string(h) + ", " + std::to_string(w) +
+                             ") output holds " + std::to_string(h * w) +
+                             "; a stage changed the raster's extent or plane count, which this "
+                             "binding cannot return yet.");
+  }
+  Array out({static_cast<py::ssize_t>(h), static_cast<py::ssize_t>(w)});
+  std::memcpy(out.request().ptr, src, count * sizeof(T));
+  return out;
+}
+
 // `input.color.default_method` of a params JSON, else the keyword argument.
 std::string default_color_method(const nlohmann::json& cfg, const std::string& fallback) {
   if (cfg.contains("input") && cfg["input"].is_object() && cfg["input"].contains("color") &&
@@ -191,9 +213,7 @@ FloatArray filter_slice(const FloatArray& image, const std::string& params_json,
     filtered = msseg::apply_filter(slice, filter);
   }
 
-  FloatArray out({static_cast<py::ssize_t>(h), static_cast<py::ssize_t>(w)});
-  std::memcpy(out.request().ptr, filtered.data(), filtered.size() * sizeof(float));
-  return out;
+  return to_2d_array<FloatArray>(filtered.data(), filtered.size(), h, w, "the filter stage");
 }
 
 py::array_t<std::int32_t> segment_slice(const FloatArray& image, const std::string& params_json) {
@@ -210,9 +230,8 @@ py::array_t<std::int32_t> segment_slice(const FloatArray& image, const std::stri
     labels = msseg::compute_msc2d_labels(filtered, msc);
   }
 
-  py::array_t<std::int32_t> out({static_cast<py::ssize_t>(h), static_cast<py::ssize_t>(w)});
-  std::memcpy(out.request().ptr, labels.data(), labels.size() * sizeof(std::int32_t));
-  return out;
+  return to_2d_array<py::array_t<std::int32_t>>(labels.data(), labels.size(), h, w,
+                                                "the segmentation");
 }
 
 // Apply an ordered filter chain (params_json['filters'] array, or a single
@@ -234,9 +253,7 @@ FloatArray filter_chain(const FloatArray& image, const std::string& params_json,
     py::gil_scoped_release release;
     filtered = msseg::apply_filter_chain(slice, chain);
   }
-  FloatArray out({static_cast<py::ssize_t>(h), static_cast<py::ssize_t>(w)});
-  std::memcpy(out.request().ptr, filtered.data(), filtered.size() * sizeof(float));
-  return out;
+  return to_2d_array<FloatArray>(filtered.data(), filtered.size(), h, w, "the filter chain");
 }
 
 // The measurement channels of one slice, as pixels: (names, (C, h, w) float32).
@@ -296,11 +313,9 @@ msseg::Msc2DPipeline prime_slice(const FloatArray& base, const FloatArray& filte
 // Feature id per pixel (int32 h,w) at the pipeline's current persistence.
 py::array_t<std::int32_t> pipeline_labels(const msseg::Msc2DPipeline& pipe) {
   const std::vector<int>& labels = pipe.labels();
-  const auto h = static_cast<py::ssize_t>(pipe.height());
-  const auto w = static_cast<py::ssize_t>(pipe.width());
-  py::array_t<std::int32_t> out({h, w});
-  std::memcpy(out.request().ptr, labels.data(), labels.size() * sizeof(std::int32_t));
-  return out;
+  return to_2d_array<py::array_t<std::int32_t>>(
+      labels.data(), labels.size(), static_cast<std::size_t>(pipe.height()),
+      static_cast<std::size_t>(pipe.width()), "the pipeline labeling");
 }
 
 // Living-region adjacency at the current persistence: (a int32[n], b int32[n],
