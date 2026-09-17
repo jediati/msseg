@@ -96,6 +96,137 @@ def stat_images(engine, base, filt, params, color=None):
     return engine.stat_channel_images(base, filt, params, color)
 
 
+# --------------------------------------------------------------------------- #
+# Preview channels (Tk-free, so they can run on a worker thread)
+# --------------------------------------------------------------------------- #
+def preview_job(kind, base_filters, filters, default_method, single=None,
+                source="base", planar=False, label=""):
+    """A plain description of one preview compute, built on the UI thread.
+
+    `kind` is "base", "filtered" or "derived"; `single` is the one-channel
+    statistics params JSON a derived channel is measured with. `have` is
+    filled by the caller with whatever rasters it already has cached (a
+    derived channel is measured on the base and filtered ones), and `label`
+    is what the timing lines name."""
+    return {"kind": kind,
+            "base_filters": list(base_filters or []),
+            "filters": list(filters or []),
+            "default_method": default_method,
+            "single": single,
+            "source": source,
+            "planar": bool(planar),
+            "label": label,
+            "have": {}}
+
+
+def _spec_reads_filtered(single):
+    """Whether a statistics params JSON names the `filtered` channel -- the
+    aggregate one, the only thing that reads that raster."""
+    try:
+        stats = (json.loads(single) or {}).get("statistics") or {}
+    except (TypeError, ValueError):
+        return True                       # unreadable: assume it does
+    if stats.get("filtered"):
+        return True
+    for c in stats.get("channels") or []:
+        if c == "filtered" or (isinstance(c, dict) and c.get("kind") == "filtered"):
+            return True
+    return False
+
+
+def preview_raster(engine, arr, job, log=lambda _m: None, should_stop=None):
+    """Compute `job` over the raw slice `arr` and return its rasters.
+
+    Returns ``{"base": raster|None, "filtered": raster|None,
+    "channels": [(name, raster), ...]}`` -- every raster the compute produced,
+    under the pipeline's own names. The CALLER owns the cache: this never
+    reads or writes one, which is what keeps those LRUs single-threaded (they
+    are bare OrderedDicts, and even a read reorders them).
+
+    Tk-free and safe on a worker thread: the two chain helpers are
+    staticmethods taking all their state as arguments, `stat_images` is a
+    plain function, and the extension entry points they reach release the GIL
+    and copy into freshly allocated arrays. It never touches an
+    ``Msc2DPipeline`` -- those are stateful, which is why assembly is
+    single-flight -- so it can run beside a prime.
+
+    `should_stop`, when given, is checked between stages: a call already
+    inside the extension cannot be interrupted, so this bails out of the REST
+    of a chain rather than aborting what is running. A superseded result is
+    dropped by the caller's token either way.
+    """
+    import numpy as np
+    out = {"base": None, "filtered": None, "channels": []}
+    stop = should_stop or (lambda: False)
+    planar = bool(job.get("planar"))
+    default_method = job.get("default_method") or "luminance"
+    have = job.get("have") or {}
+    on = f" on {job['label']}" if job.get("label") else ""
+
+    def base_raster():
+        if have.get("base") is not None:
+            return have["base"]
+        if out["base"] is None:
+            t0 = time.perf_counter()
+            raster, _ = ComputeEngine._apply_base_chain(
+                arr, job["base_filters"], engine, log, default_method)
+            log(f"preview base chain{on}: {1e3 * (time.perf_counter() - t0):.0f}ms")
+            out["base"] = raster
+        return out["base"]
+
+    def filtered_raster():
+        if have.get("filtered") is not None:
+            return have["filtered"]
+        if out["filtered"] is None:
+            t0 = time.perf_counter()
+            cur, rest = ComputeEngine._leading_color(arr, job["filters"], engine, log,
+                                                     default_method)
+            for f in rest:
+                if stop():
+                    return None
+                cur = engine.filter_slice(cur, json.dumps({"filter": f}))
+            log(f"preview filter chain{on}: {1e3 * (time.perf_counter() - t0):.0f}ms")
+            out["filtered"] = np.ascontiguousarray(cur, dtype=np.float32)
+        return out["filtered"]
+
+    kind = job["kind"]
+    if kind == "base":
+        base_raster()
+        return out
+    if kind == "filtered":
+        filtered_raster()
+        return out
+    # A derived channel is measured on the base raster or on the colour
+    # planes -- `source` is validated to be one of those two
+    # (workflow/stat_channels.cpp), and `build_stat_channels` reads the
+    # filtered raster only for a channel whose KIND is "filtered", which a
+    # one-channel derived spec never has. So the topology chain need not run
+    # at all here: base stands in for it, and the only thing that looks at it
+    # is the dimension check. Asserted against the spec rather than assumed,
+    # so an extension that starts reading it is still fed the real thing.
+    base = base_raster()
+    if stop():
+        return out
+    if _spec_reads_filtered(job.get("single")):
+        filt = filtered_raster()
+        if filt is None or stop():
+            return out
+    else:
+        filt = base
+    t0 = time.perf_counter()
+    names, imgs = stat_images(engine, np.asarray(base, dtype=np.float32),
+                              np.asarray(filt, dtype=np.float32), job["single"],
+                              np.ascontiguousarray(arr, dtype=np.float32) if planar
+                              else None)
+    names = list(names)
+    log(f"preview channel{'s' if len(names) != 1 else ''} {'/'.join(names)}{on}: "
+        f"{1e3 * (time.perf_counter() - t0):.0f}ms ({len(names)} plane(s))")
+    # Every plane the kind returned (hessian yields two per sigma) rides back:
+    # they cost the same traversal, so the caller caches them all.
+    out["channels"] = [(n, np.array(imgs[k], copy=True)) for k, n in enumerate(names)]
+    return out
+
+
 class ComputeEngine:
     def __init__(self, params_provider):
         # params_provider(si, level, li) -> dict: the UI-state snapshot for one
@@ -145,30 +276,45 @@ class ComputeEngine:
 
     @staticmethod
     def _leading_color(arr, chain, engine, log, default_method="luminance"):
-        """Peel a chain's leading `color` stage.
+        """Peel the chain's leading PLANE-CARRYING prefix.
 
-        Returns (scalar raster, remaining stages). A planar (C,h,w) slice is
-        reduced by the chain's first stage when that is a `color` stage, else by
-        `default_method` -- the same rule the C++ chain applies -- so an empty
-        chain on a colour slice still yields a scalar. A (h,w) slice passes
-        through unless the chain itself starts with a colour stage (one-plane
-        methods such as pick are allowed there).
+        Returns (scalar raster, remaining stages), so every caller's loop below
+        it runs one plane at a time and can keep applying `normalize` in Python.
+
+        The prefix is the leading run of stages that consume the plane stack --
+        `color`, and since the plane stages landed, `adapt` and
+        `stain_deconvolution` too. It runs as ONE `filter_chain` call, which is
+        the same split the CLI makes (`mscoupon::apply_filter_chain` over an
+        InputSlice): core owns the plane carrier, this side owns the scalar tail.
+        A planar slice with no such head still gets `default_method`, because
+        core synthesizes the conversion exactly as it always has.
+
+        A (h,w) slice with no plane-consuming head passes straight through, which
+        is what every chain that predates this did.
         """
         import numpy as np
+        from . import config_io
         chain = list(chain or [])
-        head = chain[0] if chain and chain[0].get("operation") == "color" else None
-        if head is None and getattr(arr, "ndim", 2) != 3:
+        channels = arr.shape[0] if getattr(arr, "ndim", 2) == 3 else 1
+        tail = next((i for i, c in enumerate(chain) if not config_io._consumes_planes(c)),
+                    len(chain))
+        if tail == 0 and channels == 1:
             return arr, chain
-        stage = head if head is not None else {"operation": "color",
-                                               "params": {"method": default_method}}
-        cur = engine.filter_slice(np.ascontiguousarray(arr, dtype=np.float32),
-                                  json.dumps({"filter": stage}), default_method)
+        prefix = chain[:tail]
+        cur = engine.filter_chain(np.ascontiguousarray(arr, dtype=np.float32),
+                                  json.dumps({"filters": prefix}), default_method)
         cur = np.ascontiguousarray(cur, dtype=np.float32)
-        params = stage.get("params", {})
-        log(f"  color {params.get('method', default_method)}({params})"
-            f"{'' if head is not None else ' [default]'} "
-            f"-> min={cur.min():.4g} max={cur.max():.4g}")
-        return cur, (chain[1:] if head is not None else chain)
+        if cur.ndim != 2:
+            raise RuntimeError(
+                f"the chain yields {cur.shape[0]} planes, but the field a Morse-Smale complex "
+                "runs over is one; reduce them with an adapt stage (mode 'select' or 'project').")
+        if prefix:
+            names = " -> ".join(str(c.get("operation")) for c in prefix)
+            log(f"  {names} -> min={cur.min():.4g} max={cur.max():.4g}")
+        else:
+            log(f"  color {default_method} [default] "
+                f"-> min={cur.min():.4g} max={cur.max():.4g}")
+        return cur, chain[tail:]
 
     @staticmethod
     def _apply_base_chain(arr, base_filters, engine, log, default_color_method="luminance"):
@@ -458,6 +604,54 @@ class ComputeEngine:
         self.commit_id += 1
         self.slices = {k: v for k, v in self.slices.items()
                        if v.get("commit") == self.commit_id}
+
+    def drop_sequence(self, si):
+        """Forget primed sequence `si` -- its rasters, pipes, records and 3D
+        assembly -- and shift the later ones down one index, keeping the
+        list parallel to the caller's sequences. Returns False when there is
+        no such entry. Not while a worker runs: the workers index the list.
+        """
+        if self.pending_work():
+            raise RuntimeError("cannot drop a sequence while a worker is running")
+        if not (0 <= si < len(self.primed)):
+            return False
+        del self.primed[si]
+        self.assembly = {(s - (s > si)): v for s, v in self.assembly.items() if s != si}
+        self.slices = {(s - (s > si), l): v for (s, l), v in self.slices.items()
+                       if s != si}
+        active = getattr(self, "_gpu_active", None)
+        if active is not None:
+            asi, ali = active
+            self._gpu_active = None if asi == si else (asi - (asi > si), ali)
+        return True
+
+    def drop_slice(self, si, li):
+        """Forget slice `li` of primed sequence `si`: its raster, pipe and
+        record go, the later slices shift down, and the sequence's 3D
+        assembly goes too (it spanned that slice). Returns False when there
+        is no such slice. Not while a worker runs."""
+        if self.pending_work():
+            raise RuntimeError("cannot drop a slice while a worker is running")
+        p = self.primed[si] if 0 <= si < len(self.primed) else None
+        if p is None or not (0 <= li < len(p.get("pipes") or [])):
+            return False
+        for name in ("files", "base", "filtered", "pipes", "normalizers", "color"):
+            seq = p.get(name)
+            if isinstance(seq, list) and li < len(seq):
+                # A NEW list: "files" may be the caller's own sequence list
+                # (start_run shares it), which the caller edits itself.
+                p[name] = seq[:li] + seq[li + 1:]
+        self.assembly.pop(si, None)
+        self.slices = {(s, l - (1 if s == si and l > li else 0)): v
+                       for (s, l), v in self.slices.items() if (s, l) != (si, li)}
+        active = getattr(self, "_gpu_active", None)
+        if active is not None:
+            asi, ali = active
+            if (asi, ali) == (si, li):
+                self._gpu_active = None
+            elif asi == si and ali > li:
+                self._gpu_active = (si, ali - 1)
+        return True
 
     def reset(self):
         """Drop every primed stack, cached slice and assembly (a config load is
