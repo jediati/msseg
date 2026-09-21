@@ -1,7 +1,9 @@
 # Design note: many task-specific models over one set of slides
 
-Status: **proposal only, third draft** (2026-09-21; first draft 2026-09-18).
-Nothing here is built; no code has been changed. The second draft was a
+Status: **third draft; stage 1 built** (2026-09-21; first draft 2026-09-18).
+Stage 1 of §12 -- the task object with a stack, the Tasks list, session v3 --
+is implemented (`msseg.labeler.task`, `AnnotationShell`; see "What exists"
+at the end of §12). Stages 2-8 remain proposals. The second draft was a
 critique-and-rewrite of the first (§1); the third adds §8, which reverses one
 of the first draft's "load-bearing" claims -- that a gesture should bind to an
 item -- after the observation that a squiggle saying *inside gland* is a
@@ -498,9 +500,28 @@ Stages:
    then embeddings.
 8. **Multi-task overlay and composite export** (§11).
 
-Stage 1 touches `session_doc.py`, a new `msseg/labeler/task.py`,
-`annotate.py`, `classifier.py`, `seam_classifier.py`, `shell.py`,
-`panels/classpanel.py`, `panels/model.py`. Stage 2 touches `labeling.py`
+**What exists (stage 1, 2026-09-21).** `msseg/labeler/task.py` (`Task`,
+`ModelStack`, `TaskCaches`, `TASK_VIEW_KEYS`, `new_uid`); class names on
+`LabelStore` (`names` / `set_name`, written only when set); session document
+v3 (`tasks[]` + `active_task`, tasks-less form unchanged, a v2 document
+reads as one task); `AnnotationShell` keeps every downstream attribute name
+as a property over the active task, with `_activate_task`, `_bind_workflow`,
+a `_switch_profile` override that stamps the task's workflow, profile
+rename/delete propagation, lazy pickle reload on activation, per-task
+`models/<uid>/` autosaves, a New session that keeps the tasks; the Tasks
+`Treeview` + New / Dup / Rename… / Delete in the left column, the profile
+box titled "0. Workflow", double-click-to-name on a class title. Decisions
+taken on the way: task identity is uid + name (§13.3 closed); the four
+Model-tab keys left the window `view` for the task's; the rev-keyed caches
+are cleared on a switch rather than discriminated. Tests: `test_task.py`,
+`test_class_names.py`, `test_session_doc_tasks.py`, task sections in both
+labeler selftests. Not done, by design: places/enrolment, slide-bound
+gestures, layered cache keys (a cross-workflow switch still drops primes),
+subscriptions, multi-task display.
+
+Stage 1 touched `session_doc.py`, the new `msseg/labeler/task.py`,
+`labeling.py`, `annotate.py`, `shell.py`, `panels/classpanel.py`,
+`mspath/labeler.py` (`_profile_from_model`). Stage 2 touches `labeling.py`
 (binding, bbox, width), `seam_labeling.py` (corridor), `annotate.py`
 (`_slice_key`, counts, dooming), `mspath/labeler.py`, and the magic-fill /
 blobber commit path (outlines). The four protocols are untouched through

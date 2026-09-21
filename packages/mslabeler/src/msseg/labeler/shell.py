@@ -61,6 +61,7 @@ class ViewerShell:
     APP_TITLE = "labeler"
     WINDOW_TITLE = "labeler"
     LOG_PREFIX = "labeler"
+    PROFILE_SECTION_TITLE = "0. Compute profile"   # the left column's profile box
     # The module the session file goes through (session_path, read_json_file,
     # serialize_session, write_session_text, rotate_session_backups). An app
     # that re-exports these through its own module names that instead, so a
@@ -397,8 +398,9 @@ class ViewerShell:
 
 
     def _build_profile_section(self):
-        # 0. Compute profile: the named parameter set the panel below edits.
-        c = ttk.LabelFrame(self._left_section_parent("profile"), text="0. Compute profile")
+        # 0. Compute profile: the named parameter set the panel below edits
+        # (a labeler titles it "Workflow": there it is the active task's).
+        c = ttk.LabelFrame(self._left_section_parent("profile"), text=self.PROFILE_SECTION_TITLE)
         c.pack(fill="x", padx=6, pady=4)
         self.profile_frame = c
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
@@ -1630,7 +1632,14 @@ class ViewerShell:
             profiles=self.profiles,
             active_profile=active,
             run=self._run_settings(),
-            view=self._view_state())
+            view=self._view_state(),
+            **self._session_doc_kwargs())
+
+    def _session_doc_kwargs(self):
+        """Extra keyword arguments for ``build_session_doc`` -- what a
+        subclass adds to the document. The viewer adds nothing; the
+        annotation shell passes its tasks (and the document becomes v3)."""
+        return {}
 
     def _apply_session_doc(self, doc, source="session", notes=None):
         """THE apply path: push a session document onto the whole app.

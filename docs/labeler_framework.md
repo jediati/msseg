@@ -144,6 +144,28 @@ extremum's position and value columns. The magic fill, `TrainingSetBuilder`,
 | `_reset_compute()` / `_settle_controls()` / `_update_busy()` / `_refresh_render()` / `_handle_compute_event(ev)` | minimal | the engine, Rerun/Run state, HUD, the render, primed/assembly events |
 | `_run_settings()` / `_apply_run_settings` / `_apply_view_state` | `{}` / none / none | cores + concurrency / the coupon view keys |
 | `_session_doc_from_json` / `_import_legacy_docs` / `_profile_to_file_doc` / `_profile_from_file_doc` / `_profile_from_ui` / `_apply_profile_to_ui` | passthrough | `session.*` |
+| `_session_doc_kwargs()` / `PROFILE_SECTION_TITLE` / `_left_section_parent("tasks")` | `{}` / `"0. Compute profile"` / `self.left` | the annotation shell passes its `tasks` + `active_task` (the document becomes v3), titles the box `"0. Workflow"` and packs the Tasks list above the session lists |
+
+**Tasks** (`task.py`, `AnnotationShell`): a session holds several named
+detectors and one is active. Every attribute the mixins, the tools and the
+selftests read -- `store`, `models`, `_clf*`, `_edge_model`, `_context_model`,
+`_seam_model`, `_search_spec`, `_pred`, `_seam_pred`, `_cm_cell`, the undo
+stacks, `_models_dir` -- is a **property over `self._task`**, so a task switch
+is one assignment and nothing downstream knows there is more than one.
+`_activate_task(task)` stashes the outgoing task's Model-tab view
+(`_task_view_from_ui`: kind, search, neighbours, context), clears the
+rev-keyed caches (`_class_luts`, the seam caches, `_ctx_cache`), switches to
+the task's workflow through `_switch_profile` (a no-op when shared, so the
+primes survive), loads its newest saved pickle **lazily** (the load runs the
+compatibility gate against the ACTIVE workflow, which is why it cannot happen
+at restore time for an inactive task), pushes its view and repaints; it is
+refused while an Optimize / sweep / evaluate worker runs, because the finish
+installs into the active task. `_switch_profile` is overridden to stamp the
+active task's `workflow`; `_profile_rename` / `_profile_delete` propagate to
+every task; the bindings' `_profile_from_model` should append the profile and
+call `_bind_workflow(name)` rather than set `active_profile_idx`.
+`_task_new(name)` / `_task_duplicate(name)` / `_task_rename(name)` /
+`_task_delete(confirm)` are headless-callable with their arguments given.
 
 **Row removal** is one path for the sequence tree's right-click menu
 (*Go to* / *Clear annotations…* / *Remove …*), the Remove / Clear all
@@ -179,8 +201,24 @@ reach the app only through `viewer`, `regions`, `catalogue`, `store`,
   detection. The old module paths `msseg.mscoupon.model_search.FeatureSubset`
   and `msseg.mscoupon.torch_mlp.TorchMLPClassifier` resolve through the shims
   in `packages/mscoupon` -- never delete those shim modules.
-* **Session document v2** (`session_doc`): profiles are opaque to the
-  framework; the app's reader/default are injected.
+* **Session document v2 / v3** (`session_doc`): profiles are opaque to the
+  framework; the app's reader/default are injected. A document with
+  `tasks[]` + `active_task` is **v3** (`SESSION_DOC_VERSION_TASKS`); each
+  task entry carries `uid`, `name`, `workflow` (a profile name),
+  `annotations` (the store document), `models` (the saved-model records)
+  and `view` (the four `TASK_VIEW_KEYS`: `model_kind`, `model_search`,
+  `neighbours`, `context`, which are NOT in the window `view` any more).
+  Without `tasks` the document is the v2 one it always was, byte for byte --
+  the viewers keep writing it -- and the reader turns it into ONE task named
+  after the active profile, moving the four keys out of `view`. The reader
+  always returns `tasks` + `active_task`, and `annotations` / `models` as
+  the active task's for older callers; a task whose workflow names no
+  profile is repointed to the active one with a note
+  (`tests/test_session_doc_tasks.py`).
+* **Class names** (`LabelStore.names`, `set_name`): display only -- ids stay
+  the wire format of every raster, LUT and probability column. `to_json`
+  writes `"name"` inside a `classes[]` entry only when one is set, so an
+  unnamed store's document is unchanged (`tests/test_class_names.py`).
 * **`np` as a parameter**: `labeling`, `magic_fill`, `training` and the tools
   take numpy as an argument instead of importing it, so the pure-function
   tests and headless callers control the import. Keep the convention.

@@ -773,12 +773,20 @@ def _selftest():
     sdoc = app._session_doc()
     assert sdoc["view"]["center_tab"] == "Model"
     assert sdoc["view"]["panes"] == [0.2, 0.5], sdoc["view"]["panes"]
-    assert sdoc["view"]["model_kind"] == _CUSTOM_EDGE_KIND, "the picked kind rides the view"
+    # The Model-tab settings and the gestures are the TASK's (session v3):
+    # one task here, and nothing duplicated at the top level.
+    assert sdoc["session_version"] == 3 and len(sdoc["tasks"]) == 1
+    assert sdoc["active_task"] == sdoc["tasks"][0]["uid"] == app._task.uid
+    assert "model_kind" not in sdoc["view"], "the picked kind is the task's, not the window's"
+    assert sdoc["tasks"][0]["view"]["model_kind"] == _CUSTOM_EDGE_KIND, \
+        "the picked kind rides the task's view"
     app.model_kind_var.set("dense FC")
     app.center.select(app.processing_tab)
-    assert "labels" not in sdoc, "the gesture geometry is 'annotations' now"
-    assert sdoc["annotations"]["n_classes"] == 2
-    assert len(sdoc["annotations"]["interactions"]) == 2
+    assert "labels" not in sdoc and "annotations" not in sdoc and "models" not in sdoc, \
+        "the gesture geometry is the task's 'annotations' now"
+    assert sdoc["tasks"][0]["annotations"]["n_classes"] == 2
+    assert len(sdoc["tasks"][0]["annotations"]["interactions"]) == 2
+    assert sdoc["tasks"][0]["workflow"] == app.profiles[app.active_profile_idx]["name"]
     assert sdoc["sequences"][0]["folder"] == "data"
     app.store = LabelStore()             # clobber
     app._apply_session_doc(sdoc, "test")
@@ -787,10 +795,10 @@ def _selftest():
     assert app._pane_fractions() == [0.2, 0.5], "the sashes restore too"
     assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND, "the picked kind restores"
     bad = json.loads(json.dumps(sdoc))
-    bad["view"]["model_kind"] = "no such kind"
+    bad["tasks"][0]["view"]["model_kind"] = "no such kind"
     app._apply_session_doc(bad, "test")
     assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND, "an unknown kind is ignored"
-    sdoc["view"]["model_kind"] = kind_pick        # later re-applies keep the default
+    sdoc["tasks"][0]["view"]["model_kind"] = kind_pick   # later re-applies keep the default
     app.model_kind_var.set(kind_pick)
     app.center.select(app.processing_tab)
     assert len(app.store.interactions) == 2
@@ -799,20 +807,111 @@ def _selftest():
 
     # ...and a session written BEFORE the rename still restores: the key moved,
     # the document under it did not.
-    legacy = {k: v for k, v in sdoc.items() if k != "annotations"}
-    legacy["labels"] = sdoc["annotations"]
-    legacy["view"] = dict(sdoc["view"], center_tab="bogus")   # unknown -> untouched
+    # (A pre-task v2 document: no tasks, the store under the old key, the
+    # Model-tab keys in the window view.)
+    legacy = {k: v for k, v in sdoc.items() if k not in ("tasks", "active_task")}
+    legacy["session_version"] = 2
+    legacy["labels"] = sdoc["tasks"][0]["annotations"]
+    legacy["view"] = dict(sdoc["view"], center_tab="bogus",      # unknown -> untouched
+                          **sdoc["tasks"][0]["view"])
     app.store = LabelStore()
     app._apply_session_doc(legacy, "legacy key")
     assert app._center_tab_name() == "Processing", "an unknown tab name is ignored"
     assert len(app.store.interactions) == 2, \
         "a pre-rename session's 'labels' key still loads"
+    assert len(app.tasks) == 1 and app._task.name == app.profiles[app.active_profile_idx]["name"], \
+        "a v2 session reads as one task named after its active profile"
+    assert app.model_kind_var.get() == kind_pick, "…with the window's Model-tab keys as its view"
     # ...and so does a session written before the View tab retired.
     app.center.select(app.model_tab)
     app._apply_session_doc(dict(legacy, view=dict(sdoc["view"], center_tab="View")),
                            "pre-split view")
     assert app._center_tab_name() == "Model", "the retired View name leaves the tab alone"
     app.center.select(app.processing_tab)
+
+    # Tasks: several detectors over the same data, one active. Gestures, undo
+    # history, class vocabulary and Model-tab settings are per task; the
+    # session document carries every task; a task points at a profile by
+    # name and follows it through renames and deletions.
+    from unittest import mock as _mock
+    t1 = app._task
+    n1 = len(app.store.interactions)
+    assert app.tasks == [t1] and tuple(app.task_tree.selection()) == (t1.uid,)
+    assert t1.workflow == app.profiles[app.active_profile_idx]["name"]
+    assert app._rename_class(1, "gland") and app.store.name(1) == "gland"
+    assert app._class_title_labels[1].cget("text").startswith("1 gland ·")
+    assert not app._rename_class(1, "gland"), "an unchanged name is a no-op"
+    app.model_kind_var.set(_CUSTOM_EDGE_KIND)
+    t2 = app._task_new("stroma")
+    assert t2 is app._task and app.tasks == [t1, t2] and t2.name == "stroma"
+    assert app.store is t2.store and app.store.interactions == [], "a new task starts empty"
+    assert app.store.n_classes == t1.store.n_classes and not app.store.has_name(1)
+    assert app._undo_stack == [] and app._pred == {}
+    assert tuple(app.task_tree.selection()) == (t2.uid,)
+    assert t1.view["model_kind"] == _CUSTOM_EDGE_KIND, "the outgoing task's Model tab was stashed"
+    assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND, "a new task inherits what is on screen"
+    app.model_kind_var.set("dense FC")
+    app._push_history()
+    app.store.add("squiggle", [(3.0, 3.0), (4.0, 4.0)], 1, "data/s0.tiff")
+    app._rebuild_class_panels()
+    assert len(app.store.interactions) == 1 and len(t1.store.interactions) == n1
+    assert app.task_tree.set(t2.uid, "annot") == "1" and app.task_tree.set(t1.uid, "annot") == str(n1)
+    assert app._activate_task(t1) and app._task is t1
+    assert len(app.store.interactions) == n1 and app.store.name(1) == "gland"
+    assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND, "each task's Model tab comes back"
+    assert t2.view["model_kind"] == "dense FC"
+    assert len(app._undo_stack) == 1, "task 1's history: the class rename, and not task 2's gesture"
+    assert tuple(app.task_tree.selection()) == (t1.uid,)
+    # Clicking a row activates; a rename repaints in place and dedupes.
+    app.task_tree.selection_set(t2.uid)
+    app.root.update()
+    assert app._task is t2, "selecting a task row activates it"
+    assert app._task_rename("stroma detector")
+    assert app.task_tree.item(t2.uid, "text") == "stroma detector"
+    assert app._task_rename(t1.name) and t2.name == f"{t1.name} (2)", "names stay unique"
+    assert app._task_rename("stroma detector")
+    # The session document: both tasks, the active one marked, both restored.
+    sdoc_t = app._session_doc()
+    assert sdoc_t["session_version"] == 3 and sdoc_t["active_task"] == t2.uid
+    assert [t["name"] for t in sdoc_t["tasks"]] == [t1.name, "stroma detector"]
+    assert sdoc_t["tasks"][0]["annotations"]["classes"][0]["name"] == "gland"
+    assert sdoc_t["tasks"][0]["view"]["model_kind"] == _CUSTOM_EDGE_KIND
+    app._apply_session_doc(sdoc_t, "tasks")
+    assert [t.name for t in app.tasks] == [t1.name, "stroma detector"]
+    assert app._task.uid == t2.uid and len(app.store.interactions) == 1
+    assert len(app.tasks[0].store.interactions) == n1 and app.tasks[0].store.name(1) == "gland"
+    assert app.model_kind_var.get() == "dense FC"
+    assert all(it.bound for it in app.tasks[0].store.interactions), "every task's store rebinds"
+    t1, t2 = app.tasks
+    # A search in flight refuses a switch: its finish installs into the
+    # active task, so a switch would land the winner in the wrong one.
+    app._search = object()
+    assert not app._activate_task(t1) and app._task is t2
+    assert tuple(app.task_tree.selection()) == (t2.uid,)
+    app._search = None
+    # Profiles are the session's pool; a task points at one by name.
+    app._profile_new()
+    new_prof = app.profiles[app.active_profile_idx]["name"]
+    assert t2.workflow == new_prof and t1.workflow != new_prof
+    assert app.task_tree.set(t2.uid, "workflow") == new_prof
+    with _mock.patch("tkinter.simpledialog.askstring", return_value="renamed wf"):
+        app._profile_rename()
+    assert t2.workflow == "renamed wf" and app.task_tree.set(t2.uid, "workflow") == "renamed wf"
+    with _mock.patch.object(messagebox, "askyesno", return_value=True):
+        app._profile_delete()
+    assert "renamed wf" not in [p["name"] for p in app.profiles]
+    assert t2.workflow == app.profiles[app.active_profile_idx]["name"], \
+        "a task on a deleted profile moves to the survivor"
+    assert app._activate_task(t1) and app.profiles[app.active_profile_idx]["name"] == t1.workflow, \
+        "activating a task activates its workflow"
+    # Delete: the neighbour takes over; the last task stays.
+    assert app._activate_task(t2) and app._task_delete(confirm=True)
+    assert app.tasks == [t1] and app._task is t1 and len(app.store.interactions) == n1
+    assert not app._task_delete(confirm=True), "the last task stays"
+    assert tuple(app.task_tree.selection()) == (t1.uid,)
+    # Back to the single-task state the rest of the selftest expects.
+    assert app._rename_class(1, "") and not app.store.has_name(1)
+    app.model_kind_var.set(kind_pick)
 
     # Export writes annotations.json alongside the config(s).
     with tempfile.TemporaryDirectory() as td:
@@ -1182,8 +1281,8 @@ def _selftest():
         app._evaluate_edges(sync=True)
         assert app._search is None and app.edge_progress_var.get(), app.edge_progress_var.get()
         assert str(app.edge_eval_btn.cget("state")) == "normal"
-        # The stack settings ride the session view and are validated on the way in.
-        v = app._view_state()["neighbours"]
+        # The stack settings ride the task's view and are validated on the way in.
+        v = app._task_view_from_ui()["neighbours"]
         assert v["custom_hidden"] == "4" and v["edge_spec"]["lam"] == 1.0 and v["freeze_base"] is False
         app._apply_neighbours_view({"custom_hidden": "8-4", "freeze_base": True,
                                     "edge_spec": {"lam": 0.5, "rounds": 2, "features": ["absdiff"]}})
@@ -1416,7 +1515,7 @@ def _selftest():
             assert app.model_kind_var.get() == _TUNED_KIND
             assert app.model_arch_var.get() == _model_description(_TUNED_KIND, spec, 2)
         # The search settings ride the session view, clamped on the way in.
-        assert app._view_state()["model_search"] == \
+        assert app._task_view_from_ui()["model_search"] == \
             {"trials": 3, "timeout_s": 3600, "seed": 0, "feature_search": True,
              "backend": "auto",
              "sweep_sizes": "64-32, 32-16, 16-8, 8-4, 4", "sweep_trials": _SWEEP_TRIALS}, \
@@ -1548,8 +1647,8 @@ def _selftest():
             assert app.models and app.models[-1]["fingerprint"] == ["area", "mean_base"]
             assert app.models[-1]["kind"] == "random forest"
             sdoc2 = app._session_doc()
-            assert sdoc2["models"] and sdoc2["models"][-1]["path"] == \
-                os.path.abspath(clf_path)
+            models2 = sdoc2["tasks"][0]["models"]
+            assert models2 and models2[-1]["path"] == os.path.abspath(clf_path)
             app._clf = None
             app._clf_names = None
             app.classify_btn.config(state="disabled")
@@ -1761,7 +1860,7 @@ def _selftest():
     doc_m = app._session_doc()
     assert doc_m["view"]["magic"]["metric"] == "mean"
     assert any(d.get("meta", {}).get("tool") == "magic"
-               for d in doc_m["annotations"]["interactions"])
+               for d in doc_m["tasks"][0]["annotations"]["interactions"])
     n_now = len(app.store.interactions)
     app._undo()
     assert len(app.store.interactions) == n_now - 1
@@ -2075,7 +2174,7 @@ def _selftest():
     app.context_kind_vars["ring_std"].set(True); app._on_context_settings_change()
     assert "context changed" in app.model_arch_var.get()
     assert app._check_model_compat(app._clf_names, "t") is None
-    assert app._view_state()["context"]["kinds"] == ["ring_mean", "ring_std", "ring_contrast"], \
+    assert app._task_view_from_ui()["context"]["kinds"] == ["ring_mean", "ring_std", "ring_contrast"], \
         "the picked context rides the session view, kinds in canonical order"
     # A context-free pickle refuses the fingerprint of a context model, and
     # vice versa: the columns are part of the schema.
@@ -2270,7 +2369,8 @@ def _selftest():
     assert app._on_trace_commit_key(_KeyEv()) is None, "Enter with no trace in flight passes"
     # The session document carries the seams (v3) and the view state the toll.
     doc_s = app._session_doc()
-    assert doc_s["annotations"]["version"] == 3 and len(doc_s["annotations"]["seams"]) == 2
+    ann_s = doc_s["tasks"][0]["annotations"]
+    assert ann_s["version"] == 3 and len(ann_s["seams"]) == 2
     assert doc_s["view"]["seams"]["toll"] == "feature" and doc_s["view"]["tool"] == "trace"
     app.seam_toll_var.set("barrier"); app.show_seams_var.set(False)
     app._apply_seams_view(doc_s["view"]["seams"])
@@ -2314,12 +2414,23 @@ def _selftest():
     app.store.add("squiggle", [(3.0, 3.0)], 1, "data/s0.tiff")
     assert app.store.interactions
     clf_keep = app._clf
+    # ...and the tasks stay, emptied: a second one with its own vocabulary.
+    task_names = [app._task.name, "bubbles"]
+    tb = app._task_new("bubbles")
+    assert tb is app._task and app._clf is None
+    app._rename_class(1, "bubble")
+    app._push_history()
+    app.store.add("box", [(1.0, 1.0), (5.0, 5.0)], 1, "data/s0.tiff")
+    assert app._activate_task(app.tasks[0]) and app._clf is clf_keep
     assert [o[0] for o in app._new_session_options()] == ["profiles", "model"]
     assert app._new_session(keep={"profiles": True, "model": True})
     assert app.folders == [] and app.subsequences == [] and not app.primed
     assert not app.flat_slices and not app._pred
     assert app.store.interactions == [] and app.store.n_classes == n_cls
     assert app.store.seams == [], "a new session drops the seam gestures too"
+    assert [t.name for t in app.tasks] == task_names and app._task is app.tasks[0]
+    assert all(t.gesture_count == 0 and t.undo == [] for t in app.tasks), "every store emptied"
+    assert app.tasks[1].store.name(1) == "bubble", "vocabularies stay"
     assert [p["name"] for p in app.profiles] == prof_names
     assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND
     assert app.custom_hidden_var.get() == "4"
@@ -2327,6 +2438,8 @@ def _selftest():
     assert app._session_owned and "kept" in app.status_var.get()
     assert app._new_session(keep={"profiles": False, "model": False})
     assert len(app.profiles) == 1 and app.profiles[0]["name"] == "default"
+    assert [t.name for t in app.tasks] == task_names, "tasks survive; their models do not"
+    assert all(t.model.empty and t.models == [] and t.workflow == "default" for t in app.tasks)
     assert app._clf is None and app._edge_model is None and app.models == []
     assert app.model_kind_var.get() == "dense FC"
     assert app.custom_hidden_var.get() == _DEFAULT_CUSTOM_HIDDEN
@@ -2350,7 +2463,9 @@ def _selftest():
           "on a commit), tree context menu + guarded row removal + clear per "
           "row / per class, context columns + their pickle/gate/session ride, "
           "saddle-free contact edges, latent ring head, labels as context, "
-          "seam tools: scope + livewire trace + resolution + overlay + seam model + export")
+          "seam tools: scope + livewire trace + resolution + overlay + seam model + export, "
+          "tasks: per-task stores / vocabularies / Model tabs, session v3 + v2-as-one-task, "
+          "workflow binding through profile rename / delete, New session keeps tasks")
     return 0
 
 

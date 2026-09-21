@@ -23,6 +23,7 @@ from tkinter import ttk, filedialog, messagebox
 
 from . import context, edge_model, magic_fill, model_search, fields
 from . import bundle as model_bundle
+from . import session_doc
 from .labeling import (LabelStore, MAX_CLASSES, TOOLS, resolve_slice, resolve_sets,
                           touched_sets, class_lut, scalar_lut, line_pixels, polygon_mask,
                           preview_lut)
@@ -39,6 +40,47 @@ from .panels.classpanel import ClassPanelMixin
 from .panels.seams import SeamPanelMixin
 from .seam_classifier import SeamModelMixin
 from .seams import SEAM_BOUNDARY
+from .task import TASK_VIEW_KEYS, ModelStack, Task, TaskCaches, dedupe_task_name
+
+
+# --------------------------------------------------------------------------- #
+# The active task's state, under the names every mixin has always read.
+#
+# A session holds several tasks (msseg.labeler.task) and exactly one is
+# active. Rather than thread a task through ~150 call sites in the mixins,
+# the tools and the selftests, the shell keeps the attribute names they use
+# -- ``self.store``, ``self._clf``, ``self._pred``, ... -- as properties that
+# read and write the active task. A task switch is then one assignment to
+# ``self._task``; nothing downstream knows there is more than one.
+# --------------------------------------------------------------------------- #
+_UNSET = object()
+
+
+def _task_attr(field, doc):
+    def get(self):
+        return getattr(self._task, field)
+
+    def put(self, value):
+        setattr(self._task, field, value)
+    return property(get, put, doc=doc)
+
+
+def _stack_attr(field, doc):
+    def get(self):
+        return getattr(self._task.model, field)
+
+    def put(self, value):
+        setattr(self._task.model, field, value)
+    return property(get, put, doc=doc)
+
+
+def _cache_attr(field, doc):
+    def get(self):
+        return getattr(self._task.caches, field)
+
+    def put(self, value):
+        setattr(self._task.caches, field, value)
+    return property(get, put, doc=doc)
 
 
 class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewControlsMixin,
@@ -47,38 +89,75 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
     APP_TITLE = "labeler"
     WINDOW_TITLE = "labeler"
     MODEL_APP_TAG = model_bundle.DEFAULT_APP_TAG     # the classifier pickle "app" tag
+    # The left column's profile section: in a labeler a profile is the active
+    # task's WORKFLOW (the Combobox shows and rebinds it), so say so.
+    PROFILE_SECTION_TITLE = "0. Workflow"
+
+    # -- the active task's state (see the factories above) ------------------ #
+    store = _task_attr("store", "The active task's LabelStore (gestures, seams, vocabulary).")
+    models = _task_attr("models", "The active task's saved-model records, newest last.")
+    _undo_stack = _task_attr("undo", "Store snapshots behind the active task's Ctrl+Z.")
+    _redo_stack = _task_attr("redo", "Store snapshots ahead of it.")
+    _clf = _stack_attr("clf", "The active task's fitted region pipeline.")
+    _clf_names = _stack_attr("names", "Its feature-column order.")
+    _clf_kind = _stack_attr("kind", "Its model kind.")
+    _clf_spec = _stack_attr("spec", "Its tuned ModelSpec (dense (tuned) kinds).")
+    _clf_scope = _stack_attr("scope", "The regime it was fitted in (see _feature_scope).")
+    _clf_context = _stack_attr("context", "The ContextSpec its feature row was built with.")
+    _context_model = _stack_attr("latent", "The latent-ring head fit on top of it.")
+    _edge_model = _stack_attr("edge", "The edge model fit on top of it.")
+    _search_spec = _stack_attr("search_spec", "The last Optimize winner (what Train rebuilds).")
+    _seam_model = _stack_attr("seam", "The active task's seam model.")
+    _pred = _cache_attr("pred", "(si, li) -> (commit, region_class, region_proba, aux).")
+    _seam_pred = _cache_attr("seam_pred", "item key -> (commit, boundaryness[S]).")
+    _pred_store_rev = _cache_attr("pred_store_rev", "The store rev the predictions were made under.")
+    _cm_cell = _cache_attr("cm_cell", "The selected confusion cell (true, pred).")
+
+    @property
+    def _models_dir(self):
+        """Where a finished search saves its winner so a restart (or the
+        morning after an overnight run) finds it -- per task, so two tasks'
+        autosaves never interleave. The selftest points this at a temp dir,
+        and at None to switch the autosave off, so an explicit assignment
+        wins over the per-task default."""
+        if self._models_dir_override is not _UNSET:
+            return self._models_dir_override
+        return os.path.join(self.SESSION_IO.app_data_dir(self.SESSION_APP), "models",
+                            self._task.uid)
+
+    @_models_dir.setter
+    def _models_dir(self, value):
+        self._models_dir_override = value
 
     def __init__(self, root, initial=None, autosave=True):
-        # Labeler state first: the base __init__ calls the overridden build
-        # methods, which read these.
-        self.store = LabelStore()
+        # The task first: every piece of labeler state below that belongs to
+        # a detector -- store, vocabulary, model stack, prediction caches,
+        # undo history -- lives on the active task, reached through the
+        # properties above. The base __init__ calls the overridden build
+        # methods, which read these. The first task's workflow binds once
+        # the profiles exist (_build_task_section).
+        self.tasks = [Task.new("task 1")]
+        self._task = self.tasks[0]
+        self._models_dir_override = _UNSET
+        self._task_rows_syncing = False
         self._training_builder = TrainingSetBuilder(self.FIELDS)
         # (si, li) -> (commit, store.rev, lut|None, {uid: touched id set});
         # one rasterization pass serves both the class layer and the
-        # which-interactions-touch-this-region hover lookup.
+        # which-interactions-touch-this-region hover lookup. Keyed on the
+        # store's rev with no task discriminator, so a task switch clears it.
         self._class_luts = {}
+        # Likewise the context-column memo (_context_table): bounded to two
+        # entries, keyed on the store's rev.
+        self._ctx_cache = {}
         self._hover_key = None     # (si, li, region) whose geometry is on screen
-        self._cm_cell = None       # selected confusion cell (true, pred)
         self._hover_uid = None     # row-hovered interaction whose geometry shows
-        # Classifier state: model + its feature-column order, and per-slice
-        # predicted region->class arrays keyed by the commit they were made at.
-        self._clf = None
-        self._clf_names = None
-        self._clf_scope = None          # the regime it was fitted in (see _feature_scope)
-        self._clf_kind = "dense FC"
         self.model_kind_var = tk.StringVar(master=root, value="dense FC")
-        # "dense (tuned)": the spec the CURRENT model was built from (rides its
-        # pickle), the last search's winner (what Train rebuilds; survives a
-        # kind switch), and the in-flight search's worker state.
-        self._clf_spec = None
-        self._search_spec = None
+        # The in-flight Optimize / sweep / evaluate worker: one per window,
+        # not per task -- its finish installs into the ACTIVE task, which is
+        # why _activate_task refuses while it runs.
         self._search = None            # {"queue","stop","thread","names","n","t0"}
         self.search_trials_var = tk.StringVar(master=root, value=str(_SEARCH_TRIALS))
         self.search_timeout_var = tk.StringVar(master=root, value=str(_SEARCH_TIMEOUT_MIN))
-        # Where a finished search saves its winner so a restart (or the
-        # morning after an overnight run) finds it: the session reloads the
-        # most recent recorded model. The selftest points this at a temp dir.
-        self._models_dir = os.path.join(self.SESSION_IO.app_data_dir(self.SESSION_APP), "models")
         self.search_seed_var = tk.StringVar(master=root, value="0")
         self.search_features_var = tk.BooleanVar(master=root, value=True)
         self.search_backend_var = tk.StringVar(master=root, value="auto")
@@ -92,9 +171,9 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self.sweep_summary_var = tk.StringVar(master=root, value="")
         self._sweep = None                   # last model_search.SweepResult
         # "-> edges" kinds: the pair model on top of the base net (rides the
-        # classifier pickle), the custom base's hidden sizes, whether Train
-        # keeps the base (to try edge variants on top), and the edge spec.
-        self._edge_model = None
+        # classifier pickle; on the task's stack), the custom base's hidden
+        # sizes, whether Train keeps the base (to try edge variants on top),
+        # and the edge spec.
         self.custom_hidden_var = tk.StringVar(master=root, value=_DEFAULT_CUSTOM_HIDDEN)
         self.freeze_base_var = tk.BooleanVar(master=root, value=False)
         self.edge_layer_var = tk.StringVar(master=root, value="last")
@@ -107,17 +186,16 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self.edge_readout_var = tk.StringVar(master=root, value="")
         self.edge_progress_var = tk.StringVar(master=root, value="")
         # Neighbourhood context (context.py): the columns the CURRENT model was
-        # fit over ride with it (predictions and the gate rebuild exactly
-        # those); the Model tab's controls describe the NEXT model.
-        self._clf_context = context.ContextSpec()
+        # fit over ride with it on the task's stack (predictions and the gate
+        # rebuild exactly those); the Model tab's controls describe the NEXT
+        # model.
         self.context_kind_vars = {k: tk.BooleanVar(master=root, value=False)
                                   for k in context.KINDS}
         self.context_weight_vars = {w: tk.BooleanVar(master=root, value=(w == "uniform"))
                                     for w in context.WEIGHTS}
         self.context_source_var = tk.StringVar(master=root, value="all")
         # The latent-ring head (context.LatentContextModel) fit on top of the
-        # base net, and the controls that describe the next one.
-        self._context_model = None
+        # base net rides the task's stack; these controls describe the next one.
         self.context_latent_var = tk.BooleanVar(master=root, value=False)
         self.context_latent_weight_var = tk.StringVar(master=root, value="uniform")
         self.context_latent_layer_var = tk.StringVar(master=root, value="last")
@@ -126,16 +204,12 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         # as columns, with a training-time dropout.
         self.context_labels_var = tk.BooleanVar(master=root, value=False)
         self.context_label_dropout_var = tk.StringVar(master=root, value="0.3")
-        self._pred_store_rev = None
         # Provenance line above the classifier controls: which model is loaded,
         # how wide its feature vector is, and whether it still agrees with the
         # active profile (a mismatch blocks Classify, so say so up front).
         self.model_strip_var = tk.StringVar(master=root, value="no model")
-        # Session-level model references: saved/loaded pickles + their feature
-        # fingerprint, for the profile-compatibility check.
-        self.models = []           # [{"path","fingerprint","kind","statistics"}]
-        # (si, li) -> (commit, region_class uint8, region_proba float32)
-        self._pred = {}
+        # The saved-model records (`self.models`) and the per-item prediction
+        # caches (`self._pred`) live on the task.
         self.show_pred_var = tk.BooleanVar(master=root, value=True)
         self.show_gt_var = tk.BooleanVar(master=root, value=True)
         # Master overlay switch (Tab toggles it): base image only when off.
@@ -164,8 +238,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self.seam_color_var = tk.StringVar(master=root, value=_SEAM_MODE_CLASS)
         self._seam_caches = {}      # (si, li) -> (commit, rev, class[S], sets, graph)
         self._seam_rasters = {}     # (si, li) -> (commit, graph, seam-index raster)
-        self._seam_pred = {}        # key -> (commit, boundaryness[S])
-        self._seam_model = None     # seam_model.SeamModel, or None
+        # (`_seam_pred` and `_seam_model` are the task's.)
         # True while a gesture previews on the canvas: the pointer is busy
         # drawing, so the hover outlines stay off until it is released.
         self._hover_suppressed = False
@@ -181,10 +254,9 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self._drop_panel = None    # class panel currently highlighted as target
         self._panel_relief = "flat"
         # Undo/redo over store mutations (add/delete/move/class-count), as
-        # whole-store snapshots: the store is small and a snapshot restore
-        # reuses the load path, so history can never drift from reality.
-        self._undo_stack = []
-        self._redo_stack = []
+        # whole-store snapshots on the task (`_undo_stack` / `_redo_stack`):
+        # the store is small and a snapshot restore reuses the load path, so
+        # history can never drift from reality.
         # Set while the first render of a run happened on an unmapped canvas:
         # the base fits the image only on that first render, and an unmapped
         # canvas is 1x1, so the fit is redone once it is on screen.
@@ -197,6 +269,10 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self.model_hint_var = tk.StringVar(master=root, value="")
         self._hint_after = None
         super().__init__(root, initial=initial, autosave=autosave)
+        # The profiles exist now: the first task's workflow is the active one.
+        if self._task.workflow is None and 0 <= self.active_profile_idx < len(self.profiles):
+            self._task.workflow = self.profiles[self.active_profile_idx]["name"]
+        self._update_task_rows()
         root.title(self.WINDOW_TITLE)
         self._build_label_panel()
         if self.viewer is not None:
@@ -333,6 +409,9 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
 
     def _build_left(self):
         super()._build_left()
+        # The Tasks list sits between the workflow box and the session lists:
+        # data below, what is being detected in it above.
+        self._build_task_section()
         # The section and its lists grow with their panes, and each group's
         # buttons are packed at the bottom AHEAD of the list in pack order,
         # so a pane dragged short clips list rows rather than the buttons.
@@ -891,22 +970,47 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         # groups are out of the way is part of how it is set up.
         d["panes"] = self._pane_fractions()
         d["proc_open"] = self._proc_open_state()
-        # The PICKED kind, apart from the trained model: a plain Train writes
-        # no pickle, so a restore that reloads the newest saved model would
-        # otherwise land on that pickle's kind (e.g. the last Optimize winner).
-        d["model_kind"] = self.model_kind_var.get()
-        trials, timeout_s, seed, feat, backend = self._search_settings()
-        d["model_search"] = {"trials": trials, "timeout_s": timeout_s, "seed": seed,
-                             "feature_search": feat, "backend": backend,
-                             "sweep_sizes": self.sweep_sizes_var.get(),
-                             "sweep_trials": self._sweep_settings_trials()}
-        d["neighbours"] = {"custom_hidden": self.custom_hidden_var.get(),
-                           "freeze_base": bool(self.freeze_base_var.get()),
-                           "edge_spec": self._edge_spec_from_ui().to_dict()}
-        # The PICKED context (what the next Train builds), apart from the
-        # trained model's, which rides its pickle.
-        d["context"] = self._context_spec_from_ui().to_dict()
+        # The Model-tab settings (kind, search, neighbours, context) are the
+        # TASK's view, not the window's: see _task_view_from_ui.
         return d
+
+    # -- the task's view: what the Model tab describes -------------------- #
+    def _task_view_from_ui(self):
+        """The Model-tab settings that belong to the active task
+        (``TASK_VIEW_KEYS``): the PICKED kind, apart from the trained model
+        (a plain Train writes no pickle, so a restore that reloads the newest
+        saved model would otherwise land on that pickle's kind, e.g. the last
+        Optimize winner); the Optimize settings; the custom base / edge
+        settings; and the PICKED context (what the next Train builds), apart
+        from the trained model's, which rides its pickle."""
+        trials, timeout_s, seed, feat, backend = self._search_settings()
+        return {"model_kind": self.model_kind_var.get(),
+                "model_search": {"trials": trials, "timeout_s": timeout_s, "seed": seed,
+                                 "feature_search": feat, "backend": backend,
+                                 "sweep_sizes": self.sweep_sizes_var.get(),
+                                 "sweep_trials": self._sweep_settings_trials()},
+                "neighbours": {"custom_hidden": self.custom_hidden_var.get(),
+                               "freeze_base": bool(self.freeze_base_var.get()),
+                               "edge_spec": self._edge_spec_from_ui().to_dict()},
+                "context": self._context_spec_from_ui().to_dict()}
+
+    def _stash_task_view(self, task):
+        """Record the Model tab's current settings on `task` (the one they
+        describe) -- before a switch, a save, or a New session."""
+        task.view = self._task_view_from_ui()
+
+    def _apply_task_view(self, view):
+        """Push a task's view onto the Model tab. A key that is absent leaves
+        the control as it is, so a task created without settings inherits
+        the ones on screen (and records them at its first stash). The kind
+        and the context win over a reloaded pickle's, so this runs AFTER a
+        model reload."""
+        view = view if isinstance(view, dict) else {}
+        self._apply_search_view(view.get("model_search"))
+        self._apply_neighbours_view(view.get("neighbours"))
+        self._apply_context_view(view.get("context"))
+        if view.get("model_kind") in _MODEL_KINDS:
+            self.model_kind_var.set(view["model_kind"])
 
     def _apply_context_view(self, d):
         if isinstance(d, dict):
@@ -918,6 +1022,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         super()._rebuild_class_panels()
         self._labels_changed()
         self._refresh_seam_panel()
+        self._update_task_rows()          # the gesture count column
 
     def _apply_neighbours_view(self, d):
         if not isinstance(d, dict):
@@ -953,11 +1058,13 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
                     and lo <= val <= hi):
                 var.set(f"{float(val):g}")
 
-    def _session_doc(self):
-        doc = super()._session_doc()
-        doc["annotations"] = self.store.to_json()   # rides the 4s autosave
-        doc["models"] = [dict(m) for m in self.models]
-        return doc
+    def _session_doc_kwargs(self):
+        """The tasks (the document becomes v3): every task's gestures, saved
+        model records and Model-tab view, the active one's view read from
+        the controls first. Rides the 4 s autosave."""
+        self._stash_task_view(self._task)
+        return {"tasks": [t.to_doc() for t in self.tasks],
+                "active_task": self._task.uid}
 
     # -- new session ---------------------------------------------------- #
     def _new_session_options(self):
@@ -973,43 +1080,57 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
                 "no annotations (class count and colours stay).")
 
     def _new_session_doc(self, keep):
+        """The tasks survive a New session -- names, workflows, vocabularies
+        (class count, colours, names) and, with the model option, their
+        saved-model records and Model-tab views -- with every store emptied.
+        The old session was auto-saved first, so nothing is lost."""
         doc = super()._new_session_doc(keep)
-        empty = self.store.to_json()
-        empty["interactions"] = []            # classes + colours, no gestures
-        empty.pop("seams", None)              # ...and no seam gestures: a v2 doc
-        empty["version"] = 2
-        doc["annotations"] = empty
         keep_model = keep.get("model", True)
-        doc["models"] = [dict(m) for m in self.models] if keep_model else []
-        if not keep_model:
-            for key in ("model_search", "neighbours", "model_kind", "context"):
-                doc["view"].pop(key, None)
-        # The in-memory model is not in the document (a plain Train writes
-        # no pickle): stash it so the apply's pickle reload cannot replace it.
-        self._new_session_stash = ((self._clf, self._clf_names, self._clf_kind,
-                                    self._clf_spec, self._edge_model, self._search_spec,
-                                    self._clf_scope, self._clf_context, self._context_model)
+        self._stash_task_view(self._task)
+        tasks = []
+        for t in self.tasks:
+            td = t.to_doc()
+            empty = td["annotations"]
+            empty["interactions"] = []        # classes + colours + names, no gestures
+            empty.pop("seams", None)          # ...and no seam gestures: a v2 doc
+            empty["version"] = 2
+            if not keep_model:
+                td["models"] = []
+                td["view"] = {}
+            tasks.append(td)
+        doc.pop("annotations", None)
+        doc.pop("models", None)
+        doc["tasks"] = tasks
+        doc["active_task"] = self._task.uid
+        doc["session_version"] = session_doc.SESSION_DOC_VERSION_TASKS
+        # The in-memory models are not in the document (a plain Train writes
+        # no pickle): stash every task's stack, by uid, so the apply's pickle
+        # reload cannot replace one with an older saved state.
+        self._new_session_stash = ({t.uid: t.model for t in self.tasks}
                                    if keep_model else None)
-        self._new_session_seam_stash = self._seam_model if keep_model else None
         return doc
 
     def _after_new_session(self, keep):
-        stash = getattr(self, "_new_session_stash", None)
+        stash = getattr(self, "_new_session_stash", None) or {}
         self._new_session_stash = None
         if keep.get("model", True):
-            if stash is not None and stash[0] is not None:
-                (self._clf, self._clf_names, self._clf_kind, self._clf_spec,
-                 self._edge_model, self._search_spec, self._clf_scope,
-                 self._clf_context, self._context_model) = stash
-                self.classify_btn.config(state="normal")
-            self._seam_model = getattr(self, "_new_session_seam_stash", None)
+            for t in self.tasks:
+                if t.uid in stash:
+                    t.model = stash[t.uid]
+                    t.model_pending = False
         else:
+            for t in self.tasks:
+                t.model = ModelStack()
             self._reset_model_selection()
-        self._pred.clear()
-        self._seam_pred.clear()
-        if not keep.get("model", True):
-            self._seam_model = None
-        self._cm_cell = None
+        for t in self.tasks:
+            t.caches.clear()
+        self._set_classify_enabled()
+        self._refresh_model_panels()
+        self._update_task_rows()
+
+    def _refresh_model_panels(self):
+        """Repaint everything that shows the active task's model and
+        predictions: after a New session, a task switch, a model reset."""
         self._refresh_region_modes()
         self._refresh_confusion()
         self._refresh_model_readout()
@@ -1017,6 +1138,11 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self._refresh_edge_readout()
         self._fill_error_list(None)
         self._refresh_seam_panel()
+
+    def _set_classify_enabled(self):
+        btn = getattr(self, "classify_btn", None)
+        if btn is not None:
+            btn.config(state="normal" if self._clf is not None else "disabled")
 
     def _reset_model_selection(self):
         """No model, the default kind, default edge / search settings."""
@@ -1043,42 +1169,38 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self.classify_btn.config(state="disabled")
 
     def _apply_session_doc(self, doc, source="session", notes=None):
-        notes = super()._apply_session_doc(doc, source,
-                                           notes if notes is not None else [])
-        sdoc = self._session_doc_from_json(doc, [])
-        # The store installs AFTER sequences exist, so rebind sees them (and
+        notes = notes if notes is not None else []
+        # (An app's override may return None rather than the list it was
+        # given; the notes it appended are in ours either way.)
+        returned = super()._apply_session_doc(doc, source, notes)
+        if returned is not None:
+            notes = returned
+        # The base already parsed (and noted) folders / sequences / profiles;
+        # only the task notes of this second parse are new.
+        rnotes = []
+        sdoc = self._session_doc_from_json(doc, rnotes)
+        notes.extend(n for n in rnotes if n.startswith("task "))
+        # The tasks install AFTER sequences exist, so rebind sees them (and
         # migrates legacy bare-basename keys against the qualified identity).
-        if sdoc.get("annotations"):
-            try:
-                self._install_store(
-                    LabelStore.from_json(sdoc["annotations"]))
-            except Exception as exc:
-                notes.append(f"labels not restored: {exc}")
-        else:
-            self._install_store(LabelStore())
-        self.models = list(sdoc.get("models") or [])
-        # Lazily reload the most recent model whose pickle still exists; a
-        # failure (moved file, incompatible profile) is a note, never fatal.
-        for entry in reversed(self.models):
-            if os.path.isfile(entry.get("path", "")):
-                try:
-                    self._load_classifier_from(entry["path"])
-                except Exception as exc:
-                    notes.append(f"model not reloaded: {exc}")
-                break
+        self.tasks = [Task.from_doc(td, notes) for td in sdoc["tasks"]]
+        for t in self.tasks:
+            unbound = t.store.rebind(self.subsequences, resolve=self.catalogue.index_of)
+            if unbound:
+                notes.append(f"task {t.name!r}: {unbound} annotation(s) reference "
+                             f"{self.ITEM_NOUN}s not in the session (kept, greyed)")
+        active = next((t for t in self.tasks if t.uid == sdoc["active_task"]), self.tasks[0])
+        # Activation switches to the task's workflow, reloads its newest saved
+        # pickle (a failure -- moved file, incompatible profile -- is a note,
+        # never fatal) and pushes its Model-tab view, which wins over the
+        # pickle's kind and context.
+        self._activate_task(active, initial=True)
+        if active.load_note:
+            notes.append(active.load_note)
         view = sdoc.get("view") or {}
         if view.get("tool") in _UI_TOOLS:
             self.tool_var.set(view["tool"])
         self._apply_magic_view(view.get("magic"))
         self._apply_seams_view(view.get("seams"))
-        self._apply_search_view(view.get("model_search"))
-        self._apply_neighbours_view(view.get("neighbours"))
-        # The picked context wins over the reloaded pickle's (as the kind does).
-        self._apply_context_view(view.get("context"))
-        # The picked kind wins over the reloaded pickle's kind (the model
-        # reload above set model_kind_var from the pickle).
-        if view.get("model_kind") in _MODEL_KINDS:
-            self.model_kind_var.set(view["model_kind"])
         # Keep the regions toggle in sync with whatever seg_source restored to.
         self.show_regions_var.set(self._region_layer_visible())
         # The center tab, by name; an unknown or missing value leaves it alone
@@ -1093,6 +1215,302 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
             except tk.TclError:
                 pass
         return notes
+
+    # ------------------------------------------------------------------ #
+    # Tasks: several named detectors, one active
+    # ------------------------------------------------------------------ #
+    def _profile_index(self, name):
+        for i, p in enumerate(self.profiles):
+            if p["name"] == name:
+                return i
+        return None
+
+    def _bind_workflow(self, name):
+        """Make the profile called `name` the active task's workflow (and
+        the active profile). The bindings' `_profile_from_model` hooks use
+        this after appending a profile, instead of poking the index."""
+        idx = self._profile_index(name)
+        if idx is not None:
+            self._switch_profile(idx)
+
+    def _switch_profile(self, idx):
+        """The active profile IS the active task's workflow: whichever way it
+        changes -- the Combobox, New / Duplicate / Load / Delete profile, a
+        profile built from a model -- the task follows."""
+        super()._switch_profile(idx)
+        if 0 <= self.active_profile_idx < len(self.profiles):
+            self._task.workflow = self.profiles[self.active_profile_idx]["name"]
+        self._update_task_rows()
+
+    def _profile_rename(self):
+        old = self.profiles[self.active_profile_idx]["name"]
+        super()._profile_rename()
+        new = self.profiles[self.active_profile_idx]["name"]
+        if new != old:
+            for t in self.tasks:
+                if t.workflow == old:
+                    t.workflow = new
+            self._update_task_rows()
+
+    def _profile_delete(self):
+        old = self.profiles[self.active_profile_idx]["name"]
+        super()._profile_delete()
+        names = [p["name"] for p in self.profiles]
+        if old not in names:
+            # The active task was re-stamped by the switch inside; every
+            # other task on the deleted workflow moves to the survivor too.
+            survivor = names[self.active_profile_idx]
+            for t in self.tasks:
+                if t.workflow == old:
+                    t.workflow = survivor
+            self._update_task_rows()
+
+    def _activate_task(self, task, initial=False):
+        """Make `task` the active one: its workflow becomes the active
+        profile, its store / model / caches are what every control reads,
+        its Model-tab view is on screen. Returns False when refused.
+
+        Refused while an Optimize / sweep / evaluate worker runs: its finish
+        installs into the ACTIVE task, so a switch mid-search would land the
+        winner in the wrong task. On the initial activation of a session
+        load there is no previous task to refuse in favour of."""
+        if task is self._task and not initial:
+            return True
+        if self._search is not None and not initial:
+            self._notify("A search is running - Cancel it before switching tasks.")
+            self._update_task_rows()
+            return False
+        if not initial:
+            self._stash_task_view(self._task)
+        # Caches keyed on the store's rev with no task discriminator: two
+        # stores can share a rev with different content, so they clear (each
+        # rebuilds in one rasterization pass per visible item).
+        self._class_luts.clear()
+        self._clear_seam_caches()
+        self._ctx_cache.clear()
+        self._hover_key = None
+        self._hover_uid = None
+        self._task = task
+        idx = self._profile_index(task.workflow)
+        if idx is None:
+            if task.workflow is not None:
+                self._log(f"task {task.name!r}: workflow {task.workflow!r} is not in "
+                          f"the session - using the active profile")
+            idx = max(0, self.active_profile_idx)
+        # A no-op (primes kept) when it is already the active profile; a
+        # different workflow drops them, as a profile switch always has.
+        self._switch_profile(idx)
+        if 0 <= self.active_profile_idx < len(self.profiles):
+            task.workflow = self.profiles[self.active_profile_idx]["name"]
+        # The saved pickle loads on activation, not at session restore: the
+        # load runs the compatibility gate against the ACTIVE workflow.
+        if task.model_pending and task.model.empty:
+            self._reload_task_model(task)
+        self._apply_task_view(task.view)
+        # Rows may have come or gone while the task was inactive: rebind its
+        # gestures, and drop predictions made under another row layout.
+        task.store.rebind(self.subsequences, resolve=self.catalogue.index_of)
+        sig = tuple(self.catalogue.keys())
+        if task.caches.keys_sig is not None and task.caches.keys_sig != sig:
+            task.caches.pred.clear()
+            task.caches.seam_pred.clear()
+            task.caches.cm_cell = None
+        task.caches.keys_sig = sig
+        self.n_classes_var.set(task.store.n_classes)
+        if self.active_class_var.get() >= task.store.n_classes:
+            self.active_class_var.set(0)
+        self._set_classify_enabled()
+        self._rebuild_class_panels()
+        self._refresh_model_panels()
+        self._update_task_rows()
+        try:
+            self._refresh_render()
+        except Exception as exc:
+            self._log(f"redraw after task switch failed: {exc}")
+        return True
+
+    def _reload_task_model(self, task):
+        """Load the newest of the task's recorded pickles that still exists
+        into its stack (it must be the active task: the loader writes
+        through the properties). A failure is a note on the task."""
+        assert task is self._task
+        task.model_pending = False
+        task.load_note = None
+        for entry in reversed(task.models):
+            if os.path.isfile(entry.get("path", "")):
+                try:
+                    self._load_classifier_from(entry["path"])
+                except Exception as exc:
+                    task.load_note = f"task {task.name!r}: model not reloaded: {exc}"
+                    self._log(task.load_note)
+                break
+
+    # -- the Tasks list ------------------------------------------------- #
+    def _build_task_section(self):
+        """The task list, above the session lists: one row per task (name,
+        workflow, gesture count, model), the active one selected; New /
+        Dup / Rename… / Delete underneath. Built inside the base __init__,
+        after the profiles exist, so the first task binds its workflow here."""
+        c = ttk.LabelFrame(self._left_section_parent("tasks"), text="Tasks")
+        c.pack(fill="x", padx=6, pady=4, before=self.session_frame)
+        self.task_frame = c
+        tree = ttk.Treeview(c, columns=("workflow", "annot", "model"),
+                            show="tree headings", height=3, selectmode="browse")
+        tree.heading("#0", text="task")
+        tree.column("#0", width=110, minwidth=60, stretch=True)
+        tree.heading("workflow", text="workflow")
+        tree.column("workflow", width=90, minwidth=40, stretch=True)
+        tree.heading("annot", text="annot")
+        tree.column("annot", width=46, minwidth=30, stretch=False, anchor="e")
+        tree.heading("model", text="model")
+        tree.column("model", width=96, minwidth=40, stretch=True)
+        tree.pack(fill="x", padx=4, pady=(4, 2))
+        tree.bind("<<TreeviewSelect>>", self._on_task_select)
+        tree.bind("<Double-1>", lambda _e: self._task_rename())
+        attach_tooltip(tree, "The detectors this session trains, each with its own "
+                             "classes, annotations, workflow and model.\n"
+                             "Click: switch (a different workflow drops the primed "
+                             "data, as a profile switch does). Double-click: rename.")
+        self.task_tree = tree
+        row = ttk.Frame(c)
+        row.pack(fill="x", padx=4, pady=(0, 4))
+        self.task_btn_row = row
+        ttk.Button(row, text="New", width=5, command=self._task_new).pack(side="left")
+        b = ttk.Button(row, text="Dup", width=5, command=self._task_duplicate)
+        b.pack(side="left", padx=2)
+        attach_tooltip(b, "A new task with this one's classes, colours, names, "
+                          "workflow and Model-tab settings -- no gestures, no model")
+        ttk.Button(row, text="Rename…", command=self._task_rename).pack(side="left", padx=2)
+        ttk.Button(row, text="Delete", command=self._task_delete).pack(side="left", padx=2)
+        if self._task.workflow is None and 0 <= self.active_profile_idx < len(self.profiles):
+            self._task.workflow = self.profiles[self.active_profile_idx]["name"]
+        self._paint_task_rows(tree)
+
+    def _task_row_values(self, task):
+        n = task.gesture_count
+        if task.model.clf is not None or task.model.seam is not None:
+            model = task.model.kind if task.model.clf is not None else "seam model"
+        elif task.model_pending and task.models:
+            model = f"{task.models[-1].get('kind', '?')} (saved)"
+        else:
+            model = ""
+        return (task.workflow or "-", str(n) if n else "", model)
+
+    def _paint_task_rows(self, tree):
+        """Repaint in place (the sequence tree's pattern): rows are keyed by
+        uid, so a rename or a count change never rebuilds the list, and the
+        selection -- the active task -- is set under a guard so the
+        Treeview's own select event does not re-activate it."""
+        want = [t.uid for t in self.tasks]
+        self._task_rows_syncing = True
+        try:
+            if list(tree.get_children("")) != want:
+                tree.delete(*tree.get_children(""))
+                for t in self.tasks:
+                    tree.insert("", "end", iid=t.uid, text=t.name,
+                                values=self._task_row_values(t))
+            else:
+                for t in self.tasks:
+                    tree.item(t.uid, text=t.name, values=self._task_row_values(t))
+            if tuple(tree.selection()) != (self._task.uid,):
+                tree.selection_set(self._task.uid)
+            tree.see(self._task.uid)
+        except tk.TclError:
+            pass
+        finally:
+            self._task_rows_syncing = False
+
+    def _update_task_rows(self):
+        """Repaint the Tasks list from `self.tasks` (a no-op before the list
+        exists)."""
+        tree = getattr(self, "task_tree", None)
+        if tree is None:
+            return
+        self._paint_task_rows(tree)
+
+    def _on_task_select(self, _event=None):
+        if self._task_rows_syncing:
+            return
+        sel = self.task_tree.selection()
+        if not sel:
+            return
+        task = next((t for t in self.tasks if t.uid == sel[0]), None)
+        if task is not None:
+            self._activate_task(task)
+
+    def _task_by_name(self, name):
+        return next((t for t in self.tasks if t.name == name), None)
+
+    def _task_new(self, name=None):
+        """A task on the active workflow with the current class count and
+        default colours, activated. `name` given -> no dialog (headless)."""
+        taken = [t.name for t in self.tasks]
+        name = dedupe_task_name(str(name or "task"), taken)
+        workflow = None
+        if 0 <= self.active_profile_idx < len(self.profiles):
+            workflow = self.profiles[self.active_profile_idx]["name"]
+        task = Task.new(name, workflow=workflow, n_classes=self.store.n_classes,
+                        taken=[t.uid for t in self.tasks])
+        self.tasks.append(task)
+        if not self._activate_task(task):
+            self.tasks.remove(task)
+            return None
+        self.status_var.set(f"Task '{task.name}' created on workflow '{task.workflow}'.")
+        return task
+
+    def _task_duplicate(self, name=None):
+        src = self._task
+        taken = [t.name for t in self.tasks]
+        name = dedupe_task_name(str(name or src.name), taken)
+        self._stash_task_view(src)
+        task = src.duplicate(name, taken=[t.uid for t in self.tasks])
+        self.tasks.append(task)
+        if not self._activate_task(task):
+            self.tasks.remove(task)
+            return None
+        self.status_var.set(f"Task '{task.name}' duplicated from '{src.name}' "
+                            "(classes and settings; no gestures, no model).")
+        return task
+
+    def _task_rename(self, name=None):
+        current = self._task.name
+        if name is None:
+            from tkinter import simpledialog
+            name = simpledialog.askstring(self.APP_TITLE, "Task name:",
+                                          initialvalue=current, parent=self.root)
+        name = str(name or "").strip()
+        if not name or name == current:
+            return False
+        name = dedupe_task_name(name, [t.name for t in self.tasks if t is not self._task])
+        self._task.name = name
+        self._update_task_rows()
+        return True
+
+    def _task_delete(self, confirm=None):
+        """Delete the active task. Refused for the last one. Asks when the
+        task has gestures or a model unless `confirm` says (headless)."""
+        task = self._task
+        if len(self.tasks) <= 1:
+            self.status_var.set("A session keeps at least one task.")
+            return False
+        loaded = not task.model.empty
+        if confirm is None and (task.gesture_count or loaded):
+            what = " and ".join(p for p, on in ((f"{task.gesture_count} annotation(s)",
+                                                 task.gesture_count),
+                                                ("its model", loaded)) if on)
+            confirm = messagebox.askyesno(
+                self.APP_TITLE, f"Delete task '{task.name}' with {what}?\n\n"
+                                "Its saved pickles stay on disk.")
+        if confirm is False:
+            return False
+        idx = self.tasks.index(task)
+        neighbour = self.tasks[idx - 1] if idx > 0 else self.tasks[1]
+        if not self._activate_task(neighbour):
+            return False
+        self.tasks.remove(task)
+        self._update_task_rows()
+        self.status_var.set(f"Task '{task.name}' deleted.")
+        return True
 
     # ------------------------------------------------------------------ #
     # Hooks with defaults (what the app's profile and compute look like)

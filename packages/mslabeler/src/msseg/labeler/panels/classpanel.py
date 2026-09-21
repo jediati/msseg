@@ -291,12 +291,19 @@ class ClassPanelMixin:
             swatch.bind("<ButtonRelease-1>",
                         lambda e, k=k: self.active_class_var.set(k))
             swatch.bind("<Button-3>", lambda e, k=k: self._pick_class_color(k))
-            attach_tooltip(swatch, f"Left-click: draw with class {k} (key {k})\n"
+            attach_tooltip(swatch, (f"{self.store.name(k)}\n" if self.store.has_name(k) else "")
+                                   + f"Left-click: draw with class {k} (key {k})\n"
                                    f"Right-click: change color")
             swatch.pack(side="left", padx=(0, 4))
             self._class_swatches[k] = swatch
-            self._class_title_labels[k] = ttk.Label(title, text=f"Class {k}")
+            # The counts label; double-click names the class (the task's
+            # vocabulary: "gland" / "not gland" rather than 1 / 2).
+            self._class_title_labels[k] = ttk.Label(title, text=f"Class {k}", cursor="xterm")
             self._class_title_labels[k].pack(side="left")
+            self._class_title_labels[k].bind("<Double-Button-1>",
+                                             lambda e, k=k: self._rename_class(k))
+            attach_tooltip(self._class_title_labels[k],
+                           "k · annotations · regions\nDouble-click: name this class")
             # Clear the class: every one of its annotations on every item,
             # after asking -- the per-row context menu is the finer tool.
             clear = ttk.Button(title, text="clear", width=6,
@@ -592,7 +599,9 @@ class ClassPanelMixin:
             try:
                 # Terse: the full "Class k — annot: n — regions: m" overflowed
                 # the 300 px pane. a = annotations (all slices), r = regions.
-                lbl.configure(text=f"{k} · {annot.get(k, 0)}a · "
+                # A named class shows its name after the id.
+                head = f"{k} {self.store.name(k)}" if self.store.has_name(k) else f"{k}"
+                lbl.configure(text=f"{head} · {annot.get(k, 0)}a · "
                                    f"{regions.get(k, 0)}r")
             except tk.TclError:
                 pass
@@ -627,6 +636,25 @@ class ClassPanelMixin:
         self.store.set_color(k, hexv)    # rev bump -> LUT caches rebuild
         self._rebuild_class_panels()
         self._refresh_render()
+
+    def _rename_class(self, k, name=None):
+        """Name class `k` in the active task's vocabulary (display only: ids
+        stay the wire format). `name` given -> no dialog (headless); an
+        empty name clears it. Undoable, like a colour change."""
+        if name is None:
+            from tkinter import simpledialog
+            current = self.store.names.get(int(k), "")
+            name = simpledialog.askstring(self.APP_TITLE, f"Name for class {k}:",
+                                          initialvalue=current, parent=self.root)
+            if name is None:
+                return False
+        name = str(name).strip()
+        if (self.store.names.get(int(k)) or "") == name:
+            return False
+        self._push_history()
+        self.store.set_name(k, name)
+        self._rebuild_class_panels()
+        return True
 
     def _interaction_row_text(self, it):
         """The row's label. The rows normally all belong to the current slice,

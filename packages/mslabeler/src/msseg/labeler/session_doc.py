@@ -15,10 +15,19 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import shutil
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 SESSION_DOC_VERSION = 2
+# A document that carries ``tasks[]`` (several named detectors, each with its
+# own annotations, models and Model-tab settings -- msseg.labeler.task)
+# declares 3. Without tasks the document is the v2 one it always was.
+SESSION_DOC_VERSION_TASKS = 3
+# The Model-tab keys that belong to a task rather than to the window (the
+# same tuple as ``task.TASK_VIEW_KEYS``; spelled here too so this module
+# stays import-free of the task module, which imports it).
+TASK_VIEW_KEYS = ("model_kind", "model_search", "neighbours", "context")
 
 
 # --------------------------------------------------------------------------- #
@@ -63,6 +72,17 @@ def dedupe_profile_name(name: str, taken: Sequence[str]) -> str:
     while f"{name} ({i})" in taken_set:
         i += 1
     return f"{name} ({i})"
+
+
+def new_task_uid(taken: Sequence[str] = ()) -> str:
+    """A fresh task id, ``t_`` + six hex digits, not in `taken`. A task's
+    identity is separate from its display name so a rename can never break a
+    cross-reference (see ``msseg.labeler.task``)."""
+    taken_set = set(taken)
+    while True:
+        uid = "t_" + secrets.token_hex(3)
+        if uid not in taken_set:
+            return uid
 
 
 # --------------------------------------------------------------------------- #
@@ -123,10 +143,18 @@ def build_session_doc(*, app: str,
                       run: Dict[str, Any],
                       view: Dict[str, Any],
                       annotations: Optional[Dict[str, Any]] = None,
-                      models: Optional[Sequence[Dict[str, Any]]] = None) -> Dict[str, Any]:
+                      models: Optional[Sequence[Dict[str, Any]]] = None,
+                      tasks: Optional[Sequence[Dict[str, Any]]] = None,
+                      active_task: Optional[str] = None) -> Dict[str, Any]:
+    """The session document. With ``tasks`` (each a ``Task.to_doc()`` dict:
+    uid / name / workflow / annotations / models / view) the document is v3
+    and the per-task ``annotations`` / ``models`` live ONLY under their task
+    -- one source of truth, so the top-level keys are not written even when
+    passed. Without tasks it is the v2 document it always was, byte for
+    byte: the viewers, which have no tasks, keep writing exactly that."""
     doc: Dict[str, Any] = {
         "app": str(app),
-        "session_version": SESSION_DOC_VERSION,
+        "session_version": SESSION_DOC_VERSION_TASKS if tasks is not None else SESSION_DOC_VERSION,
         "folders": [{"path": str(f.get("path") or ""),
                      "name": str(f.get("name") or "")} for f in folders],
         "sequences": [{"name": str(s.get("name") or ""),
@@ -138,6 +166,12 @@ def build_session_doc(*, app: str,
         "run": dict(run),
         "view": dict(view),
     }
+    if tasks is not None:
+        doc["tasks"] = [dict(t) for t in tasks]
+        uids = [str(t.get("uid") or "") for t in tasks]
+        doc["active_task"] = (str(active_task) if active_task is not None and str(active_task) in uids
+                              else (uids[0] if uids else ""))
+        return doc
     if annotations is not None:
         doc["annotations"] = annotations
     if models is not None:
@@ -212,8 +246,79 @@ def session_doc_from_json(doc: Any, notes: Optional[List[str]] = None, *,
         active = names[0]
 
     run = _as_dict(root.get("run"))
+    # A copy: the tasks-less path below moves the Model-tab keys out of it.
+    view = dict(_as_dict(root.get("view")))
+
+    # Tasks. A v3 document lists them; anything older IS one task -- the
+    # session's single annotations block, model registry and Model-tab
+    # settings, named after the active profile -- so a reader never has to
+    # know which it was given. Either way the result is a list of normalized
+    # task entries and the uid of the active one.
+    raw_tasks = [t for t in _as_list(root.get("tasks")) if isinstance(t, dict)]
+    had_tasks = bool(raw_tasks)
+    tasks: List[Dict[str, Any]] = []
+    if had_tasks:
+        uids: List[str] = []
+        tnames: List[str] = []
+        for td in raw_tasks:
+            uid = str(td.get("uid") or "")
+            if not uid or uid in uids:
+                fresh = new_task_uid(uids)
+                _note(notes, f"task {td.get('name')!r}: "
+                             f"{'duplicate' if uid else 'missing'} uid - assigned {fresh}")
+                uid = fresh
+            name = dedupe_profile_name(str(td.get("name") or "task"), tnames)
+            workflow = td.get("workflow")
+            workflow = str(workflow) if workflow is not None else None
+            if workflow is not None and workflow not in names:
+                _note(notes, f"task {name!r}: workflow {workflow!r} is not in the "
+                             f"session - using {active!r}")
+                workflow = active
+            tview = _as_dict(td.get("view"))
+            tasks.append({"uid": uid, "name": name, "workflow": workflow,
+                          "annotations": _first_dict(td.get("annotations"), td.get("labels")),
+                          "models": _models_from_json(td.get("models")),
+                          "view": {k: tview[k] for k in TASK_VIEW_KEYS if k in tview}})
+            uids.append(uid)
+            tnames.append(name)
+        active_task = str(root.get("active_task") or "")
+        if active_task not in uids:
+            active_task = uids[0]
+    else:
+        tasks.append({"uid": new_task_uid(), "name": active, "workflow": active,
+                      # "labels" is what sessions written before the rename
+                      # call this, and it is the ONLY thing that key ever
+                      # meant here (the raw gesture geometry); elsewhere in
+                      # the tree "labels" is the MSC label raster.
+                      "annotations": _first_dict(root.get("annotations"), root.get("labels")),
+                      "models": _models_from_json(root.get("models")),
+                      "view": {k: view.pop(k) for k in TASK_VIEW_KEYS if k in view}})
+        active_task = tasks[0]["uid"]
+    current = next(t for t in tasks if t["uid"] == active_task)
+
+    return {
+        "app": str(root.get("app") or ""),
+        "session_version": SESSION_DOC_VERSION_TASKS if had_tasks else SESSION_DOC_VERSION,
+        "folders": folders,
+        "sequences": sequences,
+        "profiles": profiles,
+        "active_profile": active,
+        "run": {"cores_per_slice": _as_int(run.get("cores_per_slice"), 0) or None,
+                "concurrent_slices": _as_int(run.get("concurrent_slices"), 0) or None},
+        "view": view,
+        "tasks": tasks,
+        "active_task": active_task,
+        # The active task's, for readers that predate tasks.
+        "annotations": current["annotations"],
+        "models": current["models"],
+    }
+
+
+def _models_from_json(raw: Any) -> List[Dict[str, Any]]:
+    """Saved-model records (``bundle.model_record_entry`` dicts), normalized;
+    an entry without a path names nothing and is dropped."""
     models = []
-    for m in _as_list(root.get("models")):
+    for m in _as_list(raw):
         md = _as_dict(m)
         if md.get("path"):
             models.append({"path": str(md["path"]),
@@ -228,24 +333,10 @@ def session_doc_from_json(doc: Any, notes: Optional[List[str]] = None, *,
                            # Only when present, so an entry without them is
                            # the document it always was.
                            **({"scope": str(md["scope"])} if md.get("scope") is not None else {}),
+                           **({"context": _as_dict(md["context"])}
+                              if isinstance(md.get("context"), dict) and md["context"] else {}),
                            **({"seam": True} if md.get("seam") else {})})
-
-    return {
-        "app": str(root.get("app") or ""),
-        "session_version": SESSION_DOC_VERSION,
-        "folders": folders,
-        "sequences": sequences,
-        "profiles": profiles,
-        "active_profile": active,
-        "run": {"cores_per_slice": _as_int(run.get("cores_per_slice"), 0) or None,
-                "concurrent_slices": _as_int(run.get("concurrent_slices"), 0) or None},
-        "view": _as_dict(root.get("view")),
-        # "labels" is what sessions written before the rename call this, and it
-        # is the ONLY thing that key ever meant here (the raw gesture geometry);
-        # elsewhere in the tree "labels" is the MSC label raster.
-        "annotations": _first_dict(root.get("annotations"), root.get("labels")),
-        "models": models,
-    }
+    return models
 
 
 # --------------------------------------------------------------------------- #

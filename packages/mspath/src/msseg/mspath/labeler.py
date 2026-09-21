@@ -131,9 +131,9 @@ class LabelerApp(AnnotationShell, MsPathApp):
         if statistics:
             prof["statistics"] = dict(statistics)
         self.profiles.append(prof)
-        self.active_profile_idx = len(self.profiles) - 1
-        self._refresh_profile_combo()
-        self._apply_profile_to_ui(prof, lambda v, x: v.set(x), [])
+        # Through the switch, so the active task's workflow follows the
+        # profile (and the compute state is reset, as any switch does).
+        self._bind_workflow(prof["name"])
         return prof
 
     # ------------------------------------------------------------------ #

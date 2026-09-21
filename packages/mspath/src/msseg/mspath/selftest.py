@@ -889,11 +889,39 @@ def run_labeler_selftest():
     app._undo()
     assert len(app.store.interactions) == 3 and not any(it.bound for it in app.store.interactions)
 
+    # Tasks: a second detector over the same slides has its own store and
+    # model; a profile built from a model binds to the active task; both
+    # tasks ride the session document into a fresh window.
+    t1 = app._task
+    clf1 = app._clf
+    assert clf1 is not None
+    t2 = app._task_new("stroma")
+    assert app._task is t2 and app._clf is None and app.store.interactions == []
+    assert app._pred == {} and t2.workflow == t1.workflow
+    assert str(app.classify_btn.cget("state")) == "disabled"
+    assert app._activate_task(t1) and app._clf is clf1 and len(app.store.interactions) == 3
+    assert str(app.classify_btn.cget("state")) == "normal"
+    n_prof = len(app.profiles)
+    prof = app._profile_from_model(os.path.join("C:", "x", "gland_model.pkl"), {"channels": ["base"]})
+    assert len(app.profiles) == n_prof + 1 and app.active_profile_idx == n_prof
+    assert t1.workflow == prof["name"] and t2.workflow != prof["name"], \
+        "a profile from a model becomes the active task's workflow only"
+    doc_t = app._session_doc()
+    assert doc_t["session_version"] == 3 and len(doc_t["tasks"]) == 2
+    assert doc_t["active_task"] == t1.uid and doc_t["tasks"][0]["workflow"] == prof["name"]
+    app2 = LabelerApp(tk.Toplevel(root), autosave=False)
+    app2._apply_session_doc(doc_t, "tasks")
+    assert [t.name for t in app2.tasks] == [t1.name, "stroma"] and app2._task.uid == t1.uid
+    assert len(app2.store.interactions) == 3 and app2.tasks[1].gesture_count == 0
+    assert app2.profiles[app2.active_profile_idx]["name"] == prof["name"]
+    assert app2._feature_scope() == app._feature_scope()
+
     root.destroy()
     print("labeler selftest OK: placement, slide-coordinate gestures, class layer, "
           "box over the item, training rows, level-scoped compat gate, "
           "classify + propose ROIs, refusal notice on the HUD, "
           "predictions survive an incremental prime, undo, tree rows: "
           "slide/overview/ROI menu + guarded removal + orphan annotations, "
-          "seam tools in slide coordinates")
+          "seam tools in slide coordinates, tasks: own store + model, "
+          "profile-from-model binds the active task, two tasks into a fresh window")
     return 0

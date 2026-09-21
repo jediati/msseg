@@ -198,6 +198,44 @@ fell back to plain stratified folds. Both selftests, the pytest suites and the
 byte-level baselines (annotations.json round trip, canvas composite, classifier
 pickles) were held identical through the extraction.
 
+**Labeler tasks** (2026-09-21, `msseg.labeler.task`, stage 1 of
+[docs/design_multi_model_tasks.md](docs/design_multi_model_tasks.md)): a
+session holds several named detectors ("gland detector", "bubble &
+background") over one corpus, exactly one active. A `Task` owns a
+**workflow** (a profile NAME in the session's shared pool -- profiles stay
+session-level so two tasks on one workflow share its primes), the class
+vocabulary (count, colours, and now **names**, `LabelStore.names` /
+`set_name`, written into `classes[].name` only when set), the `LabelStore`
+with its undo history, the `ModelStack` (region clf + names/kind/spec/scope/
+context, edge, latent, search winner, seam) with its prediction caches, the
+saved-model records and the Model-tab view (`TASK_VIEW_KEYS`: `model_kind`,
+`model_search`, `neighbours`, `context`). Identity is a `uid` (`t_` + 6 hex)
+apart from the display name. **Every attribute the mixins, tools and
+selftests read -- `store`, `models`, `_clf*`, `_pred`, `_seam_model`,
+`_undo_stack`, `_models_dir`, ... -- is a property over `self._task`**
+(`annotate.py`), so ~150 call sites are unchanged and a switch is one
+assignment. `_activate_task` stashes the outgoing Model-tab view, clears the
+`store.rev`-keyed caches (`_class_luts`, seam caches, `_ctx_cache`), switches
+to the task's workflow via `_switch_profile` (no-op when shared), loads its
+newest pickle **lazily** (the load gates against the ACTIVE workflow),
+pushes its view and repaints; refused while a search worker runs (its finish
+installs into the active task). `_switch_profile` stamps the active task's
+workflow; profile rename/delete propagate; `_profile_from_model` binds via
+`_bind_workflow`. Session document **v3**: `tasks[]` + `active_task`, no
+top-level `annotations`/`models`; the tasks-less form is unchanged (the
+viewers write it) and reads as ONE task named after the active profile with
+the four view keys moved out of `view`; the reader returns
+`annotations`/`models` as the active task's for older callers and now keeps
+the model record's `context` key (a pre-existing drop). New session keeps the
+tasks with emptied stores. UI: a Tasks `Treeview` (name / workflow / annot /
+model) above the session lists with New / Dup / Rename… / Delete; the
+profile box is titled "0. Workflow" (`PROFILE_SECTION_TITLE`); double-click
+a class title to name it. Accepted for stage 1: a cross-workflow switch drops
+primes; row removal dooms only the active task's gestures (others rebind
+greyed on activation); `MAX_CLASSES` still bounds every vocabulary.
+Tests: `test_task.py`, `test_class_names.py`, `test_session_doc_tasks.py`,
+plus task sections in both labeler selftests.
+
 **mscoupon labeler magic fill + gesture previews** (`mscoupon-labeler`, see
 [docs/mscoupon_labeler.md](docs/mscoupon_labeler.md)): every drawing gesture now
 previews the regions it WILL paint on a transient canvas layer (brightened class

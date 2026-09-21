@@ -35,7 +35,7 @@ things you edit.
 
 | column / tab | holds |
 |---|---|
-| **left** | the compute-profile picker, the session browser (folders, files, sequences) and Run |
+| **left** | the workflow (compute-profile) picker, the **Tasks** list, the session browser (folders, files, sequences) and Run |
 | **middle** | the slice canvas, hover readout, slice navigation, image/overlay/alpha controls and the persistence entry |
 | **Processing** (default tab) | the profile tools (New/Dup/Rename/Delete, Save/Load profile) and the profile being edited, as one column of collapsible groups: colour input, filter chain, base channel, MSC parameters, statistics channels |
 | **Annotation** | classes, tools, the Magic rows, the per-class interaction lists, Save/Load annotations, and the classifier (Train/Classify, the model strip, the confusion matrix, exports, Save/Load classifier) |
@@ -57,6 +57,43 @@ The canvas used to be a tab of its own, beside Processing. A filter chain is
 judged by *looking* at what it produces, and that made the judging a round trip
 -- edit, switch, squint, switch back, and no way to tell whether what was on
 screen reflected the edit. So the picture is never the thing that is hidden.
+
+## Tasks
+
+A session holds several **tasks** -- named detectors such as *gland detector*
+or *bubble & background* -- over the same folders and sequences, and exactly
+one is active. A task owns what a detector is made of: its **workflow** (a
+compute profile, referenced by name from the session's shared pool), its
+**class vocabulary** (count, colours and names -- double-click a class title
+to name it *gland* / *not gland*), its **annotations** with their undo
+history, its **model stack** (the region classifier, the edge model, the
+latent head, the seam model) with its predictions, its saved-model records,
+and its Model-tab settings (kind, Optimize, neighbours, context). *Not gland*
+is a statement about one detector's decision boundary, which is why the
+gestures are per task rather than one ten-class vocabulary for everything.
+
+The **Tasks** list sits above the session lists in the left column: name,
+workflow, gesture count, model. Click a row to switch -- the workflow box
+follows (it shows and rebinds the ACTIVE task's workflow; two tasks on one
+workflow share its primed data, a different workflow drops it, as a profile
+switch always has) and the class stack, the Model tab and the predictions are
+the task's. **New** starts an empty task on the active workflow with the
+current class count; **Dup** copies the vocabulary, workflow and Model-tab
+settings and nothing else; **Rename…** and **Delete** (refused for the last
+task; asks when the task has gestures or a model) do what they say. A switch
+is refused while an Optimize / sweep / evaluate search runs, because its
+result installs into the active task. A task's saved pickle loads when the
+task is first activated, and its Optimize autosaves go to
+`models/<task uid>/`.
+
+The session document is **v3**: `tasks[]` + `active_task`, each task with its
+`annotations`, `models` and `view`. A session written before tasks (v2)
+restores as one task named after its active profile, with everything it had;
+**New session…** keeps the tasks and empties their stores (their models too,
+when the model option is kept). Renaming or deleting a profile follows
+through to the tasks that point at it. Design and the stages that follow
+(shared places, slide-bound gestures, cross-task masks and borrowed gestures):
+[design_multi_model_tasks.md](design_multi_model_tasks.md).
 
 ### Editing a filter chain
 

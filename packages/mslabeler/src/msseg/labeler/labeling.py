@@ -93,6 +93,7 @@ class LabelStore:
         self.interactions = []                   # uid order == creation order
         self.seams = []                          # seam gestures (SEAM_TOOLS), same uid space
         self.colors = {}                         # class_id -> "#rrggbb" override
+        self.names = {}                          # class_id -> display name (a task's vocabulary)
         self.rev = 0
         self._next_uid = 1
 
@@ -119,6 +120,30 @@ class LabelStore:
             return
         self.colors[int(class_id)] = hexv
         self.rev += 1                    # render LUT caches key on rev
+
+    # -- class names (a task's vocabulary; display only, ids stay the wire
+    #    format for every raster, LUT and probability column) ------------ #
+    def name(self, class_id):
+        """The class's display name, ``"class k"`` when none was given."""
+        return self.names.get(int(class_id)) or f"class {int(class_id)}"
+
+    def has_name(self, class_id):
+        return bool(self.names.get(int(class_id)))
+
+    def set_name(self, class_id, name):
+        """Name a class; an empty name clears it. A real change bumps rev
+        so undo snapshots and the session autosave see it."""
+        k = int(class_id)
+        if not (1 <= k < MAX_CLASSES):
+            return
+        name = str(name or "").strip()
+        if (self.names.get(k) or "") == name:
+            return
+        if name:
+            self.names[k] = name
+        else:
+            self.names.pop(k, None)
+        self.rev += 1
 
     # -- mutations (each bumps rev) ------------------------------------ #
     def add(self, tool, points, class_id, slice_key, si=None, li=None, meta=None):
@@ -236,7 +261,11 @@ class LabelStore:
             "version": 3 if self.seams else 2,
             "app": "mscoupon-labeler",
             "n_classes": self.n_classes,
-            "classes": [{"id": k, "color": self.color(k)}
+            # "name" only when one was given: a store without names is
+            # byte-identical to what older versions wrote, and older readers
+            # ignore the key.
+            "classes": [{"id": k, "color": self.color(k),
+                         **({"name": self.names[k]} if self.names.get(k) else {})}
                         for k in range(1, self.n_classes)],
             "interactions": [self._row(it) for it in self.interactions],
         }
@@ -250,6 +279,9 @@ class LabelStore:
         for c in doc.get("classes") or []:
             if isinstance(c, dict) and c.get("id") and c.get("color"):
                 store.colors[int(c["id"])] = str(c["color"])
+            if isinstance(c, dict) and c.get("id") and isinstance(c.get("name"), str) \
+                    and c["name"].strip():
+                store.names[int(c["id"])] = c["name"].strip()
         for d in doc.get("interactions", []):
             meta = d.get("meta")
             it = Interaction(d["uid"], d["slice"], d.get("si"), d.get("li"),
