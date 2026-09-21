@@ -64,10 +64,11 @@ void validate_color_chain(const char* name, const std::vector<FilterConfig>& cha
                           const ColorInputConfig& color) {
   for (std::size_t i = 0; i < chain.size(); ++i) {
     if (chain[i].operation != msseg::kColorOperation) continue;
-    if (i != 0) {
-      throw std::runtime_error(std::string(name) + "[" + std::to_string(i) +
-                               "]: 'color' must be the first stage of the chain.");
-    }
+    // `color` is valid wherever the arity works now; the plane count it is
+    // checked against below is the INPUT's, which is right for a leading stage
+    // and the best guess available without planning for one further in. The
+    // planner checks it exactly, against the planes that actually reach it.
+    if (i != 0) continue;
     msseg::FilterParams stage;
     stage.operation = chain[i].operation;
     stage.params = chain[i].params;
@@ -191,6 +192,35 @@ void parse_statistics_json(const nlohmann::json& root, StatisticsConfig& stats) 
   if (!root.contains("statistics") || root.at("statistics").is_null()) return;
   const auto& s = root.at("statistics");
 
+  // Named measurement sources, parsed before `channels` so a bare string there
+  // may name one. Each is an ordinary filter chain over the input planes.
+  if (s.contains("sources") && !s.at("sources").is_null()) {
+    const auto& src = s.at("sources");
+    if (!src.is_object()) {
+      throw std::runtime_error("statistics.sources must be an object of name -> filter chain.");
+    }
+    for (auto it = src.begin(); it != src.end(); ++it) {
+      if (it.key() == "base" || it.key() == "filtered" || it.key() == "color") {
+        throw std::runtime_error("statistics.sources cannot redefine '" + it.key() + "'.");
+      }
+      if (!it.value().is_array()) {
+        throw std::runtime_error("statistics.sources['" + it.key() + "'] must be an array of stages.");
+      }
+      std::vector<msseg::FilterParams> chain;
+      for (const auto& f : it.value()) {
+        const FilterConfig one = parse_one_filter(f);
+        msseg::FilterParams p;
+        p.operation = one.operation;
+        p.params = one.params;
+        chain.push_back(std::move(p));
+      }
+      if (chain.empty()) {
+        throw std::runtime_error("statistics.sources['" + it.key() + "'] is empty; a source needs a chain.");
+      }
+      stats.spec.sources[it.key()] = std::move(chain);
+    }
+  }
+
   if (s.contains("channels") && !s.at("channels").is_null()) {
     const auto& arr = s.at("channels");
     if (!arr.is_array()) throw std::runtime_error("statistics.channels must be an array.");
@@ -208,9 +238,12 @@ void parse_statistics_json(const nlohmann::json& root, StatisticsConfig& stats) 
           stats.spec.filtered_channel = true;
         } else if (name == "color") {
           stats.spec.color_channel = true;   // the raw input planes, color_c0..
+        } else if (stats.spec.sources.count(name)) {
+          stats.spec.source_channel.insert(name);   // that source's own planes
         } else {
           throw std::runtime_error(
-              "statistics.channels[] string must be base/filtered/color (got '" + name +
+              "statistics.channels[] string must be base/filtered/color or a name declared in "
+              "statistics.sources (got '" + name +
               "'); a derived channel is an object like "
               "{\"kind\": \"blur\", \"sigmas\": [1.0]}.");
         }

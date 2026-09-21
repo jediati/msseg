@@ -33,6 +33,7 @@
 #include "msseg/filter/color_stage.hpp"
 #include "msseg/filter/plane_stages.hpp"
 #include "msseg/filter/filter_stage.hpp"
+#include "msseg/graph/seam_graph.hpp"
 #include "msseg/io/tiff_io.hpp"
 #include "msseg/workflow/input_slice.hpp"
 
@@ -117,6 +118,17 @@ std::string default_color_method(const nlohmann::json& cfg, const std::string& f
     return cfg["input"]["color"].value("default_method", fallback);
   }
   return fallback;
+}
+
+// `input.color.reduce_at`: where the conversion goes when the chain does not
+// reduce on its own. Read from the same block, so a caller that already passes a
+// params JSON needs no new argument.
+std::string reduce_at_of(const nlohmann::json& cfg) {
+  if (cfg.contains("input") && cfg["input"].is_object() && cfg["input"].contains("color") &&
+      cfg["input"]["color"].is_object()) {
+    return cfg["input"]["color"].value("reduce_at", std::string("front"));
+  }
+  return "front";
 }
 
 // The optional colour planes handed alongside base/filtered: None, or a planar
@@ -229,8 +241,8 @@ FloatArray filter_slice(const FloatArray& image, const std::string& params_json,
     diffg::MultiImage<float> filtered;
     {
       py::gil_scoped_release release;
-      filtered = msseg::apply_filter_chain_planes(planes.view(),
-                                                  std::vector<msseg::FilterParams>{filter}, method);
+      filtered = msseg::apply_filter_chain_planes(
+          planes.view(), std::vector<msseg::FilterParams>{filter}, method, reduce_at_of(cfg));
     }
     return planes_to_array(filtered, h, w);
   }
@@ -278,7 +290,8 @@ FloatArray filter_chain(const FloatArray& image, const std::string& params_json,
     diffg::MultiImage<float> filtered;
     {
       py::gil_scoped_release release;
-      filtered = msseg::apply_filter_chain_planes(planes.view(), chain, method);
+      filtered = msseg::apply_filter_chain_planes(planes.view(), chain, method,
+                                                  reduce_at_of(cfg));
     }
     return planes_to_array(filtered, h, w);
   }
@@ -296,7 +309,7 @@ FloatArray filter_chain(const FloatArray& image, const std::string& params_json,
 // input gets when the chain does not start with one is IN the list, marked
 // index -1, which is the whole point -- it used to exist only inside the runner.
 py::dict chain_plan_py(const std::string& chain_json, int channels,
-                       const std::string& default_method) {
+                       const std::string& default_method, const std::string& reduce_at) {
   nlohmann::json arr = chain_json.empty() ? nlohmann::json::array() : nlohmann::json::parse(chain_json);
   if (!arr.is_array()) throw std::runtime_error("chain_plan: expected a JSON array of stages");
   std::vector<msseg::FilterParams> chain;
@@ -306,7 +319,8 @@ py::dict chain_plan_py(const std::string& chain_json, int channels,
     if (f.contains("params") && f["params"].is_object()) fp.params = f["params"];
     chain.push_back(std::move(fp));
   }
-  const msseg::ChainPlan plan = msseg::plan_chain(chain, static_cast<std::size_t>(channels), default_method);
+  const msseg::ChainPlan plan =
+      msseg::plan_chain(chain, static_cast<std::size_t>(channels), default_method, reduce_at);
 
   py::list stages;
   for (const msseg::StageRecord& rec : plan.stages) {
@@ -317,6 +331,7 @@ py::dict chain_plan_py(const std::string& chain_json, int channels,
     d["out"] = static_cast<int>(rec.out_channels);
     d["index"] = rec.config_index;
     d["synthesized"] = rec.synthesized();
+    d["lifted"] = rec.lifted;
     stages.append(std::move(d));
   }
   py::dict out;
@@ -412,6 +427,36 @@ py::tuple pipeline_region_arcs(msseg::Msc2DPipeline& pipe) {
     ps[i] = arc.saddle_value;
   }
   return py::make_tuple(std::move(a), std::move(b), std::move(saddle));
+}
+
+// The seam graph of ANY int32 (h,w) label raster (-1 background): the crack
+// polylines along which regions meet. Returns (a, b, j0, j1, offsets, points
+// (P,2), junction_xy (J,2)) -- see msseg/graph/seam_graph.hpp for the
+// canonical form the numpy reference (msseg.labeler.seams) reproduces.
+py::tuple seam_graph_py(py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> labels) {
+  const auto info = labels.request();
+  if (info.ndim != 2) throw std::runtime_error("seam_graph: expected a 2D (h,w) int32 array");
+  const auto h = static_cast<std::size_t>(info.shape[0]);
+  const auto w = static_cast<std::size_t>(info.shape[1]);
+  msseg::SeamGraph sg;
+  {
+    py::gil_scoped_release release;
+    sg = msseg::extract_seam_graph(static_cast<const std::int32_t*>(info.ptr), h, w);
+  }
+  const auto vec_i32 = [](const std::vector<std::int32_t>& v) {
+    py::array_t<std::int32_t> out(static_cast<py::ssize_t>(v.size()));
+    if (!v.empty()) std::memcpy(out.request().ptr, v.data(), v.size() * sizeof(std::int32_t));
+    return out;
+  };
+  const auto pairs_i32 = [](const std::vector<std::int32_t>& v) {
+    py::array_t<std::int32_t> out({static_cast<py::ssize_t>(v.size() / 2), static_cast<py::ssize_t>(2)});
+    if (!v.empty()) std::memcpy(out.request().ptr, v.data(), v.size() * sizeof(std::int32_t));
+    return out;
+  };
+  py::array_t<std::int64_t> offsets(static_cast<py::ssize_t>(sg.offsets.size()));
+  std::memcpy(offsets.request().ptr, sg.offsets.data(), sg.offsets.size() * sizeof(std::int64_t));
+  return py::make_tuple(vec_i32(sg.a), vec_i32(sg.b), vec_i32(sg.j0), vec_i32(sg.j1), std::move(offsets),
+                        pairs_i32(sg.points), pairs_i32(sg.junction_xy));
 }
 
 // Per-surviving-feature statistics, COLUMNAR: the field names once, then one
@@ -793,8 +838,13 @@ PYBIND11_MODULE(mscoupon_py, m) {
            "Prefer this over feature_stats() -- it is one buffer copy rather than a dict "
            "per feature, which is what keeps a wide channel set usable on a slider.");
 
+  m.def("seam_graph", &seam_graph_py, py::arg("labels"),
+        "Seam graph of an int32 (h,w) label raster (-1 background): the crack polylines along "
+        "which regions meet, as (a, b, j0, j1, offsets, points (P,2), junction_xy (J,2)). "
+        "Flanks a < b; j0 == j1 == -1 marks a loop, whose points repeat the first corner.");
   m.def("chain_plan", &chain_plan_py, py::arg("chain_json"), py::arg("channels") = 1,
         py::arg("default_method") = std::string("luminance"),
+        py::arg("reduce_at") = std::string("front"),
         "Plan a filter chain over `channels` planes, with no raster: "
         "{stages: [{operation, params, in, out, index, synthesized}], in, out, color_stage}. "
         "A multi-plane input whose chain does not start with `color` gets one synthesized at "

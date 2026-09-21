@@ -175,7 +175,7 @@ honored by the CLI; the GUI's on-the-fly 3D assembly
 [docs/labeler_framework.md](docs/labeler_framework.md)): the viewer and the
 labeler are bindings of a pure-Python framework. `ViewerShell` (window,
 session browser, profiles, navigation, work-queue pump, session document) and
-`AnnotationShell` (annotation store + undo, drawing tools, three panes,
+`AnnotationShell` (annotation store + undo, drawing tools, three columns,
 classifier lifecycle in `classifier.py`, UI clusters as `panels/*` mixins) are
 cooperative base classes: `MscouponApp(ViewerShell)` and
 `LabelerApp(AnnotationShell, MscouponApp)`. Data and compute reach the
@@ -227,13 +227,28 @@ class (`next` after the active one, or a fixed id) -- committed as two taps
 interactions, ring first so the core wins on a merge. Escape abandons any
 gesture in flight.
 
-**mscoupon labeler layout** (three panes, tabbed center): the left pane is data
-navigation + processing *selection* (profile dropdown, session, Run); the right
-pane is annotation management + the classifier; the center is a `ttk.Notebook`
--- **Processing** (profile tools + the edited profile in two columns),
-**View** (the canvas and its controls; `self.right` *is* this tab, so every
-viewer-area builder packs into it unchanged) and **Model** (kind + architecture
-readout formatted from the `_make_model` constants). `MscouponApp` grew three
+**mscoupon labeler layout** (2026-09-18: three columns, **data | picture |
+tabs**, about **1:3:2**). Left is data navigation + processing *selection*
+(profile dropdown, session, Run); the middle is the slice (`self.right`, still
+a plain frame, so every viewer-area builder packs into it unchanged); the right
+is a `ttk.Notebook` of everything you EDIT -- **Processing**, **Annotation**
+(the class stack, the drawing tools and the classifier, which used to be the
+window's third pane), **Model** and **Analysis**. **Only the middle pane
+carries a weight**, so window growth goes entirely to the picture and the two
+side columns keep the width they were given; the proportions are the SASHES,
+placed explicitly from `_LABELER_PANES` and remembered as fractions in
+`view.panes` (a weight would drift them). `F9` folds the tab column away.
+The profile and the picture were sibling tabs until 2026-09-17, which made
+judging a filter chain a round trip (edit, switch, squint, switch back); the
+chain IS judged by looking, so the picture is never the thing that is hidden.
+`_goto_region` no longer switches tabs, so the Analysis list stays open beside
+the region it sent you to. **Processing is ONE column of collapsible groups**
+(`widgets.Collapsible`, built through the `_group(parent, text, key)` hook --
+a plain `ttk.LabelFrame` in the viewer's left column, a folding group in the
+labeler's column; which groups are shut rides `view.proc_open`): two columns
+needed a tab as wide as the window, where a column that folds needs only the
+group being edited -- all five open is 844 px, all five shut is 135 px.
+`MscouponApp` grew three
 layout hooks (`_build_center`, `_profile_tools_parent`, `_processing_parent`)
 whose defaults reproduce the viewer's tree exactly; the labeler overrides them
 rather than forking `_build_left`. The session view keeps the selected tab
@@ -250,6 +265,37 @@ bottom. **Previews compute channels**: `_preview_channel` runs the base chain /
 filter chain / `stat_channel_images` on the raw preview array (memoised per
 path, channel and params), so the Image dropdown shows any derived field
 before a Run; an unprimed sequence-tree row previews like a file-list click.
+**A parameter edit repaints, without priming** (2026-09-17): a filter field used
+to commit into `card["params"]` and notify nothing, so the canvas only caught
+up at the next unrelated event. Every commit now calls
+`ViewerShell._notify_profile_edit`, which settles for `_PREVIEW_SETTLE_MS`
+(250 ms -- a sigma typed `1`, `.`, `5` is ONE edit) and then hands
+`_launch_preview` the shown channel; a 400 ms `_preview_poll` over a
+`_chain_fingerprint` is the backstop, because the chain cards are two
+near-identical implementations (coupon and mspath) rebuilt from scratch on
+every operation change, so a commit path that forgets to report itself must
+degrade to a delay rather than to a dead control. The compute is the SAME calls
+a run makes, moved off the Tk thread: `engine.preview_raster` is Tk-free and
+cache-free, run by `msseg.labeler.preview.PreviewWorker` (queue + daemon thread
++ `root.after` pump + supersede token, modelled on the Optimize search) with a
+`sync=True` path for the selftests; `_preview_channel` keeps its signature and
+runs the same function inline for the callers that need a raster in hand. What
+is *not* recomputed is the point: a channel's cache key IS its dependency set,
+so editing `filters` while the dropdown shows `base` is one tuple comparison,
+and retyping the old sigma is a cache hit. The preview stays live **after** a
+prime -- `_paint_live` records a `_preview_override` and takes the region
+overlays OFF (they are from a different field, so drawing them over this raster
+would not be slightly stale but wrong) with a `Preview - filters changed, Run to
+re-prime` badge that a Run or an undo clears. Zoom and pan survive, because
+`set_base` never touches the viewport and the path key is held constant.
+A derived statistics channel cannot depend on `filters` at all: a statistics
+source is validated to be base or colour, and `build_stat_channels` reads the
+filtered raster only for a channel whose *kind* is `filtered`, so a derived
+preview skips the topology chain entirely (`engine._spec_reads_filtered`).
+mspath gets the same loop, over `SlideEngine.read_item` -- the read is what
+costs seconds at a deep level, so the array is cached per (item, level, halo)
+and a chain edit does not invalidate it -- with the result placed by
+`PlacedImageSource` at the item's own origin and scale, halo trimmed.
 Two link-labels -- heading the Run section and the classifier section
 respectively -- show the active workflow rendered by
 `session.profile_summary` (two lines: `topo field: base→b(1.5)→e(0.7)→msc(asc, 10%)`
@@ -321,6 +367,45 @@ predictions-vs-annotations list (`_confusion_cell_rows` / `_fill_error_list`: a
 confusion cell's regions across slices; double-click -> `_goto_region`,
 which uses `SliceCanvas.center_on`). The in-tree pyd was
 refreshed from the build tree so records carry MSC arcs with saddles.
+
+**Labeler context features** (2026-09-14, `msseg.labeler.context`, the
+**Context** panel on the Model tab, [docs/mscoupon_labeler.md](docs/mscoupon_labeler.md)
+"Context features"): input-side neighbourhood context for the region
+classifier, as ORDINARY columns appended to the statistics row -- ring
+reductions over a region's arc neighbours (`ring_mean/min/max/std`,
+`ring_contrast` = own minus ring mean), a 2-hop mean, and per-item
+`slice_mean/contrast` -- over a chosen source (all columns, `ext_*` only,
+`mean_*` only) and an OPTIONAL neighbour weighting (`uniform` default,
+`area`, `contact` = shared boundary length from the label raster, derived
+lazily and cached on the arcs dict as `length`). Columns are named
+`<kind>[<weight>]__<col>` (prefixes never collide with `mean_`/`std_`/`hist`),
+`schema_entries` files each kind as its own Optimize mask group, and
+`augment` returns a NEW table (`rec["stats"]` untouched, so the magic fill
+and readouts see the raw one). No saddle value is read anywhere. Plumbing:
+`_stream_stat_slices(action, spec)` yields the augmented table; the model's
+own spec (`_clf_context`, pickle `stack["context"]`, model record `context`)
+is what predictions and the compat gate rebuild (`_expected_names_for`),
+the Model tab's picked spec (`view.context`) is the NEXT model's; both keys
+exist only when non-empty, so an empty spec is byte-identical to before.
+Two more rungs ride the same spec: the edge model's opt-in `contact` pair
+feature (`log1p` shared boundary length; with `barrier` off the pair model
+is saddle-free; `edge_model.DEFAULT_FEATURES` keeps the old three), and the
+**latent ring head** (`ContextSpec.latent` = `LatentSpec`): after the base
+is fit, `context.latent_columns` averages the ring's hidden-layer embeddings
+(uniform/area/contact/`latent` softmax) and `ring_h0` adds the H0 shape of
+region + ring in latent space (largest merge, ratio, own attach, component
+count; degree-bucketed vectorised Prim), and a second net of the base's own
+spec is fit on row ++ those columns and makes the prediction
+(`_context_model`, pickle `stack["latent"]`, dropped on load unless
+`names_hash`/`net_hash` match; NOT in the fingerprint). **Labels as context**
+(`ContextSpec.labels` = `LabelSpec(dropout, seed)`, columns
+`nbr_class__c<k>` + `nbr_class__any`, IN the fingerprint): the ring's
+annotated-class fractions, own label excluded, training-time dropout via a
+seeded rng from `_context_table(..., training=True)`; predictions depend on
+the store, so `_predict_slice` and the `_rebuild_class_panels` override in
+`AnnotationShell` (`_labels_changed`) clear `_pred` when `store.rev` moves.
+`experiments/context_ablation.py` scores every variant (labels visible vs
+hidden on the held-out slices).
 
 **mscoupon extremum statistics** (`ext_x`, `ext_y`, `ext_base`, `ext_filtered`):
 the per-slice selection chain can also ask about a region's **seeding critical
@@ -487,3 +572,50 @@ leaves the bins out, and switching histograms on widens the field set so saved
 models are invalidated by the compat gate, as designed. Histogram specs stay on
 the CPU statistics path. Gradient-orientation histograms are designed, not
 built: `docs/design_orientation_histograms.md`.
+
+**Seam labeling** (2026-09-15, [docs/seam_labeling.md](docs/seam_labeling.md)):
+boundaries between regions are first-class annotations. Vocabulary: a
+**seam** is a junction-to-junction chain of **cracks** (unit steps between
+pixel **corners** that separate two differently labelled pixels) between the
+same two **flanks**; a **junction** is a corner where >= 3 regions meet or a
+seam ends; a region's statistics row is its **descriptor**; "edge" keeps its
+existing meanings (the `edges` channel, the region-pair edge model). Seams are
+traced from the label raster's crack graph -- `msseg::extract_seam_graph`
+(`libs/core/msseg/graph/seam_graph.cpp`, no MSCEER; `mscoupon_py.seam_graph`)
+with a canonical output the numpy reference `msseg.labeler.seams` reproduces
+array for array (`packages/mscoupon/tests/test_seam_graph.py`), reached
+through `RegionProvider.seams(key, np)` -- NOT from MSCEER arc geometry: the
+crack lattice is segmentation-independent, so a stored **trace** re-resolves
+against a new decomposition by crack coverage (`seam_labeling.resolve_seams`,
+tau 0.5; scopes first, then traces, by uid). Tools (`tools.TraceController`,
+keys T / S / E / Enter / BackSpace): a **scope** box labels every seam inside
+it interior; a **trace** is a livewire (`seam_path.Livewire`: virtual anchor
+on any seam point, ONE Dijkstra over the junction graph per anchor, hover =
+predecessor walk) whose **toll** is `geometric` / `feature` / `bhattacharyya`
+/ `barrier` / `edges` (edge-model pdiff) / `model`. Seam gestures live in
+`LabelStore.seams` and serialize under `"seams"` with `"version": 3` only
+when present (a seam-less store is byte-identical to v2). The **seam model**
+(`seam_model.py`, `seam_classifier.SeamModelMixin`: pair terms on the flank
+descriptors or the base net's embedding + saddle barrier + pdiff + geometry,
+balanced logistic, leave-items-out Evaluate on the Optimize pump) scores
+every seam's **boundaryness** (the `model` toll, the boundaryness colouring)
+and rides the classifier pickle under `ModelBundle.seam`; **Export** writes
+`seams_<item>.json` + `seams_summary.csv`. The overlay paints both flank
+pixels of every crack through `_region_overlay` (mspath places it).
+
+**Region encoder, offline** (2026-09-15, [docs/design_region_autoencoder.md](docs/design_region_autoencoder.md)):
+a task-free latent of the statistics ROW, so the labeler's head is not the
+only thing that ever compresses it. `mspath-embed harvest --tiff-folder DIR
+--process-profile P.json --out H/ [--level 4]` primes slides tile by tile
+through `SlideEngine.prime_item` (tiles ranked by tissue, the per-level
+persistence pin written after the first tile and restored on resume, every
+tile recorded at `--factors 1,0.5,2` of the profile's persistence) into
+resumable `.npz` shards of rows + arcs; `mspath-embed train H/ --out E.msenc`
+(`msseg.labeler.embedding_train`) fits `n_row -> 64 -> 32 -> d` by InfoNCE
+whose positive is a random walk over the region arcs (spatial coherence as
+the label-free signal), plus a reconstruction head and a VICReg var/cov
+penalty, with schema-group dropout and marginal corruption as augmentation;
+`--arch pca` is trial zero. The `.msenc` bundle (`msseg.labeler.embedding.
+EncoderBundle`) applies with numpy alone and exposes the latent as
+`emb<hash8>__z..` columns so the name-set compat gate needs no new logic.
+NOT yet wired into the labeler, and the transfer probe is unbuilt.

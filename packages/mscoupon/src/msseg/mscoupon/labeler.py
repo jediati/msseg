@@ -120,10 +120,6 @@ class LabelerApp(AnnotationShell, MscouponApp):
                                     command=self._rerun_selection)
         self.rerun_btn.pack(side="left", padx=4)
 
-    def _image_window(self, _channel):
-        """One fractional window follows whichever image channel is active."""
-        return self.vmin_var.get(), self.vmax_var.get()
-
     def _feature_schema_now(self):
         try:
             return config_io.feature_schema(self._params_json())
@@ -421,10 +417,12 @@ def _selftest():
     assert app.rerun_btn.cget("text") == "update region simplification"
     assert app.show_pred_var.get(), "classification rendering is on by default"
 
-    # Window layout: a tabbed center. The left pane keeps the profile PICKER,
-    # the session and Run; the profile is EDITED on the Processing tab (two
-    # columns); the View tab is `app.right`; the model kind lives on the Model
-    # tab and is gone from the classifier panel.
+    # Window layout: three columns -- data navigation, `app.right` (the canvas
+    # and its controls), and a notebook of everything that is edited. The left
+    # column keeps the profile PICKER, the session and Run; the profile is
+    # EDITED on the Processing tab as one column of collapsible groups; the
+    # annotations and the classifier are the Annotation tab; the model kind
+    # lives on the Model tab and is gone from the classifier panel.
     def _under(w, ancestor):
         while w is not None:
             if w is ancestor:
@@ -433,15 +431,47 @@ def _selftest():
         return False
 
     tabs = [str(app.center.tab(t, "text")) for t in app.center.tabs()]
-    assert tabs == list(_CENTER_TABS) == ["Processing", "View", "Model", "Analysis"], tabs
-    assert app.center.nametowidget(app.center.select()) is app.right, \
-        "the View tab is selected at start"
-    assert app._center_tab_name() == "View"
+    assert tabs == list(_CENTER_TABS) == ["Processing", "Annotation", "Model",
+                                          "Analysis"], tabs
+    assert [str(p) for p in app.paned.panes()] \
+        == [str(app.left_pane), str(app.right), str(app.center)], "data | view | tabs"
+    assert _under(app.viewer.canvas, app.right), "the canvas is the middle column"
+    assert _under(app.label_pane, app.annot_tab), "the annotations are a tab now"
+    assert app._center_tab_name() == "Processing"
+    # Only the viewer pane has a weight, so a resize goes to the picture.
+    weights = [int(app.paned.pane(p, weight=None)) for p in app.paned.panes()]
+    assert weights == [0, 1, 0], weights
+    # The sashes are persisted as fractions (restored with the session doc
+    # below), and F9 folds the tab column away. A withdrawn root lays nothing
+    # out, so the fractions are the WANTED ones throughout -- what is checked
+    # here is the bookkeeping, not the pixels.
+    assert app._view_state()["panes"] == list(app._DEFAULT_PANES)
+    app._apply_pane_fractions([0.2, 0.5])
+    app.root.update_idletasks()
+    assert app._pane_fractions() == [0.2, 0.5]
+    app._apply_pane_fractions([0.5, 0.2])                  # sashes cannot cross
+    assert app._pane_fractions() == [0.2, 0.5], "an out-of-order pair is ignored"
+    app._apply_pane_fractions([9.0, 9.0])
+    assert app._pane_fractions() == [0.2, 0.5], "an absurd fraction is ignored"
+    assert app._toggle_center_tabs() == "break" and app._panes_collapsed
+    app._toggle_center_tabs(); app.root.update_idletasks()
+    assert not app._panes_collapsed
+    assert app._pane_fractions() == [0.2, 0.5], "F9 remembers where they were"
+    # Processing is ONE column of collapsible groups, and which are folded
+    # rides the session.
     for w in (app.filters_frame, app.base_frame, app.msc_frame, app.stats_frame,
               app.profile_load_btn):
         assert _under(w, app.processing_tab), w
-    assert app.filters_frame.master is app.base_frame.master is app.proc_col_a
-    assert app.msc_frame.master is app.stats_frame.master is app.proc_col_b
+    for w in (app.filters_frame, app.base_frame, app.msc_frame, app.stats_frame):
+        assert _under(w, app.proc_col), w
+    assert set(app._proc_groups) >= {"filters", "base", "msc", "stats"}
+    assert app._proc_open_state() == {}, "everything starts open"
+    app._proc_groups["msc"].toggle()
+    assert not app._proc_groups["msc"].is_open()
+    assert app._view_state()["proc_open"] == {"msc": False}
+    assert app._proc_groups["msc"].body.winfo_manager() == "", "the body is folded"
+    app._apply_proc_open({"msc": True})
+    assert app._proc_groups["msc"].is_open() and app._proc_open_state() == {}
     assert _under(app.profile_combo, app.left) and _under(app.run_btn, app.left_pane)
     assert not _under(app.profile_load_btn, app.left), "profile tools moved"
     # Left pane: Run pinned at the bottom (packed first, side=bottom), the
@@ -504,7 +534,9 @@ def _selftest():
     assert app._center_tab_name() == "Model"
     app._show_center_tab("nope")
     assert app._center_tab_name() == "Model", "an unknown name is ignored"
-    app.center.select(app.right)
+    app._show_center_tab("View")
+    assert app._center_tab_name() == "Model", "the retired View name is ignored"
+    app.center.select(app.processing_tab)
     app._clf, app._clf_names, app._clf_kind = object(), ["a", "b"], "random forest"
     assert app._model_hint_text().startswith("model: random forest · 2 feats")
     app._clf = None
@@ -520,7 +552,8 @@ def _selftest():
     assert any(isinstance(w, ttk.Button) and str(w.cget("text")).startswith("Train")
                for w in train_row.winfo_children()), "Train/Classify right under the hint"
 
-    # `app.right` IS the View tab, so the scan below reads unchanged.
+    # `app.right` is still the frame the viewer area packs into, so the scan
+    # below reads unchanged.
     right_rows = list(app.right.winfo_children())
     assert not any(isinstance(w, ttk.LabelFrame)
                    and str(w.cget("text")) == "Live parameters"
@@ -540,10 +573,25 @@ def _selftest():
     assert isinstance(overlay_children[master_idx + 1], ttk.Separator), \
         "a vertical separator must follow the overlay master"
     assert overlay_children[master_idx + 2] is app.show_regions_check
+    # One brightness window per channel: the sliders edit the channel on
+    # screen, a channel with nothing on the canvas yet is not cached, and F
+    # flips base <-> filtered (nothing derived remembered yet).
+    assert app.viewer.source is None
+    assert app._window_for("edges_s1") == (0.0, 1.0)
+    assert "edges_s1" not in app._channel_windows, "no source: nothing to measure, nothing cached"
+    assert app._window_channel == "edges_s1"
     app.vmin_var.set(0.2); app.vmax_var.set(0.8)
-    assert app._image_window("base") == (0.2, 0.8)
-    assert app._image_window("filtered") == (0.2, 0.8)
-    assert app._image_window("edges_s1") == (0.2, 0.8)
+    app._on_window_change()
+    assert app._channel_windows["edges_s1"] == (0.2, 0.8), "a moved slider is kept for that channel"
+    assert app._window_for("edges_s1") == (0.2, 0.8)
+    assert app._window_for("base") == (0.0, 1.0) and app.vmin_var.get() == 0.0, \
+        "the sliders follow the channel"
+    assert app.background_var.get() == "base"
+    assert app._on_swap_key() is None and app.background_var.get() == "filtered"
+    assert "(F: base)" in app.status_var.get(), app.status_var.get()
+    app._on_swap_key()
+    assert app.background_var.get() == "base" and app._swap_channel == "filtered"
+    app._channel_windows.clear(); app._window_channel = None; app._swap_channel = None
     app.vmin_var.set(0.0); app.vmax_var.set(1.0)
 
     # The labeler never needs more than the per-slice tier.
@@ -724,9 +772,10 @@ def _selftest():
     app.model_kind_var.set(_CUSTOM_EDGE_KIND)
     sdoc = app._session_doc()
     assert sdoc["view"]["center_tab"] == "Model"
+    assert sdoc["view"]["panes"] == [0.2, 0.5], sdoc["view"]["panes"]
     assert sdoc["view"]["model_kind"] == _CUSTOM_EDGE_KIND, "the picked kind rides the view"
     app.model_kind_var.set("dense FC")
-    app.center.select(app.right)
+    app.center.select(app.processing_tab)
     assert "labels" not in sdoc, "the gesture geometry is 'annotations' now"
     assert sdoc["annotations"]["n_classes"] == 2
     assert len(sdoc["annotations"]["interactions"]) == 2
@@ -734,6 +783,8 @@ def _selftest():
     app.store = LabelStore()             # clobber
     app._apply_session_doc(sdoc, "test")
     assert app._center_tab_name() == "Model", "the center tab restores by name"
+    app.root.update_idletasks()
+    assert app._pane_fractions() == [0.2, 0.5], "the sashes restore too"
     assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND, "the picked kind restores"
     bad = json.loads(json.dumps(sdoc))
     bad["view"]["model_kind"] = "no such kind"
@@ -741,7 +792,7 @@ def _selftest():
     assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND, "an unknown kind is ignored"
     sdoc["view"]["model_kind"] = kind_pick        # later re-applies keep the default
     app.model_kind_var.set(kind_pick)
-    app.center.select(app.right)
+    app.center.select(app.processing_tab)
     assert len(app.store.interactions) == 2
     assert all(it.bound for it in app.store.interactions), \
         "rebind by folder-qualified key"
@@ -753,9 +804,15 @@ def _selftest():
     legacy["view"] = dict(sdoc["view"], center_tab="bogus")   # unknown -> untouched
     app.store = LabelStore()
     app._apply_session_doc(legacy, "legacy key")
-    assert app._center_tab_name() == "View", "an unknown tab name is ignored"
+    assert app._center_tab_name() == "Processing", "an unknown tab name is ignored"
     assert len(app.store.interactions) == 2, \
         "a pre-rename session's 'labels' key still loads"
+    # ...and so does a session written before the View tab retired.
+    app.center.select(app.model_tab)
+    app._apply_session_doc(dict(legacy, view=dict(sdoc["view"], center_tab="View")),
+                           "pre-split view")
+    assert app._center_tab_name() == "Model", "the retired View name leaves the tab alone"
+    app.center.select(app.processing_tab)
 
     # Export writes annotations.json alongside the config(s).
     with tempfile.TemporaryDirectory() as td:
@@ -1017,6 +1074,29 @@ def _selftest():
         assert "-> edges" in app.status_var.get(), app.status_var.get()
         assert "-> edges" in app.model_strip_var.get() and "-> edges" in app.model_hint_var.get()
         assert "edges: logistic" in app.model_arch_var.get()
+        # The saddle-free pair model: `contact` (log shared boundary length,
+        # from the label raster) in, `barrier` out. Off by default, so the
+        # widths above are the historical ones.
+        assert not app.edge_feat_vars["contact"].get() and edge.spec.features == \
+            edge_model.DEFAULT_FEATURES
+        app.edge_feat_vars["contact"].set(True); app.edge_feat_vars["barrier"].set(False)
+        app._on_edge_settings_change()
+        assert "edge settings changed" in app.model_arch_var.get()
+        app._train_classifier()
+        edge_sf = app._edge_model
+        assert edge_sf is not None and edge_sf.spec.features == ("absdiff", "prod", "contact")
+        assert edge_sf.n_in == 9 and edge_sf.used_contact and not edge_sf.used_saddle
+        assert "contact lengths" in edge_sf.describe()
+        assert app.regions.arcs("data/s0.tiff", np).get("length") is not None, \
+            "contact lengths derived onto the arcs once"
+        app._classify()
+        pr_sf = app._pred.get(app.catalogue.key_of(0, 0))
+        assert len(pr_sf) == 4 and np.isfinite(app._pred_aux(pr_sf)["pdiff"]).all()
+        app.edge_feat_vars["contact"].set(False); app.edge_feat_vars["barrier"].set(True)
+        app._on_edge_settings_change()
+        app._train_classifier()
+        edge = app._edge_model
+        assert edge.n_in == 10 and edge.spec.features == edge_model.DEFAULT_FEATURES
         app._classify()
         pr = app._pred.get(app.catalogue.key_of(0, 0))
         assert len(pr) == 4, "the cache entry grows an aux dict with an edge model"
@@ -1129,7 +1209,8 @@ def _selftest():
         app.errors_tree.selection_set("0")
         app._on_error_row_open()
         app.root.update_idletasks()                    # the deferred centring
-        assert app._center_tab_name() == "View"
+        assert app._center_tab_name() == "Analysis", \
+            "the canvas is always on screen, so the list stays open"
         assert app._current() == (first["si"], first["li"])
         assert app._hover_key == (first["si"], first["li"], first["region"])
         assert app.status_var.get().startswith(f"region {first['region']}")
@@ -1817,6 +1898,266 @@ def _selftest():
     app.active_class_var.set(0)
     app.tool_var.set("squiggle")
 
+    # Rows of the sequence tree: the context menu's entries, a removal that
+    # asks first and takes the row's annotations and primed data with it
+    # (indices shift, keys do not), undo bringing the annotations back, and
+    # "clear annotations" per row and per class.
+    from unittest import mock as _mock
+    fx = list(app.subsequences[0]["files"])        # the fixture as it stands now
+    dx = os.path.dirname(fx[0])
+    rec_cur = app.engine.record(0, 0)
+    assert rec_cur is not None, "the fixture record is stale"
+    assert app.primed[0]["files"] == fx, "the fixture is not primed as listed"
+    n_on = len(app.store.for_slice("data/s0.tiff"))
+    n_all = len(app.store.interactions)
+    assert n_on >= 2
+    assert app._seq_tree_row("q1:0") == (1, 0) and app._seq_tree_row("q1") == (1, None)
+    assert app._seq_tree_row("x1") is None and app._seq_tree_row("") is None
+    assert app._seq_tree_context(_FakeEvent(0, -1)) is None, "no row under the pointer: no menu"
+    labels = [e[0] if e else None for e in app._seq_tree_menu_entries(0, 0)]
+    assert labels == ["Go to", None, f"Clear annotations\u2026 ({n_on})", "Remove slice\u2026"], labels
+    labels = [e[0] if e else None for e in app._seq_tree_menu_entries(0, None)]
+    assert labels[-1] == "Remove sequence\u2026" and labels[0] == "Go to", labels
+    assert app._row_owns_key(0, 0, "data/s0.tiff") and app._row_owns_key(0, None, "data/s0.tiff")
+    assert not app._row_owns_key(0, 0, "data/other.tiff") and not app._row_owns_key(0, 0, None)
+    # A second sequence holding the SAME slice: the key is the slice, so the
+    # annotations belong to both and go only when the last one does.
+    app.subsequences.append({"name": "seq2", "folder": "data", "files": list(fx)})
+    app.primed.append({"files": list(fx), "base": [zeros], "filtered": [zeros],
+                       "pipes": [None], "normalizers": [[]]})
+    app._slices[(1, 0)] = dict(rec_cur)
+    app._rebuild_flat_slices(); app._refresh_subseq_list(); app._goto_slice(0)
+    assert app._doomed_interactions([(1, None)]) == [], "the slice is still in seq1"
+    assert "No annotations" in app._remove_rows_message([(1, None)])
+    assert len(app._doomed_interactions([(0, None), (1, None)])) == n_on
+    assert f"The {n_on} annotation(s)" in app._remove_rows_message([(0, None), (1, None)])
+    assert "slice 's0.tiff' of sequence" in app._remove_rows_message([(0, 0)])
+    with _mock.patch.object(messagebox, "askyesno", return_value=False):
+        assert not app._remove_rows_guarded([(1, None)]), "declined: nothing happens"
+    assert len(app.subsequences) == 2 and len(app.primed) == 2
+    app.engine.asm_running = True
+    with _mock.patch.object(messagebox, "askyesno",
+                            side_effect=AssertionError("must not ask while busy")):
+        assert not app._remove_rows_guarded([(1, None)])
+    assert "Busy" in app.status_var.get()
+    app.engine.asm_running = False
+    with _mock.patch.object(messagebox, "askyesno", return_value=True):
+        assert app._remove_rows_guarded([(1, None)])
+    assert len(app.subsequences) == 1 and len(app.primed) == 1
+    assert app.flat_slices == [(0, 0)] and (1, 0) not in app._slices
+    assert len(app.store.interactions) == n_all, "shared slice: the annotations stayed"
+    # The item on screen survives a removal in FRONT of it: its record, its
+    # annotations' hints and the navigation all shift down with it.
+    z = [os.path.join(dx, "z.tiff")]
+    app.subsequences.insert(0, {"name": "seq0", "folder": "data", "files": z})
+    app.primed.insert(0, {"files": z, "base": [zeros], "filtered": [zeros],
+                          "pipes": [None], "normalizers": [[]]})
+    app._slices = {(1, 0): rec_cur}
+    app._rebuild_flat_slices(); app._goto_slice(1)
+    app.store.rebind(app.subsequences)
+    assert app._current() == (1, 0) and app.store.for_slice("data/s0.tiff")[0].si == 1
+    assert app._slice_msc_mark(0, 0) == "Y"
+    assert app._remove_rows([(0, None)]) == 1
+    assert app._current() == (0, 0) and app.subsequences[0]["name"] == "seq1"
+    assert app.primed[0]["files"] == fx and app._slices == {(0, 0): rec_cur}, \
+        "the primed entry and the record moved with their sequence"
+    assert all(it.si == 0 for it in app.store.for_slice("data/s0.tiff")), "hints rebound"
+    assert len(app.store.interactions) == n_all
+    # A slice of a primed sequence: its raster and record go, the rest shift.
+    s1 = os.path.join(dx, "s1.tiff")
+    two = fx + [s1]
+    app.subsequences[0]["files"] = list(two)       # a copy: the removal deletes from it
+    app.primed[0] = {"files": list(two), "base": [zeros, zeros], "filtered": [zeros, zeros],
+                     "pipes": [None, None], "normalizers": [[], []]}
+    app._slices = {(0, 0): {"commit": app._commit_id, "labels": None},
+                   (0, 1): rec_cur}
+    app.engine.assembly[0] = {"_commit": app._commit_id}
+    app._rebuild_flat_slices(); app._goto_slice(1)
+    assert app._remove_rows([(0, 0)]) == 1
+    assert app.subsequences[0]["files"] == [s1] and app.primed[0]["files"] == [s1]
+    assert len(app.primed[0]["pipes"]) == 1 and app._slices == {(0, 0): rec_cur}
+    assert 0 not in app.engine.assembly, "the 3D assembly spanned the removed slice"
+    assert app._current() == (0, 0) and app._slice_msc_mark(0, 0) == "Y"
+    app.subsequences[0]["files"] = list(fx)     # a copy: the removal deletes from it
+    app.primed[0]["files"] = list(fx)
+    app._rebuild_flat_slices(); app._goto_slice(0)
+    app.store.rebind(app.subsequences)
+    # Removing the slice itself takes its annotations; undo brings them back,
+    # greyed, since the slice is gone.
+    with _mock.patch.object(messagebox, "askyesno", return_value=True):
+        assert app._remove_rows_guarded([(0, 0)])
+    assert app.subsequences == [] and app.primed == [] and app.flat_slices == []
+    assert len(app.store.interactions) == n_all - n_on
+    assert "annotation(s)" in app.status_var.get()
+    app._undo()
+    assert len(app.store.interactions) == n_all
+    assert not any(it.bound for it in app.store.for_slice("data/s0.tiff"))
+    # The fixture, back.
+    app.subsequences = [{"name": "seq1", "folder": "data", "files": fx}]
+    app.primed = [{"files": fx, "base": [zeros], "filtered": [zeros],
+                   "pipes": [None], "normalizers": [[]]}]
+    app._slices = {(0, 0): rec_cur}
+    app._rebuild_flat_slices(); app._goto_slice(0)
+    app.store.rebind(app.subsequences)
+    app._rebuild_class_panels()
+    assert all(it.bound for it in app.store.for_slice("data/s0.tiff"))
+    # Clear per class (every item) and per row: guarded, one undo step each,
+    # and the tree's annot column follows.
+    app.active_class_var.set(1); app._commit_interaction("taps", [(5.0, 5.0)])
+    app.active_class_var.set(2); app._commit_interaction("taps", [(15.0, 15.0)])
+    app.active_class_var.set(0)
+    n_on = len(app.store.for_slice("data/s0.tiff"))
+    n_all = len(app.store.interactions)
+    k1, k2 = len(app.store.for_class(1)), len(app.store.for_class(2))
+    assert k1 and k2
+    assert set(app._class_clear_buttons) == set(range(1, app.store.n_classes))
+    with _mock.patch.object(messagebox, "askyesno", return_value=False):
+        assert not app._clear_class_guarded(1)
+    assert len(app.store.for_class(1)) == k1
+    with _mock.patch.object(messagebox, "askyesno", return_value=True):
+        assert app._clear_class_guarded(1)
+    assert not app.store.for_class(1) and len(app.store.for_class(2)) == k2
+    assert not app._clear_class_guarded(1) and "no annotations" in app.status_var.get()
+    app._undo()
+    assert len(app.store.for_class(1)) == k1 and len(app.store.interactions) == n_all
+    assert app.subseq_list.item("q0:0", "values")[1] == str(n_on)
+    with _mock.patch.object(messagebox, "askyesno", return_value=True):
+        assert app._clear_row_annotations_guarded(0, 0)
+    assert len(app.store.interactions) == n_all - n_on
+    assert app.subseq_list.item("q0:0", "values")[1] == ""
+    assert not app._clear_row_annotations_guarded(0, 0) and "No annotations" in app.status_var.get()
+    app._undo()
+    assert len(app.store.interactions) == n_all
+    assert app.subseq_list.item("q0:0", "values")[1] == str(n_on)
+
+    # Neighbourhood context (msseg.labeler.context): ring columns join every
+    # row by name, so the model, the gate, the pickle and the session all see
+    # them as ordinary columns -- and an empty spec leaves the fingerprint
+    # exactly what it was.
+    from msseg.labeler import context as _cx
+    app._expected_feature_names = lambda: ["area", "mean_base"]
+    app.model_kind_var.set("dense FC")
+    ctx_spec = _cx.ContextSpec(kinds=("ring_mean", "ring_contrast"),
+                               weights=("uniform", "contact"))
+    app._apply_context_spec(ctx_spec)
+    assert app._context_spec_from_ui() == ctx_spec
+    assert "ring(mean,contrast)" in app.model_arch_var.get()
+    app._train_classifier()
+    assert app._clf_names[:2] == ["area", "mean_base"], app._clf_names
+    assert app._clf_names[2:] == _cx.column_names(ctx_spec, ["area", "mean_base"]), \
+        app._clf_names
+    assert "ring_mean[contact]__mean_base" in app._clf_names
+    assert app._clf_context == ctx_spec, "the spec the model was fit under rides with it"
+    assert "ctx: ring(mean,contrast) [uniform,contact]" in app.model_strip_var.get()
+    assert "mismatch" not in app.model_strip_var.get(), \
+        "the gate expects the model's own context columns"
+    assert app._check_model_compat(app._clf_names, "t") is None
+    arcs_now = app.regions.arcs("data/s0.tiff", np)
+    assert arcs_now.get("length") is not None, "contact lengths derived once and cached"
+    app._classify()
+    assert app._pred and len(next(iter(app._pred.values()))) == 3, "plain entries"
+    # The pickle carries the spec (only when there is one) and a load restores
+    # it -- onto the model AND the Model tab -- after the gate has passed.
+    ctx_td = tempfile.mkdtemp()
+    ctx_path = os.path.join(ctx_td, "ctx.pkl")
+    app._save_classifier_to(ctx_path)
+    assert app.models[-1]["context"] == ctx_spec.to_dict()
+    assert model_bundle.ModelBundle.load(ctx_path).stack["context"] == ctx_spec.to_dict()
+    app._apply_context_spec(_cx.ContextSpec())               # the tab moves off
+    assert "context changed" in app.model_arch_var.get()
+    app._load_classifier_from(ctx_path)
+    assert app._clf_context == ctx_spec and app._context_spec_from_ui() == ctx_spec
+    assert app.context_kind_vars["ring_mean"].get() and app.context_weight_vars["contact"].get()
+    app._classify()
+    assert app._pred, "a reloaded context model classifies"
+    # A different spec on the tab is the NEXT model, not this one: the
+    # readout says so and the gate still judges the loaded model by its own.
+    app.context_kind_vars["ring_std"].set(True); app._on_context_settings_change()
+    assert "context changed" in app.model_arch_var.get()
+    assert app._check_model_compat(app._clf_names, "t") is None
+    assert app._view_state()["context"]["kinds"] == ["ring_mean", "ring_std", "ring_contrast"], \
+        "the picked context rides the session view, kinds in canonical order"
+    # A context-free pickle refuses the fingerprint of a context model, and
+    # vice versa: the columns are part of the schema.
+    assert app._check_model_compat(["area", "mean_base"], "t", ctx=ctx_spec) is not None
+    assert app._check_model_compat(app._clf_names, "t", ctx=_cx.ContextSpec()) is not None
+    # Back to a plain model: the fingerprint is exactly the old one and the
+    # pickle document has no context key at all.
+    app._apply_context_spec(_cx.ContextSpec())
+    app._train_classifier()
+    assert app._clf_names == ["area", "mean_base"] and app._clf_context.empty()
+    plain_path = os.path.join(ctx_td, "plain.pkl")
+    app._save_classifier_to(plain_path)
+    assert "context" not in model_bundle.ModelBundle.load(plain_path).stack
+    assert "context" not in app.models[-1]
+    # The latent-ring head: a second net on the base's embedding of the ring,
+    # fit after the base (a dense net embeds; a forest cannot). It makes the
+    # prediction, adds nothing to the fingerprint, rides the pickle as
+    # stack["latent"] and comes back with the base it was fit on.
+    lat_spec = _cx.ContextSpec(latent=_cx.LatentSpec(weight="latent", h0=True))
+    app._apply_context_spec(lat_spec)
+    assert app.context_latent_var.get() and app._context_spec_from_ui() == lat_spec
+    assert "context changed" in app.model_arch_var.get()
+    app._train_classifier()
+    lat = app._context_model
+    assert lat is not None, app.status_var.get()
+    assert app._clf_names == ["area", "mean_base"], "latent columns are not in the fingerprint"
+    assert lat.names[:2] == ["area", "mean_base"] and lat.names[-4:] == list(_cx.H0_NAMES)
+    assert lat.width == _MLP_HIDDEN[-1] and lat.n_in == 2 + lat.width + 4
+    assert "latent(mean[latent],h0)" in app.status_var.get(), app.status_var.get()
+    assert "latent head on" in app.model_arch_var.get()
+    assert app._check_model_compat(app._clf_names, "t") is None
+    app._classify()
+    assert app._pred and len(next(iter(app._pred.values()))) == 3
+    lat_path = os.path.join(ctx_td, "latent.pkl")
+    app._save_classifier_to(lat_path)
+    assert "latent" in model_bundle.ModelBundle.load(lat_path).stack
+    app._context_model = None
+    app._load_classifier_from(lat_path)
+    assert app._context_model is not None and app._clf_context == lat_spec
+    assert app._context_model.net_hash == lat.net_hash
+    app._classify()
+    assert app._pred, "a reloaded latent head classifies"
+    # A forest has no embedding: the head is skipped with a note, the base predicts.
+    app.model_kind_var.set("random forest")
+    app._train_classifier()
+    assert app._context_model is None and "latent head skipped" in app.status_var.get()
+    app._classify()
+    assert app._pred
+    app.model_kind_var.set("dense FC")
+    app._apply_context_spec(_cx.ContextSpec())
+    app._train_classifier()
+    assert app._context_model is None and app._clf_context.empty()
+    # Labels as context: the ring's annotated classes are columns (the
+    # region's own never is), the fingerprint grows by them, and predictions
+    # are dropped the moment the store changes, since they depend on it.
+    app._apply_context_spec(_cx.ContextSpec(labels=_cx.LabelSpec(dropout=0.0)))
+    got_spec = app._context_spec_from_ui()
+    assert got_spec.labels is not None and got_spec.labels.dropout == 0.0
+    app._train_classifier()
+    lab_names = _cx.column_names(got_spec, ["area", "mean_base"])
+    assert app._clf_names == ["area", "mean_base"] + lab_names and lab_names[-1] == "nbr_class__any"
+    assert "labels(p=0)" in app.model_strip_var.get()
+    assert app._check_model_compat(app._clf_names, "t") is None
+    app._classify()
+    assert app._pred and app._pred_store_rev == app.store.rev
+    rev0 = app.store.rev
+    app.active_class_var.set(1); app._commit_interaction("taps", [(5.0, 5.0)])
+    app.active_class_var.set(0)
+    assert app.store.rev != rev0 and not app._pred, "annotating drops label-context predictions"
+    app._undo()
+    assert not app._pred
+    app._classify()
+    assert app._pred, "Classify rebuilds them from the current annotations"
+    app._apply_context_spec(_cx.ContextSpec())
+    app._train_classifier()
+    assert app._clf_names == ["area", "mean_base"] and app._clf_context.empty()
+    app._classify()
+    app.active_class_var.set(1); app._commit_interaction("taps", [(5.0, 5.0)])
+    app.active_class_var.set(0)
+    assert app._pred, "without labels in the context, annotating keeps the predictions"
+    app._undo()
+
     # A re-prime (engine "done") bumps the commit, so every commit-keyed cache
     # (per-slice records, class LUTs, predictions) self-invalidates -- the
     # "stale overlays after adding a folder and re-running" regression.
@@ -1824,6 +2165,144 @@ def _selftest():
     app.engine.work_q.put(("done", []))
     app.engine.poll()
     assert app._commit_id == c0 + 1, "re-prime must bump the commit"
+
+    # -- Seam tools: scope box, livewire trace, resolution, overlay, session -- #
+    # A fresh one-slice fixture (the four sparse-id blocks) at the current
+    # commit; the seam graph comes from the compiled extension when present,
+    # else the numpy reference, through the provider.
+    from msseg.labeler.seams import SEAM_BOUNDARY, SEAM_INTERIOR
+    from .common import FeatureTable as _FT
+    lab_s = np.full((20, 20), -1, np.int32)
+    lab_s[2:10, 2:10] = 0; lab_s[2:10, 10:18] = 2
+    lab_s[10:18, 2:10] = 5; lab_s[10:18, 10:18] = 9
+    ids_s = np.array([0, 2, 5, 9], np.float64)
+    table_s = _FT(["feature_id", "area", "mean_base", "std_base", "ext_filtered",
+                   "ext_x", "ext_y"],
+                  np.stack([ids_s, np.full(4, 64.0), np.array([0.0, 1.0, 5.0, 6.0]),
+                            np.ones(4), np.array([0.0, 1.0, 5.0, 6.0]),
+                            np.array([5.0, 13.0, 5.0, 13.0]),
+                            np.array([5.0, 5.0, 13.0, 13.0])], axis=1))
+    rec_s = {"commit": app._commit_id, "labels": lab_s, "stats": table_s,
+             "kept": set(), "cc": None, "n_feat": 4}
+    app._slices[(0, 0)] = rec_s
+    for _sl in app.flat_slices:           # every listed slice has a record
+        app._slices.setdefault(tuple(_sl), dict(rec_s))
+    app._pred = {}
+    app._clear_seam_caches()
+    key_s = app.catalogue.key_of(0, 0)
+    v = app.viewer
+    v.view_x, v.view_y, v.scale = 0.0, 0.0, 1.0
+    ctrl = v.tool
+    tc = ctrl.trace
+    g_s = app.regions.seams(key_s, np)
+    assert g_s is not None and g_s.n_seams == 4 and rec_s.get("_seams") is g_s
+    assert app.regions.seams(key_s, np) is g_s, "the seam graph is cached on the record"
+    n_seams0 = len(app.store.seams)
+    from msseg.viz import min_colors as _mc_s
+
+    class _KeyEv:            # a toplevel key event whose widget is the canvas
+        widget = v.canvas
+
+    # Scope: a box over everything -> every seam interior, previewed on the
+    # transient layer with the HUD saying how many.
+    app.tool_var.set("scope"); app.seam_class_var.set(SEAM_INTERIOR)
+    assert ctrl.on_press(_FakeEvent(1, 1)) and tc.active
+    assert ctrl.on_move(_FakeEvent(19, 19))
+    assert v._transient is not None and v._hud_mode == "info", (v._hud_mode, v._hud_text)
+    assert "scope: 4 seams" in v._hud_text, v._hud_text
+    assert ctrl.on_release(_FakeEvent(19, 19))
+    assert v._transient is None and not tc.active and v._hud_mode is None
+    assert len(app.store.seams) == n_seams0 + 1 and app.store.seams[-1].tool == "scope"
+    assert app.store.seams[-1].meta["seams"] == 4
+    _g, cls_s = app._seam_classes_for(0, 0, np)
+    assert (cls_s == SEAM_INTERIOR).all()
+    ovs_s = app._seg_overlays(0, 0, rec_s, None, np, _mc_s)
+    seam_ov = ovs_s[-1]
+    assert int(seam_ov["lut"][:, 3].max()) == 255 and seam_ov["labels"].shape == (20, 20)
+    assert seam_ov["labels"][5, 9] >= 0 and seam_ov["labels"][5, 10] >= 0, "both flanks lit"
+    assert seam_ov["labels"][5, 5] < 0
+
+    # Trace: a press near the 0|2 seam (x = 10) anchors; hovering shows the
+    # path; a click at the centre junction and one at the right edge add
+    # legs; Enter commits ONE trace in the boundary class.
+    app.tool_var.set("trace"); app.seam_class_var.set(SEAM_BOUNDARY)
+    assert app.seam_toll_var.get() == "feature"
+    assert ctrl.on_press(_FakeEvent(10, 3)) and tc.active
+    assert v._hud_mode == "info" and "trace feature" in v._hud_text, v._hud_text
+    tc.on_hover(10, 9)
+    assert tc._s["hover"] is not None and tc._s["hover"][1] is not None
+    assert len(v.canvas.find_withtag("trace")) >= 2, "the hover leg and the anchor are drawn"
+    assert ctrl.on_press(_FakeEvent(10, 10)) and len(tc._s["lw"].legs) == 1
+    assert ctrl.on_press(_FakeEvent(18, 10)) and len(tc._s["lw"].legs) == 2
+    assert app._on_trace_commit_key(_KeyEv()) == "break"
+    assert not tc.active and v._transient is None and v._hud_mode is None
+    assert len(app.store.seams) == n_seams0 + 2
+    tr_s = app.store.seams[-1]
+    assert tr_s.tool == "trace" and tr_s.class_id == SEAM_BOUNDARY
+    assert tr_s.points == [(10.0, 3.0), (10.0, 10.0), (18.0, 10.0)], tr_s.points
+    assert tr_s.meta["seams"] == 2 and tr_s.meta["anchors"] == 3
+    assert tr_s.meta["toll"] == "feature"
+    assert tr_s.meta["scoped"], "anchored inside the scope that covers everything"
+    _g, cls_s = app._seam_classes_for(0, 0, np)
+    idx_s = {(int(a), int(b)): i for i, (a, b) in enumerate(zip(_g.a, _g.b))}
+    assert cls_s[idx_s[(0, 2)]] == SEAM_BOUNDARY and cls_s[idx_s[(2, 9)]] == SEAM_BOUNDARY
+    assert cls_s[idx_s[(0, 5)]] == SEAM_INTERIOR and cls_s[idx_s[(5, 9)]] == SEAM_INTERIOR
+    assert "2 boundary, 2 interior" in app.seam_readout_var.get(), app.seam_readout_var.get()
+    assert len(app._seam_rows) == 2, "the panel lists this slice's seam gestures"
+    # Undo / redo take the whole trace.
+    app._undo()
+    assert len(app.store.seams) == n_seams0 + 1
+    app._redo()
+    assert len(app.store.seams) == n_seams0 + 2
+    # A trace anchored inside a scope is confined to it (the scope covers
+    # everything here, so the search is merely flagged as scoped).
+    assert ctrl.on_press(_FakeEvent(10, 3)) and tc._s["restricted"]
+    # BackSpace drops a leg, Escape abandons; a press far from any seam and a
+    # toll without its input are refused (fall through to the pan).
+    assert ctrl.on_press(_FakeEvent(10, 10)) and len(tc._s["lw"].legs) == 1
+    assert app._on_trace_back_key(_KeyEv()) == "break" and len(tc._s["lw"].legs) == 0
+    app._on_escape()
+    assert not tc.active and v._transient is None
+    assert not ctrl.on_press(_FakeEvent(0, 0)), "no seam within reach"
+    app.seam_toll_var.set("model")
+    assert not ctrl.on_press(_FakeEvent(10, 3)) and "seam model" in app.status_var.get()
+    app.seam_toll_var.set("feature")
+    assert app._on_trace_commit_key(_KeyEv()) is None, "Enter with no trace in flight passes"
+    # The session document carries the seams (v3) and the view state the toll.
+    doc_s = app._session_doc()
+    assert doc_s["annotations"]["version"] == 3 and len(doc_s["annotations"]["seams"]) == 2
+    assert doc_s["view"]["seams"]["toll"] == "feature" and doc_s["view"]["tool"] == "trace"
+    app.seam_toll_var.set("barrier"); app.show_seams_var.set(False)
+    app._apply_seams_view(doc_s["view"]["seams"])
+    assert app.seam_toll_var.get() == "feature" and app.show_seams_var.get()
+    # The seam model: fit on the two boundary + two interior seams, every
+    # seam scored, the 'model' toll then accepted, the boundaryness colouring
+    # shown, and the export written.
+    try:
+        import sklearn  # noqa: F401
+    except ImportError:
+        sklearn = None
+    if sklearn is not None:
+        app._train_seam_model()
+        assert app._seam_model is not None, app.status_var.get()
+        assert key_s in app._seam_pred and len(app._seam_pred[key_s][1]) == 4
+        app.seam_toll_var.set("model")
+        assert ctrl.on_press(_FakeEvent(10, 3)) and tc.active
+        app._on_escape()
+        app.seam_toll_var.set("feature")
+        app.seam_color_var.set(_SEAM_MODE_BOUNDARYNESS)
+        ovs_b = app._seg_overlays(0, 0, rec_s, None, np, _mc_s)
+        assert ovs_b[-1]["lut"].shape == (4, 4) and int(ovs_b[-1]["lut"][:, 3].max()) > 0
+        app.seam_color_var.set(_SEAM_MODE_CLASS)
+        with tempfile.TemporaryDirectory() as td_s:
+            n_it, n_sm = app._export_seams_to(td_s)
+            assert n_it >= 1 and n_sm >= 4, (n_it, n_sm)
+            assert os.path.isfile(os.path.join(td_s, "seams_summary.csv"))
+            assert any(f.startswith("seams_") and f.endswith(".json") for f in os.listdir(td_s))
+        assert "logistic" in app.seam_readout_var.get(), app.seam_readout_var.get()
+    # Row helpers see seam gestures too.
+    assert len(app._row_interactions(0, 0)) >= 2
+    app.tool_var.set("squiggle")
 
     # New session: data, sequences, primed stacks and annotations go; the
     # profiles and the model selection stay when asked to, and the model in
@@ -1840,6 +2319,7 @@ def _selftest():
     assert app.folders == [] and app.subsequences == [] and not app.primed
     assert not app.flat_slices and not app._pred
     assert app.store.interactions == [] and app.store.n_classes == n_cls
+    assert app.store.seams == [], "a new session drops the seam gestures too"
     assert [p["name"] for p in app.profiles] == prof_names
     assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND
     assert app.custom_hidden_var.get() == "4"
@@ -1867,7 +2347,10 @@ def _selftest():
           "magic fill, blobber, hop gain + drag + cosine/proba metrics, "
           "center notebook + model tab, toolbar hints, optimize network, size sweep, "
           "edge kinds, analysis tab + region list, panel diffing (no rebuild "
-          "on a commit)")
+          "on a commit), tree context menu + guarded row removal + clear per "
+          "row / per class, context columns + their pickle/gate/session ride, "
+          "saddle-free contact edges, latent ring head, labels as context, "
+          "seam tools: scope + livewire trace + resolution + overlay + seam model + export")
     return 0
 
 

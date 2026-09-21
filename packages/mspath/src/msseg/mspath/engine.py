@@ -216,8 +216,11 @@ class SlideEngine:
         method = default_color_method(profile)
         cur, rest = ComputeEngine._leading_color(arr, profile.get("filters") or [], ext, say,
                                                  method)
-        for f in rest:
-            cur = ext.filter_slice(cur, json.dumps({"filter": f}))
+        # One call for the remainder: core plans what it is handed, and a stage
+        # passed alone is a chain of one, which can plan differently from the
+        # same stage inside its chain.
+        if rest:
+            cur = ext.filter_chain(cur, json.dumps({"filters": rest}), method)
         filtered = np.ascontiguousarray(cur, dtype=np.float32)
         base, _norms = ComputeEngine._apply_base_chain(
             arr, profile.get("base_filters") or [], ext, say, method)

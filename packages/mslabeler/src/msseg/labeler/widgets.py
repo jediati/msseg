@@ -4,6 +4,11 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
+# Focus-widget classes whose keystrokes must not fire hotkeys (typing "1" into
+# the persistence entry is not a request to arm class 1).
+TYPING_CLASSES = ("Entry", "TEntry", "Spinbox", "TSpinbox", "TCombobox",
+                  "Listbox", "Text")
+
 
 def _wheel_delta(event):
     """Scroll units for one wheel event, normalized across platforms.
@@ -34,6 +39,61 @@ def _bind_click_to_value(scale):
         return "break"
     scale.bind("<Button-1>", jump)
     scale.bind("<B1-Motion>", jump)
+
+
+class Collapsible(ttk.Frame):
+    """A titled group of rows that folds away behind its header.
+
+    A parameter panel laid out as ONE tall column only works if the parts you
+    are not editing can be put away -- the filter chain alone grows a card per
+    stage. The header is a full-width flat button, so the whole strip is the
+    hit target and the keyboard reaches it; `.body` is what rows pack into,
+    exactly as they would pack into a `ttk.LabelFrame`.
+    """
+
+    _OPEN, _SHUT = "▾", "▸"          # small down / right triangles
+
+    def __init__(self, parent, text="", open=True, on_toggle=None):
+        super().__init__(parent)
+        self._title = str(text)
+        self._open = bool(open)
+        self._on_toggle = on_toggle
+        try:
+            self._btn = ttk.Button(self, style="Toolbutton", command=self.toggle)
+        except tk.TclError:                     # a theme without Toolbutton
+            self._btn = ttk.Button(self, command=self.toggle)
+        self._btn.pack(fill="x")
+        self.body = ttk.Frame(self)
+        self._sync()
+
+    def _sync(self):
+        arrow = self._OPEN if self._open else self._SHUT
+        try:
+            self._btn.config(text=f"{arrow} {self._title}")
+        except tk.TclError:
+            return
+        if self._open:
+            self.body.pack(fill="x", padx=(10, 2), pady=(0, 4))
+        else:
+            self.body.pack_forget()
+
+    def toggle(self):
+        self.set_open(not self._open)
+
+    def set_open(self, value):
+        value = bool(value)
+        if value == self._open:
+            return
+        self._open = value
+        self._sync()
+        if self._on_toggle is not None:
+            self._on_toggle(value)
+
+    def is_open(self):
+        return self._open
+
+    def title(self):
+        return self._title
 
 
 class ScrollFrame(ttk.Frame):

@@ -2,6 +2,7 @@
 
 #include <array>
 #include <map>
+#include <set>
 #include <utility>
 #include <optional>
 #include <string>
@@ -112,6 +113,30 @@ struct StatsSpec {
   std::vector<StatChannelRequest> derived;
   // The raw input planes as measurement channels (`color_c0`, `color_c1`, ...).
   bool color_channel = false;
+  // Named measurement SOURCES: a small filter chain over the input planes whose
+  // output planes become measurable, the way `color` already is.
+  //
+  // This is what lets a workflow measure something the pipeline does not already
+  // hold. `{"he": [stain_deconvolution]}` makes hematoxylin and eosin
+  // concentrations first-class channels (`he_c0`, `he_c1`, and every derived
+  // response over them), so nucleus density becomes a classifier feature rather
+  // than only something removed from the topology field.
+  //
+  // It is deliberately NOT "let the base be a stack". `base` has a role beyond
+  // being a raster -- it is the one `relevance` is measured on, the one the
+  // per-slice CSV reports, and the one a pixel filter means by "base" -- and a
+  // measurement source needs none of that. A source is measured and nothing
+  // else, so it costs a name and a plane count.
+  //
+  // Ordered, because the map's order is the channel order and therefore the CSV
+  // column order. Each chain is planned with `plan_chain`, so its plane count is
+  // DERIVED rather than declared -- unlike `color_channels`, which has to be
+  // asserted in config and re-checked against every slice.
+  std::map<std::string, std::vector<FilterParams>> sources;
+  // Which named sources contribute their RAW planes as channels (`he_c0`, ...),
+  // the way `color_channel` does for the input stack. A source may be declared
+  // purely to carry derived responses, so this is separate from `sources`.
+  std::set<std::string> source_channel;
   // Planes the colour source has (`input.color.channels`). The schema must be
   // computable with no raster in hand -- config validation, the CSV header,
   // the GUI pickers -- so this is a declared fact, verified against every
@@ -135,10 +160,14 @@ struct StatsSpec {
 
   bool any_aggregate() const { return mean || min || max || std; }
   // Whether any measurement channel reads the input's colour planes.
+  // Whether anything reads the input's colour planes -- directly, or through a
+  // named source, whose chain runs over them.
   bool uses_color() const {
     if (color_channel) return true;
+    if (!source_channel.empty()) return true;
     for (const auto& r : derived) {
       if (r.source == "color") return true;
+      if (sources.count(r.source)) return true;
     }
     return false;
   }

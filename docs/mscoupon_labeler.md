@@ -29,19 +29,56 @@ chosen channel (filter chain, base chain, or a derived scale-space response)
 on that preview, so a profile can be judged before any Run. A colour TIFF
 previews as RGB, with `color` / `color_c<i>` entries beside the channels; its
 chains start with a `color` card (see [mscoupon_gui.md](mscoupon_gui.md),
-"Colour input"). The **right**
-pane is annotation management (classes, tools, the
-Magic rows, the per-class interaction lists, Save/Load annotations) and the
-classifier (Train/Classify, the model strip, the confusion matrix, exports,
-Save/Load classifier). The **center** is a notebook whose inactive tabs are
-hidden:
+"Colour input"). The **middle** column is the slice itself -- always on screen,
+whatever you are editing -- and the **right** column is a notebook of the
+things you edit.
 
-| tab | holds |
+| column / tab | holds |
 |---|---|
-| **Processing** | the profile tools (New/Dup/Rename/Delete, Save/Load profile) and the profile being edited, in two columns: filter chain + base channel, MSC parameters + statistics channels |
-| **View** (default) | the slice canvas, hover readout, slice navigation, image/overlay/alpha controls and the persistence entry |
+| **left** | the compute-profile picker, the session browser (folders, files, sequences) and Run |
+| **middle** | the slice canvas, hover readout, slice navigation, image/overlay/alpha controls and the persistence entry |
+| **Processing** (default tab) | the profile tools (New/Dup/Rename/Delete, Save/Load profile) and the profile being edited, as one column of collapsible groups: colour input, filter chain, base channel, MSC parameters, statistics channels |
+| **Annotation** | classes, tools, the Magic rows, the per-class interaction lists, Save/Load annotations, and the classifier (Train/Classify, the model strip, the confusion matrix, exports, Save/Load classifier) |
 | **Model** | the classifier kind, a read-only description of its architecture, the **Edge model** panel (the `-> edges` kinds) and the **Optimize network** search (trials, time limit, seed, feature-subset toggle, progress line) |
 | **Analysis** | **Predictions vs annotations** (the regions behind a confusion cell; double-click a row to go there) and the **Size sweep** report; a home for plots later |
+
+The three columns start at about **1:3:2**, and **only the middle one grows**:
+widen the window and every new pixel goes to the picture. Drag either sash to
+change the proportions -- they are remembered with the session as fractions of
+the width, so they restore sanely into a differently sized window -- and press
+**F9** to fold the tab column away entirely, F9 again to bring it back.
+
+Each Processing group folds away behind its title, and which ones are shut is
+remembered too. That is what makes one column work: the filter chain alone
+grows a card per stage, so all five groups open is about 850 px of panel and
+all five shut is 135 px.
+
+The canvas used to be a tab of its own, beside Processing. A filter chain is
+judged by *looking* at what it produces, and that made the judging a round trip
+-- edit, switch, squint, switch back, and no way to tell whether what was on
+screen reflected the edit. So the picture is never the thing that is hidden.
+
+### Editing a filter chain
+
+Changing any parameter of either chain repaints the image about a quarter of a
+second after you stop typing, with **no Run**: the chain is applied to the raw
+slice on a worker thread (the window stays responsive even through a ~5 s GMM
+normalize), the spinner says `Previewing <channel>`, and zoom and pan do not
+move. Set **Image** to `filtered` to watch the topology field, `base` to watch
+the base channel, or any derived statistics channel.
+
+Only what is on screen is recomputed. Editing the topology chain while the
+Image dropdown shows `base` costs nothing, and retyping a sigma you had before
+comes back instantly from the cache. Derived statistics channels never depend
+on the topology chain at all (a statistics source is the base raster or the
+colour planes), so editing `filters` while one is shown is free too.
+
+This works **after** a Run as well: the canvas switches to the live chain, the
+region overlays come off -- they came from a different field, so drawing their
+boundaries over this picture would be worse than drawing nothing -- and the
+badge reads `Preview - filters changed, Run to re-prime`. Undo the edit and the
+primed view comes straight back from the cache; Run and the overlays are about
+the picture again.
 
 Two link-labels say what is in effect: the Run section is headed by the
 **selected workflow** as two compact chains --
@@ -52,13 +89,17 @@ on, then channels × reductions); hover for the code table -- and the classifier
 section, above Train/Classify, by the **active model** (the kind Train will
 build, or the trained model and its feature count); clicking either opens its
 tab. The selected tab rides the session as
-`view.center_tab` and is restored by name, and so does the picked model kind
+`view.center_tab` (with the sashes as `view.panes` and the folded Processing
+groups as `view.proc_open`) and is restored by name, and so does the picked
+model kind
 (`view.model_kind`: a plain Train writes no pickle, so without it a restore
 would land on the kind of the newest saved model). **New session…** (toolbar)
 starts over with no data and no annotations; its dialog keeps the compute
 profiles and the model selection (kind, the model in memory, edge and search
-settings) unless unticked. The hotkeys are window-wide, so `Tab` still toggles the overlay from any
-tab. The viewer (`mscoupon-gui`) keeps its two-pane layout.
+settings) unless unticked. The hotkeys are window-wide, so `Tab` still toggles
+the overlay and `F9` still folds the tab column from any tab. The viewer
+(`mscoupon-gui`) keeps its two-pane layout, with its parameter sections in the
+left column as plain titled boxes -- and the same live filter preview.
 
 ## Annotations are gestures, not region ids
 
@@ -87,12 +128,38 @@ today only the magic fill writes it. Resolution never reads it, so a stale
 | magic | press, drag up/down, release | a similarity flood from the pressed region |
 | blobber | as magic | the flood in the active class **and** its bounding regions in the ring class |
 | *SHIFT + drag* | a box, any tool | **accepts** the classifier's predictions under it as `taps` |
+| trace | click to anchor, move, click to extend, Enter / double-click | a livewire path along the **seams** (the boundaries between regions), labelled `boundary` -- see [seam_labeling.md](seam_labeling.md) |
+| scope | drag a rectangle | every seam fully inside it labelled `interior` (unless a trace says boundary) |
 
 Hotkeys: `1..4` arm a class, `0`/Escape disarm, `M` selects magic, `B` the
-blobber, `Tab`
+blobber, `T` the trace and `S` the scope (seam tools; `E` toggles the seam
+layer, Enter commits a trace, BackSpace drops its last leg), `Tab`
 toggles the overlays, `Ctrl-Z`/`Ctrl-Y` undo/redo, `R` train + classify,
-`C` classify. Middle/right drag always pans; a right-click opens the
+`C` classify, `F` flips the image between the original (base, or the colour
+planes of an RGB slice) and the derived channel last shown (filtered until
+one is picked). Middle/right drag always pans; a right-click opens the
 annotation menu for the region under it.
+
+Each image channel keeps its **own brightness window**: the Min/Max sliders
+show and edit the channel on screen, a channel seen for the first time opens
+at its raster's 1st/99th percentiles, and a window stays as set once moved.
+The windows ride the session (`view.windows`).
+
+### Removing data and annotations
+
+A **right-click on a row of the sequence tree** (a sequence or one of its
+slices; in `mspath-labeler` a slide, its overview or an ROI) offers *Go to*,
+*Clear annotations… (n)* and *Remove …*. Both destructive entries ask first.
+*Remove* takes the row out of the session together with what was computed for
+it (the primed rasters, records and 3D assembly of a coupon slice; the primed
+item of an ROI, or every item and the open pyramid of a slide) and with the
+annotations on it -- except a slice that another sequence still holds, whose
+key is the slice, so its annotations stay. The annotations come back with
+**Ctrl-Z**, greyed until the data is added again; the data itself does not.
+The *Remove* and *Clear all* buttons under the sequence list and the ROI
+section's *Remove* go through the same path. Each **class panel's `clear`
+button** deletes every annotation of that class on every slice, after asking,
+as one undo step.
 
 ### "Will be painted" preview
 
@@ -227,8 +294,11 @@ refined is one keystroke and the confusion matrix is the before/after.
 The **Edge model** panel on the Model tab holds the pair model's settings --
 `layer` (last = the narrow layer, best in the experiment; previous = the wider
 one), `model` (balanced logistic, or an MLP 32-16), the pair `features`
-(`|d|`, `product`, and the saddle `barrier`: `saddle - max(ext_a, ext_b)` and
-`|ext_a - ext_b|`, zeros on pixel adjacency), `C`, and the voting `lambda` and
+(`|d|`, `product`, the saddle `barrier`: `saddle - max(ext_a, ext_b)` and
+`|ext_a - ext_b|`, zeros on pixel adjacency; and, off by default, `contact`:
+`log(1 + shared boundary length)` measured on the label raster, so that with
+`barrier` unticked the pair model reads no saddle value at all -- embeddings
+plus geometry), `C`, and the voting `lambda` and
 `rounds` (these two apply at once to cached predictions; the rest wait for
 Train) -- and **Evaluate edges**: a leave-slices-out report that refits the
 base per fold and scores the pair model against the base's own answers
@@ -266,9 +336,10 @@ Clicking a confusion cell highlights its regions on the current slice and
 lists them -- every slice, largest first, with the model's probabilities and
 whether neighbour voting changed the class -- on the **Analysis** tab;
 double-clicking the cell opens that tab. Double-clicking a row (or Enter)
-opens the View tab on that slice, centred on the region's seeding extremum
-(zooming in to 1:1 if further out), with the gestures touching it outlined
-and the cell's highlight still on.
+shows that slice, centred on the region's seeding extremum (zooming in to 1:1
+if further out), with the gestures touching it outlined and the cell's
+highlight still on. The tab does not change: the canvas is above the notebook,
+so the list stays open beside the region it just sent you to.
 
 ## Classifier and exports
 
@@ -285,6 +356,88 @@ its other reductions in the Optimize feature-subset search. Switching either
 on changes the field set, so a model saved under the old profile is refused by
 the compatibility gate ("profile adds: ...") until retrained -- by design, a
 bin must mean the same thing the model learned it as.
+
+### Context features (the neighbourhood, as columns)
+
+The row describes a region's own pixels, and sometimes they do not say
+enough: a shallow dip inside metal and a real void can share a `mean_base`.
+The **Context** panel on the Model tab appends columns computed from the
+living-region graph (`msseg.labeler.context`), so the net sees the
+neighbourhood *before* it decides -- unlike the edge model, which can only
+reshuffle probabilities afterwards. Each checked **ring** kind adds one
+column per source column:
+
+| kind | column | what it is |
+|---|---|---|
+| `ring_mean` | `ring_mean__<col>` | weighted mean over the regions this one touches (its arc neighbours) |
+| `ring_contrast` | `ring_contrast__<col>` | own value minus the ring mean |
+| `ring_min` / `ring_max` | `ring_min__<col>` … | extremes over the ring |
+| `ring_std` | `ring_std__<col>` | weighted spread over the ring |
+| `hop2_mean` | `hop2_mean__<col>` | the weighted mean applied twice (the neighbours' neighbourhoods) |
+| `slice_mean` / `slice_contrast` | `slice_mean__<col>` … | the item-wide mean, and own value minus it |
+
+**weights** says how much each neighbour counts: `uniform` (once each; needs
+only the arcs), `area` (by pixel count) or `contact` (by the shared boundary
+length, measured on the label raster once per slice and cached on the arcs
+as an optional `length`). More than one weighting gives a column set each
+(`ring_mean[contact]__mean_base`). **source** picks which columns the
+context is built over: every non-positional column, only `ext_*` (the
+seeding extremum -- what the region looks like away from its boundary) or
+only `mean_*`. A region with no neighbours keeps its own value (contrast 0).
+No saddle value enters any of this: the saddle lives on the topology field
+and only reports what the reduction to a scalar already made large.
+
+The columns are ordinary columns from there on. Train fits over them, the
+Optimize feature mask files each kind (and weighting) as its own group
+(`use_ring_mean`, …) so the search can switch a rung off, the compatibility
+gate expects them, and the pickle (`stack.context`), the session's model
+record (`context`) and the session view (`context`, the *picked* spec for
+the next Train) carry the spec. The model strip and the Model tab readout
+show the spec in force (`ctx: ring(mean,contrast) [contact] on ext`) and
+flag "context changed - Train to apply" when the panel differs from the
+loaded model's. Predictions rebuild exactly the loaded model's columns, so
+changing the panel never touches a classified slice. An empty spec is
+byte-identical to before: same fingerprint, same pickle document.
+
+**Latent ring head.** The raw rungs aggregate pixel statistics; the
+feature-row -> 16 -> 8 net distils *what kind of material* a region is, and
+that is the thing worth averaging over a ring. With **latent ring head**
+on, Train fits the base net as usual, embeds every region with its hidden
+layer (`layer`: last = the narrow one), averages the ring's embeddings
+(`weight`: uniform / area / contact, or `latent` = a softmax over the
+latent distance scaled by the slice's median arc distance, so neighbours
+of the region's own kind count more) and, with **H0 shape** on, adds four
+columns from the single-linkage filtration of the region plus its ring in
+latent space: the largest merge, its ratio to the second, the region's own
+attach distance (an outlier against its ring reads high) and the component
+count at mean + z·std of the slice's arc distances (a ring with two kinds
+of neighbour reads 2). Rows are bucketed by degree and each bucket runs one
+vectorised Prim, so a slice costs milliseconds. A second net of the base's
+own architecture (the tuned spec when there is one, its feature mask
+widened by the new columns) is then fit on the row plus those columns with
+balanced weights, and *its* probabilities are the prediction; the edge
+model keeps embedding with the base. These columns come from the fitted
+model, not the profile, so they are **not** in the fingerprint: the head
+rides the pickle as `stack.latent` and is dropped on load when the base is
+not the one it was fit on. A forest cannot host it (no embedding); the
+status line says so.
+
+**Labels as context.** With **labels as context** on, the row gains one
+column per class -- the fraction of the ring annotated with it -- plus the
+fraction annotated at all (`nbr_class__c1`, …, `nbr_class__any`, under
+the same weightings as the ring kinds). A region's own label is never in
+its ring. At training every labeled neighbour is hidden with probability
+**dropout** (a seeded draw per slice), so the net learns to work with a
+partly labeled ring; at prediction it sees everything drawn so far. That
+makes the loop transductive: five taps re-predict the slice. Predictions
+therefore depend on the store, and the labeler drops the cached ones the
+moment an annotation changes (the overlay empties until Classify). A
+held-out score with the slice's own labels visible is optimistic; the
+ablation harness reports both "labels visible" and "labels hidden".
+
+`packages/mscoupon/experiments/context_ablation.py` scores every kind,
+weighting and source on the autosaved session by leave-slices-out log-loss
+(and, with `--search N`, lets Optimize's mask pick).
 
 ## Optimize network (the `dense (tuned)` kind)
 

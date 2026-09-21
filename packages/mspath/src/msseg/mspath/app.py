@@ -72,6 +72,9 @@ DEFAULT_HALO = 64
 # before any raster is in hand.
 SLIDE_PLANES = 3
 
+# The Image channel that means "the chain's state after config stage k".
+STAGE_CHANNEL = "stage:"
+
 # The largest ROI worth offering, measured rather than guessed
 # (experiments/roi_bench.py): 4096^2 is 8.7 s and ~1.9 GB peak, 8192^2 is 35 s
 # and 7.2 GB. Past this an "ROI" stops being something you wait for.
@@ -249,6 +252,25 @@ class MsPathApp(ViewerShell):
             self._build_auto_color_card(frame, head, chain)
         for idx, card in enumerate(cards):
             self._build_filter_card(idx, card, chain)
+        if chain == "topo":
+            try:
+                self._refresh_stage_channels()
+            except Exception:
+                pass
+
+    def _plan_record(self, chain, idx):
+        """The planned arity of config stage `idx`, or None if it cannot be
+        planned (a chain mid-edit often cannot)."""
+        try:
+            cards, _frame = self._chain(chain)
+            plan = config_io.chain_plan(cards, SLIDE_PLANES,
+                                        default_color_method(self._profile_from_ui()))
+            for rec in plan["stages"]:
+                if rec["index"] == idx:
+                    return rec
+        except Exception:
+            return None
+        return None
 
     def _build_auto_color_card(self, parent, stage, chain):
         """Draw the conversion the runner inserts, greyed and read-only.
@@ -287,6 +309,22 @@ class MsPathApp(ViewerShell):
         combo.pack(side="left", padx=2, pady=2)
         combo.bind("<<ComboboxSelected>>",
                    lambda e, i=idx, v=op_var, c=chain: self._on_filter_op_change(i, v.get(), c))
+        # The plan's arity for this stage, so lifting is never silent: a card
+        # reading `3->3 (per plane)` is the whole reason automatic lifting is
+        # acceptable where the leading reduction was not.
+        rec = self._plan_record(chain, idx)
+        if rec is not None and (rec["in"] != 1 or rec["out"] != 1):
+            text = f"{rec['in']}→{rec['out']}" + (" (per plane)" if rec.get("lifted") else "")
+            ttk.Label(top, text=text, foreground="#777").pack(side="left", padx=4)
+        # "show": paint this stage's output. A radio on the card rather than a
+        # dropdown entry, because the chain is where the eye already is -- and F
+        # walks the same set in order.
+        chan_var = getattr(self, "background_var", None)
+        if (chan_var is not None and chain == "topo"
+                and str(card.get("operation") or "") not in ("", "none")):
+            ttk.Radiobutton(top, text="show", value=f"{STAGE_CHANNEL}{idx}",
+                            variable=chan_var,
+                            command=self._on_stage_radio).pack(side="right", padx=2)
         if idx < len(cards) - 1 or card["operation"] != "none":
             ttk.Button(top, text="✕", width=3,
                        command=lambda i=idx, c=chain: self._remove_filter_card(i, c)
@@ -697,8 +735,7 @@ class MsPathApp(ViewerShell):
     def _build_processing_sections(self):
         parent = self._processing_parent("filters")
 
-        slide = ttk.LabelFrame(parent, text="1. Slide")
-        slide.pack(fill="x", padx=4, pady=4)
+        slide = self._group(parent, "1. Slide", key="slide")
         row = ttk.Frame(slide); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="overview level:").pack(side="left")
         ttk.Spinbox(row, from_=0, to=9, width=4, textvariable=self.level_var,
@@ -710,20 +747,19 @@ class MsPathApp(ViewerShell):
         ttk.Label(slide, textvariable=self.level_hint, foreground="#666").pack(
             anchor="w", padx=6)
 
-        topo = ttk.LabelFrame(parent, text="2. Topology field (the MSC runs on this)")
-        topo.pack(fill="x", padx=4, pady=4)
+        topo = self._group(parent, "2. Topology field (the MSC runs on this)",
+                           key="filters")
         self.filters_frame = ttk.Frame(topo); self.filters_frame.pack(fill="x")
         self._rebuild_filter_cards("topo")
 
-        base = ttk.LabelFrame(parent, text="3. Base channel (statistics are read from this)")
-        base.pack(fill="x", padx=4, pady=4)
+        base = self._group(parent, "3. Base channel (statistics are read from this)",
+                           key="base")
         ttk.Label(base, text="Derived from the raw slide, not chained onto the topology field.",
                   foreground="#666").pack(anchor="w", padx=6)
         self.base_frame = ttk.Frame(base); self.base_frame.pack(fill="x")
         self._rebuild_filter_cards("base")
 
-        msc = ttk.LabelFrame(parent, text="4. MSC")
-        msc.pack(fill="x", padx=4, pady=4)
+        msc = self._group(parent, "4. MSC", key="msc")
         row = ttk.Frame(msc); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="manifold:").pack(side="left")
         ttk.Combobox(row, textvariable=self.manifold_var, state="readonly", width=12,
@@ -756,8 +792,8 @@ class MsPathApp(ViewerShell):
         are measure-only: the topology field is still `filters`. Sigmas are in
         PIXELS AT THE ITEM'S LEVEL, which is why a model is pinned to a level.
         """
-        c = ttk.LabelFrame(self._processing_parent("stats"), text="5. Statistics channels")
-        c.pack(fill="x", padx=4, pady=4)
+        c = self._group(self._processing_parent("stats"), "5. Statistics channels",
+                        key="stats")
         self.stats_frame = c
 
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
@@ -861,6 +897,25 @@ class MsPathApp(ViewerShell):
                 setvar(self.hist_channels_var, ", ".join(hist.get("channels") or ["base"]))
                 setvar(self.hist_ranges_var, format_hist_ranges(hist.get("ranges") or {}))
         self._refresh_stat_summary()
+
+    def _stat_sources(self):
+        """The active profile's `statistics.sources`, carried through unchanged.
+
+        There is no editor for them yet: a source is a filter chain a config or
+        another tool declares. But the statistics block is rebuilt from UI state
+        on every export, so without this a profile that declares a source would
+        lose it the first time the GUI wrote the profile back -- and its channels
+        would then stop resolving. Preserving what a profile brought is the whole
+        contract until there is a panel."""
+        try:
+            prof = self.profiles[self.active_profile_idx]
+        except (AttributeError, IndexError):
+            return None
+        stats = prof.get("statistics")
+        if not isinstance(stats, dict):
+            return None
+        src = stats.get("sources")
+        return src if isinstance(src, dict) and src else None
 
     def _stat_channel_cards(self):
         """The `statistics.channels[]` model, in slot order."""
@@ -1109,6 +1164,7 @@ class MsPathApp(ViewerShell):
                   foreground="#666").pack(side="left", padx=8)
 
     CHANNELS = ("slide", "base", "filtered")
+    _pre_stage_channel = "slide"
 
     def _original_channel(self):
         """What F flips back to: the slide itself."""
@@ -1121,11 +1177,13 @@ class MsPathApp(ViewerShell):
         # rasters there are. A slide has a third thing to look at -- itself --
         # and it is the default: the scalar channels only exist once an item
         # is primed.
-        combo = getattr(self, "background_combo", None)
-        if combo is not None:
-            combo.config(values=list(self.CHANNELS))
-        if self.background_var.get() not in self.CHANNELS:
-            self.background_var.set("slide")
+        self._refresh_stage_channels()
+        # The cards were built before the picker existed, so their `show` radios
+        # were skipped; now that it does, draw them.
+        try:
+            self._rebuild_filter_cards("topo")
+        except Exception:
+            pass
 
     def _channel_source(self, key, channel, slide_src):
         """The ImageSource for `channel` on the current item: the pyramid for
@@ -1139,6 +1197,12 @@ class MsPathApp(ViewerShell):
         live = self._live_channel_source(key, channel)
         if live is not None:
             return live, None
+        if channel in self._stage_channels():
+            # A stage is never primed; it is computed on demand and shown
+            # through the live-preview path above. Reaching here means the
+            # compute has not landed yet (or failed), so say that rather than
+            # "Run first", which would not help.
+            return slide_src, f"{self._stage_label(channel)}: computing..."
         p = self.engine.primed.get(key)
         raster = None if p is None else getattr(p, channel, None)
         if raster is None:
@@ -1156,18 +1220,133 @@ class MsPathApp(ViewerShell):
     # ------------------------------------------------------------------ #
     _PREVIEW_CHAN_MAX = 4                   # (channel, chain) rasters + sources
 
+    def _on_image_channel_change(self, *a, **kw):
+        cur = self.background_var.get() or ""
+        stages = self._stage_channels()
+        if cur not in stages:
+            self._last_non_stage_channel = cur
+            self._pre_stage_channel = cur or "slide"
+        out = super()._on_image_channel_change(*a, **kw)
+        # `base` and `filtered` come from the PRIMED record, so picking one just
+        # repaints. A stage has no primed counterpart -- it is an intermediate
+        # the chain passes through and nothing stores -- so it exists only as a
+        # preview, and picking one has to ask for it. Without this the channel
+        # changed and the picture did not.
+        if cur in stages:
+            self._launch_preview()
+        return out
+
+    def _stage_channels(self):
+        """One channel per chain stage: the state the chain passes through
+        after it. A stage yielding a stack renders as RGB, which is the whole
+        point -- `edges` lifted over three planes IS three planes, and looking
+        at them is how a chain gets judged."""
+        return [f"{STAGE_CHANNEL}{i}" for i, c in enumerate(self.filter_cards)
+                if str(c.get("operation") or "") not in ("", "none")]
+
+    def _refresh_stage_channels(self):
+        """Keep the Image picker in step with the chain."""
+        var = getattr(self, "background_var", None)
+        if var is None:
+            return
+        combo = getattr(self, "background_combo", None)
+        offered = list(self.CHANNELS) + self._stage_channels()
+        if combo is not None:
+            combo.config(values=offered)
+        if var.get() not in offered:
+            var.set("slide")
+
+    def _stage_label(self, channel):
+        idx = self._stage_index(channel)
+        if idx is None or idx >= len(self.filter_cards):
+            return str(channel)
+        return f"after {self.filter_cards[idx].get('operation')}"
+
+    def _on_stage_radio(self):
+        """A card's `show` was picked: the Image channel IS that stage.
+
+        Entering the walk from an ordinary channel remembers it, so stepping
+        off the end of the chain comes back to what was being looked at."""
+        cur = self.background_var.get() or ""
+        stages = self._stage_channels()
+        prev = getattr(self, "_last_non_stage_channel", None)
+        if prev and prev not in stages:
+            self._pre_stage_channel = prev
+        self._on_image_channel_change()
+        self.status_var.set(f"showing {self._stage_label(cur)}")
+
+    def _swap_image(self):
+        """F: while a stage is on screen, step to the next one.
+
+        A card's `show` radio ENTERS the walk; F continues it, and the last
+        stage comes back to whatever was on screen before. Anywhere else F is
+        the framework's own A/B flip (original <-> the derived channel last
+        shown), which is a different and still useful thing -- so this overrides
+        only the case the framework has no opinion about."""
+        cur = self.background_var.get() or ""
+        stages = self._stage_channels()
+        if cur not in stages:
+            return super()._swap_image()
+        nxt = stages.index(cur) + 1
+        target = stages[nxt] if nxt < len(stages) else (self._pre_stage_channel or "slide")
+        self.background_var.set(target)
+        self._on_image_channel_change()
+        self.status_var.set(f"showing {self._stage_label(target)}"
+                            if target in stages else f"showing {target}")
+        return target
+
+    def _reduce_at(self):
+        """Where the conversion goes when the chain does not reduce itself."""
+        prof = self._profile_from_ui()
+        col = ((prof.get("input") or {}).get("color") or {})
+        return "end" if col.get("reduce_at") == "end" else "front"
+
+    @staticmethod
+    def _stage_index(channel):
+        try:
+            return int(str(channel).split(":", 1)[1])
+        except (IndexError, ValueError):
+            return None
+
+    def _cycle_stage_view(self, _event=None):
+        """`f`: step through the chain's stages, then back to the picture.
+
+        A chain is judged by looking at what each step does to it, and the
+        stages are where the eye already is -- so this walks them in order and
+        wraps round to whatever channel was on screen before."""
+        cards = [c for c in self.filter_cards if c.get("operation") not in ("none", "", None)]
+        if not cards:
+            return "break"
+        cur = self.background_var.get() or ""
+        if cur.startswith(STAGE_CHANNEL):
+            nxt = (self._stage_index(cur) or 0) + 1
+            target = f"{STAGE_CHANNEL}{nxt}" if nxt < len(cards) else (self._pre_stage_channel or "slide")
+        else:
+            self._pre_stage_channel = cur or "slide"
+            target = f"{STAGE_CHANNEL}0"
+        self.background_var.set(target)
+        self._on_background_change()
+        return "break"
+
     def _preview_chain_key(self, channel):
         """(cache key, job) for previewing `channel`, or None when the channel
         is not a chain output.
 
         The key is the chain that produces it and nothing else, so "does what
         is on screen still match the panel?" is one tuple comparison."""
-        if channel not in ("base", "filtered"):
+        if channel not in ("base", "filtered") and not channel.startswith(STAGE_CHANNEL):
             return None
         prof = self._profile_from_ui()
         base_filters = prof.get("base_filters") or []
         filters = prof.get("filters") or []
         method = default_color_method(prof)
+        if channel.startswith(STAGE_CHANNEL):
+            # An intermediate depends on the WHOLE chain -- the plan decides what
+            # runs before it -- plus where the conversion goes, so both are in
+            # the key.
+            key = (channel, json.dumps({"chain": filters, "default": method,
+                                        "at": self._reduce_at()}, sort_keys=True))
+            return key, (base_filters, filters, method)
         chain = base_filters if channel == "base" else filters
         key = (channel, json.dumps({"chain": chain, "default": method},
                                    sort_keys=True))
@@ -1234,9 +1413,14 @@ class MsPathApp(ViewerShell):
             from msseg.mscoupon import mscoupon_py as ext
         except Exception:
             return None
-        job = preview_job("base" if channel == "base" else "filtered",
-                          base_filters, filters, method,
-                          planar=getattr(arr, "ndim", 2) == 3, label=item.key)
+        if channel.startswith(STAGE_CHANNEL):
+            job = preview_job("stage", base_filters, filters, method,
+                              planar=getattr(arr, "ndim", 2) == 3, label=item.key,
+                              upto=self._stage_index(channel), reduce_at=self._reduce_at())
+        else:
+            job = preview_job("base" if channel == "base" else "filtered",
+                              base_filters, filters, method,
+                              planar=getattr(arr, "ndim", 2) == 3, label=item.key)
         self._preview_token += 1
         token = self._preview_token
         self._preview_pending = (item, channel, key)
@@ -1286,7 +1470,11 @@ class MsPathApp(ViewerShell):
         _level, _lx, _ly, lw, lh, origin, scale = geom
         halo = self._halo()
         if halo:
-            raster = np.ascontiguousarray(raster[halo:halo + lh, halo:halo + lw])
+            # A stage preview may be a plane STACK, (C, h, w). Trim the spatial
+            # axes, whichever they are.
+            raster = np.ascontiguousarray(
+                raster[..., halo:halo + lh, halo:halo + lw] if getattr(raster, "ndim", 2) == 3
+                else raster[halo:halo + lh, halo:halo + lw])
         try:
             shape = self.engine.source(item.slide).level_shape(0)
         except Exception as exc:
@@ -1353,7 +1541,8 @@ class MsPathApp(ViewerShell):
                     "simplification": self.simplification_var.get()},
             "statistics": config_io.statistics_to_json(
                 self._stat_channel_cards(), self._stat_reductions(),
-                bool(self.stat_extremum_var.get()), 0, False, self._stat_histogram()),
+                bool(self.stat_extremum_var.get()), 0, False,
+                self._stat_histogram(), self._stat_sources()),
             "slide": {"overview_level": self._overview_level(), "halo": self._halo()},
         }
 

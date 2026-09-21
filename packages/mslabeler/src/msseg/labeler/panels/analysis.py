@@ -158,16 +158,17 @@ class AnalysisPanelMixin:
         self._goto_region(d["si"], d["li"], d["region"])
 
     def _goto_region(self, si, li, region):
-        """Open the View tab on slice (si, li), centred on `region` (its
-        seeding extremum), with the gestures touching it outlined and the
-        selected confusion cell still highlighting it."""
+        """Show slice (si, li) centred on `region` (its seeding extremum),
+        with the gestures touching it outlined and the selected confusion cell
+        still highlighting it. The tab does not change: the canvas is above
+        the notebook, so the Analysis list stays open beside the region it
+        just sent you to."""
         try:
             idx = self.flat_slices.index((si, li))
         except ValueError:
             self.status_var.set(f"slice {si}:{li} is not primed")
             return False
         self._goto_slice(idx)
-        self._show_center_tab("View")
         rec = self.regions.record(self.catalogue.key_of(si, li))
         pt = None
         if rec is not None and rec.get("labels") is not None:
@@ -183,7 +184,7 @@ class AnalysisPanelMixin:
             return True
 
         def go():
-            # Runs AFTER the View tab's own idle repaint (which may refit the
+            # Runs AFTER the repaint _goto_slice queued (which may refit the
             # canvas when the first render happened hidden), so the centring
             # is what the user ends up seeing.
             v = self.viewer

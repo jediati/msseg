@@ -267,11 +267,13 @@ shape survive as features. Nothing below touches the statistics chain except
    applied to the OD planes, per §5. Suppression rather than removal: a nucleus
    still occupies space and its boundary is real, and what is wanted is that it
    stop being the *dominant* boundary, not that it vanish.
-4. **Nuclei as statistics columns.** `base_filters` ends with C planes,
-   `resolve_stat_channels` resolves them, and `mean_hematoxylin` becomes a real
-   feature. This is the part that turns nucleus density into classifier input
-   rather than only removing it from the topology — and it is by far the most
-   invasive of the four (§7, Stage 3).
+4. **Nuclei as statistics columns.** A named measurement source —
+   `statistics.sources: {"he": [stain_deconvolution]}` — makes the stain
+   concentrations measurable as `he_c0`, `he_c1`, and every derived response
+   over them, so `mean_he_c0` is a classifier feature. This is the part that
+   turns nucleus density into input rather than only removing it from the
+   topology field. It was built as a *source* rather than as a multi-plane base;
+   see §7.
 
 A fifth route was considered and set aside: **scale-selective morphology**. A
 nucleus is a compact extremum at a known physical size, and `open` (OD space,
@@ -313,11 +315,12 @@ cannot *return* planes, which is Stage 2's actual work. `prime_slice` (`:280`)
 and `stat_channel_images` (`:249`) call `to_image(base, …)`, which throws on
 `ndim != 2` — noisy, therefore fine.
 
-**`base_c<i>` naming and position.** The column-order prefix property cannot
-break, because no existing config can produce a C>1 base; every ordering choice
-for C>1 is free. The invariant to pin is narrower and sharper: *when
-`base_filters` yields one plane, the name must be the literal `"base"`, never
-`"base_c0"`, and the whole list must be identical to today's.* Three collisions:
+**`base_c<i>` naming and position — moot, recorded for the day it returns.**
+None of this was built, because named sources sidestep it: `base` keeps its
+name and its role, and a source brings its own prefix. Had the base become a
+stack, the invariant to pin would have been: *when `base_filters` yields one
+plane, the name must be the literal `"base"`, never `"base_c0"`, and the whole
+list must be identical to today's.* Three collisions would have followed:
 
 - A base-sourced per-plane derived name decorated `_c<i>` **collides with the
   colour source's** (`stat_channels.cpp:134`) and trips the duplicate-name
@@ -337,16 +340,55 @@ base-sourced derived channel to bank 0 — `c.source == "color" ? 1 + c.input_ch
 : 0` — with no term for base planes, and the slot guard `planes_needed + 2 >
 kMaxSlots` (`:498`) has none either. `blur_b0_s1` and `blur_b2_s1` would land on
 consecutive slots of the same bank over `d_base`: wrong pixels, consistent slot
-count, no assertion fired. Cheap first cut: `decline("a multi-plane base")`, one
-line, which ships Stage 3 without touching the compile-gated `.cu` that most
-developers do not build.
+count, no assertion fired. A named source has the same shape — its planes are
+built on the host and would collide with the colour planes at `2 + p` — so what
+shipped is the one-line `decline("a computed statistics source")` at the
+`planes_needed` scan, serving it correctly on the CPU without touching the
+compile-gated `.cu` most developers do not build.
 
-**A multi-plane base is not a statistics-layer change.** Six sites in
-`pipeline.cpp` assume a scalar base — including `compute_segment_table` (the
-segment CSV's own intensity columns), `label_selected_components` (the pixel-trim
-chain) and `segment_slice_pipeline` — plus `base_relevance_floor` / `ceiling`
-(`msc_stage.cpp:62`), which are percentiles *of the base raster* and undefined
-for C planes without a choice.
+**A multi-plane base is not a statistics-layer change — and was not built.**
+Mapping it is what changed the plan. Eight sites in `pipeline.cpp` assume a
+scalar base, including `compute_segment_table` (the segment CSV's own intensity
+columns), `label_selected_components` (the pixel-trim chain) and
+`segment_slice_pipeline`; `base_relevance_floor` / `ceiling` are percentiles *of
+the base raster* and undefined for C planes without a choice, and they are
+carried as two scalars through `Msc2DFeatureStat` → `SliceSegmentation` →
+`CcNodeStat` → `GlobalFeatureStat` → pybind. Add the frozen legacy CSV header,
+plane-aware pixel filters, and the two silent-zero paths above.
+
+The decisive fact is what `base` *is*. `msc2d.hpp` says it plainly: base is "the
+raster the derived scale-space channels are computed FROM **and the one
+`relevance` is measured on**". It is a role, not just a raster — the one the
+per-slice CSV reports and the one a pixel filter means by `"base"`. A
+measurement channel needs none of that.
+
+So Stage 3 landed as **named measurement sources** instead:
+
+```jsonc
+"statistics": {
+  "sources":  { "he": [ {"operation": "stain_deconvolution", "params": {"preset": "he"}} ] },
+  "channels": [ "base", "he", {"kind": "blur", "sigmas": [1.5], "source": "he"} ]
+}
+```
+
+→ `he_c0`, `he_c1`, `he_c2` and `he_blur_c0_s1.5` …, hence `mean_he_c0`.
+
+It is confined to `resolve_stat_channels`, `build_stat_channels`, the config
+parser and one GPU decline, because the machinery was already there:
+`run_bank` and `alias_derived` are **already** keyed by a source string and take
+a `MultiImageView`, so they needed no change at all, and the statistics
+accumulator indexes by slot and never saw a raster. Two properties fall out that
+the multi-plane base would not have given:
+
+* A source's plane count is **derived** by `plan_chain` from its own chain,
+  where `color_channels` is a declared fact that has to be asserted in config
+  and re-checked against every loaded slice.
+* A named source **prefixes** its channels (`he_blur_c0_s1.5`), so two sources
+  measured the same way cannot collide — the `_b<i>` naming problem above
+  disappears rather than being solved.
+
+`base`, `color` and every shipped column keep their bare names, and a spec with
+no sources emits a `statistics` block byte-identical to before.
 
 **The `(auto)` card is derived state, never stored.** `_on_filter_op_change`
 (`app.py:915`, `mspath/app.py:333`) wipes `params` and rebuilds every card from
@@ -372,7 +414,7 @@ Each stage is independently shippable and testable.
 | 0 | this note | — |
 | 1 | `StageIO` + `plan_chain`, **no behaviour change**; `plan_color_chain` becomes a wrapper returning identical results; both card UIs replace the `idx == 0` test with a plan lookup; `(auto)` card display-only | the silence |
 | 2 | **landed 2026-09-17**: `plane_stages.cpp` (`adapt{select,project}`, `stain_deconvolution`), `optical_density{output:"planes"}`, `apply_filter_chain_planes`, the pybind result path returning `(C, h, w)`, the mscoupon chain split (plane prefix in core, scalar tail here so `normalize` still measures in Python), the plan-driven Python mirror, and the GUI schema rows | **stain deconvolution and `E − λ·H`** |
-| 3 | `base_c<i>` in `resolve_stat_channels`; a third bank traversal; a plane base through `Msc2DPipeline::build`; the six `pipeline.cpp` sites; GPU declines | **`mean_hematoxylin` as a feature** |
+| 3 | **landed 2026-09-17, in a different shape**: named measurement SOURCES (`statistics.sources`) rather than a multi-plane base — see below | **`mean_hematoxylin` as a feature** |
 | 4+ | `FieldKind` + `cast`; component-wise lifting; pin-and-move UI; `adapt{reduce, broadcast}`; the rest of the unary arithmetic; `branch`/`combine`; all-component `hsv`/`dizenzo`/`structure`/`hessian` | deferrable indefinitely |
 
 **What Stage 2 settled.** The composition claim of §5 is no longer an argument:
@@ -438,6 +480,6 @@ And the two that a naive design would have broken, recorded here because
 a `color` stage after index 0 raises.
 
 One test should legitimately *gain* a case rather than change:
-`test_gpu_stats_parity.py:21`–`:31` wants a multi-plane-base spec in its
-parametrize list once Stage 3 lands, so the bank-map hazard above cannot come
-back silently.
+`test_gpu_stats_parity.py:21`–`:31` wants a named-source spec in its parametrize
+list, so that the GPU decline is exercised and the host path it falls back to is
+held to the device path's numbers.

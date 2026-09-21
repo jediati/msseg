@@ -11,7 +11,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from .. import edge_model, magic_fill, model_search, fields
+from .. import context, edge_model, magic_fill, model_search, fields
 from .. import bundle as model_bundle
 from ..labeling import (LabelStore, MAX_CLASSES, TOOLS, resolve_slice, resolve_sets,
                           touched_sets, class_lut, scalar_lut, line_pixels, polygon_mask,
@@ -28,6 +28,7 @@ class ModelPanelMixin:
         """Model design. For now: which estimator kind Train builds, and a
         read-only description of its architecture (formatted from the same
         constants _make_model uses)."""
+        parent = self._tab_scroll(parent)
         box = ttk.LabelFrame(parent, text="Region classifier")
         box.pack(side="top", fill="x", padx=6, pady=4)
         row = ttk.Frame(box); row.pack(fill="x", padx=4, pady=(4, 2))
@@ -39,13 +40,14 @@ class ModelPanelMixin:
         self.model_kind_combo.bind("<<ComboboxSelected>>", self._unfocus_entries)
         self.model_arch_var = tk.StringVar(master=self.root, value="")
         self.model_arch_label = ttk.Label(box, textvariable=self.model_arch_var,
-                                          justify="left", wraplength=700,
+                                          justify="left", wraplength=360,
                                           foreground="#333")
         self.model_arch_label.pack(anchor="w", padx=6, pady=(0, 6))
         # A trace rather than the combobox event: Load classifier… sets the
         # kind programmatically and the readout must follow that too.
         self.model_kind_var.trace_add("write", lambda *_: self._on_kind_change())
         self._refresh_model_readout()
+        self._build_context_panel(parent)
         self._build_edge_panel(parent)
 
         # -- Optimize network: the search over the dense FC space ------------ #
@@ -143,7 +145,178 @@ class ModelPanelMixin:
                 text += " -> " + spec.describe(widths) + " [not trained yet - Train (R)]"
             if self.freeze_base_var.get():
                 text += " [base frozen: Train refits only the edges]"
+        ctx = self._context_spec_from_ui()
+        have = getattr(self, "_clf_context", None)
+        if not ctx.empty():
+            text += " + " + ctx.describe(self._clf_names if self._clf is not None else None)
+        latent = getattr(self, "_context_model", None)
+        if latent is not None:
+            text += " -> " + latent.describe()
+        elif self._clf is not None and have is not None and have.latent is not None:
+            text += " [latent head not fit - Train (R)]"
+        if self._clf is not None and have is not None and have != ctx:
+            text += " [context changed - Train (R) to apply]"
         return text
+
+    # -- neighbourhood context ------------------------------------------- #
+    def _context_spec_from_ui(self):
+        kinds = tuple(k for k in context.KINDS if self.context_kind_vars[k].get())
+        weights = tuple(w for w in context.WEIGHTS if self.context_weight_vars[w].get())
+        source = self.context_source_var.get()
+        if source not in context.SOURCES:
+            source = "all"
+        latent = None
+        if self.context_latent_var.get():
+            w = self.context_latent_weight_var.get()
+            latent = context.LatentSpec(
+                layer=context.LATENT_LAYERS.get(self.context_latent_layer_var.get(), -1),
+                weight=w if w in context.LATENT_WEIGHTS else "uniform",
+                h0=bool(self.context_latent_h0_var.get()))
+        labels = None
+        if self.context_labels_var.get():
+            labels = context.LabelSpec(
+                dropout=_bounded_float(self.context_label_dropout_var.get(), 0.3, 0.0, 0.95),
+                seed=int(self._search_settings()[2]))
+        return context.ContextSpec(kinds=kinds, weights=weights or ("uniform",), source=source,
+                                   latent=latent, labels=labels)
+
+    def _apply_context_spec(self, spec):
+        """Push a ContextSpec onto the Model tab controls."""
+        for k, var in self.context_kind_vars.items():
+            var.set(k in spec.kinds)
+        for w, var in self.context_weight_vars.items():
+            var.set(w in spec.weights)
+        self.context_source_var.set(spec.source if spec.source in context.SOURCES else "all")
+        self.context_latent_var.set(spec.latent is not None)
+        if spec.latent is not None:
+            self.context_latent_weight_var.set(spec.latent.weight)
+            for name, idx in context.LATENT_LAYERS.items():
+                if idx == spec.latent.layer:
+                    self.context_latent_layer_var.set(name)
+            self.context_latent_h0_var.set(bool(spec.latent.h0))
+        self.context_labels_var.set(spec.labels is not None)
+        if spec.labels is not None:
+            self.context_label_dropout_var.set(f"{spec.labels.dropout:g}")
+        self._refresh_model_readout()
+
+    def _on_context_settings_change(self, *_a):
+        """Context settings edited: they apply at the next Train (the readout
+        says so); nothing cached changes."""
+        self._refresh_model_readout()
+        self._refresh_model_strip()
+
+    def _build_context_panel(self, parent):
+        """The neighbourhood context columns (context.py): which reductions
+        over a region's arc neighbours join its feature row, under which
+        weighting, over which source columns."""
+        box = ttk.LabelFrame(parent, text="Context: neighbourhood columns added to every region's row")
+        box.pack(side="top", fill="x", padx=6, pady=4)
+        row = ttk.Frame(box); row.pack(fill="x", padx=4, pady=(4, 2))
+        lbl = ttk.Label(row, text="ring:")
+        lbl.pack(side="left")
+        attach_tooltip(lbl, "Reductions over the regions that touch this one (its arc "
+                            "neighbours). Each adds one column per source column; the "
+                            "Optimize feature mask can switch each kind off again.")
+        for kind, label, tip in (
+                ("ring_mean", "mean", "Weighted mean of the neighbours' values."),
+                ("ring_contrast", "contrast", "Own value minus the ring mean: how this "
+                                              "region differs from what surrounds it."),
+                ("ring_min", "min", "Smallest neighbour value."),
+                ("ring_max", "max", "Largest neighbour value."),
+                ("ring_std", "std", "Spread of the neighbours' values (weighted).")):
+            chk = ttk.Checkbutton(row, text=label, variable=self.context_kind_vars[kind],
+                                  command=self._on_context_settings_change)
+            chk.pack(side="left", padx=(2, 4))
+            attach_tooltip(chk, tip)
+        ttk.Label(row, text=" ").pack(side="left")
+        for kind, label, tip in (
+                ("hop2_mean", "2-hop mean", "The weighted mean applied twice: what the "
+                                            "neighbours' neighbourhoods look like."),
+                ("slice_mean", "slice mean", "The item-wide mean of each source column, "
+                                             "the same on every region of the item."),
+                ("slice_contrast", "slice contrast", "Own value minus the item-wide mean.")):
+            chk = ttk.Checkbutton(row, text=label, variable=self.context_kind_vars[kind],
+                                  command=self._on_context_settings_change)
+            chk.pack(side="left", padx=(2, 4))
+            attach_tooltip(chk, tip)
+        row = ttk.Frame(box); row.pack(fill="x", padx=4, pady=(0, 4))
+        lbl = ttk.Label(row, text="weights:")
+        lbl.pack(side="left")
+        attach_tooltip(lbl, "How much each neighbour counts. More than one gives a "
+                            "separate column set per weighting (named ring_mean[contact]__…).")
+        for w, label, tip in (
+                ("uniform", "uniform", "Every touching region counts once (needs only the arcs)."),
+                ("area", "area", "By the neighbour's pixel count."),
+                ("contact", "contact", "By the length of the shared boundary, measured on "
+                                       "the label raster (derived once per slice, cached).")):
+            chk = ttk.Checkbutton(row, text=label, variable=self.context_weight_vars[w],
+                                  command=self._on_context_settings_change)
+            chk.pack(side="left", padx=(2, 4))
+            attach_tooltip(chk, tip)
+        ttk.Label(row, text="   source:").pack(side="left")
+        combo = ttk.Combobox(row, textvariable=self.context_source_var, state="readonly",
+                             values=context.SOURCES, width=6)
+        combo.pack(side="left", padx=4)
+        combo.bind("<<ComboboxSelected>>",
+                   lambda e: (self._unfocus_entries(), self._on_context_settings_change()))
+        attach_tooltip(combo, "Which of the row's columns the context is built over: every "
+                              "non-positional column, only the ext_* columns (the seeding "
+                              "extremum: what the region looks like away from its boundary), "
+                              "or only the mean_* columns.")
+        # The latent ring: a second head on the base net's embedding of the ring.
+        row = ttk.Frame(box); row.pack(fill="x", padx=4, pady=(0, 4))
+        chk = ttk.Checkbutton(row, text="latent ring head", variable=self.context_latent_var,
+                              command=self._on_context_settings_change)
+        chk.pack(side="left")
+        attach_tooltip(chk, "After the base net is fit, embed every region with its hidden "
+                            "layer, average the ring's embeddings (what KIND of material "
+                            "surrounds this one) and fit a second net on the row plus those "
+                            "columns. Needs a dense base (not a forest). These columns come "
+                            "from the model, not the profile, so they are not in the "
+                            "fingerprint; the head rides the pickle.")
+        ttk.Label(row, text=" layer:").pack(side="left")
+        combo = ttk.Combobox(row, textvariable=self.context_latent_layer_var, state="readonly",
+                             values=tuple(context.LATENT_LAYERS), width=8)
+        combo.pack(side="left", padx=2)
+        combo.bind("<<ComboboxSelected>>",
+                   lambda e: (self._unfocus_entries(), self._on_context_settings_change()))
+        attach_tooltip(combo, "Which hidden layer embeds a region (last = the narrow one).")
+        ttk.Label(row, text=" weight:").pack(side="left")
+        combo = ttk.Combobox(row, textvariable=self.context_latent_weight_var, state="readonly",
+                             values=context.LATENT_WEIGHTS, width=8)
+        combo.pack(side="left", padx=2)
+        combo.bind("<<ComboboxSelected>>",
+                   lambda e: (self._unfocus_entries(), self._on_context_settings_change()))
+        attach_tooltip(combo, "How the ring's embeddings are averaged: uniform, by area, by "
+                              "contact length, or `latent` = softmax over the latent distance "
+                              "(neighbours of the region's own kind count more).")
+        chk = ttk.Checkbutton(row, text="H0 shape", variable=self.context_latent_h0_var,
+                              command=self._on_context_settings_change)
+        chk.pack(side="left", padx=(6, 0))
+        attach_tooltip(chk, "Four columns from the single-linkage (H0) filtration of the "
+                            "region + its ring in latent space: the largest merge, its ratio "
+                            "to the second, the region's own attach distance (an outlier "
+                            "against its ring reads high) and the component count at "
+                            "mean + std of the slice's arc distances (a ring with two kinds "
+                            "of neighbour reads 2).")
+        # Labels as context: the ring's annotations as columns.
+        row = ttk.Frame(box); row.pack(fill="x", padx=4, pady=(0, 4))
+        chk = ttk.Checkbutton(row, text="labels as context", variable=self.context_labels_var,
+                              command=self._on_context_settings_change)
+        chk.pack(side="left")
+        attach_tooltip(chk, "One column per class: the fraction of the ring annotated with "
+                            "it (plus the fraction annotated at all). A region's own label "
+                            "never enters. Predictions then depend on the annotations, so "
+                            "they clear whenever the store changes -- Classify (C) refreshes "
+                            "them with everything drawn so far.")
+        ttk.Label(row, text=" dropout:").pack(side="left")
+        en = ttk.Entry(row, textvariable=self.context_label_dropout_var, width=5)
+        en.pack(side="left", padx=2)
+        en.bind("<Return>", lambda e: (self._unfocus_entries(), self._on_context_settings_change()))
+        en.bind("<FocusOut>", lambda e: self._on_context_settings_change())
+        attach_tooltip(en, "At training, each labeled neighbour is hidden with this "
+                           "probability (0..0.95), so the net learns to work with a partly "
+                           "labeled ring -- what it meets on a fresh slice.")
 
     def _custom_hidden(self):
         """The custom base's hidden sizes from the Model tab entry (first rung
@@ -162,7 +335,7 @@ class ModelPanelMixin:
         c = _bounded_float(self.edge_c_var.get(), 1.0, *_EDGE_C_RANGE)
         lam = _bounded_float(self.edge_lam_var.get(), 1.0, *_EDGE_LAM_RANGE)
         rounds = int(round(_bounded_float(self.edge_rounds_var.get(), 3.0, *_EDGE_ROUNDS_RANGE)))
-        return edge_model.EdgeSpec(layer=int(layer), features=feats or edge_model.FEATURE_KINDS,
+        return edge_model.EdgeSpec(layer=int(layer), features=feats or edge_model.DEFAULT_FEATURES,
                                    model=model, C=float(c), lam=float(lam), rounds=rounds,
                                    seed=int(self._search_settings()[2]))
 
@@ -230,7 +403,10 @@ class ModelPanelMixin:
                                      "features both regions share."),
                 ("barrier", "barrier", "The saddle joining the two regions: its depth "
                                        "above their extrema (saddle - max(ext_a, ext_b)) "
-                                       "and |ext_a - ext_b|. Zero on pixel adjacency.")):
+                                       "and |ext_a - ext_b|. Zero on pixel adjacency."),
+                ("contact", "contact", "log(1 + shared boundary length) of the two regions, "
+                                       "measured on the label raster (saddle-free geometry; "
+                                       "with barrier off the pair model reads no saddle).")):
             chk = ttk.Checkbutton(row, text=label, variable=self.edge_feat_vars[f],
                                   command=self._on_edge_settings_change)
             chk.pack(side="left", padx=(2, 4))
@@ -349,7 +525,11 @@ class ModelPanelMixin:
         bits = [self._clf_kind, f"{len(names)} feats", self._stats_brief(stats)]
         if self._clf_spec is not None:
             bits[1] = self._clf_spec.brief(len(names))
-        expected = self._expected_feature_names()
+        ctx = getattr(self, "_clf_context", None)
+        if ctx is not None and not ctx.empty():
+            bits.append(ctx.brief())
+        # The model's own context columns are expected too (the gate's view).
+        expected = self._expected_names_for(None)
         if expected is not None and set(expected) != set(names):
             bits.append("⚠ profile mismatch")
         if self._edge_model is not None and not _is_edge_kind(self._clf_kind):

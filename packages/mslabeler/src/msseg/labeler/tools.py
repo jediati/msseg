@@ -27,6 +27,13 @@ from .defaults import *  # noqa: F401,F403
 
 
 
+import time
+
+from . import seam_labeling, seam_path
+from .labeling import SEAM_TOOLS
+from .seams import SEAM_CLASSES, SEAM_COLORS, nearest_seam_point
+
+
 class DrawController:
     """The canvas drawing tool (SliceCanvas.tool): claims button-1 while a
     class is armed, collects the gesture in IMAGE coordinates (floats -- so a
@@ -54,6 +61,8 @@ class DrawController:
         self._accept = False       # SHIFT-box: accept predictions under the box
         self._pv = None            # "will be painted" preview state, or None
         self.magic = MagicFillController(app)
+        # The seam tools: a livewire trace along the seams and a scope box.
+        self.trace = TraceController(app)
 
     def _image_pt(self, e):
         v = self.app.viewer
@@ -70,6 +79,11 @@ class DrawController:
         # armed class, that turns the predictions under it into real labels.
         self._accept = bool(e.state & self._SHIFT)
         tool = self.app.tool_var.get()
+        if self.trace.active and (self._accept or tool not in SEAM_TOOLS):
+            self.trace.cancel("trace abandoned (tool changed)")
+        if not self._accept and tool in SEAM_TOOLS:
+            # Before the armed-class test: seam gestures carry their own class.
+            return self.trace.on_press(e, scope=(tool == "scope"))
         if not self._accept and tool in ("magic", "blobber"):
             return self.magic.on_press(e, ring=(tool == "blobber"))
         if not self._accept and self.app.active_class_var.get() <= 0:
@@ -84,6 +98,8 @@ class DrawController:
         return "box" if self._accept else self.app.tool_var.get()
 
     def on_move(self, e):
+        if self.trace.active:
+            return self.trace.on_move(e)
         if self.magic.active:
             return self.magic.on_move(e)
         if self._pts is None:
@@ -108,6 +124,8 @@ class DrawController:
         return True
 
     def on_release(self, e):
+        if self.trace.active:
+            return self.trace.on_release(e)
         if self.magic.active:
             return self.magic.on_release(e)
         if self._pts is None:
@@ -131,6 +149,8 @@ class DrawController:
     def cancel(self):
         """Escape: abandon whatever is in flight (any tool) without committing.
         Returns True when there was something to abandon."""
+        if self.trace.active:
+            return self.trace.cancel()
         if self.magic.active:
             return self.magic.cancel()
         if self._pts is None:
@@ -141,6 +161,11 @@ class DrawController:
         self.app.viewer.canvas.delete("draw")
         self.app.status_var.set("gesture cancelled")
         return True
+
+    def redraw(self):
+        """Re-project whatever the tools draw in screen space after a
+        zoom/pan (the trace in flight)."""
+        self.trace.redraw()
 
     # -- "will be painted" preview --------------------------------------- #
     def _preview_begin(self):
@@ -522,6 +547,329 @@ class MagicFillController:
         self.app._end_preview()
         if v is not None and v.hud[0] == "info":
             v.set_hud(*s["hud"])       # give the canvas HUD back to the engine
+
+
+class TraceController:
+    """The seam tools (docs/seam_labeling.md).
+
+    **Trace** (tool "trace", key T): a press snaps to the nearest crack of
+    any seam and anchors a ``seam_path.Livewire`` there -- one Dijkstra over
+    the junction graph with the toll picked in the Seams row; every mouse
+    move then shows the cheapest path from the anchor to the seam point
+    under the pointer (a predecessor walk, not a search); a click freezes
+    that path as a leg and re-anchors; Enter or a double-click commits the
+    legs as ONE "trace" gesture in the picked seam class (boundary by
+    default); BackSpace drops the last leg; Escape abandons. An anchor
+    inside a scope confines the search to that scope's seams.
+
+    **Scope** (tool "scope", key S): a box drag, previewing the seams that lie
+    fully inside it on the transient layer; the release commits a "scope"
+    gesture in the picked class (interior by default).
+
+    Points are stored in IMAGE coordinates like every gesture; the snapping
+    and the search run on the item's raster through ``_region_placement``.
+    """
+
+    SNAP_RADIUS = 8            # raster px around the pointer searched for a crack
+    DOUBLE_CLICK_S = 0.35      # a second click on the same point commits
+
+    def __init__(self, app):
+        self.app = app
+        self._s = None             # trace in flight
+        self._box = None           # scope box in flight
+        self._last_click = None    # (monotonic s, (seam, idx))
+
+    @property
+    def active(self):
+        return self._s is not None or self._box is not None
+
+    def _image_pt(self, e):
+        v = self.app.viewer
+        return (v.view_x + e.x * v.scale, v.view_y + e.y * v.scale)
+
+    def _context(self):
+        """(cur, key, rec, graph, np) for the item on screen, or None."""
+        app = self.app
+        cur = app._current()
+        if cur is None:
+            return None
+        key = app.catalogue.key_of(*cur)
+        rec = app.regions.record(key)
+        if rec is None or rec.get("labels") is None:
+            return None
+        import numpy as np
+        graph = app.regions.seams(key, np)
+        if graph is None or graph.n_seams == 0:
+            return None
+        return cur, key, rec, graph, np
+
+    # -- dispatch ------------------------------------------------------ #
+    def on_press(self, e, scope=False):
+        self.app._unfocus_entries()
+        if scope:
+            if self._s is not None:
+                self.cancel("trace abandoned")
+            return self._scope_press(e)
+        return self._trace_press(e)
+
+    def on_move(self, e):
+        if self._box is not None:
+            return self._scope_move(e)
+        return self._s is not None
+
+    def on_release(self, e):
+        if self._box is not None:
+            return self._scope_release(e)
+        return self._s is not None
+
+    def cancel(self, why=None):
+        """Escape: abandon the gesture in flight. True when there was one."""
+        if self._box is not None:
+            b, self._box = self._box, None
+            self._finish(b["hud"])
+            self.app.status_var.set(why or "scope cancelled")
+            return True
+        if self._s is not None:
+            s, self._s = self._s, None
+            self._finish(s["hud"])
+            self.app.status_var.set(why or "trace cancelled")
+            return True
+        return False
+
+    def redraw(self):
+        if self._s is not None:
+            self._draw_trace()
+        elif self._box is not None:
+            self._draw_box()
+
+    def _finish(self, hud):
+        app = self.app
+        v = app.viewer
+        app._end_preview()
+        if v is not None:
+            v.canvas.delete("trace")
+            if v.hud[0] == "info":
+                v.set_hud(*hud)         # give the canvas HUD back to the engine
+
+    # -- scope ---------------------------------------------------------- #
+    def _scope_press(self, e):
+        ctx = self._context()
+        if ctx is None:
+            self.app._notify("Scope needs computed regions - Run first.")
+            return False
+        cur, key, rec, graph, np = ctx
+        v = self.app.viewer
+        self._box = {"si": cur[0], "li": cur[1], "commit": rec.get("commit"), "rec": rec,
+                     "graph": graph, "pts": [self._image_pt(e)], "mask": None,
+                     "cls": int(self.app.seam_class_var.get()), "hud": v.hud}
+        self.app._begin_preview()
+        return True
+
+    def _scope_move(self, e):
+        b = self._box
+        pt = self._image_pt(e)
+        if len(b["pts"]) > 1:
+            b["pts"][-1] = pt
+        else:
+            b["pts"].append(pt)
+        self._scope_preview()
+        self._draw_box()
+        return True
+
+    def _scope_preview(self):
+        b = self._box
+        import numpy as np
+        from .labeling import Interaction
+        it = Interaction(0, "", b["si"], b["li"], "scope", b["pts"], b["cls"])
+        mask = seam_labeling.scope_mask(it, b["graph"], np)
+        if b["mask"] is not None and np.array_equal(mask, b["mask"]):
+            return
+        b["mask"] = mask
+        raster = self.app._seam_raster_for(b["si"], b["li"], b["rec"], b["graph"], np)
+        lut = np.zeros((b["graph"].n_seams, 4), np.uint8)
+        r, g, bb, _a = SEAM_COLORS[b["cls"]] if 0 <= b["cls"] < len(SEAM_COLORS) else SEAM_COLORS[-1]
+        lut[mask] = (min(255, r + 60), min(255, g + 60), min(255, bb + 60), 255)
+        self.app.viewer.set_transient(self.app._region_overlay(raster, lut, np))
+        name = SEAM_CLASSES[b["cls"]] if 0 <= b["cls"] < len(SEAM_CLASSES) else str(b["cls"])
+        self.app.viewer.set_hud("info", f"scope: {int(mask.sum())} seams -> {name}")
+
+    def _scope_release(self, e):
+        b, self._box = self._box, None
+        self._finish(b["hud"])
+        pts = b["pts"]
+        if len(pts) < 2 or pts[0] == pts[-1]:
+            return True
+        n = int(b["mask"].sum()) if b["mask"] is not None else 0
+        self.app._commit_seam("scope", [pts[0], pts[-1]], b["cls"],
+                              meta={"tool": "scope", "seams": n})
+        return True
+
+    def _draw_box(self):
+        b = self._box
+        v = self.app.viewer
+        c = v.canvas
+        c.delete("trace")
+        if b is None or len(b["pts"]) < 2:
+            return
+        color = self.app._seam_color_hex(b["cls"])
+        (x0, y0), (x1, y1) = [((x - v.view_x) / v.scale, (y - v.view_y) / v.scale)
+                              for x, y in (b["pts"][0], b["pts"][-1])]
+        c.create_rectangle(x0, y0, x1, y1, outline=color, width=2, dash=(6, 3),
+                           tags=("draw", "trace"))
+
+    # -- trace ---------------------------------------------------------- #
+    def _snap(self, s_or_ctx, x, y):
+        """Image point -> (seam, idx) of the nearest crack, or None."""
+        place, graph, labels, np = s_or_ctx
+        rx, ry = place.to_raster(x, y)
+        return nearest_seam_point(graph, labels, rx, ry, np, radius=self.SNAP_RADIUS)
+
+    def _trace_press(self, e):
+        app = self.app
+        ctx = self._context()
+        if ctx is None:
+            app._notify("Trace needs computed regions - Run first.")
+            return False
+        cur, key, rec, graph, np = ctx
+        s = self._s
+        if s is not None and (s["commit"] != rec.get("commit") or (s["si"], s["li"]) != cur):
+            self.cancel("trace cancelled: regions changed under it")
+            s = None
+        place = app._region_placement()
+        x, y = self._image_pt(e)
+        hit = self._snap((place, graph, rec["labels"], np), x, y)
+        if hit is None:
+            app._notify(f"No seam within {self.SNAP_RADIUS} px - press nearer a region boundary")
+            return False
+        now = time.monotonic()
+        if s is None:
+            try:
+                tolls = app._seam_tolls_for(key, rec, graph, np)
+            except ValueError as exc:
+                app._notify(f"trace: {exc}")
+                return False
+            restrict = app._scope_restrict(cur[0], cur[1], rec, graph, hit[0], np)
+            lw = seam_path.Livewire(graph, tolls, np, restrict=restrict)
+            lw.anchor(*hit)
+            v = app.viewer
+            self._s = {"si": cur[0], "li": cur[1], "commit": rec.get("commit"),
+                       "graph": graph, "labels": rec["labels"], "np": np, "place": place,
+                       "lw": lw, "cls": int(app.seam_class_var.get()),
+                       "toll": app.seam_toll_var.get(), "restricted": restrict is not None,
+                       "hover": None, "hud": v.hud}
+            app._begin_preview()          # no region hover outlines while tracing
+            self._last_click = (now, hit)
+            self._hud()
+            self._draw_trace()
+            return True
+        last = self._last_click
+        self._last_click = (now, hit)
+        if last is not None and now - last[0] < self.DOUBLE_CLICK_S and last[1] == hit:
+            self.commit()
+            return True
+        lw = s["lw"]
+        if hit == lw.anchor_point:
+            return True
+        if not lw.extend(*hit):
+            app._notify("Unreachable along the seams"
+                        + (" inside the scope" if s["restricted"] else ""))
+            return True
+        s["hover"] = None
+        self._hud()
+        self._draw_trace()
+        return True
+
+    def on_hover(self, ix, iy):
+        """The pointer moved over the image (image coords): show the path from
+        the anchor to the seam point under it."""
+        s = self._s
+        if s is None or ix is None or iy is None:
+            return
+        hit = self._snap((s["place"], s["graph"], s["labels"], s["np"]), ix, iy)
+        path = None if hit is None else s["lw"].path_to(*hit)
+        s["hover"] = (hit, path)
+        self._hud(hit)
+        self._draw_trace()
+
+    def _hud(self, hover=None):
+        s = self._s
+        if s is None:
+            return
+        lw = s["lw"]
+        text = (f"trace {s['toll']}{' (scoped)' if s['restricted'] else ''}  "
+                f"anchors {len(lw.anchors)}  cost {lw.total_cost:.3g}  "
+                f"seams {len(lw.seams_on_path)}")
+        if hover is not None:
+            c = lw.cost_to(*hover)
+            text += f"  +{c:.3g}" if c is not None else "  (unreachable)"
+        text += "  |  click: anchor - Enter: commit - BackSpace: undo leg - Esc: abandon"
+        self.app.viewer.set_hud("info", text)
+
+    def _screen(self, s, pts):
+        v = self.app.viewer
+        place = s["place"]
+        out = []
+        for x, y in pts:
+            ix, iy = place.to_image(x, y)
+            out.append(((ix - v.view_x) / v.scale, (iy - v.view_y) / v.scale))
+        return out
+
+    def _draw_trace(self):
+        s = self._s
+        v = self.app.viewer
+        if v is None:
+            return
+        c = v.canvas
+        c.delete("trace")
+        if s is None:
+            return
+        color = self.app._seam_color_hex(s["cls"])
+        lw = s["lw"]
+        tags = ("draw", "trace")
+        pts = lw.points()
+        if len(pts) >= 2:
+            flat = [coord for pt in self._screen(s, pts) for coord in pt]
+            c.create_line(*flat, fill=color, width=3, tags=tags)
+        hover = s.get("hover")
+        if hover is not None and hover[1] is not None and len(hover[1]) >= 2:
+            flat = [coord for pt in self._screen(s, hover[1]) for coord in pt]
+            c.create_line(*flat, fill=color, width=2, dash=(5, 3), tags=tags)
+        graph = s["graph"]
+        for seam, idx in lw.anchors:
+            x, y = graph.seam_points(seam)[idx]
+            (sx, sy), = self._screen(s, [(x, y)])
+            c.create_oval(sx - 4, sy - 4, sx + 4, sy + 4, outline=color, width=2, tags=tags)
+
+    def commit(self):
+        """Enter / double-click: store the legs as one trace gesture."""
+        s = self._s
+        if s is None:
+            return False
+        lw = s["lw"]
+        pts = lw.commit_points()
+        self._s = None
+        self._finish(s["hud"])
+        if len(pts) < 2:
+            self.app.status_var.set("trace needs a second anchor - nothing committed")
+            return True
+        meta = {"tool": "trace", "toll": s["toll"], "anchors": int(len(lw.anchors)),
+                "seams": int(len(lw.seams_on_path)), "cost": round(lw.total_cost, 4),
+                "scoped": bool(s["restricted"])}
+        self.app._commit_seam("trace", s["graph"].to_image(pts), s["cls"], meta=meta)
+        return True
+
+    def drop_last(self):
+        """BackSpace: drop the last leg; with only the anchor left, abandon."""
+        s = self._s
+        if s is None:
+            return False
+        s["lw"].drop_last()
+        if not s["lw"].active:
+            return self.cancel("trace abandoned")
+        s["hover"] = None
+        self._hud()
+        self._draw_trace()
+        return True
 
 
 def _extremum_points(labels, ids, table, np, conv=fields.DEFAULT, place=None):

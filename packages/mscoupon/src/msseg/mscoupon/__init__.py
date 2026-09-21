@@ -30,6 +30,9 @@ _EXPORTS = (
     "feature_schema",
     "stat_channels",
     "stat_channel_images",
+    # The chain plan: what each stage receives and yields, in planes, with no
+    # raster. What the cards draw their arity badges from.
+    "chain_plan",
     "fit_gmm",
     "measure_histogram",
     "measure_regions",

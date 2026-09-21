@@ -100,14 +100,19 @@ def stat_images(engine, base, filt, params, color=None):
 # Preview channels (Tk-free, so they can run on a worker thread)
 # --------------------------------------------------------------------------- #
 def preview_job(kind, base_filters, filters, default_method, single=None,
-                source="base", planar=False, label=""):
+                source="base", planar=False, label="", upto=None, reduce_at="front"):
     """A plain description of one preview compute, built on the UI thread.
 
-    `kind` is "base", "filtered" or "derived"; `single` is the one-channel
-    statistics params JSON a derived channel is measured with. `have` is
-    filled by the caller with whatever rasters it already has cached (a
-    derived channel is measured on the base and filtered ones), and `label`
-    is what the timing lines name."""
+    `kind` is "base", "filtered", "derived" or "stage"; `single` is the
+    one-channel statistics params JSON a derived channel is measured with.
+    `have` is filled by the caller with whatever rasters it already has cached
+    (a derived channel is measured on the base and filtered ones), and `label`
+    is what the timing lines name.
+
+    `upto` (kind "stage") is the CONFIG index of the stage whose output to
+    show. The chain is planned whole and only a PREFIX OF THE PLAN is run, so
+    an intermediate is the state the full chain really passes through -- not
+    what a truncated chain would plan on its own, which can differ."""
     return {"kind": kind,
             "base_filters": list(base_filters or []),
             "filters": list(filters or []),
@@ -116,6 +121,8 @@ def preview_job(kind, base_filters, filters, default_method, single=None,
             "source": source,
             "planar": bool(planar),
             "label": label,
+            "upto": upto,
+            "reduce_at": reduce_at or "front",
             "have": {}}
 
 
@@ -179,17 +186,52 @@ def preview_raster(engine, arr, job, log=lambda _m: None, should_stop=None):
             return have["filtered"]
         if out["filtered"] is None:
             t0 = time.perf_counter()
+            # The check moved AHEAD of the work. It used to sit between stages,
+            # which only meant anything while the chain was applied one stage at
+            # a time; it is one call now, so the point at which a superseded
+            # preview can still be abandoned is before it starts.
+            if stop():
+                return None
             cur, rest = ComputeEngine._leading_color(arr, job["filters"], engine, log,
                                                      default_method)
-            for f in rest:
+            if rest:
                 if stop():
                     return None
-                cur = engine.filter_slice(cur, json.dumps({"filter": f}))
+                cur = engine.filter_chain(cur, json.dumps({"filters": rest}), default_method)
             log(f"preview filter chain{on}: {1e3 * (time.perf_counter() - t0):.0f}ms")
             out["filtered"] = np.ascontiguousarray(cur, dtype=np.float32)
         return out["filtered"]
 
+    def stage_raster():
+        """The chain's state after config stage `upto`, as it really passes
+        through it: the WHOLE chain is planned, and a prefix of that plan is
+        run with reduce_at="none" so nothing is planned a second time. The
+        result may be a stack, which is the point -- an RGB intermediate."""
+        if stop():
+            return None
+        plan = engine.chain_plan(json.dumps(job["filters"]),
+                                 arr.shape[0] if getattr(arr, "ndim", 2) == 3 else 1,
+                                 job["default_method"], job["reduce_at"])
+        cut = None
+        for n, rec in enumerate(plan["stages"], start=1):
+            if rec["index"] == job["upto"]:
+                cut = n
+                break
+        if cut is None:                      # the stage is not in the plan
+            return None
+        prefix = [{"operation": r["operation"], "params": r["params"]}
+                  for r in plan["stages"][:cut]]
+        return np.ascontiguousarray(
+            engine.filter_chain(np.ascontiguousarray(arr, dtype=np.float32),
+                                json.dumps({"filters": prefix,
+                                            "input": {"color": {"reduce_at": "none"}}}),
+                                job["default_method"]),
+            dtype=np.float32)
+
     kind = job["kind"]
+    if kind == "stage":
+        out["filtered"] = stage_raster()
+        return out
     if kind == "base":
         base_raster()
         return out
@@ -296,25 +338,31 @@ class ComputeEngine:
         from . import config_io
         chain = list(chain or [])
         channels = arr.shape[0] if getattr(arr, "ndim", 2) == 3 else 1
-        tail = next((i for i, c in enumerate(chain) if not config_io._consumes_planes(c)),
-                    len(chain))
-        if tail == 0 and channels == 1:
+        # Cut ONLY at a stage core cannot apply. Any other cut re-plans a
+        # fragment, and whether a leading conversion is synthesized is a property
+        # of the WHOLE chain -- so cutting `[edges, adapt{reduce}]` before the
+        # reduction made core insert a luminance the whole chain would not have,
+        # and the field was silently a different one from the CLI's.
+        cut = next((i for i, c in enumerate(chain)
+                    if str((c or {}).get("operation") or "") in config_io.PACKAGE_ONLY_OPERATIONS),
+                   len(chain))
+        head = chain[:cut]
+        if not head and channels == 1:
             return arr, chain
-        prefix = chain[:tail]
         cur = engine.filter_chain(np.ascontiguousarray(arr, dtype=np.float32),
-                                  json.dumps({"filters": prefix}), default_method)
+                                  json.dumps({"filters": head}), default_method)
         cur = np.ascontiguousarray(cur, dtype=np.float32)
         if cur.ndim != 2:
             raise RuntimeError(
                 f"the chain yields {cur.shape[0]} planes, but the field a Morse-Smale complex "
-                "runs over is one; reduce them with an adapt stage (mode 'select' or 'project').")
-        if prefix:
-            names = " -> ".join(str(c.get("operation")) for c in prefix)
+                "runs over is one; reduce them with an adapt stage (mode 'reduce' or 'select').")
+        if head:
+            names = " -> ".join(str(c.get("operation")) for c in head)
             log(f"  {names} -> min={cur.min():.4g} max={cur.max():.4g}")
         else:
             log(f"  color {default_method} [default] "
                 f"-> min={cur.min():.4g} max={cur.max():.4g}")
-        return cur, chain[tail:]
+        return cur, chain[cut:]
 
     @staticmethod
     def _apply_base_chain(arr, base_filters, engine, log, default_color_method="luminance"):
@@ -331,8 +379,26 @@ class ComputeEngine:
         cur, rest = ComputeEngine._leading_color(arr, base_filters, engine, log,
                                                  default_color_method)
         measured = []
-        for i, f in enumerate(rest, start=len(base_filters) - len(rest)):
+        # Consecutive core stages go in ONE call, the way run_scalar_chain
+        # batches them: a stage handed to core on its own is a chain of one, and
+        # core would plan it as such.
+        pending = []
+        base = len(base_filters) - len(rest)
+
+        def flush():
+            nonlocal cur, pending
+            if not pending:
+                return
+            cur = np.ascontiguousarray(
+                engine.filter_chain(cur, json.dumps({"filters": pending}), default_color_method),
+                dtype=np.float32)
+            names = " -> ".join(str(f.get("operation")) for f in pending)
+            log(f"  base[{base}..] {names} -> min={cur.min():.4g} max={cur.max():.4g}")
+            pending = []
+
+        for i, f in enumerate(rest, start=base):
             if f.get("operation") == "normalize":
+                flush()
                 params = dict(f.get("params", {}))
                 tp = measure_two_point(cur, **params)
                 cur = tp.apply(cur, clamp=bool(params.get("clamp", False)))
@@ -341,9 +407,8 @@ class ComputeEngine:
                     f"-> low={tp.low:.6g} high={tp.high:.6g} "
                     f"[{cur.min():.4g}, {cur.max():.4g}]")
             else:
-                cur = engine.filter_slice(cur, json.dumps({"filter": f}))
-                log(f"  base[{i}] {f['operation']}({f.get('params', {})}) "
-                    f"-> min={cur.min():.4g} max={cur.max():.4g}")
+                pending.append(f)
+        flush()
         return np.ascontiguousarray(cur, dtype=np.float32), measured
 
     def _run_worker(self, subseqs, params, run_info):
@@ -428,14 +493,19 @@ class ComputeEngine:
                     # The colour planes ride with the primed slice (in the file's
                     # own integer dtype) for the Image dropdown and the 3D assembly.
                     color = compact_planes(arr) if arr.ndim == 3 else None
-                    # Apply the filter chain step by step so each stage's params +
-                    # output range are logged (functionally == filter_chain).
+                    # The remainder in ONE call. It used to run stage by stage
+                    # for a per-stage log line, on the assumption that this was
+                    # "functionally == filter_chain" -- which stopped being true
+                    # when whether a leading conversion is synthesized became a
+                    # property of the WHOLE chain. A chain of one plans
+                    # differently from the same stage inside its chain.
                     cur, rest = self._leading_color(arr, filters, engine, log,
                                                     default_color_method)
-                    for i, f in enumerate(rest, start=len(filters) - len(rest)):
-                        cur = engine.filter_slice(cur, json.dumps({"filter": f}))
-                        log(f"  filter[{i}] {f['operation']}({f.get('params', {})}) "
-                            f"-> min={cur.min():.4g} max={cur.max():.4g}")
+                    if rest:
+                        cur = engine.filter_chain(cur, json.dumps({"filters": rest}),
+                                                  default_color_method)
+                        names = " -> ".join(f"{f['operation']}({f.get('params', {})})" for f in rest)
+                        log(f"  filters {names} -> min={cur.min():.4g} max={cur.max():.4g}")
                     filt = np.ascontiguousarray(cur, dtype=np.float32)
                     if float(filt.max()) == float(filt.min()):
                         # A constant topology field makes the MSC degenerate

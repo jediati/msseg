@@ -5,10 +5,14 @@
 #include <limits>
 #include <stdexcept>
 
+#include "msseg/filter/color_stage.hpp"
+
 namespace msseg {
 namespace {
 
-const char* const kAdaptModes[] = {"select", "project"};
+const char* const kAdaptModes[] = {"select", "project", "reduce"};
+const char* const kReduceHow[] = {"mean", "sum", "max", "min", "norm", "first"};
+const char* const kPromoted[] = {"hsv", "optical_density", "chgradmag", "dizenzo", "structure"};
 const char* const kStainPresets[] = {"he", "hdab", "hed"};
 
 // Ruifrok & Johnston's unit OD vectors, the same numbers scikit-image carries as
@@ -114,7 +118,25 @@ std::vector<double> invert3(const std::vector<double>& m) {
 }  // namespace
 
 bool is_plane_operation(const std::string& operation) {
-  return operation == kAdaptOperation || operation == kStainOperation;
+  return operation == kAdaptOperation || operation == kStainOperation ||
+         is_promoted_color_operation(operation);
+}
+
+bool is_promoted_color_operation(const std::string& operation) {
+  return std::find(std::begin(kPromoted), std::end(kPromoted), operation) != std::end(kPromoted);
+}
+
+const std::vector<std::string>& promoted_color_operations() {
+  static const std::vector<std::string> v(std::begin(kPromoted), std::end(kPromoted));
+  return v;
+}
+
+FilterParams as_color_stage(const FilterParams& stage) {
+  FilterParams out;
+  out.operation = kColorOperation;
+  out.params = stage.params;
+  out.params["method"] = stage.operation;
+  return out;
 }
 
 const std::vector<std::string>& adapt_modes() {
@@ -199,7 +221,17 @@ int plane_stage_output_channels(const FilterParams& stage, std::size_t in_channe
       if (!matrix_rows(p, in_channels, &flat, &rows, why)) return -1;
       return static_cast<int>(rows);
     }
-    return fail_int(why, "adapt: unknown mode '" + mode + "'. Available: select, project.");
+    if (mode == "reduce") {
+      const std::string how = p.value("how", "mean");
+      if (std::find(std::begin(kReduceHow), std::end(kReduceHow), how) == std::end(kReduceHow)) {
+        return fail_int(why, "adapt: reduce.how must be mean|sum|max|min|norm|first (got '" + how + "').");
+      }
+      if (how == "mean" && has(p, "weights") && get_doubles(p, "weights").size() != in_channels) {
+        return fail_int(why, "adapt: reduce.weights needs one entry per plane.");
+      }
+      return 1;
+    }
+    return fail_int(why, "adapt: unknown mode '" + mode + "'. Available: select, project, reduce.");
   }
   if (stage.operation == kStainOperation) {
     if (in_channels != 3) {
@@ -209,6 +241,13 @@ int plane_stage_output_channels(const FilterParams& stage, std::size_t in_channe
     std::string local;
     if (stain_matrix(stage.params.value("preset", "he"), &local).empty()) return fail_int(why, local);
     return 3;
+  }
+  if (is_promoted_color_operation(stage.operation)) {
+    const FilterParams as_color = as_color_stage(stage);
+    if (!color_stage_accepts(as_color, in_channels, why)) return -1;
+    // `optical_density` can keep its planes; every other promoted method is a
+    // reduction to one.
+    return color_stage_keeps_planes(as_color) ? static_cast<int>(in_channels) : 1;
   }
   return fail_int(why, "'" + stage.operation + "' is not a plane stage.");
 }
@@ -226,8 +265,39 @@ diffg::MultiImage<float> apply_plane_stage(diffg::MultiImageView<const float> pl
   for (std::size_t c = 0; c < C; ++c) in[c] = planes.channel_data(c);
   diffg::MultiImage<float> out(planes.dims(), K, planes.spacing());
 
+  if (is_promoted_color_operation(stage.operation)) {
+    // One implementation per method: the promoted operation is the colour stage
+    // with its method filled in, run on whatever stack reaches it.
+    return apply_color_stage_multi(planes, as_color_stage(stage));
+  }
+
   if (stage.operation == kAdaptOperation) {
     const std::string mode = mode_of(stage);
+    if (mode == "reduce") {
+      const std::string how = stage.params.value("how", "mean");
+      const auto w = get_doubles(stage.params, "weights");
+      float* o = out.channel_data(0);
+      for (std::size_t i = 0; i < n; ++i) {
+        if (how == "max" || how == "min") {
+          float v = in[0][i];
+          for (std::size_t c = 1; c < C; ++c) v = how == "max" ? std::max(v, in[c][i]) : std::min(v, in[c][i]);
+          o[i] = v;
+        } else if (how == "first") {
+          o[i] = in[0][i];
+        } else if (how == "norm") {
+          double acc = 0.0;
+          for (std::size_t c = 0; c < C; ++c) acc += static_cast<double>(in[c][i]) * in[c][i];
+          o[i] = static_cast<float>(std::sqrt(acc));
+        } else {  // mean (optionally weighted) or sum
+          double acc = 0.0;
+          for (std::size_t c = 0; c < C; ++c) {
+            acc += (w.empty() ? 1.0 : w[c]) * static_cast<double>(in[c][i]);
+          }
+          o[i] = static_cast<float>(how == "sum" ? acc : acc / static_cast<double>(C));
+        }
+      }
+      return out;
+    }
     if (mode == "select") {
       const auto ch = get_doubles(stage.params, "channels");
       for (std::size_t k = 0; k < K; ++k) {

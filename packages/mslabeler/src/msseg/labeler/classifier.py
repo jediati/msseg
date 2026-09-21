@@ -3,6 +3,7 @@ classifier's whole lifecycle on top of the headless training and bundle
 modules, run on a worker thread drained by a Tk pump."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import os
@@ -12,7 +13,8 @@ import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from . import edge_model, magic_fill, model_search, fields
+from . import seam_model
+from . import context, edge_model, magic_fill, model_search, fields
 from . import bundle as model_bundle
 from .labeling import (LabelStore, MAX_CLASSES, TOOLS, resolve_slice, resolve_sets,
                           touched_sets, class_lut, scalar_lut, line_pixels, polygon_mask,
@@ -28,7 +30,7 @@ class ClassifierMixin:
     # ------------------------------------------------------------------ #
     # Classifier: train on the labeled regions, predict every region
     # ------------------------------------------------------------------ #
-    def _stream_stat_slices(self, action):
+    def _stream_stat_slices(self, action, spec=None, training=False):
         """Yield ``(si, li, key, rec, table)`` for every primed item, one at a
         time.
 
@@ -39,6 +41,11 @@ class ClassifierMixin:
         session of whole-slide items: each record carries a label raster and a
         statistics table, and every consumer here (the training set, the edge
         set, classification) walks them exactly once.
+
+        `spec` is the ``ContextSpec`` whose columns the yielded table carries
+        on top of the record's own (see `_context_table`); None or an empty
+        spec yields ``rec["stats"]`` itself. `training` says the rows are for
+        a fit (the labels block then applies its dropout).
 
         None when the operation must abort before it starts; ``TrainingProblem``
         when an item cannot be computed part-way through, which is what the
@@ -51,9 +58,10 @@ class ClassifierMixin:
         if self.regions.pending():
             self.status_var.set("Busy computing - try again in a moment.")
             return None
-        return self._stat_slice_iter(action, list(keys))
+        return self._stat_slice_iter(action, list(keys), spec, training)
 
-    def _stat_slice_iter(self, action, keys):
+    def _stat_slice_iter(self, action, keys, spec=None, training=False):
+        import numpy as np
         total = len(keys)
         self._compute_badge(f"{action} 0/{total}")
         try:
@@ -66,14 +74,82 @@ class ClassifierMixin:
                         or getattr(table, "values", None) is None):
                     raise TrainingProblem(
                         f"{action} stopped: could not compute slice {si}:{li}.")
+                try:
+                    table = self._context_table(key, rec, spec, np, training)
+                except ValueError as exc:
+                    raise TrainingProblem(f"{action} stopped: {exc} (slice {si}:{li}).")
                 yield si, li, key, rec, table
         finally:
             self._clear_compute_badge()
 
-    def _all_stat_slices(self, action):
+    def _context_table(self, key, rec, spec, np, training=False):
+        """The record's statistics table plus the context columns `spec` asks
+        for (``context.augment``), or ``rec["stats"]`` itself for None / an
+        empty spec. Built from the provider's arcs (contact lengths derived
+        from the label raster and cached on them only when a weighting needs
+        them); the labels block reads the store's classes for the item (with
+        a seeded dropout draw when `training`); a small bounded cache keyed
+        on the record's commit, the spec and (for labels) the store's
+        revision keeps Train-then-Classify from rebuilding the slice on
+        screen. Raises ValueError when the spec cannot be built here."""
+        table = rec.get("stats")
+        if spec is None or spec.empty():
+            return table
+        cache = getattr(self, "_ctx_cache", None)
+        if cache is None:
+            cache = self._ctx_cache = {}
+        with_labels = spec.labels is not None
+        ck = (key, rec.get("commit"), spec.key(),
+              (bool(training), self.store.rev) if with_labels else None)
+        hit = cache.get(ck)
+        if hit is not None and hit[0] is table:
+            return hit[1]
+        arcs = self.regions.arcs(key, np)
+        labels = rec.get("labels")
+        extra = None
+        if with_labels:
+            ids = table.column(self.FIELDS.id_field)
+            rc = self._training_builder.row_classes(
+                self.store.for_slice(key), labels, ids, np, self.regions.label_layer(key))
+            rng = None
+            if training:
+                import zlib
+                salt = zlib.crc32(str(key).encode("utf-8"))
+                rng = np.random.default_rng([int(spec.labels.seed),
+                                             int(rec.get("commit") or 0), int(salt)])
+            extra = {"row_classes": rc, "rng": rng}
+        aug = context.augment(table, arcs, spec, np, conv=self.FIELDS, labels=labels,
+                              extra=extra)
+        if len(cache) >= 2:
+            cache.pop(next(iter(cache)))
+        cache[ck] = (table, aug)
+        return aug
+
+    def _labels_changed(self):
+        """The store changed. With labels in the loaded model's context the
+        cached predictions were made from the previous annotations, so they
+        go (the overlay empties until Classify); everything else keeps."""
+        ctx = getattr(self, "_clf_context", None)
+        if ctx is None or ctx.labels is None or not getattr(self, "_pred", None):
+            return
+        if getattr(self, "_pred_store_rev", None) == self.store.rev:
+            return
+        self._pred.clear()
+        self._cm_cell = None
+        self._refresh_region_modes()
+        self._refresh_confusion()
+
+    def _context_spec_from_ui(self):
+        """The ContextSpec the Model tab describes (headless: empty)."""
+        return context.ContextSpec()
+
+    def _apply_context_spec(self, spec):
+        """Push a ContextSpec onto the Model tab controls (headless: no-op)."""
+
+    def _all_stat_slices(self, action, spec=None):
         """``_stream_stat_slices`` drained into a list, for a caller that needs
         random access (the edge-pairs experiment). None means abort."""
-        stream = self._stream_stat_slices(action)
+        stream = self._stream_stat_slices(action, spec)
         if stream is None:
             return None
         try:
@@ -116,6 +192,7 @@ class ClassifierMixin:
         if got is None:
             return
         X, y, _groups, names = got
+        ctx = self._context_spec_from_ui()
         kind = self.model_kind_var.get()
         base = _base_kind(kind)
         spec = self._search_spec if base == _TUNED_KIND else None
@@ -129,9 +206,14 @@ class ClassifierMixin:
                 backend=self._search_settings()[4])
         # A frozen base: an edge kind keeps the current base net (same
         # features, has an embedding) and refits only the edges on top.
-        frozen = (_is_edge_kind(kind) and bool(self.freeze_base_var.get())
+        want_frozen = _is_edge_kind(kind) and bool(self.freeze_base_var.get())
+        frozen = (want_frozen
                   and self._clf is not None and list(self._clf_names or []) == list(names)
                   and self._has_embedding(self._clf))
+        # The context columns are part of `names`: a changed context spec
+        # means a different design matrix, so the base cannot be kept.
+        context_changed = (want_frozen and not frozen and self._clf is not None
+                           and getattr(self, "_clf_context", None) != ctx)
         t0 = time.perf_counter()
         if frozen:
             clf = self._clf
@@ -149,13 +231,20 @@ class ClassifierMixin:
         dt_ms = 1e3 * (time.perf_counter() - t0)
         edge, edge_note = (None, "")
         if _is_edge_kind(kind):
-            edge, edge_note = self._fit_edge_model_now(clf, names)
-        self._install_model(clf, names, kind, spec, preserve_view, edge=edge)
+            edge, edge_note = self._fit_edge_model_now(clf, names, ctx)
+        latent, latent_note = (None, "")
+        if ctx.latent is not None:
+            latent, latent_note = self._fit_latent_head_now(clf, names, ctx, spec)
+        edge_note += latent_note
+        self._install_model(clf, names, kind, spec, preserve_view, edge=edge, ctx=ctx,
+                            latent=latent)
         if base in (_TUNED_KIND, _CUSTOM_KIND):
             acc = f", train acc {clf.score(X, y):.1%}"
             hint = "" if spec is None else " - " + spec.brief(len(names))
             if frozen:
                 hint += " (base frozen)"
+            elif context_changed:
+                hint += " (base refit: context changed)"
         elif kind in _DENSE_TOP_N:
             selector = clf.named_steps["select"]
             selected = [(names[i], float(v)) for i, v in
@@ -178,13 +267,16 @@ class ClassifierMixin:
             acc = f", train acc {clf.score(X, y):.1%}"
             hint = ""
         self._refresh_model_strip()
+        if ctx is not None and not ctx.empty():
+            hint += " - " + ctx.brief()
         self.status_var.set(f"Trained {kind} on {len(y)} labeled regions in "
                             f"{dt_ms:.0f} ms{acc}{hint}{edge_note}")
 
-    def _training_set(self):
+    def _training_set(self, spec=None):
         """``(X, y, groups, names)`` over every labeled region of every primed
         slice -- `groups` is each row's slice index, for leave-slices-out CV --
-        or None with the reason in the status bar."""
+        or None with the reason in the status bar. `names` carries the context
+        columns of `spec` (the Model tab's when None) after the record's own."""
         try:
             import sklearn  # noqa: F401
         except ImportError:
@@ -192,7 +284,9 @@ class ClassifierMixin:
                                 "pip install scikit-learn to enable training")
             return None
         import numpy as np
-        slices = self._stream_stat_slices("Preparing training")
+        if spec is None:
+            spec = self._context_spec_from_ui()
+        slices = self._stream_stat_slices("Preparing training", spec, training=True)
         if slices is None:
             return None
         items = ((key, rec, table, self.catalogue.group_of(key), f"{si}:{li}")
@@ -205,10 +299,15 @@ class ClassifierMixin:
             self.status_var.set(str(problem))
             return None
 
-    def _install_model(self, clf, names, kind, spec=None, preserve_view=False, edge=None):
+    def _install_model(self, clf, names, kind, spec=None, preserve_view=False, edge=None,
+                       ctx=None, latent=None):
         """Make `clf` the current model (Train and Optimize share this tail).
         `edge` is the edge model fit on top of it (None drops any old one: an
-        edge model belongs to exactly one base net)."""
+        edge model belongs to exactly one base net). `ctx` is the ContextSpec
+        whose columns `names` carries (None = none): predictions and the
+        compatibility gate rebuild exactly those columns. `latent` is the
+        latent-ring head fit on top of `clf` (None drops any old one, for
+        the same reason as the edge model)."""
         self._clf = clf
         self._clf_names = names
         self._clf_kind = kind
@@ -217,6 +316,8 @@ class ClassifierMixin:
         # rather than at save time: it must be refused the moment the profile
         # moves, not only after a round trip through a pickle.
         self._clf_scope = self._feature_scope()
+        self._clf_context = ctx if ctx is not None else context.ContextSpec()
+        self._context_model = latent
         self._edge_model = edge
         self._pred.clear()               # predictions belong to the old model
         if not preserve_view:
@@ -235,31 +336,50 @@ class ClassifierMixin:
         except TypeError:
             return False
 
-    def _edge_training_data(self, names):
+    def _edge_training_data(self, names, spec=None):
         """Every region of every primed slice (class 0 = unlabeled) with its
         slice index and extremum value, plus the edges of the region graph as
         global row pairs -- what the edge model is fit and evaluated on. Tk
         thread only (records, the store); returns copies the worker may keep.
-        None (with the reason in the status bar) when a slice lacks stats."""
+        `spec` is the ContextSpec `names` was built under (the loaded model's
+        when None). None (with the reason in the status bar) when a slice
+        lacks stats."""
         import numpy as np
-        slices = self._stream_stat_slices("Gathering edges")
+        if spec is None:
+            spec = getattr(self, "_clf_context", None)
+        slices = self._stream_stat_slices("Gathering edges", spec, training=True)
         if slices is None:
             return None
         items = ((key, rec, table, self.catalogue.group_of(key), f"{si}:{li}")
                  for si, li, key, rec, table in slices)
+        # The pair model's `contact` feature (and a contact-weighted latent
+        # ring) reads the arcs' shared boundary lengths: derived from the
+        # label raster once per record and cached on the arcs dict, only when
+        # the settings ask for it.
+        want_contact = ("contact" in self._edge_spec_from_ui().features
+                        or (spec is not None and spec.latent is not None
+                            and spec.latent.weight == "contact"))
+
+        def arcs_of(key, rec):
+            arcs = self.regions.arcs(key, np)
+            if want_contact and arcs is not None and rec.get("labels") is not None:
+                context.ensure_contact(arcs, rec["labels"], np)
+            return arcs
+
         try:
             return self._training_builder.edge_set(
-                items, self.store, names, lambda key, rec: self.regions.arcs(key, np), np,
+                items, self.store, names, arcs_of, np,
                 layer_of=lambda key, rec: self.regions.label_layer(key))
         except TrainingProblem as problem:
             self.status_var.set(str(problem))
             return None
 
-    def _fit_edge_model_now(self, clf, names):
-        """Fit the pair model on top of `clf`: (EdgeModel | None, status note)."""
+    def _fit_edge_model_now(self, clf, names, spec=None):
+        """Fit the pair model on top of `clf`: (EdgeModel | None, status note).
+        `spec` is the ContextSpec `clf` was fit under."""
         if not self._has_embedding(clf):
             return None, " - edges skipped: the base has no hidden layer to embed with"
-        data = self._edge_training_data(names)
+        data = self._edge_training_data(names, spec)
         if data is None:
             return None, " - edges skipped: no data"
         X_all, cls, _grp, ext, edges, _names = data
@@ -278,6 +398,79 @@ class ClassifierMixin:
                       f"{edge.n_diff / max(1, edge.n_edges):.0%} boundaries, "
                       f"{'MSC saddles' if edge.used_saddle else 'pixel adjacency'}, "
                       f"{edge.fit_s * 1e3:.0f} ms")
+
+    def _fit_latent_head_now(self, clf, names, ctx, spec=None):
+        """Fit the latent-ring head on top of `clf` (the base net) under
+        ContextSpec `ctx` (whose `latent` block says how):
+        (LatentContextModel | None, status note). The head is the base's own
+        architecture (the tuned spec when there is one, its feature mask
+        widened by the latent columns) refit on the row plus the ring's
+        embedding columns, with balanced weights like the base."""
+        import numpy as np
+        if ctx is None or ctx.latent is None:
+            return None, ""
+        if not self._has_embedding(clf):
+            return None, " - latent head skipped: the base has no hidden layer to embed with"
+        data = self._edge_training_data(names, ctx)
+        if data is None:
+            return None, " - latent head skipped: no data"
+        X_all, cls, grp, _ext, edges, _names = data
+        lspec = ctx.latent
+        length = edges.get("length") if lspec.weight == "contact" else None
+        g = context.directed_graph(edges["a"], edges["b"], edges["n_rows"], np, length)
+        area = None
+        af = self.FIELDS.area_field
+        if lspec.weight == "area" and af in names:
+            area = X_all[:, list(names).index(af)]
+        # `spec` is the base being installed (None for the plain kinds: the
+        # head is then the default dense net) -- never the PREVIOUS model's.
+        base_spec = spec
+        backend = self._search_settings()[4]
+
+        def make_head(all_names):
+            if base_spec is not None:
+                feats = (None if base_spec.features is None
+                         else list(base_spec.features) + list(all_names[len(names):]))
+                hs = dataclasses.replace(base_spec, features=feats, max_iter=_MLP_MAX_ITER)
+            else:
+                hs = model_search.ModelSpec(max_iter=_MLP_MAX_ITER, backend=backend)
+            return model_search.build_estimator(hs, all_names), model_search.fit_estimator
+
+        self._compute_badge("Fitting latent head")
+        try:
+            model = context.fit_latent_head(clf, X_all, cls, g, lspec, names, make_head, np,
+                                            area=area, row_slice=grp)
+        except (ValueError, TypeError) as exc:
+            self._log(f"latent head not fit: {exc}")
+            return None, f" - latent head not fit: {exc}"
+        finally:
+            self._clear_compute_badge()
+        self._log(f"latent head: {model.describe()}")
+        return model, (f" -> {lspec.brief()}: +{len(context.latent_names(lspec, model.width))} "
+                       f"columns, {model.fit_s * 1e3:.0f} ms")
+
+    def _latent_for(self, clf, names, ctx, spec=None):
+        """The latent head for an installed-elsewhere base (Optimize / sweep
+        winners), or None -- the note goes to the log."""
+        model, note = self._fit_latent_head_now(clf, names, ctx, spec)
+        if note:
+            self._log("latent head:" + note)
+        return model
+
+    def _latent_graph(self, key, table, labels, lspec, np):
+        """``(graph, area)`` over the slice's rows for the latent head, from the
+        provider's arcs (contact lengths derived when the weighting needs them)."""
+        arcs = self.regions.arcs(key, np)
+        ids = table.column(self.FIELDS.id_field)
+        n = table.n_rows
+        if arcs is None or ids is None or not len(arcs.get("a", ())):
+            return context.directed_graph([], [], n, np), None
+        ia, ib, keep = magic_fill.index_arcs(arcs, ids, np)
+        length = None
+        if lspec.weight == "contact":
+            length = np.asarray(context.ensure_contact(arcs, labels, np), np.float64)[keep]
+        area = table.column(self.FIELDS.area_field) if lspec.weight == "area" else None
+        return context.directed_graph(ia, ib, n, np, length), area
 
     def _vote_entry(self, region_proba, aux, lam, rounds, np):
         """(final classes, flips) for one cached slice: neighbour voting in
@@ -471,6 +664,9 @@ class ClassifierMixin:
         if self._search is not None:
             self.status_var.set("A search is already running - Cancel it first.")
             return
+        # The training set reads the Model tab's context itself; the spec is
+        # captured beside it so the winner is installed under the same one.
+        ctx = self._context_spec_from_ui()
         got = self._training_set()
         if got is None:
             return
@@ -481,7 +677,7 @@ class ClassifierMixin:
         except ValueError as exc:
             self.status_var.set(f"Cannot optimize: {exc}.")
             return
-        schema = self._feature_schema_now()
+        schema = self._feature_schema_with_context(ctx, names)
         searcher = "optuna" if model_search.have_optuna() else "random"
         q = queue.Queue()
         stop = threading.Event()
@@ -506,7 +702,7 @@ class ClassifierMixin:
 
         n_slices = len(set(groups.tolist()))
         self._search = {"queue": q, "stop": stop, "thread": None, "names": names,
-                        "n": int(len(y)), "t0": time.perf_counter()}
+                        "n": int(len(y)), "t0": time.perf_counter(), "context": ctx}
         self.model_kind_var.set(_TUNED_KIND)
         self._set_search_buttons(running=True)
         self.search_progress_var.set(
@@ -567,6 +763,12 @@ class ClassifierMixin:
                 elif ev[0] == "edge_done":
                     self._finish_edge_eval(ev[1])
                     finished = True
+                elif ev[0] == "seam_progress":
+                    _, f, n = ev
+                    self._compute_badge(f"Evaluating seams {f}/{n}")
+                elif ev[0] == "seam_done":
+                    self._finish_seam_eval(ev[1])
+                    finished = True
                 else:
                     self.search_progress_var.set(f"failed: {ev[1]}")
                     self.status_var.set(f"Optimize failed: {ev[1]}")
@@ -593,7 +795,10 @@ class ClassifierMixin:
         names = st["names"]
         spec = res.spec
         self._search_spec = spec
-        self._install_model(res.estimator, names, _TUNED_KIND, spec, preserve_view=True)
+        ctx = st.get("context")
+        latent = self._latent_for(res.estimator, names, ctx, spec)
+        self._install_model(res.estimator, names, _TUNED_KIND, spec, preserve_view=True,
+                            ctx=ctx, latent=latent)
         self._refresh_model_readout()
         gain = ""
         if spec.baseline_score is not None:
@@ -648,6 +853,9 @@ class ClassifierMixin:
         except ValueError as exc:
             self.status_var.set(str(exc))
             return
+        # The training set reads the Model tab's context itself; the spec is
+        # captured beside it so the winner is installed under the same one.
+        ctx = self._context_spec_from_ui()
         got = self._training_set()
         if got is None:
             return
@@ -658,7 +866,7 @@ class ClassifierMixin:
         except ValueError as exc:
             self.status_var.set(f"Cannot sweep: {exc}.")
             return
-        schema = self._feature_schema_now()
+        schema = self._feature_schema_with_context(ctx, names)
         searcher = "optuna" if model_search.have_optuna() else "random"
         q = queue.Queue()
         stop = threading.Event()
@@ -685,7 +893,7 @@ class ClassifierMixin:
         self._refresh_sweep_report([])
         self._search = {"queue": q, "stop": stop, "thread": None, "names": names,
                         "n": int(len(y)), "t0": time.perf_counter(), "kind": "sweep",
-                        "sizes": sizes, "per_size": per_size}
+                        "sizes": sizes, "per_size": per_size, "context": ctx}
         self.model_kind_var.set(_TUNED_KIND)
         self._set_search_buttons(running=True)
         self.search_progress_var.set(
@@ -733,6 +941,7 @@ class ClassifierMixin:
     def _finish_sweep(self, res):
         st = self._search
         self._sweep = res
+        self._sweep_context = st.get("context")     # for a rung installed later
         self._sweep_rows = list(res.rows)
         self._refresh_sweep_report(res.rows, stopped=res.stopped)
         lines = res.report_lines()
@@ -753,8 +962,12 @@ class ClassifierMixin:
     def _install_sweep_row(self, row, announce=True):
         names = list(self._search["names"] if self._search is not None
                      else (self._sweep.names if self._sweep is not None else []))
+        ctx = (self._search.get("context") if self._search is not None
+               else getattr(self, "_sweep_context", None))
         self._search_spec = row.spec
-        self._install_model(row.estimator, names, _TUNED_KIND, row.spec, preserve_view=True)
+        latent = self._latent_for(row.estimator, names, ctx, row.spec)
+        self._install_model(row.estimator, names, _TUNED_KIND, row.spec, preserve_view=True,
+                            ctx=ctx, latent=latent)
         self._refresh_model_readout()
         self._refresh_model_strip()
         if announce:
@@ -899,6 +1112,8 @@ class ClassifierMixin:
         for name, state in (("optimize_btn", "disabled" if running else "normal"),
                             ("sweep_btn", "disabled" if running else "normal"),
                             ("edge_eval_btn", "disabled" if running else "normal"),
+                            ("seam_eval_btn", "disabled" if running else "normal"),
+                            ("seam_train_btn", "disabled" if running else "normal"),
                             ("cancel_search_btn", "normal" if running else "disabled")):
             btn = getattr(self, name, None)
             if btn is not None:
@@ -922,13 +1137,38 @@ class ClassifierMixin:
     def _clear_compute_badge(self):
         self._update_busy()      # restores busy/stale/none per engine state
 
-    def _check_model_compat(self, names, context, scope=None):
+    def _expected_names_for(self, spec):
+        """The feature names the ACTIVE profile produces under ContextSpec
+        `spec` (the loaded model's when None): the app's own schema plus the
+        context columns built over it. None when the app cannot say (no
+        compiled extension), which skips the gate."""
+        expected = self._expected_feature_names()
+        if expected is None:
+            return None
+        if spec is None:
+            spec = getattr(self, "_clf_context", None)
+        expected = list(expected)
+        if spec is not None and not spec.empty():
+            expected += context.column_names(spec, expected, self.FIELDS)
+        return expected
+
+    def _feature_schema_with_context(self, spec, names):
+        """The active profile's ``{name, channel, reduction}`` schema plus one
+        entry per context column, so Optimize's feature mask files each
+        context kind as its own group. None when neither exists."""
+        schema = self._feature_schema_now()
+        if spec is None or spec.empty():
+            return schema
+        return list(schema or []) + context.schema_entries(spec, list(names), self.FIELDS)
+
+    def _check_model_compat(self, names, context, scope=None, ctx=None):
         """None when `names` matches the active profile's statistics schema AND
         the model's scope is the profile's; else a blocking message naming the
         exact mismatch. Names are compared as SETS: the feature matrix is
         assembled by name, so order never matters. `scope` defaults to the
-        loaded model's (see `_feature_scope`)."""
-        expected = self._expected_feature_names()
+        loaded model's (see `_feature_scope`); `ctx` is the ContextSpec whose
+        columns `names` includes, defaulting to the loaded model's too."""
+        expected = self._expected_names_for(ctx)
         if expected is None:
             self._log(f"model compatibility check skipped ({context}): "
                 "compiled extension not available")
@@ -992,6 +1232,10 @@ class ClassifierMixin:
         probabilities come out of the same forward pass as the hard label
         (which is their argmax), and the regions coloring modes and any later
         confidence read need them per region, not per feature row."""
+        ctx = getattr(self, "_clf_context", None)
+        if (ctx is not None and ctx.labels is not None and self._pred
+                and getattr(self, "_pred_store_rev", None) != self.store.rev):
+            self._pred.clear()           # labels are context: the store moved
         pr = self._pred.get(self.catalogue.key_of(si, li))
         if pr is not None and pr[0] == rec.get("commit"):
             return pr[1]
@@ -1000,16 +1244,41 @@ class ClassifierMixin:
         table = rec.get("stats")
         if getattr(table, "values", None) is None:
             return None
+        # The model's OWN context columns (not the Model tab's, which may
+        # already describe the next model): the loaded spec rebuilds them.
+        try:
+            table = self._context_table(self.catalogue.key_of(si, li), rec,
+                                        getattr(self, "_clf_context", None), np)
+        except ValueError as exc:
+            self._log(f"context columns unavailable on slice {si}:{li}: {exc}")
+            return None
         mat = self._feature_matrix(table, self._clf_names, np)
         fids = table.column("feature_id")
         if mat is None or fids is None:
             return None
-        # Column order is the estimator's own classes_, NOT 1..N: both kinds
-        # sit behind a Pipeline and neither promises contiguous class ids.
-        proba = np.asarray(self._clf.predict_proba(mat), np.float32)
-        classes = np.asarray(self._clf.classes_, int)
-        pred = classes[proba.argmax(1)].astype(np.uint8)
         labels = rec["labels"]
+        # The latent-ring head, when there is one: the base net embeds the
+        # rows, the ring columns are built over the slice's graph, and the
+        # head's probabilities are the prediction (the base's on any failure,
+        # logged -- the edge model below still embeds with the base).
+        proba = classes = None
+        latent = getattr(self, "_context_model", None)
+        if latent is not None:
+            try:
+                g, area = self._latent_graph(self.catalogue.key_of(si, li), table, labels,
+                                             latent.spec, np)
+                proba, classes = context.predict_latent(latent, self._clf, mat, g, np, area=area)
+                proba = np.asarray(proba, np.float32)
+                classes = np.asarray(classes, int)
+            except (ValueError, TypeError, IndexError) as exc:
+                self._log(f"latent head unusable on slice {si}:{li}: {exc}")
+                proba = classes = None
+        if proba is None:
+            # Column order is the estimator's own classes_, NOT 1..N: both
+            # kinds sit behind a Pipeline and neither promises contiguous ids.
+            proba = np.asarray(self._clf.predict_proba(mat), np.float32)
+            classes = np.asarray(self._clf.classes_, int)
+        pred = classes[proba.argmax(1)].astype(np.uint8)
         K = max(int(labels.max()) + 1 if labels.size else 1, 1)
         region_class = np.zeros(K, np.uint8)
         # MAX_CLASSES-wide, not n_classes-wide: the class count can change
@@ -1038,7 +1307,11 @@ class ClassifierMixin:
                            if "ext_filtered" in names else None)
                     sad = arcs.get("saddle")
                     sad = None if sad is None else np.asarray(sad, np.float64)[keep_e]
-                    pd_rows = edge_model.predict_pdiff(edge, self._clf, mat, ia, ib, sad, ext)
+                    contact = None
+                    if "contact" in edge.spec.features:
+                        contact = context.ensure_contact(arcs, labels, np)[keep_e]
+                    pd_rows = edge_model.predict_pdiff(edge, self._clf, mat, ia, ib, sad, ext,
+                                                       contact=contact)
                     pdiff = np.full(len(arcs["a"]), np.nan, np.float32)
                     pdiff[keep_e] = pd_rows
                     spec = self._edge_spec_from_ui()
@@ -1056,6 +1329,7 @@ class ClassifierMixin:
         entry = ((rec.get("commit"), final, region_proba) if aux is None
                  else (rec.get("commit"), final, region_proba, aux))
         self._pred[self.catalogue.key_of(si, li)] = entry
+        self._pred_store_rev = self.store.rev
         return final
 
     # -- training-set export --------------------------------------------- #
@@ -1093,17 +1367,32 @@ class ClassifierMixin:
         edge = None if self._edge_model is None else self._edge_model.to_dict()
         stack = {"custom_hidden": self.custom_hidden_var.get(),
                  "edge_spec": self._edge_spec_from_ui().to_dict()}
+        # The context columns the model was fit over, written only when there
+        # are any so a context-free pickle stays the document it always was.
+        ctx = getattr(self, "_clf_context", None)
+        if ctx is not None and not ctx.empty():
+            stack["context"] = ctx.to_dict()
+        latent = getattr(self, "_context_model", None)
+        if latent is not None:
+            stack["latent"] = latent.to_dict()
+        # The seam model rides along when one was fit (its own key, written
+        # only then, so a seam-less pickle is unchanged).
+        sm = getattr(self, "_seam_model", None)
+        seam = None if sm is None else sm.to_dict()
         model_bundle.ModelBundle(model=self._clf, names=list(self._clf_names), kind=self._clf_kind,
                                  statistics=stats, spec=spec, edge=edge, stack=stack,
-                                 app_tag=self.MODEL_APP_TAG).save(path)
+                                 seam=seam, app_tag=self.MODEL_APP_TAG).save(path)
         self._record_model(path, stats)
 
     def _record_model(self, path, statistics):
         """Register a saved/loaded model on the session (deduped by path)."""
+        ctx = getattr(self, "_clf_context", None)
         entry = model_bundle.model_record_entry(
             path, self._clf_names, self._clf_kind, statistics,
             None if self._clf_spec is None else self._clf_spec.to_dict(),
-            self._edge_model is not None, getattr(self, "_clf_scope", None))
+            self._edge_model is not None, getattr(self, "_clf_scope", None),
+            context=None if ctx is None or ctx.empty() else ctx.to_dict(),
+            has_seam=getattr(self, "_seam_model", None) is not None)
         self.models = [m for m in self.models if m.get("path") != entry["path"]]
         self.models.append(entry)
 
@@ -1125,12 +1414,15 @@ class ClassifierMixin:
         """Install a pickled model. `interactive` is opt-in: session restore
         and the selftest call this headlessly, where a modal would hang."""
         doc = model_bundle.ModelBundle.load(path, self.MODEL_APP_TAG)
+        # The context columns the pickle's names include: the gate must expect
+        # them, and the Model tab follows them only once the gate has passed.
+        ctx = context.ContextSpec.from_dict(doc.stack.get("context"))
         # The compatibility gate: a model trained under different statistics
         # is refused OUTRIGHT (per-feature values would silently mean the
         # wrong thing), before anything is installed. Interactively -- and only
         # for a v2 pickle, which carries the statistics it was trained under --
         # the user is first offered a profile built from those statistics.
-        msg = self._check_model_compat(doc.names, "load", doc.scope)
+        msg = self._check_model_compat(doc.names, "load", doc.scope, ctx)
         if msg and interactive and doc.statistics:
             if not messagebox.askyesno(
                     self.APP_TITLE,
@@ -1140,13 +1432,15 @@ class ClassifierMixin:
             self._profile_from_model(path, doc.statistics)
             # The new profile can still miss: feature_fields may resolve
             # differently here than in the build that saved the pickle.
-            msg = self._check_model_compat(doc.names, "load", doc.scope)
+            msg = self._check_model_compat(doc.names, "load", doc.scope, ctx)
         if msg:
             raise ValueError(msg)
         self._pred.clear()               # predictions belong to the old model
         self._clf = doc.model
         self._clf_names = list(doc.names)
         self._clf_scope = doc.scope
+        self._clf_context = ctx
+        self._apply_context_spec(ctx)
         self._clf_kind = doc.kind
         self._clf_spec = (model_search.ModelSpec.from_dict(doc.spec)
                           if doc.spec is not None else None)
@@ -1163,7 +1457,34 @@ class ClassifierMixin:
                     self._log("edge model in the pickle was fit over other features - dropped")
             except Exception as exc:
                 self._log(f"edge model in the pickle not restored: {exc}")
+        # The seam model, only when its pair block did not embed with a base
+        # net other than this one (a 'features' embedding is base-independent).
+        self._seam_model = None
+        self._seam_pred.clear()
+        if doc.seam is not None:
+            try:
+                sm = seam_model.SeamModel.from_dict(doc.seam)
+                if (sm.embed_used == "net" and sm.net_hash
+                        and sm.net_hash != edge_model.net_hash(self._clf)):
+                    self._log("seam model in the pickle was fit on another base net - dropped")
+                else:
+                    self._seam_model = sm
+            except Exception as exc:
+                self._log(f"seam model in the pickle not restored: {exc}")
         stack = doc.stack
+        # The latent-ring head on top, only when it was fit over these
+        # features and on this very base net.
+        self._context_model = None
+        if isinstance(stack.get("latent"), dict):
+            try:
+                lm = context.LatentContextModel.from_dict(stack["latent"])
+                if (lm.names_hash == edge_model.names_hash(self._clf_names)
+                        and (not lm.net_hash or lm.net_hash == edge_model.net_hash(self._clf))):
+                    self._context_model = lm
+                else:
+                    self._log("latent head in the pickle was fit over another base - dropped")
+            except Exception as exc:
+                self._log(f"latent head in the pickle not restored: {exc}")
         if isinstance(stack.get("custom_hidden"), str):
             try:
                 model_search.parse_sizes(stack["custom_hidden"])

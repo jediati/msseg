@@ -161,6 +161,40 @@ class SlideRegionProvider:
     def label_layer(self, key):
         return self.engine.label_layer(key)
 
+    def seams(self, key, np):
+        """The item's seam graph, PLACED on the slide (corner points convert
+        through the record's origin/scale, so a trace stores slide
+        coordinates like every other gesture)."""
+        rec = self.record(key)
+        if rec is None:
+            return None
+        from msseg.labeler.labeling import Placement
+        return self.seams_for_record(rec, np, key,
+                                     placement=Placement(rec["origin"], rec["scale"]))
+
+    @staticmethod
+    def seams_for_record(rec, np, key=None, placement=None):
+        """The record's seam graph (seams.SeamGraph over its label raster),
+        derived once and cached on the record (commit-keyed, so a Rerun
+        recomputes it). The compiled ``seam_graph`` when the extension has it,
+        else the numpy reference."""
+        graph = rec.get("_seams")
+        if graph is None and rec.get("labels") is not None:
+            from msseg.labeler.seams import SeamGraph
+            try:
+                from msseg import mscoupon as _m
+                ext = getattr(_m, "_ext", None)
+            except ImportError:
+                ext = None
+            t0 = time.perf_counter()
+            graph = SeamGraph.from_labels(rec["labels"], np, ext=ext, placement=placement,
+                                          rev=int(rec.get("commit") or 0))
+            rec["_seams"] = graph
+            log(f"seams: {graph.n_seams} seams / {graph.n_junctions} junctions for "
+                f"{key or 'slice'} ({1e3 * (time.perf_counter() - t0):.0f}ms, "
+                f"{'c++' if getattr(ext, 'seam_graph', None) else 'numpy'})")
+        return graph
+
     @staticmethod
     def arcs_for_record(rec, np, key=None):
         """The record's living-region arcs (MSC saddles), or pixel adjacency

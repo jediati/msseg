@@ -486,6 +486,11 @@ bool try_gpu_accumulate(ImplT& impl, const diffg::Image<float>& base,
   const std::vector<ResolvedStatChannel>& channels = impl.channels;
   int planes_needed = 0;
   for (const ResolvedStatChannel& c : channels) {
+    // A named measurement source is a chain the device path does not run: its
+    // planes are built on the host and would need slots of their own, which
+    // collide with the colour planes at 2 + p. Declining serves it correctly on
+    // the CPU rather than silently routing it into the wrong bank.
+    if (c.source != "base" && c.source != "color") return decline("a computed statistics source");
     if (c.source != "color") continue;
     if (c.input_channel < 0) return decline("a cross-channel colour kind");
     planes_needed = std::max(planes_needed, c.input_channel + 1);

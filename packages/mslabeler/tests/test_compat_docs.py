@@ -38,3 +38,22 @@ def test_v1_basenames_migrate_when_unambiguous():
     assert [(it.si, it.li) for it in store.interactions] == [(0, 0), (None, None), (None, None)]
     out = store.to_json()
     assert out["version"] == 2 and out["interactions"][0]["slice"] == "data/s0.tiff"
+
+
+def test_v3_roundtrip_is_byte_identical_and_v2_readers_ignore_seams():
+    text = open(os.path.join(DATA, "annotations_v3.json"), encoding="utf-8").read()
+    doc = json.loads(text)
+    store = LabelStore.from_json(doc)
+    assert _dump(store.to_json()) == _dump(doc)
+    assert doc["version"] == 3
+    assert [it.tool for it in store.seams] == ["scope", "trace"]
+    assert store.seams[1].meta["toll"] == "feature"
+    # The region gestures are exactly the v2 file's: a reader that ignores
+    # the "seams" key sees the v2 document (modulo the version number).
+    v2 = json.load(open(os.path.join(DATA, "annotations_v2.json"), encoding="utf-8"))
+    stripped = {k: v for k, v in doc.items() if k != "seams"}
+    stripped["version"] = 2
+    assert _dump(stripped) == _dump(v2)
+    # Dropping the seams gives back a byte-identical v2 document.
+    store.remove_many([it.uid for it in store.seams])
+    assert _dump(store.to_json()) == _dump(v2)

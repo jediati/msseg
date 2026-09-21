@@ -28,7 +28,12 @@ Extras: `classify` (scikit-learn), `optimize` (+ optuna), `torch`, `pyramid`
 | `fields.py` | `FieldConventions` -- the statistics table's column names (`DEFAULT` = the coupon schema) | no |
 | `labeling.py` | `LabelStore` / `Interaction`: gestures in image coordinates, rasterized against a label raster on demand; the LUT builders | no |
 | `magic_fill.py` | the region-graph flood (join ladder, hop gain, ring), metrics over a `FeatureTableLike` | no |
+| `seams.py` | the seam graph -- the crack polylines between regions: `SeamGraph`, the numpy reference of `msseg::extract_seam_graph`, snapping, the pixel raster, LUTs (see [seam_labeling.md](seam_labeling.md)) | no |
+| `seam_labeling.py` | scopes and traces resolved against a seam graph by crack coverage | no |
+| `seam_path.py` | tolls and the livewire (one Dijkstra over the junction graph per anchor) | no |
+| `seam_model.py`, `seam_export.py` | the seam model (boundary vs interior from a seam descriptor) and the classified-seam export | no |
 | `training.py` | `TrainingSetBuilder`: annotations + tables -> `(X, y, groups, names)` and the edge model's arrays | no |
+| `context.py` | `ContextSpec` + `augment`: neighbourhood columns (ring / 2-hop / per-item reductions over the region graph, uniform / area / contact weighting, contact lengths from the label raster) appended to a table | no |
 | `bundle.py` | `ModelBundle`: the classifier pickle (v4 writer, v1-v4 reader) and `compat_message` | no |
 | `model_search.py`, `edge_model.py`, `torch_mlp.py` | the dense-net search, the pair model + voting, the GPU MLP | no |
 | `table.py` | `FeatureTable` (the columnar per-region table) | no |
@@ -38,10 +43,11 @@ Extras: `classify` (scikit-learn), `optimize` (+ optuna), `torch`, `pyramid`
 | `canvas.py` | `SliceCanvas`: zoom/pan, an `ImageSource` base, `LabelLayer` overlays through LUTs, the transient preview layer, the HUD | yes |
 | `widgets.py` | `ScrollFrame`, `jump_scale`, `scrolled_listbox`, tooltips | yes |
 | `shell.py` | `ViewerShell`: window, session browser, profiles, navigation, pump, session flow | yes |
-| `annotate.py` | `AnnotationShell`: the labeler layer (store, tools, hotkeys, three panes, session additions) | yes |
+| `annotate.py` | `AnnotationShell`: the labeler layer (store, tools, hotkeys, the three columns and their tabs, session additions) | yes |
 | `classifier.py` | `ClassifierMixin`: Train / Classify / Optimize / size sweep / edge evaluation | yes |
-| `panels/` | `HintsMixin`, `ModelPanelMixin`, `AnalysisPanelMixin`, `ViewControlsMixin`, `ClassPanelMixin` | yes |
-| `tools.py` | `DrawController`, `MagicFillController`, `_extremum_points` | yes |
+| `seam_classifier.py` | `SeamModelMixin`: Train seams / Evaluate / Export, the seam model on the classifier pickle | yes |
+| `panels/` | `HintsMixin`, `ModelPanelMixin`, `AnalysisPanelMixin`, `ViewControlsMixin`, `ClassPanelMixin`, `SeamPanelMixin` (the Seams cluster, its caches and overlay) | yes |
+| `tools.py` | `DrawController`, `MagicFillController`, `TraceController` (trace + scope), `_extremum_points` | yes |
 | `defaults.py` | tunables and vocabularies (alphas, coloring modes, model kinds, search budgets, tool options) | -- |
 
 `import msseg.labeler` imports only the protocols; the headless modules never
@@ -67,24 +73,48 @@ selftest can too.
 `ViewerShell.__init__` order is load-bearing: data model -> `_init_compute()`
 -> catalogue + region provider -> `_init_variables()` -> the shell's variables
 -> toolbar -> paned window -> `_build_left_shell()` -> `_build_center()` ->
-`_build_left()` -> `_build_right()` -> `_after_layout()` -> status bar ->
-initial folder -> auto-save. `AnnotationShell.__init__` sets the labeler's
-state first (the base constructor calls the overridden builders), then chains.
+`_build_left()` -> `_build_right()` -> `_after_layout()` -> the chain
+fingerprint + preview poll -> status bar -> initial folder -> auto-save.
+`AnnotationShell.__init__` sets the labeler's state first (the base constructor
+calls the overridden builders), then chains. Note that `_build_left()` builds
+the parameter cards *before* `_build_right()` makes the viewer, which is why
+every edit-driven path guards on `self.viewer is None`.
+
+**A compute parameter was edited.** The filter chain is judged by looking at
+what it produces, so a field commit has to repaint -- without priming. Each
+commit calls `_notify_profile_edit()`, which debounces `_PREVIEW_SETTLE_MS`
+and then calls the app's `_launch_preview()`; `_preview_poll()` re-snapshots
+`_chain_fingerprint()` every `_PREVIEW_POLL_MS` as a backstop, because the
+chain cards are two near-identical implementations rebuilt from scratch on
+every operation change and a commit path that forgets to report itself must
+degrade to a delay rather than to a dead control (the same reasoning that made
+the workflow hint a poll). `_apply_profile_to_ui_quietly` mutes the signal
+while a profile or session lands on the widgets, which would otherwise fire a
+burst of chain recomputes for a chain nobody touched.
+
+`preview.PreviewWorker` runs the compute: a daemon thread, a `queue.Queue` the
+Tk thread drains on a `root.after` pump, a `threading.Event` the callable
+checks between stages, and one live submission at a time (a newer submit
+supersedes the older, whose result is dropped rather than painted). It takes a
+callable and knows nothing about filters. `submit(..., sync=True)` runs inline
+and pumps once, which is how the selftests drive it. It never touches a cache:
+the callable returns arrays and the pump stores them, so the raster LRUs stay
+single-threaded (they are bare `OrderedDict`s whose reads reorder them).
 
 ## The four seams (`protocols.py`)
 
 | protocol | what the framework asks | coupon implementation |
 |---|---|---|
 | `ItemCatalogue` | `keys()`, `key_of(*index)`, `index_of(key)`, `label(key)`, `group_of(key)`, `tree()` | `adapters.SequenceCatalogue`: items are slices, key = `"folder/basename"` (what `annotations.json` has always stored), address = `(si, li)`, group = the flat slice index (leave-slices-out CV) |
-| `RegionProvider` | `commit`, `keys()`, `record(key)`, `ensure_record(key)`, `request(key)`, `pending()`, `poll()`, `arcs(key, np)`, `label_layer(key)` | `adapters.EngineRegionProvider` over `ComputeEngine`: cached per-slice records, synchronous compute through `ComputeEngine.ensure_slice`, MSC arcs or a cached pixel-adjacency fallback |
+| `RegionProvider` | `commit`, `keys()`, `record(key)`, `ensure_record(key)`, `request(key)`, `pending()`, `poll()`, `arcs(key, np)`, `seams(key, np)`, `label_layer(key)` | `adapters.EngineRegionProvider` over `ComputeEngine`: cached per-slice records, synchronous compute through `ComputeEngine.ensure_slice`, MSC arcs or a cached pixel-adjacency fallback, the seam graph (C++ `seam_graph` or the numpy reference) cached on the record and, in mspath, placed on the slide |
 | `ImageSource` | `levels`, `channels`, `level_shape`, `level_scale`, `best_level(scale)`, `value_range()`, `read_region(level, x, y, w, h)` | `sources.ArrayImageSource` (one level, native floats) and `pyramid.PyramidImageSource` (a tiled pyramid: the file's own levels and dtype, colour kept, reads assembled from a byte-budgeted tile LRU) |
 | `LabelLayer` | `shape`, `n_ids`, `rev`, `crop(level, x, y, w, h)`, `id_at(x, y)`, `full()` | `sources.ArrayLabelLayer` over the record's int32 raster |
 
 A `RegionRecord` is `{commit, labels (int32 raster, -1 = background), stats
 (FeatureTableLike), arcs ({"a","b","saddle"|None,"source"} or None), kept, cc}`.
 `commit` is the parameter generation: every cache (class LUTs, predictions,
-pixel adjacency) keys on it, and a record whose commit is not the provider's
-is stale.
+pixel adjacency, the seam graph and its raster) keys on it, and a record
+whose commit is not the provider's is stale.
 
 `FieldConventions` names the table's columns: the id column, the positional
 set (never features), the mean/std prefixes, the histogram-bin pattern, the
@@ -104,10 +134,30 @@ extremum's position and value columns. The magic fill, `TrainingSetBuilder`,
 | `_build_processing_sections()` / `_build_run_section()` | none / a Run button | sections 1b-5 / cores + Run |
 | `_build_segmentation_controls(row)` / `_build_live_panel(parent)` | none / slice nav + window + alpha | seg radios + mask / persistence, queries, pixels, connectivity |
 | `_bind_preview()` / `_preview_file(path)` / `_list_files(folder)` | none / none / TIFFs | the preview machinery |
+| `_launch_preview()` | no-op | recompute and repaint the shown channel from the edited chain, off the Tk thread (coupon: `_preview_plan` + `preview_raster`; mspath: `SlideEngine.read_item` + a `PlacedImageSource`) |
+| `_group(parent, text, key)` | a `ttk.LabelFrame`, packed | the labeler returns a `widgets.Collapsible` body instead -- its Processing tab is one tall column, where a group you are not editing is only in the way. Both return the frame the rows pack into, so the apps' `_build_processing_sections` reads the same either way. |
+| `_DEFAULT_PANES` | `()` | the labeler's `1:3:2`. Fractions of `self.paned`'s width, one per sash, placed by `_schedule_panes` once the window has a width and reported by `_pane_fractions`. Only ONE pane carries a weight (the viewer area), so a resize goes entirely to the picture and the sashes hold the proportions. |
 | `_slice_msc_mark` / `_slice_nav_text` / `_enumerate_items` | "" / the key / provider keys | primed marks / `folder/base` / primed slices |
+| `ITEM_NOUN` / `_row_kind(si, li)` / `_row_description(si, li)` / `_remove_target(si, li)` / `_row_owns_key(si, li, key)` / `_goto_row(si, li)` | "slice" / sequence-or-item / a phrase / the row itself / the catalogue's keys / navigate-or-preview | the defaults (mspath: "item", slide/overview/ROI, the overview redirects to its slide, a slide row owns every key on the slide, go-to also fits the item) |
+| `_original_channel()` | `"base"` -- what the `F` swap flips back to; `_window_for(channel)` (call after the source is on the canvas) hands out each channel's brightness window, first measured by `windowing.source_window` | `"color"` when the slice has planes / mspath `"slide"` |
+| `_remove_item_at(si, li)` / `_remove_sequence_at(si)` / `_after_rows_removed(cur_key, pos)` | edit `subsequences` / rebuild + retree + renavigate | also `engine.drop_slice` / `drop_sequence` (mspath: `forget` / `forget_slide`, the ROI hint, a cleared canvas) |
 | `_reset_compute()` / `_settle_controls()` / `_update_busy()` / `_refresh_render()` / `_handle_compute_event(ev)` | minimal | the engine, Rerun/Run state, HUD, the render, primed/assembly events |
 | `_run_settings()` / `_apply_run_settings` / `_apply_view_state` | `{}` / none / none | cores + concurrency / the coupon view keys |
 | `_session_doc_from_json` / `_import_legacy_docs` / `_profile_to_file_doc` / `_profile_from_file_doc` / `_profile_from_ui` / `_apply_profile_to_ui` | passthrough | `session.*` |
+
+**Row removal** is one path for the sequence tree's right-click menu
+(*Go to* / *Clear annotations…* / *Remove …*), the Remove / Clear all
+buttons and headless callers: `_remove_rows_guarded(rows)` refuses while the
+engine is busy, asks with `_remove_rows_message(rows)`, then
+`_remove_rows(rows)` removes items before sequences from the highest index
+down and settles through `_after_rows_removed`. The labeler layers the
+annotations on it -- `_doomed_interactions(rows)` are the gestures whose item
+no longer exists afterwards (a slice held by a second sequence keeps its; a
+slide row also owns the keys of ROIs cut away earlier), they leave as one undo
+step, and the store rebinds through `catalogue.index_of` so keys that are not
+`folder/basename` bind too. Per-row `_clear_row_annotations_guarded` and the
+class panels' `clear` button (`_clear_class_guarded`) delete gestures without
+touching the data.
 
 `AnnotationShell` adds: `FIELDS`, `_workflow_summary(profile)`,
 `_workflow_hint_tooltip()`, `_set_region_layer_visible(on)`,
@@ -136,12 +186,39 @@ reach the app only through `viewer`, `regions`, `catalogue`, `store`,
   tests and headless callers control the import. Keep the convention.
 * Cross-validation groups come from `catalogue.group_of(key)` -- one group per
   item for both the region model and the edge model (leave-items-out).
+* **Context columns are ordinary columns.** `context.augment` returns a NEW
+  table (`rec["stats"]` is never mutated; the magic fill and every readout
+  keep reading the raw one), and the classifier's stream yields it in place
+  of the record's table. The compatibility gate compares
+  `expected + context.column_names(model's spec, expected)` -- the spec the
+  model was fit under rides with it (`_clf_context`, the pickle's
+  `stack["context"]`, the model record's `context`), separately from the
+  Model tab's picked spec (`view.context`), which describes the NEXT model.
+  Both keys exist only when there is a spec, so a context-free pickle and
+  session are the documents they always were. The latent-ring head
+  (`context.LatentContextModel`) is `stack["latent"]`, restored only when
+  its `names_hash` / `net_hash` match the pickle's base; its columns are
+  never part of the fingerprint. The labels block (`LabelSpec`) IS in the
+  fingerprint and makes predictions depend on the store: `AnnotationShell`
+  overrides `_rebuild_class_panels` (the "labels changed" signal) to call
+  `_labels_changed`, which drops cached predictions when `store.rev` moved.
+* The arcs dict (`{"a", "b", "saddle", "source"}`) may carry an OPTIONAL
+  `length` array (shared boundary length per arc, `context.ensure_contact`),
+  derived from the label raster on demand and cached in place; nothing
+  requires it, and no new feature reads a saddle value.
+
+* **annotations.json v3**: the `seams` list (scope / trace gestures) is
+  written, and the version raised to 3, only when there are any; a store
+  without seams is byte-identical to v2 and an older reader ignores the key
+  (`tests/test_compat_docs.py`, `tests/data/annotations_v3.json`).
+* **`ModelBundle.seam`**: the seam model's key is written only when one was
+  fit, so a seam-less pickle is the v4/v5 document it always was.
 
 ## Tests
 
 `packages/mslabeler/tests` (pure Python, `conftest.py` puts the three source
 trees on `sys.path`): `test_labeling`, `test_magic_fill`, `test_training`,
-`test_bundle`, `test_model_search`, `test_edge_model`, `test_torch_mlp`,
+`test_context`, `test_bundle`, `test_model_search`, `test_edge_model`, `test_torch_mlp`,
 `test_compat_docs`, `test_sources` (the canvas composite is compared
 pixel-for-pixel with a reference implementation). `packages/mscoupon/tests`
 keeps the coupon tests plus `test_shims` (shim identity and the old pickle

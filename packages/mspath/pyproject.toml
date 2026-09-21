@@ -28,6 +28,7 @@ torch = ["msseg-labeler[torch]"]
 [project.scripts]
 mspath-gui = "msseg.mspath.app:main"
 mspath-labeler = "msseg.mspath.labeler:main"
+mspath-embed = "msseg.mspath.embed:main"
 
 [tool.hatch.build.targets.wheel]
 # PEP 420 namespace: ship msseg/mspath/ with no top-level msseg/__init__.py.

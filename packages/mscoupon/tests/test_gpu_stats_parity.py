@@ -28,6 +28,14 @@ def _prime(engine, base, filt, planes, spec, gpu):
     {"channels": ["base", {"kind": "blur", "sigmas": [1.5], "source": "color"}],
      "reductions": ["mean", "max"], "extremum": True,
      "histogram": {"bins": 8, "channels": ["base", "blur_c1_s1.5"], "ranges": {"*": [0.0, 1.0]}}},
+    # A named measurement source. The device path DECLINES this one -- a source's
+    # planes are built on the host and would collide with the colour slots -- so
+    # what this case pins is that the fallback is correct rather than silent: the
+    # host numbers must still be the host numbers, and `use_gpu_stats` must not
+    # have quietly produced them from the wrong bank.
+    {"sources": {"he": [{"operation": "stain_deconvolution", "params": {"preset": "he"}}]},
+     "channels": ["base", "he", {"kind": "blur", "sigmas": [1.5], "source": "he"}],
+     "reductions": ["mean", "min", "max", "std"], "extremum": True},
 ])
 def test_device_path_matches_host_loop(spec):
     engine = pytest.importorskip("msseg.mscoupon")
@@ -40,6 +48,15 @@ def test_device_path_matches_host_loop(spec):
     cpu = _prime(engine, base, filt, planes, spec, gpu=False)
     gpu = _prime(engine, base, filt, planes, spec, gpu=True)
     if "gpu_stats" not in gpu.build_timings():
+        # Either no device path in this build, or the spec declined it. A
+        # declined spec must still agree with itself: the host loop ran on both
+        # sides, so the rows have to match exactly.
+        if spec.get("sources"):
+            assert np.array_equal(cpu.labels(), gpu.labels())
+            names_c, rows_c = cpu.feature_table()
+            names_g, rows_g = gpu.feature_table()
+            assert list(names_c) == list(names_g)
+            assert np.array_equal(rows_c, rows_g), "a declined spec falls back, it does not drift"
         pytest.skip("no device statistics path in this build / on this machine")
     assert "gpu_stats" not in cpu.build_timings()
     assert np.array_equal(cpu.labels(), gpu.labels()), "the GPU gradient is bit-identical"

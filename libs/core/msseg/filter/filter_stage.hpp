@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -30,7 +31,8 @@ diffg::Image<float> apply_filter_chain(const diffg::Image<float>& input,
 // intermediates, so a grayscale workflow is unchanged.
 diffg::Image<float> apply_filter_chain(diffg::MultiImageView<const float> planes,
                                        const std::vector<FilterParams>& filters,
-                                       const std::string& default_color_method = "luminance");
+                                       const std::string& default_color_method = "luminance",
+                                       const std::string& reduce_at = "front");
 
 // The same chain, allowed to END on a stack.
 //
@@ -47,7 +49,8 @@ diffg::Image<float> apply_filter_chain(diffg::MultiImageView<const float> planes
 // workflows are byte-identical AND no slower.
 diffg::MultiImage<float> apply_filter_chain_planes(
     diffg::MultiImageView<const float> planes, const std::vector<FilterParams>& filters,
-    const std::string& default_color_method = "luminance");
+    const std::string& default_color_method = "luminance",
+    const std::string& reduce_at = "front");
 
 // The measurement channels a StatsSpec asks for, as pixels.
 //
@@ -70,6 +73,12 @@ struct StatChannelBank {
   // input planes (per-channel kinds replicate per plane; the cross-channel
   // kinds reduce over them). Raw planes are aliased from the caller's stack.
   diffg::MultiImage<float> derived_color;
+  // Each named measurement source: its chain's output planes, and the derived
+  // responses over them. Held here because the slots alias into both, so they
+  // must outlive the bank's use, and because a source is materialized ONCE per
+  // slice however many channels read it.
+  std::map<std::string, diffg::MultiImage<float>> source_planes;
+  std::map<std::string, diffg::MultiImage<float>> derived_source;
   // Per-slot pointer into either the caller's base/filtered raster or `derived`.
   std::vector<const float*> data;
 

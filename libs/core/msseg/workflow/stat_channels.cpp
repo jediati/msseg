@@ -1,5 +1,7 @@
 #include "msseg/workflow/stat_channels.hpp"
 
+#include "msseg/filter/chain_plan.hpp"
+
 #include <algorithm>
 #include <cstdio>
 #include <stdexcept>
@@ -89,21 +91,53 @@ std::vector<ResolvedStatChannel> resolve_stat_channels(const StatsSpec& spec) {
     }
   }
 
+  // How many planes a named source yields. Derived from the chain by the same
+  // planner the runner uses, so a source's width is a fact about its chain
+  // rather than something a config has to assert and a slice has to be checked
+  // against.
+  const auto source_planes = [&](const std::string& name) {
+    const auto it = spec.sources.find(name);
+    if (it == spec.sources.end()) return -1;
+    need_planes("source '" + name + "'");
+    return static_cast<int>(plan_chain(it->second, static_cast<std::size_t>(planes), "luminance").out_channels);
+  };
+
+  // The raw planes of each named source, in the map's order, after `color_c<i>`
+  // so every column order that existed before sources is still a prefix.
+  for (const auto& entry : spec.sources) {
+    if (!spec.source_channel.count(entry.first)) continue;
+    const int n = source_planes(entry.first);
+    for (int i = 0; i < n; ++i) {
+      ResolvedStatChannel c;
+      c.name = entry.first + "_c" + std::to_string(i);
+      c.kind = entry.first;
+      c.source = entry.first;
+      c.input_channel = i;
+      out.push_back(c);
+    }
+  }
+
   for (const auto& req : spec.derived) {
     // base/filtered/color may also be spelled as a request object; they are
     // handled above via the flags, so skip them rather than duplicating a slot.
     if (req.kind == "base" || req.kind == "filtered" || req.kind == "color") continue;
-    if (req.source != "base" && req.source != "color") {
+    if (spec.sources.count(req.kind)) continue;   // a source named as a bare channel
+    const bool named_source = spec.sources.count(req.source) != 0;
+    if (req.source != "base" && req.source != "color" && !named_source) {
       throw std::runtime_error("statistics channel '" + req.kind + "' has source '" + req.source +
-                               "'; it must be base or color.");
+                               "'; it must be base, color, or a name declared in statistics.sources.");
     }
     const bool cross = is_cross_channel_kind(req.kind);
-    if (cross && req.source != "color") {
+    // A plane source is anything with more than one plane to reduce over: the
+    // raw input, or a named chain's output.
+    const bool on_planes = req.source == "color" || named_source;
+    if (cross && !on_planes) {
       throw std::runtime_error("statistics channel '" + req.kind +
-                               "' reduces across the input planes and needs source \"color\".");
+                               "' reduces across the input planes and needs a plane source "
+                               "(\"color\", or a name from statistics.sources).");
     }
-    const bool on_color = req.source == "color";
-    if (on_color) need_planes(req.kind);
+    const int src_planes = named_source ? source_planes(req.source) : planes;
+    if (on_planes) need_planes(req.kind);
     const int per_sigma = channels_per_sigma(req.kind);
     if (req.sigmas.empty()) {
       throw std::runtime_error("statistics channel '" + req.kind +
@@ -113,7 +147,7 @@ std::vector<ResolvedStatChannel> resolve_stat_channels(const StatsSpec& spec) {
     // A per-channel kind on the colour source repeats per plane, plane-major,
     // which is the order diffg's multi-channel bank emits. Cross-channel kinds
     // and every base-sourced kind emit once.
-    const int repeats = (on_color && !cross) ? planes : 1;
+    const int repeats = (on_planes && !cross) ? src_planes : 1;
     for (const double sigma : req.sigmas) {
       if (!(sigma > 0.0)) {
         throw std::runtime_error("statistics channel '" + prefix +
@@ -128,10 +162,13 @@ std::vector<ResolvedStatChannel> resolve_stat_channels(const StatsSpec& spec) {
           c.slot_in_request = plane * per_sigma + slot;
           c.sort_by_absolute_value = req.sort_by_absolute_value;
           c.source = req.source;
-          c.input_channel = (on_color && !cross) ? plane : -1;
-          c.name = prefix;
+          c.input_channel = (on_planes && !cross) ? plane : -1;
+          // A named source prefixes its channels, so two sources measured with
+          // the same kind and sigma cannot collide. `base` and `color` keep
+          // their bare names: those column sets already exist in shipped CSVs.
+          c.name = named_source && req.name.empty() ? req.source + "_" + prefix : prefix;
           if (per_sigma > 1) c.name += std::string("_") + kHessianSlot[slot];
-          if (on_color && !cross) c.name += "_c" + std::to_string(plane);
+          if (on_planes && !cross) c.name += "_c" + std::to_string(plane);
           c.name += "_s" + format_sigma(sigma);
           out.push_back(c);
         }

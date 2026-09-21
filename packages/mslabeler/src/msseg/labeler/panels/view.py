@@ -60,13 +60,18 @@ class ViewControlsMixin:
                                              values=["base", "filtered"], state="readonly",
                                              width=18)
         self.background_combo.pack(side="left", padx=4)
-        self.background_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_render())
+        self.background_combo.bind("<<ComboboxSelected>>", self._on_image_channel_change)
+        attach_tooltip(self.background_combo,
+                       "The image under the overlays. F flips between the original "
+                       "image and the derived channel last shown.")
         ttk.Label(chan, text="Image Min/Max:").pack(side="left", padx=(12, 4))
+        # The sliders show and edit the CURRENT channel's window; every channel
+        # keeps its own (see ViewerShell._window_for).
         self._scale(chan, from_=0.0, to=1.0, variable=self.vmin_var, orient="horizontal",
-                    command=lambda *_: self._refresh_render()
+                    command=self._on_window_change
                     ).pack(side="left", fill="x", expand=True)
         self._scale(chan, from_=0.0, to=1.0, variable=self.vmax_var, orient="horizontal",
-                    command=lambda *_: self._refresh_render()
+                    command=self._on_window_change
                     ).pack(side="left", fill="x", expand=True)
 
         overlay = ttk.Frame(parent); overlay.pack(fill="x", padx=4, pady=2)
@@ -246,6 +251,12 @@ class ViewControlsMixin:
                 lut = self._class_lut_for(si, li, rec, np)
                 if lut is not None:
                     overlays.append(self._region_overlay(rec["labels"], lut, np))
+            # The seams (boundaries between regions) by class, or by the
+            # seam model's boundaryness: a 2-px line over both flanks.
+            if self.show_seams_var.get():
+                sov = self._seam_overlay(si, li, rec, np)
+                if sov is not None:
+                    overlays.append(sov)
             # A selected confusion cell outranks everything: it is a question
             # about WHERE those regions are, so it goes on top, opaque.
             hits = self._confusion_hits()

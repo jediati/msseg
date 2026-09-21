@@ -102,25 +102,55 @@ COLOR_METHOD_PARAMS: Dict[str, List[tuple]] = {
 # than reduce it, so unlike `color` they are valid at any index the arity works
 # out. `adapt`'s extra rows depend on its mode, the way a colour card's depend on
 # its method -- filter_param_schema dispatches both.
-FILTER_SCHEMA["stain_deconvolution"] = [("preset", "choice:he,hdab,hed", "he"),
-                                        ("i0", "numstr", "max"), ("eps", "float", 0.001)]
-FILTER_SCHEMA["adapt"] = [("mode", "choice:select,project", "select")]
+ADAPT_MODES = ["select", "project", "reduce"]
+ADAPT_REDUCE_HOW = ["mean", "sum", "max", "min", "norm", "first"]
 # `matrix` is a flat list of C numbers = ONE projection row, which is every stain
 # contrast and the case worth typing; C++ accepts a list of rows too, for a
 # multi-plane projection a config can spell but a single entry cannot.
 ADAPT_MODE_PARAMS: Dict[str, List[tuple]] = {
     "select": [("channels", "floats", "0")],
     "project": [("matrix", "floats", ""), ("preset", "str", "")],
+    "reduce": [("how", "choice:" + ",".join(ADAPT_REDUCE_HOW), "mean"),
+               ("weights", "floats", "")],
 }
+
+# The colour methods promoted to operations of their own, so they run on ANY
+# stack rather than only the input at index 0 -- an HSV or Di Zenzo step after a
+# deconvolution, say. `color{method: X}` stays exactly what it was: the frozen
+# index-0 alias, which dispatches to these. The linear methods need no
+# promotion: `pick` is adapt/select, `luminance` and `weighted` are
+# adapt/project, `mean`/`max`/`min` are adapt/reduce.
+# Mirrors msseg::promoted_color_operations.
+PROMOTED_COLOR_OPERATIONS = ("hsv", "optical_density", "chgradmag", "dizenzo", "structure")
+PLANE_OPERATIONS = ("adapt", "stain_deconvolution") + PROMOTED_COLOR_OPERATIONS
+
+# Scalar operations core implements, and therefore can run plane by plane. A
+# package's own (mscoupon's `normalize`) cannot be lifted by core, and
+# `label_components` yields ids, which mean nothing per plane.
+CORE_SCALAR_OPERATIONS = ("blur", "derivative", "laplacian", "zero_crossings",
+                          "hessian_eigenvalues", "structure_eigenvalues", "edges",
+                          "erode", "dilate", "open", "close", "label_components")
+LIFTABLE_OPERATIONS = tuple(o for o in CORE_SCALAR_OPERATIONS if o != "label_components")
+
+# Operations core does not implement, applied by this package between core
+# batches. They are the ONLY legitimate reason to cut a chain in two: the
+# synthesis decision is a whole-chain property, so any other cut re-plans a
+# fragment and can insert a conversion the whole chain would not have.
+PACKAGE_ONLY_OPERATIONS = ("normalize",)
+
+FILTER_SCHEMA["stain_deconvolution"] = [("preset", "choice:he,hdab,hed", "he"),
+                                        ("i0", "numstr", "max"), ("eps", "float", 0.001)]
+FILTER_SCHEMA["adapt"] = [("mode", "choice:" + ",".join(ADAPT_MODES), "select")]
+# A promoted operation's rows ARE its colour method's rows, because it IS that
+# method: core applies one by handing it to the colour stage.
+for _op in PROMOTED_COLOR_OPERATIONS:
+    FILTER_SCHEMA[_op] = list(COLOR_METHOD_PARAMS.get(_op, []))
 
 FILTER_OPERATIONS = list(FILTER_SCHEMA.keys())
 
 
-PLANE_OPERATIONS = ("adapt", "stain_deconvolution")
-
 # The `adapt` modes and `stain_deconvolution` presets core accepts. Mirrors
 # msseg::adapt_modes / msseg::stain_presets.
-ADAPT_MODES = ["select", "project"]
 STAIN_PRESETS = ["he", "hdab", "hed"]
 
 
@@ -135,6 +165,29 @@ def _consumes_planes(card: Any) -> bool:
     return op == "color" or op in PLANE_OPERATIONS
 
 
+def _chain_ends_scalar(cards: Sequence[Any], channels: int) -> bool:
+    """Would the chain, given no help, land on a single plane?
+
+    Tolerant on purpose: anything it cannot answer means "no", which routes the
+    chain to the leading conversion it has always had -- so a chain containing a
+    stage this module cannot reason about (`normalize`) behaves exactly as it
+    did. Mirrors msseg::chain_ends_scalar."""
+    current = channels
+    for card in cards:
+        op = str(card.get("operation") or "none")
+        if op in ("none", ""):
+            continue
+        if not _consumes_planes(card) and current != 1:
+            if op not in LIFTABLE_OPERATIONS:
+                return False
+            continue                      # lifts: as many planes out as in
+        out = _stage_out_channels(card, current)
+        if out is None:
+            return False
+        current = out
+    return current == 1
+
+
 def _stage_out_channels(card: Any, current: int) -> Optional[int]:
     """Planes out, given planes in -- or None when the stage cannot run on them.
 
@@ -147,8 +200,16 @@ def _stage_out_channels(card: Any, current: int) -> Optional[int]:
         return current if _keeps_planes(card) else 1
     if op == "stain_deconvolution":
         return 3 if current == 3 else None
+    if op in PROMOTED_COLOR_OPERATIONS:
+        if op == "optical_density" and p.get("output") == "planes":
+            return current
+        if op in ("hsv",) and current < 3:
+            return None
+        return 1
     if op == "adapt":
         mode = p.get("mode", "select")
+        if mode == "reduce":
+            return 1 if str(p.get("how", "mean")) in ADAPT_REDUCE_HOW else None
         if mode == "select":
             ch = p.get("channels") or []
             if not ch or any(not isinstance(c, (int, float)) or c < 0 or int(c) >= current
@@ -175,18 +236,22 @@ def _stage_out_channels(card: Any, current: int) -> Optional[int]:
 def filter_operations_at(index: int) -> List[str]:
     """The operations a card at `index` may choose.
 
-    `color` is a frozen alias: a legacy spelling whose placement rule is a rule
-    about the literal operation name, enforced in `msseg::plan_chain`, the C++
-    config parser and here. One function rather than the literal that used to sit
-    in both card UIs -- they are near-identical by copy, so a rule written twice
-    is a rule that drifts once."""
-    if index == 0:
-        return list(FILTER_OPERATIONS)
-    return [o for o in FILTER_OPERATIONS if o != "color"]
+    Every one of them, at every index. `color` was pinned to index 0 while it
+    was the only stage that consumed planes and everything after it was a
+    scalar; a chain can carry a stack now, so `color{method}` further in has
+    planes to reduce -- which is the only way to reach `luminance`, `weighted`
+    and `pick` mid-chain, none of which the promoted operations cover.
+
+    Kept as a function rather than the literal that used to sit in both card
+    UIs: they are near-identical by copy, so a rule written twice is a rule that
+    drifts once. `index` stays in the signature because arity, not position, is
+    what constrains a stage now -- and the planner reports that."""
+    return list(FILTER_OPERATIONS)
 
 
 def chain_plan(chain: Sequence[Any], channels: int = 1,
-               default_method: str = "luminance") -> Dict[str, Any]:
+               default_method: str = "luminance",
+               reduce_at: str = "front") -> Dict[str, Any]:
     """What each stage of `chain` receives and yields, in planes -- the Python
     mirror of `msseg::plan_chain` (mscoupon_py.chain_plan), for the GUI, which
     draws cards with no raster and, in a headless selftest, no extension.
@@ -203,31 +268,50 @@ def chain_plan(chain: Sequence[Any], channels: int = 1,
     error: Optional[str] = None
     cards = [c for c in chain if isinstance(c, dict)]
 
-    for i, card in enumerate(cards[1:], start=1):
-        if card.get("operation") == "color":
-            error = (f"'color' must be the first stage of the chain (found at index {i}): "
-                     "it consumes the input planes, and every later stage runs on a scalar.")
-            break
-
     channels = max(0, int(channels or 0))
-    # A conversion is synthesized only when the chain does not ALREADY consume
-    # the stack. `color` was the only plane-consuming stage when that rule was
-    # written; `adapt` and `stain_deconvolution` consume it too.
+    # A conversion is synthesized only when the chain neither consumes the stack
+    # itself nor reduces it somewhere along the way. Writing a reduction is how a
+    # chain says where that happens; a chain with none gets the conversion it has
+    # always had, at the front.
     consumes = bool(cards) and _consumes_planes(cards[0])
-    if not consumes and channels > 1:
+    if (not consumes and channels > 1 and reduce_at == "front"
+            and not _chain_ends_scalar(cards, channels)):
         stages.append({"operation": "color", "params": {"method": default_method},
-                       "in": channels, "out": 1, "index": -1, "synthesized": True})
+                       "in": channels, "out": 1, "index": -1, "synthesized": True,
+                       "lifted": False})
 
     current = channels if not stages else 1
     for i, card in enumerate(cards):
         op = str(card.get("operation") or "none")
-        out = _stage_out_channels(card, current)
+        lifted = False
+        if current != 1 and not _consumes_planes(card) and op not in ("none", ""):
+            if op not in LIFTABLE_OPERATIONS:
+                error = error or (
+                    f"{op} (stage {i}) reads one plane, but {current} reach it, and it cannot "
+                    "run plane by plane; reduce them first (adapt, mode 'reduce' or 'select').")
+                out = current
+                stages.append({"operation": op, "params": dict(card.get("params") or {}),
+                               "in": current, "out": out, "index": i,
+                               "synthesized": False, "lifted": False})
+                current = out
+                continue
+            lifted = True
+        out = current if lifted else _stage_out_channels(card, current)
         if out is None:                       # a refusal; report and stop planning
             error = error or (f"{op} (stage {i}) cannot run on {current} plane(s).")
             out = current
         stages.append({"operation": op, "params": dict(card.get("params") or {}),
-                       "in": current, "out": out, "index": i, "synthesized": False})
+                       "in": current, "out": out, "index": i,
+                       "synthesized": False, "lifted": lifted})
         current = out
+
+    # `reduce_at: end` appends the conversion instead, so the chain keeps its
+    # planes for every stage that wants them and an RGB intermediate exists.
+    if current > 1 and reduce_at == "end":
+        stages.append({"operation": "color", "params": {"method": default_method},
+                       "in": current, "out": 1, "index": -1, "synthesized": True,
+                       "lifted": False})
+        current = 1
 
     return {"stages": stages, "in": channels, "out": current,
             "color_stage": next((k for k, s in enumerate(stages)
@@ -533,7 +617,8 @@ def statistics_to_json(channels: Sequence[Dict[str, Any]],
                        extremum: bool = True,
                        extremum_sample_radius: int = 0,
                        relevance: bool = True,
-                       histogram: Any = None) -> Dict[str, Any]:
+                       histogram: Any = None,
+                       sources: Any = None) -> Dict[str, Any]:
     """The `statistics` block for a config.
 
     `channels` mirrors what the CLI parses: a bare string for `base`/`filtered`,
@@ -541,10 +626,11 @@ def statistics_to_json(channels: Sequence[Dict[str, Any]],
     scale-space channel. Emitted only in the shape the parser accepts, so a GUI
     export and a hand-written config are the same document.
     """
+    src = {str(k): list(v) for k, v in (_as_dict(sources) or {}).items() if isinstance(v, list) and v}
     out: List[Any] = []
     for entry in channels:
         kind = str(entry.get("kind") or "")
-        if kind in ("base", "filtered", "color"):
+        if kind in ("base", "filtered", "color") or kind in src:
             out.append(kind)
             continue
         if kind not in DERIVED_CHANNEL_KINDS:
@@ -555,7 +641,10 @@ def statistics_to_json(channels: Sequence[Dict[str, Any]],
         item: Dict[str, Any] = {"kind": kind, "sigmas": sigmas}
         # `source` is emitted only for the colour planes, so a base-sourced
         # spec is the document it always was.
-        if kind in COLOR_ONLY_KINDS or entry.get("source") == "color":
+        source = str(entry.get("source") or "")
+        if source in src:
+            item["source"] = source
+        elif kind in COLOR_ONLY_KINDS or source == "color":
             item["source"] = "color"
         if kind == "hessian" and not entry.get("sort_by_absolute_value", True):
             item["sort_by_absolute_value"] = False
@@ -577,6 +666,11 @@ def statistics_to_json(channels: Sequence[Dict[str, Any]],
     hist = histogram_to_json(histogram)
     if hist is not None:
         block["histogram"] = hist
+    # Emitted only when non-empty, so a spec without sources is the document it
+    # always was. A source that no channel names is still carried: it is the
+    # chain a user is editing, and dropping it would lose their work.
+    if src:
+        block["sources"] = {k: filters_to_json(v) for k, v in src.items()}
     return block
 
 
@@ -585,19 +679,33 @@ def statistics_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[st
     read side. Returns {channels, reductions, extremum, extremum_sample_radius,
     relevance, histogram} with `channels` always in the dict form the GUI edits."""
     block = _as_dict(doc)
+    sources: Dict[str, Any] = {}
+    for name, chain in (_as_dict(block.get("sources")) or {}).items():
+        if not isinstance(chain, list) or not chain:
+            _note(notes, f"statistics.sources: {name!r} is not a chain - dropped")
+            continue
+        # Read losslessly, NOT through filters_from_json: that fills a card's
+        # schema defaults, while filters_to_json keeps whatever is present, so
+        # the two are not inverse and a profile grew a little every first load.
+        # A source is a config chain, not a card being edited -- there is no
+        # editor for one yet -- so it round-trips as written.
+        sources[str(name)] = [
+            {"operation": str(f.get("operation") or "none"), "params": dict(f.get("params") or {})}
+            for f in chain if isinstance(f, dict)
+        ]
     raw = block.get("channels")
     channels: List[Dict[str, Any]] = []
     if isinstance(raw, list):
         for item in raw:
             if isinstance(item, str):
-                if item in ("base", "filtered", "color"):
+                if item in ("base", "filtered", "color") or item in sources:
                     channels.append({"kind": item})
                 else:
                     _note(notes, f"statistics.channels: unknown channel {item!r} - dropped")
                 continue
             entry = _as_dict(item)
             kind = str(entry.get("kind") or "")
-            if kind in ("base", "filtered", "color"):
+            if kind in ("base", "filtered", "color") or kind in sources:
                 channels.append({"kind": kind})
                 continue
             if kind not in DERIVED_CHANNEL_KINDS:
@@ -612,10 +720,12 @@ def statistics_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[st
                 continue
             out: Dict[str, Any] = {"kind": kind, "sigmas": sigmas}
             source = str(entry.get("source") or "base")
-            if source not in STAT_SOURCES:
+            if source not in STAT_SOURCES and source not in sources:
                 _note(notes, f"statistics.channels: {kind!r} has source {source!r} - using base")
                 source = "base"
-            if kind in COLOR_ONLY_KINDS or source == "color":
+            if source in sources:
+                out["source"] = source
+            elif kind in COLOR_ONLY_KINDS or source == "color":
                 out["source"] = "color"
             if kind == "hessian":
                 out["sort_by_absolute_value"] = bool(
@@ -642,6 +752,7 @@ def statistics_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[st
         "extremum_sample_radius": _as_int(block.get("extremum_sample_radius"), 0),
         "relevance": relevance,
         "histogram": histogram_from_json(block.get("histogram")),
+        "sources": sources,
     }
 
 
@@ -671,6 +782,7 @@ def build_config(
     stat_reductions: Optional[Sequence[str]] = None,
     stat_extremum: bool = True,
     stat_relevance: bool = True,
+    stat_sources: Optional[Dict[str, Any]] = None,
     folder: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build the AppConfig-shaped dict for one subsequence (an explicit file list).
@@ -733,12 +845,14 @@ def build_config(
     # Measurement channels + reductions. Emitted only when they differ from the
     # default spec (base channel, all reductions, extremum on), so a workflow
     # that never touched the statistics panel exports exactly what it did before.
-    if stat_channels is not None or stat_reductions is not None or not stat_relevance:
+    if (stat_channels is not None or stat_reductions is not None or not stat_relevance
+            or stat_sources):
         channels = list(stat_channels) if stat_channels is not None else [{"kind": "base"}]
         reductions = (list(stat_reductions) if stat_reductions is not None
                       else list(STAT_REDUCTIONS))
         block = statistics_to_json(channels, reductions, stat_extremum,
-                                   int(extremum_sample_radius), stat_relevance)
+                                   int(extremum_sample_radius), stat_relevance,
+                                   None, stat_sources)
         default = statistics_to_json([{"kind": "base"}], STAT_REDUCTIONS, True, 0)
         if block != default:
             cfg["statistics"] = block

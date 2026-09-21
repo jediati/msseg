@@ -224,7 +224,11 @@ def session_doc_from_json(doc: Any, notes: Optional[List[str]] = None, *,
                            # dict), opaque here; absent for the other kinds.
                            "spec": _as_dict(md.get("spec")) or None,
                            # Whether an edge model rides the pickle (v4).
-                           "edge": bool(md.get("edge"))})
+                           "edge": bool(md.get("edge")),
+                           # Only when present, so an entry without them is
+                           # the document it always was.
+                           **({"scope": str(md["scope"])} if md.get("scope") is not None else {}),
+                           **({"seam": True} if md.get("seam") else {})})
 
     return {
         "app": str(root.get("app") or ""),

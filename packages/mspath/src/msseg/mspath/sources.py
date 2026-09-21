@@ -163,6 +163,16 @@ class PlacedImageSource:
         self.raster = np.asarray(raster, dtype=np.float32)
         self.ox, self.oy = int(origin[0]), int(origin[1])
         self.scale = float(scale) or 1.0
+        # A raster may be a PLANE STACK, (C, h, w) -- a chain stage carrying
+        # colour is three planes, and looking at them as RGB is the point. It is
+        # stored the way ArrayImageSource stores one, (H, W, 3), because that is
+        # what the canvas hands to PIL; reading shape[:2] off a CHW stack placed
+        # it three pixels tall, which is a picture of nothing.
+        if self.raster.ndim == 3:
+            planes = (self.raster[:3] if self.raster.shape[0] >= 3
+                      else np.repeat(self.raster[:1], 3, axis=0))
+            self.raster = np.ascontiguousarray(np.transpose(planes, (1, 2, 0)))
+        self._planes = 3 if self.raster.ndim == 3 else 1
         lh, lw = (int(v) for v in self.raster.shape[:2])
         self._shape = (tuple(int(v) for v in slide_shape) if slide_shape is not None
                        else (int(round(self.oy + lh * self.scale)),
@@ -184,7 +194,7 @@ class PlacedImageSource:
 
     @property
     def channels(self) -> int:
-        return 1
+        return self._planes
 
     def level_shape(self, level: int):
         s = self.level_scale(level)
@@ -212,10 +222,12 @@ class PlacedImageSource:
         lh, lw = self.raster.shape[:2]
         okx = (cx >= 0) & (cx < lw)
         oky = (cy >= 0) & (cy < lh)
-        out = np.full((h, w), self._range[0], np.float32)
+        shape = (h, w, self._planes) if self._planes > 1 else (h, w)
+        out = np.full(shape, self._range[0], np.float32)
         if okx.any() and oky.any():
             block = self.raster[np.clip(cy, 0, lh - 1)][:, np.clip(cx, 0, lw - 1)]
-            np.copyto(out, block, where=oky[:, None] & okx[None, :])
+            ok = oky[:, None] & okx[None, :]
+            np.copyto(out, block, where=ok[..., None] if self._planes > 1 else ok)
         # A NaN (a filter's undefined pixel, or a raster that is nothing but)
         # would reach the canvas's window as NaN and paint garbage; the
         # range's floor is what "no value" looks like everywhere else here.
@@ -230,5 +242,8 @@ class PlacedImageSource:
         cy = int((int(y) - self.oy) // self.scale)
         lh, lw = self.raster.shape[:2]
         if 0 <= cx < lw and 0 <= cy < lh:
-            return float(self.raster[cy, cx])
+            v = self.raster[cy, cx]
+            # The hover readout is one number; for a stack that is the first
+            # plane, which is what the shared window was measured against.
+            return float(v[0] if self._planes > 1 else v)
         return None

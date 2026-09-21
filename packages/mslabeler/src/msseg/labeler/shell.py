@@ -29,7 +29,11 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from . import session_doc
-from .widgets import ScrollFrame, jump_scale, scrolled_listbox, attach_tooltip
+from .widgets import (ScrollFrame, Collapsible, jump_scale, scrolled_listbox,
+                      attach_tooltip, TYPING_CLASSES)
+from . import windowing
+from .defaults import (_PREVIEW_SETTLE_MS, _PREVIEW_POLL_MS, _PANE_SASH_TRIES,
+                       _PANE_MIN_PX)
 
 IMAGE_EXTENSIONS = (".tif", ".tiff")
 
@@ -108,12 +112,31 @@ class ViewerShell:
         self._init_variables()                   # the app's own come first
         self.slice_var = tk.IntVar(value=0)
         self.alpha_var = tk.DoubleVar(value=0.5)
-        self.vmin_var = tk.DoubleVar(value=0.0)          # base window (fractions
-        self.vmax_var = tk.DoubleVar(value=1.0)          #  of the base channel's range)
+        # The brightness window of the channel ON SCREEN (fractions of the
+        # shown source's value range); every channel keeps its own pair in
+        # _channel_windows, and the sliders show the current one.
+        self.vmin_var = tk.DoubleVar(value=0.0)
+        self.vmax_var = tk.DoubleVar(value=1.0)
+        self._channel_windows = {}               # channel -> (vmin, vmax)
+        self._window_channel = None              # the channel the sliders edit
+        self._swap_channel = None                # the derived channel F returns to
         self.status_var = tk.StringVar(value="Ready.")
         self.hover_var = tk.StringVar(value="")
         self._hover_ctx = None                           # cached arrays for the hover readout
         self.autosave_var = tk.BooleanVar(value=bool(autosave))
+        # Live preview of the filter chain: the pending settle timer, the
+        # supersede token, the last chain the poll saw, and a depth counter
+        # that mutes the signal while a profile or session is being loaded.
+        self._preview_edit_after = None
+        self._preview_token = 0
+        self._preview_fingerprint = ""
+        self._preview_loading = 0
+        # Where the main paned window's sashes are wanted (fractions of its
+        # width), whether they have been placed yet, and whether a pane is
+        # folded shut.
+        self._panes_want = list(self._DEFAULT_PANES)
+        self._panes_applied = False
+        self._panes_collapsed = False
 
         # --- layout ------------------------------------------------------ #
         # The toolbar packs first: self.paned takes the cavity with expand=True,
@@ -136,6 +159,12 @@ class ViewerShell:
         self._build_left()
         self._build_right()
         self._after_layout()
+        self._bind_shell_hotkeys()
+        # Seeded from the panel as built, so the first tick is not a spurious
+        # edit; started here because _build_left's cards exist by now.
+        self._preview_fingerprint = self._chain_fingerprint()
+        self._preview_poll()
+        self._schedule_panes()
 
         ttk.Label(root, textvariable=self.status_var, relief="sunken", anchor="w").pack(
             side="bottom", fill="x")
@@ -200,11 +229,11 @@ class ViewerShell:
         ttk.Label(row, text="Slice:").pack(side="left")
         self._build_slice_nav(row)
         row = ttk.Frame(live); row.pack(fill="x", padx=4, pady=2)
-        ttk.Label(row, text="Base Min/Max:", width=14).pack(side="left")
+        ttk.Label(row, text="Image Min/Max:", width=14).pack(side="left")
         self._scale(row, from_=0.0, to=1.0, variable=self.vmin_var, orient="horizontal",
-                    command=lambda *_: self._refresh_render()).pack(side="left", fill="x", expand=True)
+                    command=self._on_window_change).pack(side="left", fill="x", expand=True)
         self._scale(row, from_=0.0, to=1.0, variable=self.vmax_var, orient="horizontal",
-                    command=lambda *_: self._refresh_render()).pack(side="left", fill="x", expand=True)
+                    command=self._on_window_change).pack(side="left", fill="x", expand=True)
         row = ttk.Frame(live); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="Overlay alpha:").pack(side="left")
         self._scale(row, from_=0.0, to=1.0, variable=self.alpha_var, orient="horizontal",
@@ -434,12 +463,15 @@ class ViewerShell:
         self.subseq_list.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.subseq_list.pack(side="left", fill="both", expand=True)
-        # Clicking a TIFF row under a sequence navigates the viewer to it.
+        # Clicking a TIFF row under a sequence navigates the viewer to it;
+        # a right-click offers go to / remove (the labeler adds its own).
         self.subseq_list.bind("<<TreeviewSelect>>", self._on_seq_tree_select)
+        self.subseq_list.bind("<Button-3>", self._seq_tree_context)
         row = ttk.Frame(g); row.pack(fill="x", padx=4, pady=2)
         self.seq_btn_row = row
         ttk.Button(row, text="Remove", command=self._remove_subsequence).pack(side="left")
-        ttk.Button(row, text="Clear all", command=self._clear_subsequences).pack(side="left", padx=4)
+        ttk.Button(row, text="Clear all",
+                   command=self._clear_subsequences_guarded).pack(side="left", padx=4)
 
 
     def _build_image_controls(self, parent):
@@ -453,8 +485,168 @@ class ViewerShell:
                                              values=["base", "filtered"], state="readonly",
                                              width=18)
         self.background_combo.pack(side="left", padx=4)
-        self.background_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_render())
+        self.background_combo.bind("<<ComboboxSelected>>", self._on_image_channel_change)
+        attach_tooltip(self.background_combo,
+                       "The image under the overlays. F flips between the original "
+                       "image and the derived channel last shown.")
         self._build_segmentation_controls(chan)
+
+    # ------------------------------------------------------------------ #
+    # The image channel: the F swap, and one brightness window per channel
+    #
+    # What is looked at is the relationship between a derived field and the
+    # original image, so F flips between the two -- the original (the app
+    # says which: the coupon's base or colour planes, a slide) and whichever
+    # derived channel was shown last. A flip is only useful if each channel
+    # keeps its own brightness, so the window is per channel: taken from the
+    # raster's 1st/99th percentiles the first time a channel is shown, then
+    # whatever the sliders were last set to for it.
+    # ------------------------------------------------------------------ #
+    def _bind_shell_hotkeys(self):
+        self.root.bind("f", self._on_swap_key)
+        self.root.bind("F", self._on_swap_key)
+
+    def _typing(self):
+        """True while a text-entry widget owns the keyboard focus."""
+        try:
+            w = self.root.focus_get()
+            return w is not None and w.winfo_class() in TYPING_CLASSES
+        except tk.TclError:
+            return False
+
+    def _unfocus_entries(self, _e=None):
+        """Give the keyboard back to the window. The hotkeys are ignored while
+        an entry/combobox has focus (typing "1" into a field must not arm a
+        class), and Tk leaves focus on a combobox after a selection -- so the
+        option widgets hand it back on selection/Return, and a canvas press
+        does too."""
+        try:
+            self.root.focus_set()
+        except tk.TclError:
+            pass
+
+    def _original_channel(self):
+        """The channel that IS the input image, which F flips back to (the
+        app's: the coupon's colour planes when the slice has them, a slide's
+        pyramid)."""
+        return "base"
+
+    def _note_channel(self, channel):
+        """Remember a derived channel as the one F returns to."""
+        if channel and channel != self._original_channel():
+            self._swap_channel = channel
+
+    def _on_image_channel_change(self, _e=None):
+        """The Image dropdown: show the pick, remember it for F, and give the
+        keyboard back (a combobox keeps focus after a selection, and every
+        hotkey is off while it has it)."""
+        self._note_channel(self.background_var.get())
+        self._unfocus_entries()
+        self._refresh_render()
+
+    def _swap_image(self):
+        """F: the original image <-> the derived channel last shown (filtered
+        when none was). Returns the channel now selected, or None when the
+        swap had nowhere to go."""
+        combo = getattr(self, "background_combo", None)
+        offered = list(combo.cget("values")) if combo is not None else []
+        cur = self.background_var.get()
+        orig = self._original_channel()
+        if cur != orig:
+            self._note_channel(cur)
+            target = orig
+        else:
+            target = self._swap_channel
+            if target not in offered:            # e.g. color_c1 on a grey slice
+                target = "filtered"
+            if target not in offered and offered:
+                self.status_var.set("Nothing to swap to - pick a channel first.")
+                return None
+        self.background_var.set(target)
+        self._refresh_render()
+        other = self._swap_channel if target == orig else orig
+        self.status_var.set(f"image: {target}" + (f"  (F: {other})" if other else ""))
+        return target
+
+    def _on_swap_key(self, _e=None):
+        if self._typing():
+            return
+        self._swap_image()
+
+    def _window_for(self, channel):
+        """The window of `channel`, and the sliders follow it. Called AFTER the
+        app has pointed the canvas at the channel's source: a channel seen for
+        the first time takes its window from that source's percentiles (not
+        cached while there is no source to measure)."""
+        channel = channel or "base"
+        win = self._channel_windows.get(channel)
+        if win is None:
+            src = self.viewer.source if self.viewer is not None else None
+            if src is None:
+                win = (0.0, 1.0)
+            else:
+                try:
+                    import numpy as np
+                    win = windowing.source_window(src, np)
+                except Exception as exc:
+                    self._log(f"window for {channel}: {type(exc).__name__}: {exc}")
+                    win = (0.0, 1.0)
+                self._channel_windows[channel] = win
+        self._window_channel = channel
+        self._sync_window_sliders(win)
+        return win
+
+    def _sync_window_sliders(self, win):
+        # A ttk.Scale's command fires on user interaction only, not on a
+        # variable set, so this cannot re-enter _on_window_change.
+        for var, value in ((self.vmin_var, win[0]), (self.vmax_var, win[1])):
+            try:
+                if float(var.get()) != float(value):
+                    var.set(float(value))
+            except (tk.TclError, ValueError):
+                pass
+
+    def _on_window_change(self, *_args):
+        """A slider moved: the window belongs to the channel on screen."""
+        try:
+            win = (float(self.vmin_var.get()), float(self.vmax_var.get()))
+        except (tk.TclError, ValueError):
+            return
+        if self._window_channel:
+            self._channel_windows[self._window_channel] = win
+        self._refresh_render()
+
+    def _seed_window(self, channel, lo, hi):
+        """Adopt a window from an older session's single pair -- only when it
+        was actually moved off the default, so old sessions still get the
+        percentile guess rather than a full-range window."""
+        try:
+            lo, hi = float(lo), float(hi)
+        except (TypeError, ValueError):
+            return
+        if (lo, hi) == (0.0, 1.0) or not (0.0 <= lo < hi <= 1.0):
+            return
+        self._channel_windows[channel] = (lo, hi)
+
+    def _apply_windows_view(self, view, notes):
+        self._channel_windows = {}
+        self._window_channel = None
+        wins = view.get("windows")
+        if isinstance(wins, dict):
+            for channel, pair in wins.items():
+                try:
+                    lo, hi = float(pair[0]), float(pair[1])
+                except (TypeError, ValueError, IndexError, KeyError):
+                    notes.append(f"ignored window {channel}={pair!r}")
+                    continue
+                if 0.0 <= lo < hi <= 1.0:
+                    self._channel_windows[str(channel)] = (lo, hi)
+                else:
+                    notes.append(f"ignored window {channel}={pair!r}")
+        else:
+            self._seed_window("base", view.get("vmin"), view.get("vmax"))
+        swap = view.get("swap_channel")
+        self._swap_channel = str(swap) if isinstance(swap, str) and swap else None
 
     # ------------------------------------------------------------------ #
     # Toolbar
@@ -546,6 +738,170 @@ class ViewerShell:
         """Parent for one of the parameter sections: "filters", "base",
         "msc" or "stats"."""
         return self.left
+
+    def _group(self, parent, text, key=None):
+        """A titled group of parameter rows: packed into `parent`, returned as
+        the frame the rows go into.
+
+        A plain `ttk.LabelFrame` here. The labeler makes it collapsible --
+        its parameter panel is one tall column, where a group you are not
+        editing is only in the way -- and `key` is what its open/shut state is
+        remembered under (the title, when not given)."""
+        f = ttk.LabelFrame(parent, text=text)
+        f.pack(fill="x", padx=6, pady=4)
+        return f
+
+    # ------------------------------------------------------------------ #
+    # The main paned window's sashes
+    # ------------------------------------------------------------------ #
+    # Only ONE pane has a weight, so window growth goes entirely to it (the
+    # viewer area). The sashes decide the proportions instead, which is why
+    # they are placed explicitly and remembered: a weight would drift them.
+    _DEFAULT_PANES = ()                  # fractions of the width, one per sash
+
+    def _pane_fractions(self):
+        """Where the sashes sit, as fractions of the paned window's width, or
+        the WANTED fractions while it has not been laid out.
+
+        A sash reads 0 until ttk has actually laid the panes out -- which for
+        a window that is never mapped is never -- and serializing that would
+        restore a collapsed pane on the next launch."""
+        try:
+            w = self.paned.winfo_width()
+            n = max(0, len(self.paned.panes()) - 1)
+            pos = [self.paned.sashpos(i) for i in range(n)]
+        except (tk.TclError, AttributeError):
+            return list(self._panes_want)
+        if w <= 1 or not pos or any(p <= 0 for p in pos):
+            return list(self._panes_want)
+        return [min(0.98, max(0.02, p / w)) for p in pos]
+
+    def _apply_pane_fractions(self, fracs):
+        """Take fractions from a session and re-arm the placement."""
+        try:
+            vals = [float(f) for f in fracs]
+        except (TypeError, ValueError):
+            return
+        if not vals or any(not 0.02 <= v <= 0.98 for v in vals):
+            return
+        if vals != sorted(vals):
+            return                       # sashes cannot cross
+        self._panes_want = vals
+        self._panes_collapsed = False
+        self._panes_applied = False
+        self._schedule_panes()
+
+    def _schedule_panes(self, tries=_PANE_SASH_TRIES):
+        """Place the wanted sashes once the paned window HAS a width.
+
+        A `sashpos` set before the geometry manager has run is silently
+        dropped, so this re-arms -- but only a bounded number of times, since
+        a window that is never mapped (a withdrawn selftest root) would
+        otherwise be polled for ever."""
+        if self._panes_applied or not self._panes_want:
+            return
+        try:
+            w = self.paned.winfo_width()
+        except (tk.TclError, AttributeError):
+            return
+        if w <= 1:
+            if tries > 0:
+                try:
+                    self.root.after(30, self._schedule_panes, tries - 1)
+                except tk.TclError:
+                    pass
+            return
+        for i, f in enumerate(self._panes_want):
+            lo, hi = _PANE_MIN_PX * (i + 1), w - _PANE_MIN_PX
+            try:
+                self.paned.sashpos(i, max(lo, min(hi, int(round(w * f)))))
+            except tk.TclError:
+                pass
+        self._panes_applied = True
+
+    # ------------------------------------------------------------------ #
+    # A compute parameter was edited (the live preview's trigger)
+    # ------------------------------------------------------------------ #
+    # The filter chain is judged by looking at what it produces, so editing a
+    # field has to repaint the image -- and repaint it WITHOUT priming, since
+    # the chain is iterated on many times before anyone cares what the basins
+    # look like. Two things report an edit:
+    #
+    #   * `_notify_profile_edit()`, called from each commit path. Instant.
+    #   * `_preview_poll()`, which re-snapshots the chain every
+    #     _PREVIEW_POLL_MS and reports a difference. The chain cards are two
+    #     near-identical implementations (coupon and mspath), rebuilt from
+    #     scratch whenever an operation changes, so a commit path that forgets
+    #     to call the first must still be caught -- as a delay, not as a dead
+    #     control. (This is the same reasoning that made the workflow hint a
+    #     poll rather than a trace per widget.)
+    #
+    # Both funnel into one debounce, because a sigma typed "1", ".", "5" is
+    # one edit, and then into `_launch_preview`, which is the app's.
+    def _chain_fingerprint(self):
+        """Everything a preview raster can depend on, and nothing else: the
+        two chains, the colour input, and the statistics channel list. The
+        MSC and selection blocks move no pixel the Image dropdown can show."""
+        try:
+            p = self._profile_from_ui()
+        except Exception:
+            return ""
+        stats = p.get("statistics") or {}
+        try:
+            return json.dumps({"filters": p.get("filters"),
+                               "base_filters": p.get("base_filters"),
+                               "input": p.get("input"),
+                               "channels": stats.get("channels")}, sort_keys=True)
+        except (TypeError, ValueError):
+            return ""
+
+    def _notify_profile_edit(self):
+        """A compute parameter was edited: settle, then let the app decide
+        whether anything on screen actually depends on it."""
+        if getattr(self, "viewer", None) is None or self._preview_loading:
+            return
+        if self._preview_edit_after is not None:
+            try:
+                self.root.after_cancel(self._preview_edit_after)
+            except tk.TclError:
+                pass
+            self._preview_edit_after = None
+        try:
+            self._preview_edit_after = self.root.after(_PREVIEW_SETTLE_MS,
+                                                       self._preview_edit_settled)
+        except tk.TclError:
+            pass
+
+    def _preview_edit_settled(self):
+        self._preview_edit_after = None
+        self._preview_fingerprint = self._chain_fingerprint()
+        self._launch_preview()
+
+    def _preview_poll(self):
+        """The backstop. Cheap: one profile snapshot and one dumps."""
+        try:
+            fp = self._chain_fingerprint()
+            if fp != self._preview_fingerprint:
+                self._preview_fingerprint = fp
+                self._notify_profile_edit()
+            self.root.after(_PREVIEW_POLL_MS, self._preview_poll)
+        except tk.TclError:
+            pass
+
+    def _apply_profile_to_ui_quietly(self, profile, setvar, notes):
+        """_apply_profile_to_ui with the edit signal muted: a profile lands on
+        dozens of widgets and each one would report an edit, so a plain load
+        would fire a burst of chain recomputes for a chain nobody touched."""
+        self._preview_loading += 1
+        try:
+            self._apply_profile_to_ui(profile, setvar, notes)
+        finally:
+            self._preview_loading -= 1
+        self._preview_fingerprint = self._chain_fingerprint()
+
+    def _launch_preview(self):
+        """Hook: recompute and repaint whatever the Image dropdown shows, if
+        it depends on the chain that just changed. No-op by default."""
 
     # ------------------------------------------------------------------ #
     # Right panel
@@ -772,12 +1128,7 @@ class ViewerShell:
         except ValueError:
             # Not primed (yet): preview the slice as a click in the file list
             # would -- a sequence is browsable before any Run.
-            try:
-                files = self.subsequences[si]["files"]
-                path = files[li] if li < len(files) else files[0]
-            except (IndexError, KeyError, TypeError):
-                return
-            self._preview_file(path)
+            self._goto_row(si, li)
             return
         if idx != int(round(float(self.slice_var.get()))):
             self._goto_slice(idx)
@@ -785,6 +1136,190 @@ class ViewerShell:
     @staticmethod
     def _sequence_row_text(s):
         return session_doc.sequence_row_text(s)
+
+    # ------------------------------------------------------------------ #
+    # The sequence tree's context menu and row removal
+    #
+    # A row is addressed as (si, li) -- li None for a sequence row -- the
+    # same pair the tree's iids encode. Removal goes through ONE path for
+    # the menu, the Remove / Clear all buttons and headless callers, so what
+    # is computed for a row (the app's) and what is annotated on it (the
+    # labeler's) leave with it, and the dialog can say what it is taking.
+    # ------------------------------------------------------------------ #
+    ITEM_NOUN = "slice"           # what a sequence's rows are called to the user
+
+    @staticmethod
+    def _seq_tree_row(iid):
+        """(si, li) for a tree iid ("q3" -> (3, None), "q3:2" -> (3, 2)),
+        or None for anything else."""
+        left, _sep, right = str(iid or "").partition(":")
+        if not left.startswith("q"):
+            return None
+        try:
+            return (int(left[1:]), int(right) if right else None)
+        except ValueError:
+            return None
+
+    def _seq_tree_context(self, e):
+        """Right-click on a tree row: select it (which navigates, as a left
+        click does) and pop the row's menu."""
+        tree = self.subseq_list
+        iid = tree.identify_row(e.y)
+        row = self._seq_tree_row(iid) if iid else None
+        if row is None or not (0 <= row[0] < len(self.subsequences)):
+            return None
+        tree.selection_set(iid)
+        tree.focus(iid)
+        entries = self._seq_tree_menu_entries(*row)
+        if not entries:
+            return None
+        menu = tk.Menu(self.root, tearoff=0)
+        for entry in entries:
+            if entry is None:
+                menu.add_separator()
+                continue
+            label, command, enabled = entry
+            menu.add_command(label=label, command=command,
+                             state="normal" if enabled else "disabled")
+        try:
+            menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _seq_tree_menu_entries(self, si, li):
+        """The row's menu as ``[(label, command, enabled) | None]`` (None is
+        a separator), Remove last; the labeler splices its entries in."""
+        target = self._remove_target(si, li)
+        return [("Go to", lambda: self._goto_row(si, li), True),
+                None,
+                (f"Remove {self._row_kind(*target)}…",
+                 lambda: self._remove_rows_guarded([target]), True)]
+
+    def _row_kind(self, si, li):
+        """What a row is called: "sequence", or the app's item noun."""
+        return "sequence" if li is None else self.ITEM_NOUN
+
+    def _row_name(self, si, li):
+        """The row's text as the tree shows it."""
+        try:
+            if li is None:
+                return self._sequence_row_text(self.subsequences[si])
+            return self._sequence_item_labels(si)[li]
+        except (IndexError, KeyError, TypeError):
+            return "?"
+
+    def _row_description(self, si, li):
+        """One phrase naming the row for a dialog."""
+        if li is None:
+            n = len(self._sequence_item_labels(si))
+            return (f"{self._row_kind(si, li)} '{self._row_name(si, li)}' "
+                    f"and its {n} {self.ITEM_NOUN}(s)")
+        return (f"{self._row_kind(si, li)} '{self._row_name(si, li)}' of "
+                f"{self._row_kind(si, None)} '{self._row_name(si, None)}'")
+
+    def _remove_target(self, si, li):
+        """The row the menu's Remove acts on: the row itself, unless the app
+        says a row cannot go alone (a slide's overview goes with the slide)."""
+        return (si, li)
+
+    def _row_owns_key(self, si, li, key):
+        """True when item key `key` is the row's: the item's own key, or any
+        of its items' for a sequence row."""
+        if key is None:
+            return False
+        if li is None:
+            n = len(self._sequence_item_labels(si))
+            return any(self.catalogue.key_of(si, l) == key for l in range(n))
+        return self.catalogue.key_of(si, li) == key
+
+    def _goto_row(self, si, li):
+        """Navigate to a row: an item goes on screen (or previews, when it is
+        not primed yet); a sequence row means its first item."""
+        li = 0 if li is None else li
+        try:
+            idx = self.flat_slices.index((si, li))
+        except ValueError:
+            try:
+                files = self.subsequences[si]["files"]
+                path = files[li] if li < len(files) else files[0]
+            except (IndexError, KeyError, TypeError):
+                return False
+            self._preview_file(path)
+            return True
+        self._goto_slice(idx)
+        return True
+
+    def _remove_rows_guarded(self, rows):
+        """Ask, then remove. Refused while the engine is busy: the computed
+        state is indexed by these rows and a worker may be reading it."""
+        rows = [(si, li) for si, li in rows if 0 <= si < len(self.subsequences)]
+        if not rows:
+            return False
+        if self.regions.pending():
+            self.status_var.set("Busy computing - try again in a moment.")
+            return False
+        if not messagebox.askyesno(self.APP_TITLE, self._remove_rows_message(rows)):
+            return False
+        self._remove_rows(rows)
+        return True
+
+    def _remove_rows_message(self, rows):
+        descs = [self._row_description(si, li) for si, li in rows]
+        if len(descs) == 1:
+            return f"Remove {descs[0]}?"
+        return (f"Remove these {len(descs)} rows?\n\n"
+                + "\n".join("- " + d for d in descs))
+
+    def _remove_rows(self, rows):
+        """Remove the rows -- items first, from the highest index down, then
+        whole sequences the same way, so every index is still valid when it
+        is used -- and settle everything derived. Returns the count."""
+        cur = self._current()
+        cur_key = self.catalogue.key_of(*cur) if cur is not None else None
+        pos = int(round(float(self.slice_var.get())))
+        seqs = {si for si, li in rows if li is None}
+        items = sorted({(si, li) for si, li in rows
+                        if li is not None and si not in seqs}, reverse=True)
+        n = 0
+        for si, li in items:
+            self._remove_item_at(si, li)
+            n += 1
+            if not self._sequence_item_labels(si):   # its last item took it
+                seqs.add(si)
+        for si in sorted(seqs, reverse=True):
+            self._remove_sequence_at(si)
+            n += 1
+        self._after_rows_removed(cur_key, pos)
+        return n
+
+    def _remove_item_at(self, si, li):
+        """Drop item `li` of sequence `si` from the session model (the app
+        also drops what it computed for it)."""
+        files = self.subsequences[si].get("files")
+        if isinstance(files, list) and 0 <= li < len(files):
+            del files[li]
+
+    def _remove_sequence_at(self, si):
+        del self.subsequences[si]
+
+    def _after_rows_removed(self, cur_key, pos):
+        """Everything derived from the sequence list follows: the flat
+        navigation (back on the item that was on screen when it survived,
+        else on its neighbour), the tree, the render."""
+        self._rebuild_flat_slices()
+        self._refresh_subseq_list()
+        if not self.flat_slices:
+            self._refresh_render()
+            return
+        idx = None
+        if cur_key is not None:
+            hit = self.catalogue.index_of(cur_key)
+            if hit is not None and hit in self.flat_slices:
+                idx = self.flat_slices.index(hit)
+        if idx is None:
+            idx = min(max(pos, 0), len(self.flat_slices) - 1)
+        self._goto_slice(idx)
 
     def _make_subsequence(self):
         if self.active_folder_idx is None:
@@ -804,14 +1339,21 @@ class ViewerShell:
     def _remove_subsequence(self):
         # A selected TIFF child counts as its sequence.
         sis = {int(iid.split(":")[0][1:]) for iid in self.subseq_list.selection()}
-        for si in sorted(sis, reverse=True):
-            if 0 <= si < len(self.subsequences):
-                del self.subsequences[si]
-        self._refresh_subseq_list()
+        rows = [(si, None) for si in sorted(sis) if 0 <= si < len(self.subsequences)]
+        if rows:
+            self._remove_rows_guarded(rows)
+
+    def _clear_subsequences_guarded(self):
+        rows = [(si, None) for si in range(len(self.subsequences))]
+        if rows:
+            self._remove_rows_guarded(rows)
 
     def _clear_subsequences(self):
-        self.subsequences.clear()
-        self._refresh_subseq_list()
+        """Every sequence goes, no questions asked (headless callers; the
+        button asks first)."""
+        rows = [(si, None) for si in range(len(self.subsequences))]
+        if rows:
+            self._remove_rows(rows)
 
     def _snapshot_active_profile(self):
         if 0 <= self.active_profile_idx < len(self.profiles):
@@ -847,7 +1389,7 @@ class ViewerShell:
             except (tk.TclError, ValueError, TypeError):
                 notes.append(f"ignored unusable value {value!r}")
 
-        self._apply_profile_to_ui(self.profiles[idx], setvar, notes)
+        self._apply_profile_to_ui_quietly(self.profiles[idx], setvar, notes)
         self._refresh_profile_combo()
         self._rebuild_flat_slices()
         self._settle_controls()
@@ -1066,8 +1608,12 @@ class ViewerShell:
         return {
             "background": self.background_var.get(),
             "alpha": float(self.alpha_var.get()),
+            # The pair on screen (older builds read it), and every channel's.
             "vmin": float(self.vmin_var.get()),
             "vmax": float(self.vmax_var.get()),
+            "windows": {k: [float(lo), float(hi)]
+                        for k, (lo, hi) in sorted(self._channel_windows.items())},
+            "swap_channel": self._swap_channel,
         }
 
     def _session_doc(self):
@@ -1149,18 +1695,19 @@ class ViewerShell:
         names = [p["name"] for p in self.profiles]
         self.active_profile_idx = names.index(sdoc["active_profile"])
         self._refresh_profile_combo()
-        self._apply_profile_to_ui(self.profiles[self.active_profile_idx],
-                                  setvar, notes)
+        self._apply_profile_to_ui_quietly(self.profiles[self.active_profile_idx],
+                                          setvar, notes)
 
         # 6. View state, all optional.
         view = sdoc.get("view") or {}
-        for key, var in (("alpha", self.alpha_var), ("vmin", self.vmin_var),
-                         ("vmax", self.vmax_var)):
-            if view.get(key) is not None:
-                try:
-                    setvar(var, float(view[key]))
-                except (TypeError, ValueError):
-                    notes.append(f"ignored {key}={view[key]!r}")
+        if view.get("alpha") is not None:
+            try:
+                setvar(self.alpha_var, float(view["alpha"]))
+            except (TypeError, ValueError):
+                notes.append(f"ignored alpha={view['alpha']!r}")
+        # The per-channel windows (or an older session's one pair); the
+        # sliders follow whatever channel is rendered next.
+        self._apply_windows_view(view, notes)
         if view.get("background"):
             setvar(self.background_var, str(view["background"]))
         self._apply_view_state(view, setvar, notes)

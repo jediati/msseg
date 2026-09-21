@@ -141,12 +141,38 @@ def _model_description(kind, spec=None, n_features=None):
 
 
 # The center notebook's tabs, in order. Named (not indexed) in the session
-# view state so a reordered tab list still restores.
-_CENTER_TABS = ("Processing", "View", "Model", "Analysis")
+# view state so a reordered tab list still restores. The slice is NOT among
+# them: the notebook is the window's right column and the canvas is the
+# middle one, so the picture is on screen whichever tab is being edited
+# (there was a "View" tab until the filter-edit loop made looking and editing
+# the same act).
+_CENTER_TABS = ("Processing", "Annotation", "Model", "Analysis")
+# The labeler's three columns -- data navigation, the viewer, the tabs -- as
+# the fractions of the width its two sashes sit at: roughly 1:3:2. Only the
+# viewer pane carries a weight, so window growth goes to the picture and the
+# two side columns keep the size they were given.
+_LABELER_PANES = (1.0 / 6.0, 4.0 / 6.0)
+# The narrowest a pane is placed at, and how many 30 ms retries the initial
+# placement gets before it gives up. A window that is never mapped (a
+# withdrawn selftest root) has no width to divide and would otherwise be
+# polled for ever.
+_PANE_MIN_PX = 120
+_PANE_SASH_TRIES = 40
 # Toolbar hint labels (workflow / model): link-blue, and how often the
 # workflow text is re-snapshotted from the panel.
 _HINT_COLOR = "#1a4fa0"
 _HINT_POLL_MS = 700
+
+# Live preview of the filter chain. SETTLE is how long a parameter field must
+# sit still before its chain is recomputed -- a sigma typed "1", ".", "5" must
+# launch ONE run, not three. POLL is the backstop: the chain cards are built
+# by two near-identical implementations (coupon and mspath) and are rebuilt
+# constantly, so a commit path that forgets to report itself degrades to this
+# delay instead of to a dead control. PUMP is how often the worker's result
+# queue is drained.
+_PREVIEW_SETTLE_MS = 250
+_PREVIEW_POLL_MS = 400
+_PREVIEW_PUMP_MS = 60
 
 # Statistics fields that are POSITIONS, not appearance: where a region sits in
 # the slice says nothing about what material it is, and coordinate features
@@ -179,12 +205,21 @@ def _bounded_float(text, default, lo, hi):
     if v != v:                       # NaN
         return default
     return min(max(v, lo), hi)
-_UI_TOOLS = tuple(v for v, _txt in _TOOL_LABELS)
+# Seam tools (docs/seam_labeling.md): a livewire trace along the polylines
+# between regions (key T) and a scope box inside which every seam is labelled
+# (key S). Stored under their own names in LabelStore.seams.
+_SEAM_TOOL_LABELS = (("trace", "trace"), ("scope", "scope"))
+_UI_TOOLS = (tuple(v for v, _txt in _TOOL_LABELS)
+             + tuple(v for v, _txt in _SEAM_TOOL_LABELS))
+# Seam overlay colourings: by resolved class, or by the seam model's p(boundary).
+_SEAM_MODE_CLASS = "class"
+_SEAM_MODE_BOUNDARYNESS = "boundaryness"
+_SEAM_MODES = (_SEAM_MODE_CLASS, _SEAM_MODE_BOUNDARYNESS)
 
 # Focus-widget classes whose keystrokes must not arm classes (typing "1" into
-# the persistence entry is not a request to arm class 1).
-_TYPING_CLASSES = ("Entry", "TEntry", "Spinbox", "TSpinbox", "TCombobox",
-                   "Listbox", "Text")
+# the persistence entry is not a request to arm class 1). Defined beside the
+# widgets, since the viewer shell's own hotkey needs it too.
+from .widgets import TYPING_CLASSES as _TYPING_CLASSES  # noqa: E402
 
 
-__all__ = ['_REGION_ALPHA', '_PRED_ALPHA', '_SCALAR_ALPHA', '_MODE_ID', '_MODE_UNCERTAINTY', '_MODE_FLIPPED', '_MODE_PDIFF', '_TUNED_KIND', '_CUSTOM_KIND', '_TUNED_EDGE_KIND', '_CUSTOM_EDGE_KIND', '_EDGE_KINDS', '_MODEL_KINDS', '_DEFAULT_CUSTOM_HIDDEN', '_EDGE_LAM_RANGE', '_EDGE_ROUNDS_RANGE', '_EDGE_C_RANGE', '_is_edge_kind', '_base_kind', '_edge_kind_of', '_DENSE_TOP_N', '_FOREST_TREES', '_OOB_MIN_SAMPLES', '_MLP_HIDDEN', '_MLP_MAX_ITER', '_SEARCH_TRIALS', '_SEARCH_TIMEOUT_MIN', '_SEARCH_TIMEOUT_S', '_SEARCH_TRIALS_RANGE', '_SEARCH_TIMEOUT_RANGE', '_SEARCH_PUMP_MS', '_SWEEP_TRIALS', '_SWEEP_TRIALS_RANGE', '_hms', '_model_description', '_CENTER_TABS', '_HINT_COLOR', '_HINT_POLL_MS', '_NON_FEATURE_FIELDS', '_TOOL_LABELS', '_RING_CHOICES', '_DEFAULT_HOP_GAIN', '_HOP_GAIN_RANGE', '_DEFAULT_DRAG_PX', '_DRAG_PX_RANGE', '_bounded_float', '_UI_TOOLS', '_TYPING_CLASSES']
+__all__ = ['_REGION_ALPHA', '_PRED_ALPHA', '_SCALAR_ALPHA', '_MODE_ID', '_MODE_UNCERTAINTY', '_MODE_FLIPPED', '_MODE_PDIFF', '_TUNED_KIND', '_CUSTOM_KIND', '_TUNED_EDGE_KIND', '_CUSTOM_EDGE_KIND', '_EDGE_KINDS', '_MODEL_KINDS', '_DEFAULT_CUSTOM_HIDDEN', '_EDGE_LAM_RANGE', '_EDGE_ROUNDS_RANGE', '_EDGE_C_RANGE', '_is_edge_kind', '_base_kind', '_edge_kind_of', '_DENSE_TOP_N', '_FOREST_TREES', '_OOB_MIN_SAMPLES', '_MLP_HIDDEN', '_MLP_MAX_ITER', '_SEARCH_TRIALS', '_SEARCH_TIMEOUT_MIN', '_SEARCH_TIMEOUT_S', '_SEARCH_TRIALS_RANGE', '_SEARCH_TIMEOUT_RANGE', '_SEARCH_PUMP_MS', '_SWEEP_TRIALS', '_SWEEP_TRIALS_RANGE', '_hms', '_model_description', '_PREVIEW_SETTLE_MS', '_PREVIEW_POLL_MS', '_PREVIEW_PUMP_MS', '_CENTER_TABS', '_LABELER_PANES', '_PANE_MIN_PX', '_PANE_SASH_TRIES', '_HINT_COLOR', '_HINT_POLL_MS', '_NON_FEATURE_FIELDS', '_TOOL_LABELS', '_RING_CHOICES', '_DEFAULT_HOP_GAIN', '_HOP_GAIN_RANGE', '_DEFAULT_DRAG_PX', '_DRAG_PX_RANGE', '_bounded_float', '_UI_TOOLS', '_TYPING_CLASSES', '_SEAM_TOOL_LABELS', '_SEAM_MODE_CLASS', '_SEAM_MODE_BOUNDARYNESS', '_SEAM_MODES']

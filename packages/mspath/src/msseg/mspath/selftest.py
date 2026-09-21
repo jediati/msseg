@@ -13,6 +13,7 @@ the labeler's does.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -120,6 +121,10 @@ def run_selftest():
     assert app.viewer.has_base, "the preview did not reach the canvas"
     src = app.viewer.source
     assert src.levels >= 2 and src.channels == 3, f"unexpected source {src}"
+    # the slide's brightness window is measured from the pyramid at once
+    lo, hi = app._channel_windows["slide"]
+    assert 0.0 <= lo < hi <= 1.0 and app._window_channel == "slide"
+    assert (float(app.vmin_var.get()), float(app.vmax_var.get())) == (lo, hi)
 
     # keep the selftest quick whatever slide it got: a level of a few Mpx
     deepest = max(0, src.levels - 3)
@@ -204,7 +209,25 @@ def run_selftest():
 
     # -- the Image dropdown shows the primed channels, placed on the slide -- #
     from .sources import PlacedImageSource
-    assert list(app.background_combo.cget("values")) == list(app.CHANNELS)
+    # The picker offers the three rasters, then one channel per chain stage --
+    # the state the chain passes through after it, which is what makes a chain
+    # judgeable by looking.
+    offered = list(app.background_combo.cget("values"))
+    assert offered[:len(app.CHANNELS)] == list(app.CHANNELS), offered
+    stages = offered[len(app.CHANNELS):]
+    assert stages == app._stage_channels(), (stages, app._stage_channels())
+    assert len(stages) == len([c for c in app.filter_cards
+                               if c.get("operation") not in ("", "none")]), stages
+
+    # A card's `show` radio ENTERS the walk; F continues it and steps off the
+    # end back to what was being looked at. F elsewhere is still the framework's
+    # A/B flip, which the block further down covers.
+    app.background_var.set("slide"); app._on_image_channel_change()
+    app.background_var.set(stages[0]); app._on_stage_radio()
+    seen = [app._swap_image() for _ in range(len(stages))]
+    assert seen[:len(stages) - 1] == stages[1:], seen
+    assert seen[-1] == "slide", "stepping off the end returns to what was on screen"
+
     for channel in ("filtered", "base"):
         app.background_var.set(channel)
         app._refresh_render()
@@ -222,6 +245,136 @@ def run_selftest():
     # the ENGINE's pyramid, not the preview's: same file, a different handle
     back = app.viewer.source
     assert back is app.engine.source(item.slide) and back.path == src.path,         "slide shows the pyramid again"
+
+    # -- each channel keeps its own brightness window, measured on first sight
+    # and kept once moved.
+    #
+    # F used to be the framework's A/B flip (original <-> the derived channel
+    # last shown). mspath overrides it to WALK the chain instead -- asserted
+    # above -- because a chain is tuned by stepping along it, so the channel is
+    # set directly here and the walk is tested on its own. ------------------- #
+    for ch in ("slide", "base", "filtered"):
+        lo, hi = app._channel_windows[ch]
+        assert 0.0 <= lo < hi <= 1.0, (ch, lo, hi)
+    assert app._original_channel() == "slide"
+    app.background_var.set("filtered"); app._on_image_channel_change()
+    assert (float(app.vmin_var.get()), float(app.vmax_var.get())) == app._channel_windows["filtered"]
+    app.vmin_var.set(0.25); app._on_window_change()
+    assert app._channel_windows["filtered"][0] == 0.25, "the slider edits the channel on screen"
+    app.background_var.set("slide"); app._on_image_channel_change()
+    assert app._channel_windows["filtered"][0] == 0.25 and float(app.vmin_var.get()) != 0.25,         "the slide's own window is back on the sliders"
+    app.background_var.set("base"); app._on_image_channel_change()
+    assert not app._typing(), "the dropdown hands the keyboard back"
+    app._on_swap_key()
+    assert app.background_var.get() == "slide"
+    app._on_swap_key()
+    assert app.background_var.get() == "base", "F returns to the channel picked last"
+    view = app._view_state()
+    assert set(view["windows"]) >= {"slide", "base", "filtered"} and view["swap_channel"] == "base"
+    app.background_var.set("slide"); app._on_image_channel_change()
+
+    # -- the live preview: a chain edit repaints without a Run ------------- #
+    # The item is primed, so `filtered` normally shows the primed raster. An
+    # edit puts the NEW chain on screen in its place -- computed on exactly
+    # the pixels a prime reads, placed where the item sits -- and the region
+    # overlays come off, because they are about a different field.
+    app._preview_sync = True
+    app._primed_chain = app._chain_fingerprint()
+    chain_before = json.loads(json.dumps(app.filter_cards))
+    app.background_var.set("filtered")
+    app._refresh_render()
+    primed_src = app._channel_source(item.key, "filtered", src)[0]
+    assert primed_src is app.engine.primed[item.key].channel_sources["filtered"]
+    app._launch_preview()                        # the chain as primed
+    assert not app._preview_is_stale(), "the chain as primed is not stale"
+    assert app._launch_preview() is None, "and asking again is free"
+    assert app._channel_source(item.key, "filtered", src)[0] is not primed_src, \
+        "though the live raster is what is on screen once computed"
+    app.filter_cards[0]["operation"] = "blur"
+    app.filter_cards[0]["params"] = {"sigma": 2.0}
+    tok = app._launch_preview()
+    assert tok == app._preview_token and tok > 0, "an edit recomputes"
+    live = app._channel_source(item.key, "filtered", src)[0]
+    assert live is not primed_src and live is app._preview_shown[3], "the live raster wins"
+    assert (live.ox, live.oy, live.scale) == (primed_src.ox, primed_src.oy,
+                                              primed_src.scale), \
+        "placed where the item is"
+    assert live.raster.shape == primed_src.raster.shape, "and the halo is trimmed"
+    assert app._preview_is_stale() and app.viewer._hud_mode == "stale"
+    import numpy as _np
+    from msseg.viz import min_colors as _min_colors
+    assert app._seg_overlays(0, 0, app.engine.record(item.key), None, _np,
+                             _min_colors) == [], "the primed region overlays come off"
+    assert app._preview_pending is None
+
+    # -- a stage channel: the intermediate the chain passes through --------- #
+    # `base` and `filtered` come from the primed record; a stage has no primed
+    # counterpart, so picking one has to ASK for it, or the channel changes and
+    # the picture does not. And a stage that carries colour must reach the
+    # canvas as RGB -- PlacedImageSource stores (H, W, 3), which is what the
+    # canvas hands to PIL; a CHW stack placed itself three pixels tall.
+    app.filter_cards[0]["operation"] = "edges"
+    app.filter_cards[0]["params"] = {"sigma": 1.0}
+    app.filter_cards[1:] = [{"operation": "adapt",
+                             "params": {"mode": "reduce", "how": "max"}}]
+    app._rebuild_filter_cards("topo")
+    stages = app._stage_channels()
+    assert len(stages) == 2, stages
+
+    from msseg.mscoupon import config_io
+    plan = config_io.chain_plan(app.filter_cards, 3, "luminance")
+    assert plan["stages"][0]["lifted"] and plan["stages"][0]["out"] == 3, plan
+    assert plan["out"] == 1, "the chain reduces on its own, so no conversion is inserted"
+
+    app.background_var.set(stages[0])
+    app._on_image_channel_change()
+    shown = app._channel_source(item.key, stages[0], src)[0]
+    assert shown is not src, "picking a stage must not fall back to the slide"
+    assert isinstance(shown, PlacedImageSource), shown
+    assert shown.channels == 3, "a lifted edges is three planes, shown as RGB"
+    region = shown.read_region(0, 0, 0, 8, 6)
+    assert region.shape == (6, 8, 3), region.shape
+
+    app.background_var.set(stages[1])
+    app._on_image_channel_change()
+    reduced = app._channel_source(item.key, stages[1], src)[0]
+    assert reduced.channels == 1 and reduced is not shown, "after the reduction, one plane"
+    assert reduced.read_region(0, 0, 0, 8, 6).shape == (6, 8)
+
+    # Showing the stages submitted work of their own, so the token the next
+    # block compares against is the one AFTER them.
+    app.filter_cards[:] = json.loads(json.dumps(chain_before))
+    app._rebuild_filter_cards("topo")
+    app.background_var.set("filtered")
+    app._on_image_channel_change()
+    app._launch_preview()
+    tok = app._preview_token
+
+    # The slide channel is not a chain output, so it never recomputes.
+    app.background_var.set("slide")
+    assert app._launch_preview() is None and app._preview_token == tok
+    assert app._channel_source(item.key, "slide", src)[0] is src
+    # Retyping the old chain comes back from the cache; the live raster stays
+    # on screen (it is what the chain on the panel produces either way), and
+    # being no longer stale, the overlays come back.
+    app.background_var.set("filtered")
+    app.filter_cards[:] = json.loads(json.dumps(chain_before))
+    assert app._launch_preview() is None, "the earlier chain is still cached"
+    assert app._preview_token == tok, "so nothing was submitted"
+    assert not app._preview_is_stale(), "back to the chain that was primed"
+    live2 = app._channel_source(item.key, "filtered", src)[0]
+    assert live2 is app._preview_shown[3] and live2 is not live, "the earlier raster"
+    assert live2.raster.shape == primed_src.raster.shape, "the item's own extent"
+    assert app.viewer._hud_mode != "stale"
+    assert app._seg_overlays(0, 0, app.engine.record(item.key), None, _np,
+                             _min_colors), "and the region overlays come back"
+    # A Run clears the preview outright.
+    app._preview_shown = ("x", "filtered", ("filtered", "{}"), primed_src)
+    app._handle_compute_event(("primed",))
+    assert app._preview_shown is None and app._primed_chain == app._chain_fingerprint()
+    app._preview_sync = False
+    app._primed_chain = None
+    app.background_var.set("slide"); app._on_image_channel_change()
 
     # -- profiles + session round-trip ------------------------------------ #
     p = app._profile_from_ui()
@@ -384,7 +537,8 @@ def run_selftest():
     root.destroy()
     print("selftest OK: pyramid preview, slide->sequence, overview item + key round-trip, "
           "prime + record, slide-coordinate positions, label layer, render + hover, "
-          "persistence entry, channel dropdown (slide/base/filtered), ROI tier, "
+          "persistence entry, channel dropdown (slide/base/filtered), "
+          "live preview on a chain edit, ROI tier, "
           "primed event keeps the current item, double-click views the item, "
           "profile + session round-trip")
     return 0
@@ -455,6 +609,59 @@ def run_labeler_selftest():
     far_x = int((lw - 1) * rec["scale"])
     rx, ry = place.to_raster(far_x + rec["origin"][0], rec["origin"][1])
     assert 0 <= int(rx) < lw and 0 <= int(ry) < lh, (rx, ry)
+
+    # -- seam tools on a placed item: gestures in slide coordinates ---------- #
+    import types as _types
+    from msseg.labeler.seams import SEAM_BOUNDARY, SEAM_INTERIOR
+    g_s = app.regions.seams(item.key, np)
+    assert g_s is not None and g_s.n_seams > 0, "the overview has seams"
+    assert g_s.placement.scale == rec["scale"]
+    assert (g_s.placement.ox, g_s.placement.oy) == tuple(rec["origin"])
+    v = app.viewer
+    ctrl = v.tool
+    view_before = (v.view_x, v.view_y, v.scale)
+    undo_before = list(app._undo_stack)
+    # one screen px == one raster px, screen (0, 0) == the item's origin
+    v.view_x, v.view_y, v.scale = (float(rec["origin"][0]), float(rec["origin"][1]),
+                                   float(rec["scale"]))
+
+    def _ev(x, y):
+        return _types.SimpleNamespace(x=int(x), y=int(y), x_root=int(x), y_root=int(y), state=0)
+
+    app.tool_var.set("scope"); app.seam_class_var.set(SEAM_INTERIOR)
+    assert ctrl.on_press(_ev(0, 0)) and ctrl.on_move(_ev(lw, lh)) and ctrl.on_release(_ev(lw, lh))
+    sc = app.store.seams[-1]
+    assert sc.tool == "scope"
+    assert abs(sc.points[0][0] - rec["origin"][0]) < 1e-6 and abs(sc.points[0][1] - rec["origin"][1]) < 1e-6
+    assert abs(sc.points[-1][0] - (rec["origin"][0] + lw * rec["scale"])) < 1e-6
+    _g, cls_s = app._seam_classes_for(0, 0, np)
+    assert (cls_s == SEAM_INTERIOR).all(), "a scope over the whole item labels every seam"
+    open_s = np.flatnonzero(g_s.j0 >= 0)
+    if len(open_s):
+        s_long = int(open_s[np.argmax(g_s.lengths(np)[open_s])])
+        pts_s = g_s.seam_points(s_long)
+        (ax, ay), (bx, by) = pts_s[0].tolist(), pts_s[-1].tolist()
+        app.tool_var.set("trace"); app.seam_class_var.set(SEAM_BOUNDARY)
+        app.seam_toll_var.set("geometric")
+        assert ctrl.on_press(_ev(ax, ay)) and ctrl.trace.active
+        ctrl.trace.on_hover(*g_s.placement.to_image(bx, by))
+        assert ctrl.trace._s["hover"][1] is not None, "the far corner is reachable"
+        assert ctrl.on_press(_ev(bx, by)) and len(ctrl.trace._s["lw"].legs) == 1
+        assert ctrl.trace.commit()
+        tr = app.store.seams[-1]
+        assert tr.tool == "trace" and tr.class_id == SEAM_BOUNDARY
+        ix0, iy0 = g_s.placement.to_image(ax, ay)
+        assert tr.points[0] == (ix0, iy0), "stored in slide coordinates"
+        _g, cls_s = app._seam_classes_for(0, 0, np)
+        assert (cls_s == SEAM_BOUNDARY).any(), "the trace labels the seams it runs along"
+        app.store.remove_many([tr.uid])
+    # leave nothing behind: the later sections count gestures and undo steps
+    app.store.remove_many([sc.uid])
+    app._rebuild_class_panels()
+    app._undo_stack[:] = undo_before
+    app._redo_stack.clear()
+    app.tool_var.set("squiggle"); app.seam_toll_var.set("feature")
+    v.view_x, v.view_y, v.scale = view_before
 
     # -- a gesture in SLIDE coordinates paints the regions under it ------- #
     layer = app.regions.label_layer(item.key)
@@ -605,9 +812,88 @@ def run_labeler_selftest():
         app._undo()
     assert not app.store.interactions
 
+    # -- tree rows: slide / overview / ROI, ownership, guarded removal ------ #
+    from unittest import mock as _mock
+    from tkinter import messagebox
+    from msseg.labeler.labeling import LabelStore
+    _settle(app)
+    n_rois = len(app._rois_of(0))
+    lvl = max(0, deepest - 1)
+    app.roi_level_var.set(lvl)
+    side = int(64 * src.level_scale(lvl))
+    cut = app._add_roi(0, lvl, 0, 0, side, side)
+    assert cut is not None
+    _settle(app)                       # navigating there primed it on demand
+    li = 1 + len(app._rois_of(0)) - 1
+    assert app._current() == (0, li) and app.engine.record(cut.key) is not None
+    assert (app._row_kind(0, None), app._row_kind(0, 0), app._row_kind(0, li)) == \
+        ("slide", "overview", "ROI")
+    assert app._remove_target(0, 0) == (0, None), "the overview goes with its slide"
+    assert app._remove_target(0, li) == (0, li)
+    labels = [e[0] if e else None for e in app._seq_tree_menu_entries(0, 0)]
+    assert labels == ["Go to", None, "Clear annotations", "Remove slide\u2026"], labels
+    assert [e[0] for e in app._seq_tree_menu_entries(0, li) if e][-1] == "Remove ROI\u2026"
+    assert "ROI" in app._row_description(0, li) and "overview" in app._row_description(0, None)
+    # one annotation on the overview, one on the ROI, one orphan on the slide
+    # (an ROI cut away earlier, whose annotations were kept for a re-cut)
+    app.active_class_var.set(1)
+    app._goto_slice(app.flat_slices.index((0, 0)))
+    app._commit_interaction("taps", [(px, py)])
+    app._goto_slice(app.flat_slices.index((0, li)))
+    rs = app.engine.record(cut.key)["stats"]
+    app._commit_interaction("taps", [(float(rs.column("ext_x")[0]),
+                                      float(rs.column("ext_y")[0]))])
+    orphan = app.store.add("taps", [(1.0, 1.0)], 1, f"{item.slide}@{lvl}#1,2,64,64")
+    assert len(app.store.for_slice(cut.key)) == 1 and len(app.store.for_slice(item.key)) == 1
+    assert app._row_owns_key(0, None, cut.key) and app._row_owns_key(0, None, orphan.slice_key)
+    assert app._row_owns_key(0, li, cut.key) and not app._row_owns_key(0, 0, cut.key)
+    assert len(app._row_interactions(0, None)) == 3 and len(app._row_interactions(0, li)) == 1
+    labels = [e[0] if e else None for e in app._seq_tree_menu_entries(0, None)]
+    assert labels == ["Go to", None, "Clear annotations\u2026 (3)", "Remove slide\u2026"], labels
+    # the ROI: its annotation goes with it, the engine forgets it, the view
+    # lands on a neighbour; undo brings the annotation back unbound, and a
+    # re-cut of the same rect (the same key) binds it again
+    msg = app._remove_rows_message([(0, li)])
+    assert "ROI" in msg and "The 1 annotation(s)" in msg, msg
+    with _mock.patch.object(messagebox, "askyesno", return_value=False):
+        assert not app._remove_rows_guarded([(0, li)])
+    assert len(app._rois_of(0)) == n_rois + 1
+    with _mock.patch.object(messagebox, "askyesno", return_value=True):
+        assert app._remove_rows_guarded([(0, li)])
+    _settle(app)
+    assert len(app._rois_of(0)) == n_rois
+    assert app.engine.record(cut.key) is None and cut.key not in app.engine.primed
+    assert not app.store.for_slice(cut.key) and len(app.store.interactions) == 2
+    cur = app._current()
+    assert cur is not None and cur[0] == 0 and cur[1] < li
+    app._undo()
+    back = app.store.for_slice(cut.key)
+    assert len(back) == 1 and not back[0].bound, "restored, greyed: its ROI is gone"
+    again = app._add_roi(0, lvl, 0, 0, side, side)
+    assert again is not None and again.key == cut.key, "the key is the place"
+    _settle(app)
+    app._install_store(LabelStore.from_json(app.store.to_json()))
+    assert all(it.bound for it in app.store.for_slice(cut.key)), "a re-cut binds again"
+    assert all(it.bound for it in app.store.for_slice(item.key)), \
+        "slide keys bind through the catalogue on a load"
+    assert not app.store.get(orphan.uid).bound
+    # the slide: everything on it goes, the orphan included, the pyramid is
+    # closed and the canvas cleared
+    assert len(app._doomed_interactions([(0, None)])) == 3
+    with _mock.patch.object(messagebox, "askyesno", return_value=True):
+        assert app._remove_rows_guarded([app._remove_target(0, 0)])
+    assert app.subsequences == [] and app.flat_slices == []
+    assert not app.store.interactions and not app.engine.primed and not app.engine.slices
+    assert item.slide not in app.engine.sources and item.slide not in app.engine.paths
+    assert not app.viewer.has_base, "the canvas shows nothing of a closed slide"
+    app._undo()
+    assert len(app.store.interactions) == 3 and not any(it.bound for it in app.store.interactions)
+
     root.destroy()
     print("labeler selftest OK: placement, slide-coordinate gestures, class layer, "
           "box over the item, training rows, level-scoped compat gate, "
           "classify + propose ROIs, refusal notice on the HUD, "
-          "predictions survive an incremental prime, undo")
+          "predictions survive an incremental prime, undo, tree rows: "
+          "slide/overview/ROI menu + guarded removal + orphan annotations, "
+          "seam tools in slide coordinates")
     return 0

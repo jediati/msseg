@@ -4,6 +4,7 @@
 // (build -> compute -> select_persistence -> snapshot -> basin_labels) and
 // checks structural invariants. No external data required.
 #include <cmath>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +16,7 @@
 #include "diffg/image.hpp"
 #include "msseg/compute/msc3d.hpp"
 #include "msseg/graph/msc_graph.hpp"
+#include "msseg/graph/seam_graph.hpp"
 #include "msseg/io/raw_io.hpp"
 #include "msseg/segment/registry.hpp"
 #include "msseg/volume/types.hpp"
@@ -152,6 +154,55 @@ int main() {
     check(same, "raw_io write/read round-trips exactly");
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
+  }
+
+  // 7. Seam graph: the crack-graph polylines between regions of a label raster.
+  {
+    // Four 6x6 blocks on a 12x12 raster: four seams meeting at the centre
+    // corner (6, 6) (degree 4) and ending at the raster edge (degree 1).
+    std::vector<std::int32_t> lab(12 * 12, -1);
+    for (int y = 0; y < 12; ++y)
+      for (int x = 0; x < 12; ++x) lab[y * 12 + x] = (y < 6 ? 0 : 2) + (x < 6 ? 0 : 1);
+    const msseg::SeamGraph sg = msseg::extract_seam_graph(lab.data(), 12, 12);
+    check(sg.n_seams() == 4, "four blocks give four seams");
+    check(sg.n_junctions() == 5, "four blocks give one centre + four edge junctions");
+    std::int64_t cracks = 0;
+    bool unit_steps = true, sorted = true, flanks_ok = true;
+    for (std::size_t i = 0; i < sg.n_seams(); ++i) {
+      cracks += sg.offsets[i + 1] - sg.offsets[i] - 1;
+      for (std::int64_t k = sg.offsets[i]; k + 1 < sg.offsets[i + 1]; ++k) {
+        const int dx = sg.points[2 * (k + 1)] - sg.points[2 * k];
+        const int dy = sg.points[2 * (k + 1) + 1] - sg.points[2 * k + 1];
+        if (std::abs(dx) + std::abs(dy) != 1) unit_steps = false;
+      }
+      if (i && std::make_pair(sg.a[i - 1], sg.b[i - 1]) > std::make_pair(sg.a[i], sg.b[i])) sorted = false;
+      if (!(sg.a[i] < sg.b[i])) flanks_ok = false;
+    }
+    check(cracks == 24, "four blocks: 24 cracks in total (4 seams x 6)");
+    check(unit_steps, "seam points advance by unit axis-aligned steps");
+    check(sorted && flanks_ok, "seams are sorted by flanks with a < b");
+
+    // An island: region 1 inside region 0 gives one loop with no junction.
+    std::vector<std::int32_t> isl(10 * 10, 0);
+    for (int y = 3; y < 7; ++y)
+      for (int x = 2; x < 5; ++x) isl[y * 10 + x] = 1;
+    const msseg::SeamGraph lg = msseg::extract_seam_graph(isl.data(), 10, 10);
+    check(lg.n_seams() == 1 && lg.n_junctions() == 0, "an island is one loop and no junction");
+    check(lg.j0[0] == -1 && lg.j1[0] == -1, "a loop has no junction ids");
+    const std::int64_t np = lg.n_points();
+    check(np == 15 && lg.points[0] == lg.points[2 * (np - 1)] && lg.points[1] == lg.points[2 * (np - 1) + 1],
+          "a loop is closed (14 cracks, first corner repeated)");
+    check(lg.points[0] == 2 && lg.points[1] == 3 && lg.points[2] == 3 && lg.points[3] == 3,
+          "a loop starts at its smallest (y, x) corner and leaves in +x");
+
+    // Background: a region against -1 ends its seams at degree-1 junctions.
+    std::vector<std::int32_t> bg(8 * 8, -1);
+    for (int y = 2; y < 6; ++y)
+      for (int x = 1; x < 7; ++x) bg[y * 8 + x] = x < 4 ? 3 : 7;
+    const msseg::SeamGraph bgg = msseg::extract_seam_graph(bg.data(), 8, 8);
+    check(bgg.n_seams() == 1 && bgg.n_junctions() == 2 && bgg.a[0] == 3 && bgg.b[0] == 7,
+          "two regions in background give one seam between two junctions");
+    check(bgg.n_points() == 5, "that seam is four cracks long");
   }
 
   std::printf("[core_smoke] %s\n", g_failures == 0 ? "PASSED" : "FAILED");

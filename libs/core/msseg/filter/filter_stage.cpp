@@ -194,7 +194,11 @@ bool stays_scalar(const ChainPlan& plan) {
   for (const StageRecord& rec : plan.stages) {
     if (rec.out_channels != 1) return false;
   }
-  return true;
+  // ...and the legacy fold can only express a colour stage that LEADS, since
+  // `first_scalar_stage` is an index into the caller's chain. A `color` further
+  // in -- now that it is allowed there -- takes the planes runner, which
+  // dispatches it wherever it sits.
+  return plan.color_stage <= 0;
 }
 
 diffg::Image<float> one_plane(const diffg::MultiImage<float>& stack) {
@@ -207,8 +211,9 @@ diffg::Image<float> one_plane(const diffg::MultiImage<float>& stack) {
 
 diffg::MultiImage<float> apply_filter_chain_planes(diffg::MultiImageView<const float> planes,
                                                    const std::vector<FilterParams>& filters,
-                                                   const std::string& default_color_method) {
-  const ChainPlan plan = plan_chain(filters, planes.channels(), default_color_method);
+                                                   const std::string& default_color_method,
+                                                   const std::string& reduce_at) {
+  const ChainPlan plan = plan_chain(filters, planes.channels(), default_color_method, reduce_at);
 
   // The caller's planes are read in place until a stage produces something.
   // Every stage allocates its own output anyway, so copying the input up front
@@ -228,18 +233,25 @@ diffg::MultiImage<float> apply_filter_chain_planes(diffg::MultiImageView<const f
     } else if (is_plane_operation(op)) {
       owned = apply_plane_stage(current(), rec.stage);
     } else {
-      // plan_chain has already refused a scalar stage handed a stack, so this
-      // holds; assert it rather than trust it, since the two could drift.
+      // A scalar stage: on one plane, once; on a stack, once per plane, which
+      // plan_chain has already decided is legitimate for this operation.
       const diffg::MultiImageView<const float> in = current();
-      if (in.channels() != 1) {
+      if (in.channels() != 1 && !rec.lifted) {
         throw std::runtime_error("'" + op + "' reads one plane, but " +
                                  std::to_string(in.channels()) + " reach it.");
       }
-      diffg::Image<float> scalar(in.dims(), in.spacing());
-      std::copy(in.channel_data(0), in.channel_data(0) + scalar.size(), scalar.data());
-      diffg::Image<float> next = apply_filter(scalar, rec.stage);
-      diffg::MultiImage<float> wrapped(next.dims(), 1, next.spacing());
-      std::copy(next.data(), next.data() + next.size(), wrapped.channel_data(0));
+      diffg::MultiImage<float> wrapped;
+      for (std::size_t c = 0; c < in.channels(); ++c) {
+        diffg::Image<float> scalar(in.dims(), in.spacing());
+        std::copy(in.channel_data(c), in.channel_data(c) + scalar.size(), scalar.data());
+        diffg::Image<float> next = apply_filter(scalar, rec.stage);
+        if (c == 0) wrapped = diffg::MultiImage<float>(next.dims(), in.channels(), next.spacing());
+        if (next.size() != wrapped.channel_stride()) {
+          throw std::runtime_error("'" + op + "' changed the raster's extent, which a lifted "
+                                   "stage cannot do.");
+        }
+        std::copy(next.data(), next.data() + next.size(), wrapped.channel_data(c));
+      }
       owned = std::move(wrapped);
     }
     have_owned = true;
@@ -253,10 +265,12 @@ diffg::MultiImage<float> apply_filter_chain_planes(diffg::MultiImageView<const f
 
 diffg::Image<float> apply_filter_chain(diffg::MultiImageView<const float> planes,
                                        const std::vector<FilterParams>& filters,
-                                       const std::string& default_color_method) {
-  const ChainPlan plan = plan_chain(filters, planes.channels(), default_color_method);
+                                       const std::string& default_color_method,
+                                       const std::string& reduce_at) {
+  const ChainPlan plan = plan_chain(filters, planes.channels(), default_color_method, reduce_at);
   if (!stays_scalar(plan)) {
-    diffg::MultiImage<float> out = apply_filter_chain_planes(planes, filters, default_color_method);
+    diffg::MultiImage<float> out =
+        apply_filter_chain_planes(planes, filters, default_color_method, reduce_at);
     if (out.channels() != 1) {
       throw std::runtime_error(
           "the chain yields " + std::to_string(out.channels()) +
@@ -301,8 +315,10 @@ diffg::FilterRequest to_diffg_request(const ResolvedStatChannel& c) {
   throw std::runtime_error("Unknown derived statistics channel kind: '" + c.kind + "'.");
 }
 
+// A raw slot is one the caller already holds pixels for: the two rasters, an
+// input plane, or a named source's own plane (whose `kind` IS the source name).
 bool is_derived_slot(const ResolvedStatChannel& c) {
-  return c.kind != "base" && c.kind != "filtered" && c.kind != "color";
+  return c.kind != "base" && c.kind != "filtered" && c.kind != "color" && c.kind != c.source;
 }
 
 // One bank traversal over `input` for the derived channels whose source it
@@ -384,12 +400,36 @@ StatChannelBank build_stat_channels(const diffg::Image<float>& base,
     bank.derived_color = run_bank(color->view(), bank.channels, "color", exec);
     alias_derived(bank, "color", bank.derived_color);
   }
+  // Named sources: run each chain over the input planes once, then the SAME
+  // bank traversal the colour source uses. run_bank and alias_derived are
+  // already keyed by a source string and take a MultiImageView, so a source
+  // needs no new machinery -- only its pixels.
+  for (const auto& entry : spec.sources) {
+    bool wanted = spec.source_channel.count(entry.first) != 0;
+    for (const ResolvedStatChannel& c : bank.channels) {
+      if (c.source == entry.first) wanted = true;
+    }
+    if (!wanted) continue;
+    diffg::MultiImage<float> planes =
+        apply_filter_chain_planes(color->view(), entry.second, "luminance");
+    if (planes.dims().width != base.dims().width || planes.dims().height != base.dims().height) {
+      throw std::runtime_error("build_stat_channels: source '" + entry.first +
+                               "' produced a raster of different dimensions.");
+    }
+    bank.source_planes[entry.first] = std::move(planes);
+    bank.derived_source[entry.first] =
+        run_bank(bank.source_planes[entry.first].view(), bank.channels, entry.first, exec);
+    alias_derived(bank, entry.first, bank.derived_source[entry.first]);
+  }
 
   for (std::size_t k = 0; k < bank.channels.size(); ++k) {
     const ResolvedStatChannel& c = bank.channels[k];
     if (c.kind == "base") bank.data[k] = base.data();
     else if (c.kind == "filtered") bank.data[k] = filtered.data();
     else if (c.kind == "color") bank.data[k] = color->channel_data(static_cast<std::size_t>(c.input_channel));
+    else if (bank.source_planes.count(c.kind)) {
+      bank.data[k] = bank.source_planes[c.kind].channel_data(static_cast<std::size_t>(c.input_channel));
+    }
   }
   return bank;
 }

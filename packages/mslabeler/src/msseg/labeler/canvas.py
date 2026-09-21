@@ -177,6 +177,17 @@ class SliceCanvas(tk.Frame):
             self._array_src = ArrayImageSource(array, path)
         self._sync_dims()
 
+    def clear(self):
+        """Show nothing: drop the base sources and every overlay (what was
+        on screen was removed from the session)."""
+        self._array_src = None
+        self._pyramid_src = None
+        self._source_path = None
+        self._overlays = []
+        self._transient = None
+        self._photo = None
+        self.canvas.delete("all")
+
     @property
     def base_is_rgb(self):
         src = self.source

@@ -11,8 +11,9 @@ implementation, no inheritance required.
   under an opaque string ``ItemKey`` that annotations bind to. Keys must be
   stable across sessions: they are what ``annotations.json`` stores.
 * ``RegionProvider`` -- the current region decomposition of an item: a label
-  raster, its per-region statistics table, the region-adjacency arcs, and a
-  ``commit`` generation that every cache keys on.
+  raster, its per-region statistics table, the region-adjacency arcs, the
+  seam graph (the polylines between regions), and a ``commit`` generation
+  that every cache keys on.
 * ``ImageSource`` -- base pixels by level and region, so a canvas can draw a
   gigapixel image without holding it (an in-memory array has one level).
 * ``LabelLayer`` -- a region-id raster served by crop, for the same reason.
@@ -124,6 +125,12 @@ class RegionProvider(Protocol):
     def label_layer(self, key: ItemKey) -> Optional["LabelLayer"]:
         """The item's current region raster as a ``LabelLayer`` (its ``rev`` is
         the record's commit); None without a record."""
+        ...
+
+    def seams(self, key: ItemKey, np):
+        """The item's seam graph (``seams.SeamGraph``, placed like the record's
+        raster) at the current commit, derived once and cached on the record;
+        None without a record."""
         ...
 
 

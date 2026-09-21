@@ -383,8 +383,8 @@ class MscouponApp(ViewerShell):
         are measure-only: the topology field is still `filters`, and the seeding
         extremum is still located on it.
         """
-        c = ttk.LabelFrame(self._processing_parent("stats"), text="5. Statistics channels")
-        c.pack(fill="x", padx=6, pady=4)
+        c = self._group(self._processing_parent("stats"), "5. Statistics channels",
+                        key="stats")
         self.stats_frame = c
 
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
@@ -656,8 +656,8 @@ class MscouponApp(ViewerShell):
         MSC parameters and the statistics channels (sections 1b-5)."""
         # 1b. Colour input: how a multi-sample TIFF's planes are read. The
         # conversion itself is a `color` stage at the head of each chain.
-        c = ttk.LabelFrame(self._processing_parent("filters"), text="1b. Colour input")
-        c.pack(fill="x", padx=6, pady=4)
+        c = self._group(self._processing_parent("filters"), "1b. Colour input",
+                        key="color")
         self.color_frame = c
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="alpha:").pack(side="left")
@@ -674,15 +674,15 @@ class MscouponApp(ViewerShell):
             anchor="w", padx=4, pady=(0, 3))
 
         # 2. Filter chain
-        self.filters_frame = ttk.LabelFrame(self._processing_parent("filters"),
-                                            text="2. Filter chain (topology field)")
-        self.filters_frame.pack(fill="x", padx=6, pady=4)
+        self.filters_frame = self._group(self._processing_parent("filters"),
+                                         "2. Filter chain (topology field)",
+                                         key="filters")
         self._rebuild_filter_cards()
 
         # 3. Base channel: 2-point normalization
-        self.base_frame = ttk.LabelFrame(self._processing_parent("base"),
-                                         text="3. Base channel (2-point normalization)")
-        self.base_frame.pack(fill="x", padx=6, pady=4)
+        self.base_frame = self._group(self._processing_parent("base"),
+                                      "3. Base channel (2-point normalization)",
+                                      key="base")
         ttk.Label(self.base_frame, wraplength=330, justify="left",
                   text="Add a 'normalize' stage to put region statistics and pixel "
                        "thresholds on a 0..1 scale between two measured landmarks. "
@@ -692,8 +692,7 @@ class MscouponApp(ViewerShell):
         self._rebuild_filter_cards("base")
 
         # 4. MSC params
-        c = ttk.LabelFrame(self._processing_parent("msc"), text="4. MSC parameters")
-        c.pack(fill="x", padx=6, pady=4)
+        c = self._group(self._processing_parent("msc"), "4. MSC parameters", key="msc")
         self.msc_frame = c
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="Max persistence %:").pack(side="left")
@@ -792,6 +791,20 @@ class MscouponApp(ViewerShell):
         for idx, card in enumerate(cards):
             self._build_filter_card(idx, card, chain)
 
+    def _plan_record(self, chain, idx):
+        """The planned arity of config stage `idx`, or None if it cannot be
+        planned (a chain mid-edit often cannot)."""
+        try:
+            cards, _frame = self._chain(chain)
+            plan = config_io.chain_plan(cards, self._current_color_count() or 1,
+                                        self._default_color_method())
+            for rec in plan["stages"]:
+                if rec["index"] == idx:
+                    return rec
+        except Exception:
+            return None
+        return None
+
     def _build_auto_color_card(self, parent, stage, chain):
         """Draw the conversion the runner inserts, greyed and read-only.
 
@@ -832,6 +845,13 @@ class MscouponApp(ViewerShell):
         combo.pack(side="left", padx=2, pady=2)
         combo.bind("<<ComboboxSelected>>",
                    lambda e, i=idx, v=op_var, c=chain: self._on_filter_op_change(i, v.get(), c))
+        # The plan's arity for this stage, so lifting is never silent: a card
+        # reading `3->3 (per plane)` is the whole reason automatic lifting is
+        # acceptable where the leading reduction was not.
+        rec = self._plan_record(chain, idx)
+        if rec is not None and (rec["in"] != 1 or rec["out"] != 1):
+            text = f"{rec['in']}→{rec['out']}" + (" (per plane)" if rec.get("lifted") else "")
+            ttk.Label(top, text=text, foreground="#777").pack(side="left", padx=4)
         if idx < len(cards) - 1 or card["operation"] != "none":
             ttk.Button(top, text="✕", width=3,
                        command=lambda i=idx, c=chain: self._remove_filter_card(i, c)
@@ -1669,9 +1689,12 @@ class MscouponApp(ViewerShell):
                 self.profiles[self.active_profile_idx].get("statistics"))["relevance"]
         return {
             "name": name,
+            # Every key `color_input_from_json` normalizes to has to be here,
+            # or the first load adds it and a profile file round trip is lossy.
             "input": {"color": {"alpha": self._color_alpha(),
                                 "default_method": self._default_color_method(),
-                                "channels": max(0, int(self.color_channels_var.get()))}},
+                                "channels": max(0, int(self.color_channels_var.get())),
+                                "reduce_at": self._reduce_at()}},
             "filters": config_io.filters_to_json(self.filter_cards),
             "base_filters": config_io.filters_to_json(self.base_cards),
             "msc": {"manifold": self.manifold_var.get(),
@@ -1683,7 +1706,7 @@ class MscouponApp(ViewerShell):
             "statistics": config_io.statistics_to_json(
                 self._stat_channel_cards(), self._stat_reductions(),
                 self.stat_extremum_var.get(), radius, relevance,
-                self._stat_histogram()),
+                self._stat_histogram(), self._stat_sources()),
             "selection": {
                 "feature_filters": config_io.queries_to_json(self.query_cards),
                 "pixel_filters": config_io.pixel_filters_to_json(self.pixel_cards),
@@ -1747,6 +1770,37 @@ class MscouponApp(ViewerShell):
         self._rebuild_pixel_cards()
         self._refresh_channel_picker()
         self._refresh_stat_summary()
+
+    def _reduce_at(self):
+        """Where the conversion goes when the chain does not reduce itself:
+        `front` (the head, as always) or `end` (append it, so the chain lifts
+        through and an RGB intermediate exists). Carried from the active
+        profile -- there is no control for it yet."""
+        try:
+            prof = self.profiles[self.active_profile_idx]
+        except (AttributeError, IndexError):
+            return "front"
+        col = ((prof.get("input") or {}).get("color") or {})
+        return "end" if col.get("reduce_at") == "end" else "front"
+
+    def _stat_sources(self):
+        """The active profile's `statistics.sources`, carried through unchanged.
+
+        There is no editor for them yet: a source is a filter chain a config or
+        another tool declares. But the statistics block is rebuilt from UI state
+        on every export, so without this a profile that declares a source would
+        lose it the first time the GUI wrote the profile back -- and its channels
+        would then stop resolving. Preserving what a profile brought is the whole
+        contract until there is a panel."""
+        try:
+            prof = self.profiles[self.active_profile_idx]
+        except (AttributeError, IndexError):
+            return None
+        stats = prof.get("statistics")
+        if not isinstance(stats, dict):
+            return None
+        src = stats.get("sources")
+        return src if isinstance(src, dict) and src else None
 
     def _stat_channel_cards(self):
         """The `statistics.channels[]` model, in slot order."""

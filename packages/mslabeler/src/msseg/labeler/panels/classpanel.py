@@ -26,14 +26,15 @@ from ..tools import DrawController, MagicFillController, _extremum_points
 class ClassPanelMixin:
 
     # ------------------------------------------------------------------ #
-    # The label panel (third pane)
+    # The label panel (the Annotation tab)
     # ------------------------------------------------------------------ #
     def _build_label_panel(self):
         # A plain frame, not a ScrollFrame: the class subpanels must DIVIDE the
         # available height between them (each scrolls its own interaction list),
-        # which needs the holder to fill the pane rather than grow it.
-        self.label_pane = ttk.Frame(self.paned, width=300)
-        self.paned.add(self.label_pane, weight=0)
+        # which needs the holder to fill the tab rather than grow it. This was
+        # the window's third PANE until the tabs moved into it.
+        self.label_pane = ttk.Frame(self.annot_tab)
+        self.label_pane.pack(fill="both", expand=True)
         panel = self.label_pane
 
         # Two titled halves: what the user DRAWS, and what the model does
@@ -42,6 +43,9 @@ class ClassPanelMixin:
         # for the class stack -- the one thing here that wants more room.
         ml = ttk.LabelFrame(panel, text="ML Region Classifier")
         ml.pack(side="bottom", fill="x", padx=4, pady=(2, 4))
+        # The seam tools (boundaries between regions) sit between the class
+        # stack and the classifier; packed bottom so the stack keeps the rest.
+        self._build_seam_panel(panel)
         ann = ttk.LabelFrame(panel, text="Annotation")
         ann.pack(side="top", fill="both", expand=True, padx=4, pady=(4, 2))
 
@@ -266,6 +270,7 @@ class ClassPanelMixin:
         self._class_panels = {}
         self._class_title_labels = {}
         self._class_swatches = {}
+        self._class_clear_buttons = {}
         self._class_lists = {}
         self._row_widgets = {}           # uid -> row record (see _sync_...)
         for k in range(1, self.store.n_classes):
@@ -292,6 +297,14 @@ class ClassPanelMixin:
             self._class_swatches[k] = swatch
             self._class_title_labels[k] = ttk.Label(title, text=f"Class {k}")
             self._class_title_labels[k].pack(side="left")
+            # Clear the class: every one of its annotations on every item,
+            # after asking -- the per-row context menu is the finer tool.
+            clear = ttk.Button(title, text="clear", width=6,
+                               command=lambda k=k: self._clear_class_guarded(k))
+            clear.pack(side="left", padx=(8, 0))
+            attach_tooltip(clear, f"Delete every class {k} annotation on every "
+                                  f"{self.ITEM_NOUN} (asks first; Ctrl+Z undoes it)")
+            self._class_clear_buttons[k] = clear
             frame.configure(labelwidget=title)
             lst = ScrollFrame(frame, width=240, canvas_width=224,
                               background="white")
@@ -584,6 +597,25 @@ class ClassPanelMixin:
             except tk.TclError:
                 pass
 
+    def _clear_class_guarded(self, k):
+        """Delete every annotation of class `k`, across every item, after
+        asking. One undo step."""
+        its = self.store.for_class(k)
+        if not its:
+            self.status_var.set(f"Class {k} has no annotations.")
+            return False
+        n_items = len({it.slice_key for it in its})
+        noun = self.ITEM_NOUN
+        if not messagebox.askyesno(
+                self.APP_TITLE,
+                f"Delete all {len(its)} class {k} annotation(s), on {n_items} "
+                f"{noun}(s)?\n\nCtrl+Z brings them back."):
+            return False
+        n = self._remove_interactions([it.uid for it in its])
+        self.status_var.set(f"Class {k}: deleted {n} annotation(s) on {n_items} "
+                            f"{noun}(s) (Ctrl+Z restores them)")
+        return True
+
     def _pick_class_color(self, k):
         from tkinter import colorchooser
         hexv = colorchooser.askcolor(color=self._class_color_hex(k),
@@ -831,6 +863,8 @@ class ClassPanelMixin:
             return
         for it in self._visible_interactions():
             self._draw_interaction_geometry(it, tags=("draw", "ipersist"))
+        for it in self._visible_seam_gestures():
+            self._draw_seam_geometry(it, tags=("draw", "ipersist"))
         # Every one of these is a Tk canvas item that the next window redraw
         # has to walk -- a magic fill commits one tap per region, so the count
         # is worth seeing beside the frame time (see labeler/perf.py).
@@ -846,6 +880,9 @@ class ClassPanelMixin:
             return
         with v.perf.span("annot.persist"):
             self._refresh_annotation_layer()
+            tool = getattr(v, "tool", None)
+            if tool is not None and hasattr(tool, "redraw"):
+                tool.redraw()          # the trace in flight, in screen space
         if self._hover_uid is None and self._hover_key is None:
             return
         with v.perf.span("annot.hover"):
@@ -869,6 +906,12 @@ class ClassPanelMixin:
         super()._on_hover(ix, iy)
         v = self.viewer
         if v is None:
+            return
+        # A trace in flight owns the pointer: the path from its anchor to the
+        # seam point under the cursor, instead of the region outlines.
+        tc = getattr(v.tool, "trace", None)
+        if tc is not None and tc.active:
+            tc.on_hover(ix, iy)
             return
         cur = self._current()
         region = None

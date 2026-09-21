@@ -136,10 +136,15 @@ def test_filter_slice_reduces_planes_with_the_default_and_an_explicit_stage():
         {"filters": [{"operation": "color", "params": {"method": "pick", "channel": 2}}],
          "input": {"color": {"default_method": "mean"}}}))
     assert np.allclose(picked, 30.0)
-    with pytest.raises(RuntimeError):
-        engine.filter_chain(planes, json.dumps(
-            {"filters": [{"operation": "blur", "params": {"sigma": 1.0}},
-                         {"operation": "color", "params": {"method": "mean"}}]}))
+    # `color` is positionally free now: it was pinned to index 0 while it was the
+    # only plane-consuming stage and everything after it was a scalar. A chain
+    # can carry a stack, so blur LIFTS over the three planes and the colour
+    # stage reduces what reaches it -- which is the only way to reach
+    # `luminance`, `weighted` or `pick` mid-chain.
+    lifted = engine.filter_chain(planes, json.dumps(
+        {"filters": [{"operation": "blur", "params": {"sigma": 1.0}},
+                     {"operation": "color", "params": {"method": "mean"}}]}))
+    assert lifted.ndim == 2 and np.allclose(lifted, 20.0), lifted.shape
 
 
 def test_statistics_json_carries_colour_sources():
@@ -168,7 +173,11 @@ def test_statistics_json_carries_colour_sources():
 
 def test_profile_input_block_rides_only_when_non_default():
     p = session.default_profile("p")
-    assert p["input"]["color"] == {"alpha": "drop", "default_method": "luminance", "channels": 0}
+    assert p["input"]["color"] == {"alpha": "drop", "default_method": "luminance",
+                                   "channels": 0, "reduce_at": "front"}
+    # `reduce_at` joined the block when a chain could be lifted through instead
+    # of reduced at the head. Its default is still dropped on export, which is
+    # what keeps every existing colour config byte-identical.
     assert "input" not in json.loads(session.profile_params_json(p))
     doc = json.loads(session.profile_params_json(p, color_channels=3))
     assert doc["input"] == {"color": {"channels": 3}}
@@ -178,6 +187,10 @@ def test_profile_input_block_rides_only_when_non_default():
     assert doc["input"] == {"color": {"alpha": "keep", "default_method": "mean", "channels": 4}}
     assert session.profile_params_json(p, color_channels=3).count('"channels": 3') == 1
     assert session.profile_summary(p).splitlines()[1] == "stats: base→1ch×4"
+    # ...and it rides only when it says something.
+    p["input"]["color"]["reduce_at"] = "end"
+    assert json.loads(session.profile_params_json(p))["input"]["color"]["reduce_at"] == "end"
+    assert session.profile_from_json(p)["input"]["color"]["reduce_at"] == "end"
 
 
 def test_extension_measures_colour_channels():

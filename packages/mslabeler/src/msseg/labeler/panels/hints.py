@@ -1,5 +1,6 @@
 """The two link-labels that say what is in effect (the active profile and the
-active model) and the centre notebook's tab bookkeeping."""
+active model), the tab bookkeeping of the window's right column, and the F9
+that folds it away."""
 from __future__ import annotations
 
 import json
@@ -77,9 +78,12 @@ class HintsMixin:
         bits = [self._clf_kind, f"{len(names)} feats"]
         if self._clf_spec is not None:
             bits[1] = self._clf_spec.brief(len(names))
-        expected = self._expected_feature_names()
+        expected = self._expected_names_for(None)
         if expected is not None and set(expected) != set(names):
             bits.append("⚠ profile mismatch")
+        ctx = getattr(self, "_clf_context", None)
+        if ctx is not None and not ctx.empty():
+            bits.append(ctx.brief())
         if self._edge_model is not None:
             r = (self._edge_model.report or {}).get("edge", {}).get("learned")
             bits.append("-> edges" + (f" {r['diff_recall']:.0%}/{r['diff_precision']:.0%}" if r else ""))
@@ -106,31 +110,62 @@ class HintsMixin:
             pass
 
     def _center_tab_name(self):
-        """Name of the selected center tab ("View" when unsure)."""
+        """Name of the selected center tab ("Processing" when unsure -- the
+        first tab, and what _build_center selects)."""
         try:
             selected = self.center.select()
         except tk.TclError:
-            return "View"
+            return "Processing"
         for name, frame in self._center_tabs.items():
             if str(frame) == str(selected):
                 return name
-        return "View"
+        return "Processing"
 
     def _on_center_tab_changed(self, _e=None):
-        """The View tab came back: repaint, and redo the one-time fit if the
-        first render of this run happened while the canvas was unmapped."""
-        if self._center_tab_name() != "View" or self.viewer is None:
+        """The canvas is above the notebook now, so a tab change is no longer
+        a reveal and needs no repaint. All that is left is finishing a fit
+        deferred while the window itself was still unmapped."""
+        if self.viewer is None:
             return
-
-        def repaint():
-            if self.viewer is None:
-                return
-            self._refresh_render()
-            if self._fit_pending:
-                self._fit_pending = False
-                self.viewer.fit()
-
         try:
-            self.root.after_idle(repaint)
+            self.root.after_idle(self._flush_pending_fit)
         except tk.TclError:
             pass
+
+    def _flush_pending_fit(self, _e=None):
+        """The one place a deferred fit lands: from a tab change, from <Map>
+        on the viewer frame, and from _after_layout. An unmapped canvas is
+        1x1, so a fit there would frame nothing."""
+        if self.viewer is None or not self._fit_pending:
+            return
+        try:
+            if not self.viewer.canvas.winfo_viewable():
+                return
+        except tk.TclError:
+            return
+        self._fit_pending = False
+        self.viewer.fit()
+
+    def _toggle_center_tabs(self, _e=None):
+        """F9: fold the tab column away so the picture takes its width, or put
+        the sashes back where they were. Only the viewer pane has a weight, so
+        a fold survives a window resize."""
+        try:
+            w = self.paned.winfo_width()
+            last = len(self.paned.panes()) - 2      # the sash before the tabs
+        except (tk.TclError, AttributeError):
+            return "break"
+        if last < 0:
+            return "break"
+        if self._panes_collapsed:
+            self._panes_collapsed = False
+            self._panes_applied = False
+            self._schedule_panes()
+        else:
+            self._panes_want = self._pane_fractions()
+            self._panes_collapsed = True
+            try:
+                self.paned.sashpos(last, max(1, w - 1))
+            except tk.TclError:
+                pass
+        return "break"

@@ -1846,7 +1846,7 @@ void test_color_chain_rules_and_identity() {
   try {
     msseg::apply_filter_chain(rgb.view(), {chain[0], color_stage({{"method", "mean"}})});
   } catch (const std::exception&) { threw = true; }
-  expect(threw, "color after index 0 is rejected");
+  expect(!threw, "color is valid wherever the arity works: it reduces the planes that reach it");
   threw = false;
   try {
     msseg::apply_filter_chain(gray.view(), {color_stage({{"method", "luminance"}})});
@@ -1948,7 +1948,8 @@ void test_chain_plan() {
       return true;
     }
   };
-  expect(throws({blur, color_of("mean")}, 3), "color after index 0 is rejected by the planner");
+  expect(!throws({blur, color_of("mean")}, 3),
+         "color is positionally free: blur lifts over the planes, color reduces them");
   expect(throws({color_of("luminance")}, 1), "a method the plane count refuses is rejected");
   expect(throws({blur}, 0), "no input planes is refused rather than read out of bounds");
 }
@@ -2088,15 +2089,25 @@ void test_plane_carrying_chain() {
   expect(threw && msg.find("adapt") != std::string::npos,
          "a chain ending on a stack is refused, naming adapt as the reduction");
 
-  // A scalar stage handed a stack is refused by the PLANNER, before any pixel
-  // is touched -- nothing lifts component-wise yet, by design.
+  // A scalar stage handed a stack LIFTS: run once per plane, recorded as such.
+  const auto lifted_plan =
+      msseg::plan_chain({he_eosin[0], stage("blur", {{"sigma", 1.0}})}, 3, "luminance");
+  expect(lifted_plan.stages[1].lifted && lifted_plan.stages[1].out_channels == 3,
+         "a liftable scalar stage runs per plane and keeps the stack's width");
+  expect(lifted_plan.out_channels == 3, "and the chain still carries three planes");
+
+  // An operation that cannot mean anything plane by plane still refuses, and
+  // says what to do instead.
   threw = false;
+  msg.clear();
   try {
-    msseg::plan_chain({he_eosin[0], stage("blur", {{"sigma", 1.0}})}, 3, "luminance");
-  } catch (const std::exception&) {
+    msseg::plan_chain({he_eosin[0], stage("label_components", {{"threshold", 0.0}})}, 3, "luminance");
+  } catch (const std::exception& e) {
     threw = true;
+    msg = e.what();
   }
-  expect(threw, "a scalar stage cannot be handed a stack");
+  expect(threw && msg.find("adapt") != std::string::npos,
+         "a stage that cannot lift is refused, naming the reduction");
 
   // optical_density can hand back its planes, and projecting them by the unit
   // stain row reproduces what the projecting form computes directly. This is
@@ -2164,6 +2175,86 @@ void test_plane_carrying_chain() {
     cli_threw = true;
   }
   expect(cli_threw, "a chain that ends on a stack is refused by the Image2D pipeline");
+}
+
+// Named measurement sources: a small chain over the input planes whose output
+// becomes measurable. This is what turns nucleus density into a feature column
+// rather than only something removed from the topology field -- and it does it
+// WITHOUT making `base` a stack, which would have changed what `base` means to
+// relevance, the per-slice CSV and pixel filters.
+void test_statistics_sources() {
+  msseg::StatsSpec spec;
+  spec.base_channel = true;
+  spec.color_channels = 3;
+  msseg::FilterParams he;
+  he.operation = "stain_deconvolution";
+  he.params = nlohmann::json{{"preset", "he"}};
+  spec.sources["he"] = {he};
+  spec.source_channel.insert("he");
+
+  // The plane count is DERIVED from the chain, not declared: nothing in the
+  // spec says "he has three planes".
+  auto names = [](const std::vector<msseg::ResolvedStatChannel>& v) {
+    std::vector<std::string> out;
+    for (const auto& c : v) out.push_back(c.name);
+    return out;
+  };
+  const auto raw = msseg::resolve_stat_channels(spec);
+  const std::vector<std::string> want = {"base", "he_c0", "he_c1", "he_c2"};
+  expect(names(raw) == want, "a source's own planes resolve after base, derived from its chain");
+  expect(raw[1].source == "he" && raw[1].input_channel == 0, "a source plane carries its source and index");
+  expect(spec.uses_color(), "a source reads the input planes, so the spec needs them");
+
+  // A derived kind over the source: prefixed, so two sources cannot collide.
+  msseg::StatChannelRequest blur;
+  blur.kind = "blur";
+  blur.sigmas = {1.5};
+  blur.source = "he";
+  spec.derived.push_back(blur);
+  const auto with_blur = names(msseg::resolve_stat_channels(spec));
+  const std::vector<std::string> want2 = {"base", "he_c0", "he_c1", "he_c2",
+                                          "he_blur_c0_s1.5", "he_blur_c1_s1.5", "he_blur_c2_s1.5"};
+  expect(with_blur == want2, "a derived channel over a source is prefixed and expands per plane");
+
+  // An undeclared source is refused, naming the fix.
+  msseg::StatsSpec bad = spec;
+  bad.derived.back().source = "nope";
+  bool threw = false;
+  try {
+    msseg::resolve_stat_channels(bad);
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  expect(threw, "an undeclared source is refused");
+
+  // And the pixels: the source's planes ARE the deconvolution's, measured.
+  diffg::MultiImage<float> rgb(diffg::Dimensions{18, 14, 1}, 3);
+  const std::size_t n = rgb.channel_stride();
+  for (std::size_t c = 0; c < 3; ++c) {
+    for (std::size_t i = 0; i < n; ++i) {
+      rgb.channel_data(c)[i] = static_cast<float>(40 + ((i * 13 + c * 29) % 170));
+    }
+  }
+  diffg::Image<float> base_img(diffg::Dimensions{18, 14, 1});
+  std::fill(base_img.data(), base_img.data() + base_img.size(), 1.0f);
+
+  msseg::StatsSpec pix = spec;
+  pix.derived.clear();
+  const msseg::StatChannelBank bank =
+      msseg::build_stat_channels(base_img, base_img, pix, {}, &rgb);
+  expect(bank.size() == 4, "the bank carries base plus the source's three planes");
+  const auto conc = msseg::apply_plane_stage(rgb.view(), he);
+  bool same = true;
+  for (std::size_t k = 0; k < 3 && same; ++k) {
+    for (std::size_t i = 0; i < n && same; ++i) {
+      same = bank.channel(k + 1)[i] == conc.channel_data(k)[i];
+    }
+  }
+  expect(same, "a source slot points at its chain's own pixels");
+
+  // A source is materialized once however many channels read it.
+  expect(bank.source_planes.size() == 1 && bank.source_planes.count("he") == 1,
+         "a source is built once per slice");
 }
 
 void write_rgb_tiff(const std::filesystem::path& path, int w, int h, int samples, bool planar) {
@@ -2482,6 +2573,7 @@ int main() try {
   RUN(test_chain_plan);
   RUN(test_plane_stages);
   RUN(test_plane_carrying_chain);
+  RUN(test_statistics_sources);
   RUN(test_tiff_planes_roundtrip);
   RUN(test_color_stat_channels);
   RUN(test_histogram_stats);

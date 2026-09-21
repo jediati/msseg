@@ -40,7 +40,8 @@ def default_color_input() -> Dict[str, Any]:
     method a chain without a leading `color` stage gets, and the plane count
     the statistics schema is resolved for (0 = grayscale / unknown; the GUI
     fills it from the slice on screen)."""
-    return {"alpha": "drop", "default_method": "luminance", "channels": 0}
+    return {"alpha": "drop", "default_method": "luminance", "channels": 0,
+            "reduce_at": "front"}
 
 
 def color_input_from_json(doc: Any) -> Dict[str, Any]:
@@ -50,7 +51,11 @@ def color_input_from_json(doc: Any) -> Dict[str, Any]:
         method = "luminance"
     return {"alpha": "keep" if col.get("alpha") == "keep" else "drop",
             "default_method": method,
-            "channels": max(0, _as_int(col.get("channels"), 0))}
+            "channels": max(0, _as_int(col.get("channels"), 0)),
+            # Where the conversion goes when the chain does not reduce itself.
+            # `end` lets a chain lift all the way through, so `edges` runs per
+            # plane and there is an RGB intermediate to look at.
+            "reduce_at": "end" if col.get("reduce_at") == "end" else "front"}
 
 
 # How persistence simplification is represented when a profile does not say:
@@ -128,10 +133,13 @@ def profile_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[str, 
     }
 
     stats = config_io.statistics_from_json(root.get("statistics"), notes)
+    # `sources` rides through: a profile that declares one and loses it on load
+    # is a profile whose channels stop resolving. There is no GUI editor for
+    # them yet, so preserving what a profile brought is the whole contract.
     out["statistics"] = config_io.statistics_to_json(
         stats["channels"], stats["reductions"], stats["extremum"],
         out["msc"]["extremum_sample_radius"], stats["relevance"],
-        stats.get("histogram"))
+        stats.get("histogram"), stats.get("sources"))
 
     sel = _as_dict(root.get("selection"))
     # Feature filters validate against the schema THIS profile's statistics
@@ -196,6 +204,8 @@ def profile_params_json(profile: Dict[str, Any], cores: int = 1,
         block["alpha"] = col["alpha"]
     if col["default_method"] != "luminance":
         block["default_method"] = col["default_method"]
+    if col.get("reduce_at") == "end":
+        block["reduce_at"] = "end"
     if channels > 0:
         block["channels"] = channels
     if block:
@@ -244,7 +254,8 @@ def _profile_from_state(state: Dict[str, Any], name: str = "imported") -> Dict[s
             state.get("stat_channels") or [{"kind": "base"}],
             state.get("stat_reductions") or list(config_io.STAT_REDUCTIONS),
             bool(state.get("stat_extremum", True)), radius,
-            bool(state.get("stat_relevance", True))),
+            bool(state.get("stat_relevance", True)), None,
+            state.get("stat_sources")),
         "selection": {
             "feature_filters": config_io.queries_to_json(state.get("feature_filters") or []),
             "pixel_filters": config_io.pixel_filters_to_json(state.get("pixel_filters") or []),

@@ -59,6 +59,19 @@ CASES = [
     ([OD_PLANES, adapt(mode="project", matrix=[[0.1, 0.9, 0.2]])], 3, "luminance"),
     ([OD_PLANES, adapt(mode="project", preset="luminance")], 3, "luminance"),
     ([OD_PLANES, adapt(mode="select", channels=[1]), BLUR], 3, "luminance"),
+    # Lifting: a scalar stage handed a stack runs per plane, and a chain that
+    # reduces on its own gets NO leading conversion.
+    ([EDGES, adapt(mode="reduce", how="max")], 3, "luminance"),
+    ([HE, EDGES, adapt(mode="reduce", how="mean")], 3, "luminance"),
+    ([HE, EDGES, BLUR, adapt(mode="reduce", how="norm")], 3, "luminance"),
+    ([EDGES, BLUR], 3, "luminance"),          # no reduction: still converts first
+    ([NORMALIZE, BLUR], 3, "luminance"),      # cannot lift: still converts first
+    # The promoted colour methods, mid-chain.
+    ([HE, {"operation": "dizenzo", "params": {"sigma": 1.5}}], 3, "luminance"),
+    ([HE, {"operation": "hsv", "params": {"component": "saturation"}}], 3, "luminance"),
+    ([HE, {"operation": "chgradmag", "params": {"sigma": 1.0}}], 3, "luminance"),
+    ([{"operation": "optical_density", "params": {"output": "planes"}},
+      adapt(mode="reduce", how="max")], 3, "luminance"),
 ]
 
 
@@ -86,17 +99,24 @@ def test_an_explicit_conversion_is_not_synthesized():
     assert plan["stages"][0]["index"] == 0
 
 
-def test_color_after_the_head_is_reported_not_raised():
+def test_color_is_positionally_free():
+    """`color` was pinned to index 0 while it was the only plane-consuming stage
+    and everything after it was a scalar. A chain carries a stack now, so blur
+    LIFTS and the colour stage reduces what reaches it -- which is the only way
+    to reach `luminance`, `weighted` or `pick` mid-chain. Lifting the rule was
+    strictly widening: it was an error before, so no valid config moved."""
     plan = config_io.chain_plan([BLUR, color("mean")], 3, "luminance")
-    assert plan["error"] and "must be the first stage" in plan["error"]
+    assert plan["error"] is None, plan
+    assert [(s["operation"], s["in"], s["out"]) for s in plan["stages"]] == [
+        ("blur", 3, 3), ("color", 3, 1)]
+    assert plan["stages"][0]["lifted"] and plan["out"] == 1
 
 
-def test_operations_at_index_carry_the_frozen_alias_rule():
-    assert "color" in config_io.filter_operations_at(0)
-    assert "color" not in config_io.filter_operations_at(1)
-    # everything else is offered at every index
-    assert set(config_io.filter_operations_at(0)) - {"color"} == set(
-        config_io.filter_operations_at(3))
+def test_every_operation_is_offered_at_every_index():
+    """Arity, not position, is what constrains a stage now -- and the planner
+    reports that, so the picker does not have to guess."""
+    assert set(config_io.filter_operations_at(0)) == set(config_io.filter_operations_at(3))
+    assert "color" in config_io.filter_operations_at(1)
 
 
 @pytest.mark.skipif(ext is None, reason="needs the compiled mscoupon extension")
@@ -122,7 +142,7 @@ def test_the_mirror_reports_what_the_extension_raises():
     """Same refusals, different shapes: C++ throws, the mirror records, because a
     chain is invalid between keystrokes in the GUI and a card rebuild must not
     depend on the chain being well-formed."""
-    chain = [BLUR, color("mean")]
+    chain = [HE, {"operation": "label_components", "params": {}}]   # cannot lift
     assert config_io.chain_plan(chain, 3, "luminance")["error"]
     with pytest.raises(Exception):
         ext.chain_plan(json.dumps(chain), 3, "luminance")
@@ -138,9 +158,13 @@ def test_a_plane_stage_head_is_not_given_a_synthesized_conversion():
     assert plan["stages"][1]["out"] == 1 and plan["out"] == 1
 
 
-def test_a_scalar_stage_after_a_stack_is_reported():
+def test_a_scalar_stage_after_a_stack_lifts():
+    """It used to be refused. Lifting discards nothing, so it is automatic --
+    and recorded, so the plan and the card drawn from it can say so."""
     plan = config_io.chain_plan([HE, BLUR], 3, "luminance")
-    assert plan["error"], plan
+    assert plan["error"] is None, plan
+    assert plan["stages"][1]["lifted"] and plan["stages"][1]["out"] == 3
+    assert plan["out"] == 3, "and the chain still carries a stack, which the MSC will refuse"
 
 
 def test_plane_stage_cards_round_trip():
@@ -195,3 +219,50 @@ def test_optical_density_output_mode_survives_export():
     assert config_io.chain_plan(chain_after, 3, "luminance")["out"] == 1
     assert "output" in [r[0] for r in config_io.filter_param_schema(
         "color", {"method": "optical_density"})]
+
+
+@pytest.mark.skipif(ext is None, reason="needs the compiled mscoupon extension")
+def test_a_chain_that_reduces_gets_no_leading_conversion():
+    """The auto-luminance appears only when a chain would not otherwise land on
+    one plane. Writing a reduction is how a chain says where that happens."""
+    lifted = config_io.chain_plan([EDGES, adapt(mode="reduce", how="max")], 3, "luminance")
+    assert [s["operation"] for s in lifted["stages"]] == ["edges", "adapt"]
+    assert lifted["stages"][0]["lifted"] and lifted["stages"][0]["out"] == 3
+    assert lifted["out"] == 1
+
+    # ...and a chain with no reduction still gets it, as every chain written
+    # before plane stages existed does.
+    plain = config_io.chain_plan([EDGES, BLUR], 3, "luminance")
+    assert plain["stages"][0]["synthesized"] and plain["stages"][0]["operation"] == "color"
+
+
+def test_a_stage_that_cannot_lift_is_reported():
+    """`normalize` measures two landmarks whose meaning is a population; per
+    plane they would destroy the cross-plane comparability a projection needs.
+    `label_components` yields ids. Neither lifts."""
+    plan = config_io.chain_plan([HE, {"operation": "label_components", "params": {}}],
+                                3, "luminance")
+    assert plan["error"] and "plane by plane" in plan["error"]
+    assert not plan["stages"][1]["lifted"]
+
+
+@pytest.mark.skipif(ext is None, reason="needs the compiled mscoupon extension")
+def test_a_promoted_method_equals_the_color_spelling():
+    """`dizenzo` the operation and `color{method: dizenzo}` are the same
+    computation -- core applies the promoted stage by handing it to the colour
+    stage, so there is one implementation, not two."""
+    import numpy as np
+    rgb = (40 + 180 * np.random.default_rng(3).random((3, 12, 10))).astype(np.float32)
+    args = {"sigma": 1.5, "eigen": "largest"}
+    alias = ext.filter_chain(rgb, json.dumps({"filters": [
+        {"operation": "color", "params": dict(method="dizenzo", **args)}]}), "luminance")
+    promoted = ext.filter_chain(rgb, json.dumps({"filters": [
+        {"operation": "dizenzo", "params": args}]}), "luminance")
+    assert np.array_equal(alias, promoted)
+
+    # ...and both spellings work mid-chain: the operation, and `color{method}`,
+    # which is what reaches the methods the promoted set does not cover.
+    for stage in ({"operation": "color", "params": {"method": "dizenzo"}},
+                  {"operation": "dizenzo", "params": {"sigma": 1.5}}):
+        plan = ext.chain_plan(json.dumps([HE, stage]), 3, "luminance")
+        assert plan["out"] == 1 and plan["stages"][1]["in"] == 3, plan

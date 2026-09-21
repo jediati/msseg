@@ -49,7 +49,10 @@ parameters that produced it have just been replaced; click *Run* again.
    *Make subsequence from selection*. Each subsequence is processed as its own 3D
    stack (e.g. `asdf_0011..0013` + `asdf_0025..0026` → two subsequences).
    Clicking a TIFF in the file list, or a TIFF row of a sequence that is not
-   primed, **previews** it on the right without a Run.
+   primed, **previews** it on the right without a Run. Right-clicking a row
+   offers *Go to* and a guarded *Remove* of that slice or sequence, which also
+   drops what was primed for it; *Remove* / *Clear all* under the list ask
+   first too.
 2. **Filter chain** — pick a filter type to populate its parameter widgets; a
    trailing "none" card lets you append more (chain e.g. morphology → edges).
    Types: `blur, derivative, laplacian, zero_crossings, hessian_eigenvalues,
@@ -72,7 +75,9 @@ parameters that produced it have just been replaced; click *Run* again.
 **Right panel — view & refine (one slice at a time)**
 - **Renderer** — a grayscale (or, for a colour slice, RGB) background channel + toggleable overlays
   (segmentation, mask), with min/max brightness/contrast and an overlay-alpha
-  slider; zoom (wheel) and pan (drag). The **Image** dropdown offers every
+  slider; zoom (wheel) and pan (drag). `F` flips between the original image
+  and the derived channel last shown; every channel keeps its own Min/Max
+  window, first set from its 1st/99th percentiles. The **Image** dropdown offers every
   measurement channel, not just `base` and `filtered`, so a threshold on
   `max_edges_s0.7` can be looked at on the raster it is thresholding. A derived
   channel is computed for the displayed slice on demand and memoised — holding
@@ -83,6 +88,14 @@ parameters that produced it have just been replaced; click *Run* again.
   name computes that scale-space response — through the same calls priming
   makes, so what is previewed is what a Run will measure. Results are memoised
   per slice, channel and parameter set, and recomputed when a parameter changes.
+  That recompute is **automatic**: editing any parameter of either chain
+  repaints the shown channel ~250 ms after you stop typing, on a worker thread
+  (so the window stays responsive through a ~5 s GMM normalize) and without
+  moving the zoom or pan. Only the shown channel is rebuilt — editing the
+  topology chain while `base` is on screen costs nothing, and retyping a sigma
+  you had before is a cache hit. It keeps working after a Run: the canvas shows
+  the live chain, the region overlays come off (they are from a different
+  field), and the badge reads `Preview - filters changed, Run to re-prime`.
 - **Slice slider (top)** — a single slider linearized over *all* subsequences'
   slices (shown when > 1 TIFF); crossing a boundary switches the active stack.
 - **Persistence %** — live re-threshold via native cancellation (cheap; no MSC
@@ -271,7 +284,9 @@ log. Two streams, both intentionally verbose:
     from a one-channel spec (not the profile's whole bank), and the base chain,
     the filtered field and each channel are memoised on exactly the parameters
     that produce them, under a byte budget; a GMM normalize is ~5 s and a blur
-    at sigma 64 ~3.5 s on 3232², each paid once per slice.
+    at sigma 64 ~3.5 s on 3232², each paid once per slice. Once a stack is
+    primed the budget drops (640 MB → 256 MB), since the stack's own
+    base/filtered rasters are resident beside it.
   - CLI: a startup config summary, then one line per slice
     (`image[min,max] filtered[min,max] regions=N kept=M`).
 

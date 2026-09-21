@@ -375,6 +375,40 @@ def test_meta_round_trips_and_defaults_to_none():
     assert LabelStore.from_json(doc).get(it.uid).meta is None
 
 
+def test_remove_many_is_one_mutation():
+    store = LabelStore(n_classes=3)
+    a = store.add("taps", [(1.0, 1.0)], 1, "d/s0.tiff", 0, 0)
+    b = store.add("taps", [(2.0, 2.0)], 2, "d/s0.tiff", 0, 0)
+    c = store.add("taps", [(3.0, 3.0)], 1, "d/s1.tiff", 0, 1)
+    assert [it.uid for it in store.for_class(1)] == [a.uid, c.uid]
+    rev = store.rev
+    assert store.remove_many([a.uid, c.uid, 999]) == 2
+    assert store.rev == rev + 1, "several removals, one rev bump"
+    assert [it.uid for it in store.interactions] == [b.uid]
+    assert store.remove_many([a.uid]) == 0 and store.rev == rev + 1, "nothing to remove, no bump"
+    assert store.for_class(1) == []
+
+
+def test_rebind_resolves_foreign_keys_through_the_catalogue():
+    """A key that is not "folder/basename" (a slide's "...@level#rect") binds
+    through the resolver; without one it stays unbound, as it always did."""
+    store = LabelStore(n_classes=3)
+    slide = store.add("taps", [(1.0, 1.0)], 1, "WSI/a.tiff@4", 7, 7)
+    plain = store.add("taps", [(1.0, 1.0)], 1, "d/s0.tiff", 7, 7)
+    gone = store.add("taps", [(1.0, 1.0)], 1, "WSI/a.tiff@0#1,2,3,4", 7, 7)
+    seqs = [{"name": "s", "folder": "d", "files": ["/x/d/s0.tiff"]}]
+    assert store.rebind(seqs) == 2
+    assert (plain.si, plain.li) == (0, 0) and not slide.bound
+
+    def resolve(key):
+        return (3, 0) if key == "WSI/a.tiff@4" else None
+    assert store.rebind(seqs, resolve=resolve) == 1
+    assert (slide.si, slide.li) == (3, 0), "bound through the resolver"
+    assert (plain.si, plain.li) == (0, 0), "file matching still comes first"
+    assert not gone.bound, "a key the resolver does not know stays unbound"
+    assert store.rebind(seqs, resolve=lambda k: 1 / 0) == 2, "a failing resolver binds nothing"
+
+
 def test_meta_does_not_change_resolution():
     lab = blocks_raster()
     pts = [(5.0, 5.0), (12.0, 12.0)]

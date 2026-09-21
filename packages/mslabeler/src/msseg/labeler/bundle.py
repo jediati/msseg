@@ -6,8 +6,11 @@ A saved classifier is one pickled dict::
      "statistics",      # v2+: the statistics block it was trained under
      "spec",            # v3+: the tuned dense spec (ModelSpec.to_dict) or None
      "edge", "stack",   # v4:  the edge model (EdgeModel.to_dict) or None, and
-                        #      the stack settings (custom hidden sizes, edge spec)
-     "scope"}           # v5:  the app's feature scope, when it has one
+                        #      the stack settings (custom hidden sizes, edge spec,
+                        #      and -- only when the names carry neighbourhood
+                        #      columns -- "context": the ContextSpec dict)
+     "scope",           # v5:  the app's feature scope, when it has one
+     "seam"}            # the seam model (seam_model.SeamModel.to_dict), when one was fit
 
 Reading is feature-detecting rather than version-gated, so every earlier
 layout (v1: no kind/statistics; v2: no spec; v3: no edge/stack; v4: no scope)
@@ -54,6 +57,7 @@ class ModelBundle:
     edge: Optional[Dict[str, Any]] = None
     stack: Dict[str, Any] = field(default_factory=dict)
     scope: Optional[str] = None
+    seam: Optional[Dict[str, Any]] = None
     app_tag: str = DEFAULT_APP_TAG
 
     def to_doc(self) -> Dict[str, Any]:
@@ -66,6 +70,9 @@ class ModelBundle:
         # keeps producing the document it always has.
         if self.scope is not None:
             doc["scope"] = str(self.scope)
+        # Likewise the seam model: only when one rides along.
+        if self.seam is not None:
+            doc["seam"] = dict(self.seam)
         return doc
 
     @classmethod
@@ -75,6 +82,7 @@ class ModelBundle:
             raise ValueError("not a labeler classifier file")
         spec = doc.get("spec")
         edge = doc.get("edge")
+        seam = doc.get("seam")
         return cls(model=doc["model"], names=list(doc["names"]),
                    kind=str(doc.get("kind") or "random forest"),
                    statistics=dict(doc.get("statistics") or {}),
@@ -82,6 +90,7 @@ class ModelBundle:
                    edge=edge if isinstance(edge, dict) else None,
                    stack=dict(doc.get("stack") or {}),
                    scope=(str(doc["scope"]) if doc.get("scope") is not None else None),
+                   seam=seam if isinstance(seam, dict) else None,
                    app_tag=app_tag)
 
     def save(self, path: str) -> None:
@@ -97,14 +106,19 @@ class ModelBundle:
     def record_entry(self, path: str) -> Dict[str, Any]:
         """The session's model record for this bundle saved at `path`."""
         return model_record_entry(path, self.names, self.kind, self.statistics,
-                                  self.spec, self.edge is not None, self.scope)
+                                  self.spec, self.edge is not None, self.scope,
+                                  has_seam=self.seam is not None)
 
 
 def model_record_entry(path: str, names: Sequence[str], kind: str, statistics: Any,
                        spec: Optional[Dict[str, Any]], has_edge: bool,
-                       scope: Optional[str] = None) -> Dict[str, Any]:
+                       scope: Optional[str] = None,
+                       context: Optional[Dict[str, Any]] = None,
+                       has_seam: bool = False) -> Dict[str, Any]:
     """A session ``models[]`` entry: where the pickle is, the feature
-    fingerprint it needs, and enough provenance to describe it unloaded."""
+    fingerprint it needs, and enough provenance to describe it unloaded.
+    `context` is the ContextSpec dict of the neighbourhood columns the
+    fingerprint includes, written only when there are any."""
     entry = {"path": os.path.abspath(path),
              "fingerprint": list(names or []),
              "kind": kind,
@@ -113,6 +127,10 @@ def model_record_entry(path: str, names: Sequence[str], kind: str, statistics: A
              "edge": bool(has_edge)}
     if scope is not None:
         entry["scope"] = str(scope)
+    if context:
+        entry["context"] = dict(context)
+    if has_seam:
+        entry["seam"] = True             # a seam model rides the pickle
     return entry
 
 

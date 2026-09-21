@@ -21,13 +21,13 @@ import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from . import edge_model, magic_fill, model_search, fields
+from . import context, edge_model, magic_fill, model_search, fields
 from . import bundle as model_bundle
 from .labeling import (LabelStore, MAX_CLASSES, TOOLS, resolve_slice, resolve_sets,
                           touched_sets, class_lut, scalar_lut, line_pixels, polygon_mask,
                           preview_lut)
 from .training import TrainingSetBuilder, TrainingProblem
-from .widgets import ScrollFrame, attach_tooltip
+from .widgets import ScrollFrame, Collapsible, attach_tooltip
 from .defaults import *  # noqa: F401,F403
 from .tools import DrawController, MagicFillController, _extremum_points
 from .classifier import ClassifierMixin
@@ -36,10 +36,13 @@ from .panels.model import ModelPanelMixin
 from .panels.analysis import AnalysisPanelMixin
 from .panels.view import ViewControlsMixin
 from .panels.classpanel import ClassPanelMixin
+from .panels.seams import SeamPanelMixin
+from .seam_classifier import SeamModelMixin
+from .seams import SEAM_BOUNDARY
 
 
 class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewControlsMixin,
-                      ClassPanelMixin, ClassifierMixin):
+                      ClassPanelMixin, SeamPanelMixin, SeamModelMixin, ClassifierMixin):
     SESSION_APP = "labeler"
     APP_TITLE = "labeler"
     WINDOW_TITLE = "labeler"
@@ -95,7 +98,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self.custom_hidden_var = tk.StringVar(master=root, value=_DEFAULT_CUSTOM_HIDDEN)
         self.freeze_base_var = tk.BooleanVar(master=root, value=False)
         self.edge_layer_var = tk.StringVar(master=root, value="last")
-        self.edge_feat_vars = {f: tk.BooleanVar(master=root, value=True)
+        self.edge_feat_vars = {f: tk.BooleanVar(master=root, value=f in edge_model.DEFAULT_FEATURES)
                                for f in edge_model.FEATURE_KINDS}
         self.edge_model_var = tk.StringVar(master=root, value="logistic")
         self.edge_c_var = tk.StringVar(master=root, value="1")
@@ -103,6 +106,27 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self.edge_rounds_var = tk.StringVar(master=root, value="3")
         self.edge_readout_var = tk.StringVar(master=root, value="")
         self.edge_progress_var = tk.StringVar(master=root, value="")
+        # Neighbourhood context (context.py): the columns the CURRENT model was
+        # fit over ride with it (predictions and the gate rebuild exactly
+        # those); the Model tab's controls describe the NEXT model.
+        self._clf_context = context.ContextSpec()
+        self.context_kind_vars = {k: tk.BooleanVar(master=root, value=False)
+                                  for k in context.KINDS}
+        self.context_weight_vars = {w: tk.BooleanVar(master=root, value=(w == "uniform"))
+                                    for w in context.WEIGHTS}
+        self.context_source_var = tk.StringVar(master=root, value="all")
+        # The latent-ring head (context.LatentContextModel) fit on top of the
+        # base net, and the controls that describe the next one.
+        self._context_model = None
+        self.context_latent_var = tk.BooleanVar(master=root, value=False)
+        self.context_latent_weight_var = tk.StringVar(master=root, value="uniform")
+        self.context_latent_layer_var = tk.StringVar(master=root, value="last")
+        self.context_latent_h0_var = tk.BooleanVar(master=root, value=True)
+        # Labels as context (context.LabelSpec): the ring's annotated classes
+        # as columns, with a training-time dropout.
+        self.context_labels_var = tk.BooleanVar(master=root, value=False)
+        self.context_label_dropout_var = tk.StringVar(master=root, value="0.3")
+        self._pred_store_rev = None
         # Provenance line above the classifier controls: which model is loaded,
         # how wide its feature vector is, and whether it still agrees with the
         # active profile (a mismatch blocks Classify, so say so up front).
@@ -130,6 +154,18 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self.blob_ring_var = tk.StringVar(master=root, value="next")
         self.magic_gain_var = tk.StringVar(master=root, value=f"{_DEFAULT_HOP_GAIN:g}")
         self.magic_drag_var = tk.StringVar(master=root, value=f"{_DEFAULT_DRAG_PX:g}")
+        # Seam tools (docs/seam_labeling.md): the class a trace / scope
+        # paints, the trace's toll and channels, the overlay and its colouring,
+        # and the per-item caches the overlay and the tools share.
+        self.seam_class_var = tk.IntVar(master=root, value=SEAM_BOUNDARY)
+        self.seam_toll_var = tk.StringVar(master=root, value="feature")
+        self.seam_channels_var = tk.StringVar(master=root, value="base")
+        self.show_seams_var = tk.BooleanVar(master=root, value=True)
+        self.seam_color_var = tk.StringVar(master=root, value=_SEAM_MODE_CLASS)
+        self._seam_caches = {}      # (si, li) -> (commit, rev, class[S], sets, graph)
+        self._seam_rasters = {}     # (si, li) -> (commit, graph, seam-index raster)
+        self._seam_pred = {}        # key -> (commit, boundaryness[S])
+        self._seam_model = None     # seam_model.SeamModel, or None
         # True while a gesture previews on the canvas: the pointer is busy
         # drawing, so the hover outlines stay off until it is released.
         self._hover_suppressed = False
@@ -149,10 +185,14 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         # reuses the load path, so history can never drift from reality.
         self._undo_stack = []
         self._redo_stack = []
-        # Set while the first render of a run happened on an unmapped View tab:
+        # Set while the first render of a run happened on an unmapped canvas:
         # the base fits the image only on that first render, and an unmapped
-        # canvas is 1x1, so the fit is redone when the tab shows.
+        # canvas is 1x1, so the fit is redone once it is on screen.
         self._fit_pending = False
+        # Which Processing groups are folded shut. Read by _group as each is
+        # built, so a session restored before the panel exists still lands.
+        self._proc_open = {}
+        self._proc_groups = {}
         self.workflow_hint_var = tk.StringVar(master=root, value="")
         self.model_hint_var = tk.StringVar(master=root, value="")
         self._hint_after = None
@@ -170,26 +210,35 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self._hint_tick()          # first paint + the poll
 
     # ------------------------------------------------------------------ #
-    # Center notebook: Processing | View | Model
+    # Three columns: data | picture | tabs
     # ------------------------------------------------------------------ #
-    # The labeler's window is three panes -- data navigation and processing
-    # SELECTION on the left, annotation management and the classifier on the
-    # right -- with a tabbed center: the compute profile is EDITED on the
-    # Processing tab, the slice is viewed and drawn on the View tab (the
-    # inherited `self.right`, so every viewer-area builder packs into it
-    # unchanged), and the model is designed on the Model tab. The notebook
-    # hides whatever tab is not active.
+    # Left is data navigation and processing SELECTION, the middle is the
+    # slice (the inherited `self.right`, still a plain frame, so every
+    # viewer-area builder packs into it unchanged), and the right is a
+    # notebook of everything you EDIT: the compute profile, the annotations
+    # and their classes, the model, the analyses. Roughly 1:3:2, and ONLY the
+    # middle carries a weight -- window growth goes to the picture, and the
+    # two side columns keep the width they were given.
+    #
+    # The profile and the picture used to be sibling tabs, which made judging
+    # a filter chain a round trip: edit, switch, squint, switch back. The
+    # chain IS judged by looking, so the picture is never the thing that is
+    # hidden; the sashes (and F9) decide how much of it there is.
     def _build_center(self):
-        self.center = ttk.Notebook(self.paned, width=900)
-        self.paned.add(self.center, weight=1)
+        self.right = ttk.Frame(self.paned, width=900)
+        self.paned.add(self.right, weight=1)
+        self.center = ttk.Notebook(self.paned, width=420)
+        self.paned.add(self.center, weight=0)
         self.processing_tab = ttk.Frame(self.center)
-        self.right = ttk.Frame(self.center)          # the View tab
+        # Annotation: what the user draws and the classifier that learns it.
+        # Filled by _build_label_panel after the base constructor returns.
+        self.annot_tab = ttk.Frame(self.center)
         self.model_tab = ttk.Frame(self.center)
         # Analysis: what the models DO with the annotations -- the region
         # list behind a confusion cell, the size sweep -- and, later, plots.
         self.analysis_tab = ttk.Frame(self.center)
         self._center_tabs = {"Processing": self.processing_tab,
-                             "View": self.right,
+                             "Annotation": self.annot_tab,
                              "Model": self.model_tab,
                              "Analysis": self.analysis_tab}
         for name in _CENTER_TABS:
@@ -197,27 +246,59 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
 
         # Processing: the profile management rows on top (anchored, not
         # filled -- the base rows pack fill="x" and would stretch across the
-        # whole tab), then the four parameter sections in two columns inside
-        # one scrolling frame, because filter cards grow the chains downward.
+        # whole tab), then the parameter sections as ONE scrolling column of
+        # collapsible groups. Two columns needed a tab as wide as the window;
+        # a column that folds needs only the group being edited.
         self.profile_tools = ttk.Frame(self.processing_tab)
         self.profile_tools.pack(side="top", anchor="w", padx=6, pady=(4, 0))
-        self.proc_scroll = ScrollFrame(self.processing_tab, width=900,
-                                       canvas_width=880)
+        self.proc_scroll = ScrollFrame(self.processing_tab, width=420,
+                                       canvas_width=400)
         self.proc_scroll.pack(side="top", fill="both", expand=True)
-        body = self.proc_scroll.inner
-        body.columnconfigure(0, weight=1, uniform="cols")
-        body.columnconfigure(1, weight=1, uniform="cols")
-        self.proc_col_a = ttk.Frame(body)
-        self.proc_col_a.grid(row=0, column=0, sticky="nsew")
-        self.proc_col_b = ttk.Frame(body)
-        self.proc_col_b.grid(row=0, column=1, sticky="nsew")
+        self.proc_col = self.proc_scroll.inner
+        self._proc_groups = {}               # key -> Collapsible
 
         self._build_model_tab(self.model_tab)
         self._build_analysis_tab(self.analysis_tab)
-        self.center.select(self.right)
+        self.center.select(self.processing_tab)
         # Bound AFTER the initial select: <<NotebookTabChanged>> fires
         # synchronously on select(), and the viewer does not exist yet.
         self.center.bind("<<NotebookTabChanged>>", self._on_center_tab_changed)
+        # No tab change is guaranteed to arrive any more, so the canvas being
+        # mapped is what finishes a fit deferred while the window was not.
+        self.right.bind("<Map>", self._flush_pending_fit, add="+")
+
+    _DEFAULT_PANES = _LABELER_PANES          # 1:3:2
+
+    def _tab_scroll(self, parent):
+        """A scrolling body for a tab whose panels stack taller than the
+        column they now live in."""
+        sf = ScrollFrame(parent, width=420, canvas_width=400)
+        sf.pack(fill="both", expand=True)
+        return sf.inner
+
+    def _group(self, parent, text, key=None):
+        """A collapsible group: the Processing tab is one tall column, so a
+        section you are not editing folds away behind its title."""
+        key = key or text
+        c = Collapsible(parent, text=text, open=self._proc_open.get(key, True),
+                        on_toggle=lambda shown, k=key: self._proc_open.__setitem__(k, shown))
+        c.pack(fill="x", padx=4, pady=(0, 2))
+        self._proc_groups[key] = c
+        return c.body
+
+    def _proc_open_state(self):
+        """{group key: open} for the groups that are SHUT -- the default is
+        open, so a session only records what was folded away."""
+        return {k: False for k, c in self._proc_groups.items() if not c.is_open()}
+
+    def _apply_proc_open(self, state):
+        if not isinstance(state, dict):
+            return
+        for key, shown in state.items():
+            self._proc_open[key] = bool(shown)
+            group = self._proc_groups.get(key)
+            if group is not None:
+                group.set_open(bool(shown))
 
     def _profile_tools_parent(self, section):
         return self.profile_tools
@@ -276,15 +357,14 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self._build_workflow_hint()
 
     def _processing_parent(self, section):
-        if section in ("filters", "base"):
-            return self.proc_col_a
-        return self.proc_col_b
+        return self.proc_col
 
     def _handle_event(self, ev):
         if ev[0] == "primed":
             # The commit bump already invalidates these; dropping them outright
             # also frees the old run's arrays.
             self._class_luts.clear()
+            self._clear_seam_caches()
             self._pred.clear()
             self._cm_cell = None
             self._refresh_region_modes()
@@ -336,6 +416,25 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self._rebuild_class_panels()
         self._refresh_render()
         self.status_var.set(f"#{it.uid} {tool} -> class {cls} ({slice_key})")
+
+    def _commit_seam(self, tool, points, class_id, meta=None):
+        """Store a seam gesture (a trace or a scope) on the current item."""
+        from .seams import SEAM_CLASSES
+        cur = self._current()
+        if cur is None:
+            return
+        si, li = cur
+        slice_key = self._slice_key(si, li)
+        if slice_key is None or int(class_id) < 1:
+            return
+        self._push_history()
+        it = self.store.add_seam(tool, points, int(class_id), slice_key, si, li, meta=meta)
+        self._rebuild_class_panels()
+        self._refresh_render()
+        name = SEAM_CLASSES[it.class_id] if it.class_id < len(SEAM_CLASSES) else str(it.class_id)
+        n = (meta or {}).get("seams")
+        self.status_var.set(f"#{it.uid} {tool} -> {name}"
+                            + (f" ({n} seams)" if n is not None else "") + f" ({slice_key})")
 
     # -- "will be painted" preview (shared by every drawing tool) ---------- #
     def _begin_preview(self):
@@ -466,6 +565,111 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self._rebuild_class_panels()
         self._refresh_render()
 
+    def _remove_interactions(self, uids):
+        """Delete several gestures as ONE undo step. Returns the count."""
+        uids = [u for u in uids if self.store.get(u) is not None]
+        if not uids:
+            return 0
+        self._push_history()
+        n = self.store.remove_many(uids)
+        self._rebuild_class_panels()
+        self._refresh_render()
+        return n
+
+    # -- the sequence tree: annotations ride with their rows -------------- #
+    def _row_interactions(self, si, li):
+        """Every interaction on a tree row (an item's own; all of a
+        sequence's items' for a sequence row -- and, where the app says so,
+        those on items of the sequence that are no longer listed)."""
+        return [it for it in self.store.interactions + self.store.seams
+                if self._row_owns_key(si, li, it.slice_key)]
+
+    def _seq_tree_menu_entries(self, si, li):
+        entries = super()._seq_tree_menu_entries(si, li)
+        n = len(self._row_interactions(si, li))
+        clear = (f"Clear annotations… ({n})" if n else "Clear annotations",
+                 lambda: self._clear_row_annotations_guarded(si, li), n > 0)
+        entries.insert(len(entries) - 1, clear)      # ahead of Remove, which is last
+        return entries
+
+    def _clear_row_annotations_guarded(self, si, li):
+        """Delete every annotation on a row (the row itself stays), after
+        asking. One undo step."""
+        its = self._row_interactions(si, li)
+        desc = self._row_description(si, li)
+        if not its:
+            self.status_var.set(f"No annotations on {desc}.")
+            return False
+        if not messagebox.askyesno(
+                self.APP_TITLE,
+                f"Delete the {len(its)} annotation(s) on {desc}?\n\n"
+                "Ctrl+Z brings them back."):
+            return False
+        n = self._remove_interactions([it.uid for it in its])
+        self.status_var.set(f"Deleted {n} annotation(s) on {desc} (Ctrl+Z restores them)")
+        return True
+
+    def _key_survives(self, key, rows):
+        """True when a row NOT in `rows` still owns `key` -- the coupon can
+        hold one slice in two sequences, and the key is the slice, so the
+        annotations stay as long as either sequence does."""
+        gone_seqs = {si for si, li in rows if li is None}
+        gone_items = {(si, li) for si, li in rows if li is not None}
+        for si in range(len(self.subsequences)):
+            if si in gone_seqs:
+                continue
+            for li in range(len(self._sequence_item_labels(si))):
+                if (si, li) not in gone_items and self._row_owns_key(si, li, key):
+                    return True
+        return False
+
+    def _doomed_interactions(self, rows):
+        """The interactions a removal takes with it: those on the rows whose
+        item no longer exists afterwards."""
+        out, seen = [], set()
+        for it in self.store.interactions + self.store.seams:
+            if it.uid in seen:
+                continue
+            if any(self._row_owns_key(si, li, it.slice_key) for si, li in rows):
+                seen.add(it.uid)
+                if not self._key_survives(it.slice_key, rows):
+                    out.append(it)
+        return out
+
+    def _remove_rows_message(self, rows):
+        msg = super()._remove_rows_message(rows)
+        n = len(self._doomed_interactions(rows))
+        if not n:
+            return msg + "\n\nNo annotations are on it."
+        return (msg + f"\n\nThe {n} annotation(s) on it go too (Ctrl+Z brings the "
+                      "annotations back, greyed until the data is added again).")
+
+    def _remove_rows(self, rows):
+        doomed = [it.uid for it in self._doomed_interactions(rows)]
+        if doomed:
+            self._push_history()
+            self.store.remove_many(doomed)
+        n = super()._remove_rows(rows)
+        if doomed:
+            self.status_var.set(f"Removed {n} row(s) and {len(doomed)} annotation(s) "
+                                "(Ctrl+Z restores the annotations)")
+        return n
+
+    def _after_rows_removed(self, cur_key, pos):
+        # Indices shifted under every (si, li)-keyed cache and hint: the LUTs
+        # go, the store's hints rebind through the catalogue once the rebuild
+        # has refreshed it, and the predictions keep only the keys that still
+        # exist.
+        self._class_luts.clear()
+        self._clear_seam_caches()
+        self._hover_key = None
+        self._hover_uid = None
+        super()._after_rows_removed(cur_key, pos)
+        self.store.rebind(self.subsequences, resolve=self.catalogue.index_of)
+        for key in [k for k in self._pred if self.catalogue.index_of(k) is None]:
+            self._pred.pop(key, None)
+        self._rebuild_class_panels()
+
     def _move_interaction(self, uid, class_id):
         it = self.store.get(uid)
         if it is None or it.class_id == int(class_id):
@@ -481,8 +685,11 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         a session starts a fresh history; undo/redo pass clear_history=False
         because they ARE the history."""
         self.store = store
-        unbound = store.rebind(self.subsequences)
+        # The file lists bind "folder/basename" keys; the catalogue binds
+        # whatever else an app calls an item (a slide's "...@level#rect").
+        unbound = store.rebind(self.subsequences, resolve=self.catalogue.index_of)
         self._class_luts.clear()
+        self._clear_seam_caches()
         if clear_history:
             self._undo_stack.clear()
             self._redo_stack.clear()
@@ -546,6 +753,19 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         # 'N': neighbours on/off -- flip between an edge kind and its base.
         self.root.bind("n", self._on_edge_key)
         self.root.bind("N", self._on_edge_key)
+        # Seam tools: T trace, S scope, E seam layer on/off, Enter commits the
+        # trace in flight, BackSpace drops its last leg.
+        self.root.bind("t", self._on_trace_key)
+        self.root.bind("T", self._on_trace_key)
+        self.root.bind("s", self._on_scope_key)
+        self.root.bind("S", self._on_scope_key)
+        self.root.bind("e", self._on_seams_toggle_key)
+        self.root.bind("E", self._on_seams_toggle_key)
+        self.root.bind("<Return>", self._on_trace_commit_key)
+        self.root.bind("<BackSpace>", self._on_trace_back_key)
+        # F9: the canvas takes the whole center, and back. A function key
+        # needs no _typing() guard -- and every letter is already taken.
+        self.root.bind("<F9>", self._toggle_center_tabs)
 
     def _on_edge_key(self, _e=None):
         """N: toggle neighbour voting by flipping between the current edge kind
@@ -572,16 +792,8 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
             return
         self.active_class_var.set(0)
 
-    def _unfocus_entries(self, _e=None):
-        """Give the keyboard back to the window. The hotkeys are ignored while
-        an entry/combobox has focus (typing "1" into a field must not arm a
-        class), and Tk leaves focus on a combobox after a selection -- so the
-        option widgets hand it back on selection/Return, and a canvas press
-        does too."""
-        try:
-            self.root.focus_set()
-        except tk.TclError:
-            pass
+    # _unfocus_entries and _typing live on ViewerShell (the viewer's own
+    # hotkey needs them too) and are inherited here.
 
     def _on_magic_key(self, _e=None):
         if self._typing():
@@ -592,14 +804,6 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         if self._typing():
             return
         self.tool_var.set("blobber")
-
-    def _typing(self):
-        """True while a text-entry widget owns the keyboard focus."""
-        try:
-            w = self.root.focus_get()
-            return w is not None and w.winfo_class() in _TYPING_CLASSES
-        except tk.TclError:
-            return False
 
     def _on_undo_key(self, e):
         if self._typing():
@@ -669,6 +873,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
     def _view_state(self):
         d = super()._view_state()
         d["tool"] = self.tool_var.get()
+        d["seams"] = self._seams_view_state()
         d["magic"] = {"metric": self.magic_metric_var.get(),
                       "mode": self.magic_mode_var.get(),
                       "channels": self.magic_channels_var.get(),
@@ -680,6 +885,12 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
                       "drag_px": _bounded_float(self.magic_drag_var.get(),
                                                 _DEFAULT_DRAG_PX, *_DRAG_PX_RANGE)}
         d["center_tab"] = self._center_tab_name()
+        # The sashes as FRACTIONS, not pixels: a session restored into a
+        # differently sized window should divide it the same way. The folded
+        # Processing groups ride along -- the panel is one column, so which
+        # groups are out of the way is part of how it is set up.
+        d["panes"] = self._pane_fractions()
+        d["proc_open"] = self._proc_open_state()
         # The PICKED kind, apart from the trained model: a plain Train writes
         # no pickle, so a restore that reloads the newest saved model would
         # otherwise land on that pickle's kind (e.g. the last Optimize winner).
@@ -692,7 +903,21 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         d["neighbours"] = {"custom_hidden": self.custom_hidden_var.get(),
                            "freeze_base": bool(self.freeze_base_var.get()),
                            "edge_spec": self._edge_spec_from_ui().to_dict()}
+        # The PICKED context (what the next Train builds), apart from the
+        # trained model's, which rides its pickle.
+        d["context"] = self._context_spec_from_ui().to_dict()
         return d
+
+    def _apply_context_view(self, d):
+        if isinstance(d, dict):
+            self._apply_context_spec(context.ContextSpec.from_dict(d))
+
+    def _rebuild_class_panels(self):
+        # The single "labels changed" signal: with labels in the model's
+        # context the cached predictions are stale (ClassifierMixin).
+        super()._rebuild_class_panels()
+        self._labels_changed()
+        self._refresh_seam_panel()
 
     def _apply_neighbours_view(self, d):
         if not isinstance(d, dict):
@@ -751,18 +976,21 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         doc = super()._new_session_doc(keep)
         empty = self.store.to_json()
         empty["interactions"] = []            # classes + colours, no gestures
+        empty.pop("seams", None)              # ...and no seam gestures: a v2 doc
+        empty["version"] = 2
         doc["annotations"] = empty
         keep_model = keep.get("model", True)
         doc["models"] = [dict(m) for m in self.models] if keep_model else []
         if not keep_model:
-            for key in ("model_search", "neighbours", "model_kind"):
+            for key in ("model_search", "neighbours", "model_kind", "context"):
                 doc["view"].pop(key, None)
         # The in-memory model is not in the document (a plain Train writes
         # no pickle): stash it so the apply's pickle reload cannot replace it.
         self._new_session_stash = ((self._clf, self._clf_names, self._clf_kind,
                                     self._clf_spec, self._edge_model, self._search_spec,
-                                    self._clf_scope)
+                                    self._clf_scope, self._clf_context, self._context_model)
                                    if keep_model else None)
+        self._new_session_seam_stash = self._seam_model if keep_model else None
         return doc
 
     def _after_new_session(self, keep):
@@ -771,11 +999,16 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         if keep.get("model", True):
             if stash is not None and stash[0] is not None:
                 (self._clf, self._clf_names, self._clf_kind, self._clf_spec,
-                 self._edge_model, self._search_spec, self._clf_scope) = stash
+                 self._edge_model, self._search_spec, self._clf_scope,
+                 self._clf_context, self._context_model) = stash
                 self.classify_btn.config(state="normal")
+            self._seam_model = getattr(self, "_new_session_seam_stash", None)
         else:
             self._reset_model_selection()
         self._pred.clear()
+        self._seam_pred.clear()
+        if not keep.get("model", True):
+            self._seam_model = None
         self._cm_cell = None
         self._refresh_region_modes()
         self._refresh_confusion()
@@ -783,6 +1016,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self._refresh_model_strip()
         self._refresh_edge_readout()
         self._fill_error_list(None)
+        self._refresh_seam_panel()
 
     def _reset_model_selection(self):
         """No model, the default kind, default edge / search settings."""
@@ -793,11 +1027,14 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self._clf_spec = None
         self._edge_model = None
         self._search_spec = None
+        self._clf_context = context.ContextSpec()
+        self._context_model = None
         self.models = []
         self.model_kind_var.set("dense FC")
         self.custom_hidden_var.set(_DEFAULT_CUSTOM_HIDDEN)
         self.freeze_base_var.set(False)
         self._apply_edge_spec(edge_model.EdgeSpec())
+        self._apply_context_spec(context.ContextSpec())
         self.search_trials_var.set(str(_SEARCH_TRIALS))
         self.search_timeout_var.set(str(_SEARCH_TIMEOUT_MIN))
         self.search_seed_var.set("0")
@@ -833,15 +1070,22 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         if view.get("tool") in _UI_TOOLS:
             self.tool_var.set(view["tool"])
         self._apply_magic_view(view.get("magic"))
+        self._apply_seams_view(view.get("seams"))
         self._apply_search_view(view.get("model_search"))
         self._apply_neighbours_view(view.get("neighbours"))
+        # The picked context wins over the reloaded pickle's (as the kind does).
+        self._apply_context_view(view.get("context"))
         # The picked kind wins over the reloaded pickle's kind (the model
         # reload above set model_kind_var from the pickle).
         if view.get("model_kind") in _MODEL_KINDS:
             self.model_kind_var.set(view["model_kind"])
         # Keep the regions toggle in sync with whatever seg_source restored to.
         self.show_regions_var.set(self._region_layer_visible())
-        # The center tab, by name; an unknown or missing value leaves it alone.
+        # The center tab, by name; an unknown or missing value leaves it alone
+        # (which is also how a pre-split session's "View" is handled).
+        if isinstance(view.get("panes"), (list, tuple)):
+            self._apply_pane_fractions(view["panes"])
+        self._apply_proc_open(view.get("proc_open"))
         tab = self._center_tabs.get(view.get("center_tab"))
         if tab is not None:
             try:

@@ -38,7 +38,12 @@ from . import magic_fill
 
 LAYER_CHOICES = {"last": -1, "previous": -2}
 EDGE_MODELS = ("logistic", "mlp")
-FEATURE_KINDS = ("absdiff", "prod", "barrier")
+# The pair-feature universe, and what a fresh EdgeSpec asks for. `contact`
+# (the log shared boundary length, from the label raster) is opt-in so an
+# existing session keeps the three it had; with `barrier` unticked the pair
+# model is saddle-free: embeddings + geometry only.
+FEATURE_KINDS = ("absdiff", "prod", "barrier", "contact")
+DEFAULT_FEATURES = ("absdiff", "prod", "barrier")
 # The report rows evaluate_edges scores (first two come from the region net).
 EVAL_ROWS = ("argmax differs", "1 - sum P_a P_b", "learned")
 _EPS = 1e-4
@@ -48,7 +53,7 @@ _EPS = 1e-4
 class EdgeSpec:
     """What the pair model is, as plain data (rides the pickle and the session)."""
     layer: int = -1                       # -1 = last hidden layer, -2 = previous
-    features: Tuple[str, ...] = FEATURE_KINDS
+    features: Tuple[str, ...] = DEFAULT_FEATURES
     model: str = "logistic"               # "logistic" | "mlp"
     C: float = 1.0                        # logistic inverse regularisation
     lam: float = 1.0                      # voting weight of the edge terms
@@ -65,8 +70,8 @@ class EdgeSpec:
         d = dict(d or {})
         known = {f.name for f in dataclasses.fields(cls)}
         d = {k: v for k, v in d.items() if k in known}
-        feats = tuple(str(f) for f in (d.get("features") or FEATURE_KINDS)
-                      if str(f) in FEATURE_KINDS) or FEATURE_KINDS
+        feats = tuple(str(f) for f in (d.get("features") or DEFAULT_FEATURES)
+                      if str(f) in FEATURE_KINDS) or DEFAULT_FEATURES
         d["features"] = feats
         d["layer"] = int(d.get("layer", -1))
         d["model"] = str(d.get("model") or "logistic")
@@ -88,7 +93,8 @@ class EdgeSpec:
         return name
 
     def describe(self, widths: Optional[Sequence[int]] = None, n_in: Optional[int] = None) -> str:
-        feats = ", ".join({"absdiff": "|d|", "prod": "product", "barrier": "barrier"}[f]
+        feats = ", ".join({"absdiff": "|d|", "prod": "product", "barrier": "barrier",
+                           "contact": "contact"}[f]
                           for f in self.features)
         head = "logistic" if self.model == "logistic" else "MLP 32-16"
         text = f"edges: {head} on the {self.layer_text(widths)} layer ({feats}"
@@ -186,10 +192,25 @@ def barrier(saddle, ext_a, ext_b, n=None) -> np.ndarray:
     return out
 
 
+def contact_column(contact, n: int) -> np.ndarray:
+    """``float32[n, 1]``: ``log1p(shared boundary length)`` per pair, zeros
+    where no length is known (None, NaN, or a length array of another size)
+    -- so the pair model's input width never depends on the slice."""
+    out = np.zeros((int(n), 1), np.float32)
+    if contact is None or n == 0:
+        return out
+    c = np.asarray(contact, np.float64).ravel()
+    if len(c) != n:
+        return out
+    ok = np.isfinite(c) & (c > 0)
+    out[ok, 0] = np.log1p(c[ok])
+    return out
+
+
 def pair_features(emb: np.ndarray, a, b, bar=None,
-                  features: Sequence[str] = FEATURE_KINDS) -> np.ndarray:
-    """``float32[n, d]`` symmetric in (a, b): ``|e_a - e_b|``, ``e_a * e_b`` and
-    the barrier columns, as `features` selects."""
+                  features: Sequence[str] = DEFAULT_FEATURES, contact=None) -> np.ndarray:
+    """``float32[n, d]`` symmetric in (a, b): ``|e_a - e_b|``, ``e_a * e_b``,
+    the barrier columns and the contact column, as `features` selects."""
     a = np.asarray(a, np.intp)
     b = np.asarray(b, np.intp)
     ea = np.asarray(emb, np.float32)[a]
@@ -203,12 +224,14 @@ def pair_features(emb: np.ndarray, a, b, bar=None,
         if bar is None or len(np.asarray(bar)) != len(a):
             bar = np.zeros((len(a), 2), np.float32)
         parts.append(np.asarray(bar, np.float32).reshape(len(a), -1))
+    if "contact" in features:
+        parts.append(contact_column(contact, len(a)))
     if not parts:
         parts.append(np.abs(ea - eb))
     return np.concatenate(parts, axis=1).astype(np.float32)
 
 
-def n_inputs(width: int, features: Sequence[str] = FEATURE_KINDS) -> int:
+def n_inputs(width: int, features: Sequence[str] = DEFAULT_FEATURES) -> int:
     d = 0
     if "absdiff" in features:
         d += width
@@ -216,6 +239,8 @@ def n_inputs(width: int, features: Sequence[str] = FEATURE_KINDS) -> int:
         d += width
     if "barrier" in features:
         d += 2
+    if "contact" in features:
+        d += 1
     return d or width
 
 
@@ -233,9 +258,10 @@ def gather_edges(slices: Sequence[Tuple[np.ndarray, Optional[Dict[str, Any]],
     from the table are dropped (``magic_fill.index_arcs``), as are self-loops.
 
     Returns ``{"a", "b"}`` (global rows), ``"saddle"`` (NaN where none),
+    ``"length"`` (the arcs' optional contact lengths, NaN where none),
     ``"slice"``, ``"both"`` (both ends labeled), ``"diff"`` (both labeled,
     different classes), ``"n_rows"``."""
-    A, B, S, K = [], [], [], []
+    A, B, S, L, K = [], [], [], [], []
     base = 0
     cls_all = []
     # A group is whatever the catalogue's group_of returns -- an int for a
@@ -262,21 +288,26 @@ def gather_edges(slices: Sequence[Tuple[np.ndarray, Optional[Dict[str, Any]],
             sad = arcs.get("saddle")
             sad = (np.full(len(ia), np.nan) if sad is None
                    else np.asarray(sad, np.float64)[keep])
+            ln = arcs.get("length")
+            ln = (np.full(len(ia), np.nan) if ln is None or len(ln) != len(keep)
+                  else np.asarray(ln, np.float64)[keep])
             ok = ia != ib
             A.append(ia[ok] + base)
             B.append(ib[ok] + base)
             S.append(sad[ok])
+            L.append(ln[ok])
             K.append(np.full(int(ok.sum()), int(k), int))
         base += len(fids)
     cls_all = np.concatenate(cls_all) if cls_all else np.zeros(0, int)
     a = np.concatenate(A).astype(np.intp) if A else np.zeros(0, np.intp)
     b = np.concatenate(B).astype(np.intp) if B else np.zeros(0, np.intp)
     s = np.concatenate(S) if S else np.zeros(0, np.float64)
+    ln = np.concatenate(L) if L else np.zeros(0, np.float64)
     k = np.concatenate(K) if K else np.zeros(0, int)
     both = (cls_all[a] > 0) & (cls_all[b] > 0) if len(a) else np.zeros(0, bool)
     diff = both & (cls_all[a] != cls_all[b]) if len(a) else np.zeros(0, bool)
-    return {"a": a, "b": b, "saddle": s, "slice": k, "both": both, "diff": diff,
-            "n_rows": int(base)}
+    return {"a": a, "b": b, "saddle": s, "length": ln, "slice": k, "both": both,
+            "diff": diff, "n_rows": int(base)}
 
 
 # --------------------------------------------------------------------------- #
@@ -293,6 +324,7 @@ class EdgeModel:
     n_edges: int = 0                      # labeled pairs it was fit on
     n_diff: int = 0                       # ... of which different-class
     used_saddle: bool = False             # any finite saddle in training
+    used_contact: bool = False            # any known contact length in training
     fit_s: float = 0.0
     report: Optional[Dict[str, Any]] = None   # last evaluate_edges() result
 
@@ -301,6 +333,7 @@ class EdgeModel:
                 "names_hash": self.names_hash, "net_hash": self.net_hash,
                 "width": int(self.width), "n_edges": int(self.n_edges),
                 "n_diff": int(self.n_diff), "used_saddle": bool(self.used_saddle),
+                "used_contact": bool(self.used_contact),
                 "fit_s": float(self.fit_s), "report": self.report}
 
     @classmethod
@@ -310,6 +343,7 @@ class EdgeModel:
                    net_hash=str(d.get("net_hash", "")), width=int(d.get("width", 0)),
                    n_edges=int(d.get("n_edges", 0)), n_diff=int(d.get("n_diff", 0)),
                    used_saddle=bool(d.get("used_saddle", False)),
+                   used_contact=bool(d.get("used_contact", False)),
                    fit_s=float(d.get("fit_s", 0.0)), report=d.get("report"))
 
     def brief(self) -> str:
@@ -324,9 +358,11 @@ class EdgeModel:
 
     def describe(self, widths: Optional[Sequence[int]] = None) -> str:
         text = self.spec.describe(widths, self.n_in)
+        geo = "MSC saddles" if self.used_saddle else "no saddles"
+        if "contact" in self.spec.features:
+            geo += ", contact lengths" if self.used_contact else ", no contact lengths"
         text += (f"; fit on {self.n_edges:,} labeled pairs "
-                 f"({self.n_diff / max(1, self.n_edges):.0%} boundaries, "
-                 f"{'MSC saddles' if self.used_saddle else 'no saddles'})")
+                 f"({self.n_diff / max(1, self.n_edges):.0%} boundaries, {geo})")
         r = (self.report or {}).get("edge", {}).get("learned")
         if r:
             base = (self.report or {}).get("edge", {}).get("argmax differs", {})
@@ -395,23 +431,27 @@ def fit_edge_model(base_pipeline, X, cls, edges: Dict[str, np.ndarray], ext=None
     a_local = np.searchsorted(rows, a)
     b_local = np.searchsorted(rows, b)
     sad = edges["saddle"][sel]
+    ln = edges.get("length")
+    ln = None if ln is None else np.asarray(ln, np.float64)[sel]
     bar = barrier(sad, None if ext is None else np.asarray(ext)[a],
                   None if ext is None else np.asarray(ext)[b], n=len(a))
-    F = pair_features(emb, a_local, b_local, bar, spec.features)
+    F = pair_features(emb, a_local, b_local, bar, spec.features, contact=ln)
     est = _fit_pair(_make_pair_estimator(spec), F, y, spec)
     return EdgeModel(model=est, spec=spec, n_in=int(F.shape[1]),
                      names_hash=names_hash(names), net_hash=net_hash(base_pipeline),
                      width=int(emb.shape[1]), n_edges=int(len(y)), n_diff=int(y.sum()),
                      used_saddle=bool(np.isfinite(sad).any()),
+                     used_contact=bool(ln is not None and (np.nan_to_num(ln) > 0).any()),
                      fit_s=time.perf_counter() - t0)
 
 
 def predict_pdiff(edge: EdgeModel, base_pipeline, X, a, b, saddle=None, ext=None,
-                  emb: Optional[np.ndarray] = None) -> np.ndarray:
+                  emb: Optional[np.ndarray] = None, contact=None) -> np.ndarray:
     """``float32[n]`` P(the edge crosses classes) for row pairs (a, b), clipped
     to ``[1e-4, 1 - 1e-4]``. ``emb`` may pass a precomputed embedding of ``X``
-    (the layer the model uses). Raises ValueError when the base net is not
-    the one the edge model was fit on."""
+    (the layer the model uses); ``contact`` the pairs' shared boundary
+    lengths (None = unknown, zeros). Raises ValueError when the base net is
+    not the one the edge model was fit on."""
     if edge.net_hash and edge.net_hash != net_hash(base_pipeline):
         raise ValueError("edge model was fit on a different region net - retrain")
     a = np.asarray(a, np.intp)
@@ -422,7 +462,7 @@ def predict_pdiff(edge: EdgeModel, base_pipeline, X, a, b, saddle=None, ext=None
         emb = _layer(embed(base_pipeline, X), edge.spec.layer)
     bar = barrier(saddle, None if ext is None else np.asarray(ext)[a],
                   None if ext is None else np.asarray(ext)[b], n=len(a))
-    F = pair_features(emb, a, b, bar, edge.spec.features)
+    F = pair_features(emb, a, b, bar, edge.spec.features, contact=contact)
     if F.shape[1] != edge.n_in:
         raise ValueError(f"edge model expects {edge.n_in} inputs, got {F.shape[1]}")
     p = np.asarray(edge.model.predict_proba(F), np.float64)
@@ -555,12 +595,15 @@ def evaluate_edges(make_estimator: Callable[[], Any], X, cls, grp, edges: Dict[s
         a_te, b_te = edges["a"][e_te], edges["b"][e_te]
         pooled["argmax differs"].append((y_te, (pred[a_te] != pred[b_te]).astype(np.float64)))
         pooled["1 - sum P_a P_b"].append((y_te, 1.0 - (P[a_te] * P[b_te]).sum(1)))
-        p_te = predict_pdiff(em, est, X, a_te, b_te, edges["saddle"][e_te], ext, emb=emb)
+        lengths = edges.get("length")
+        p_te = predict_pdiff(em, est, X, a_te, b_te, edges["saddle"][e_te], ext, emb=emb,
+                             contact=None if lengths is None else lengths[e_te])
         pooled["learned"].append((y_te, p_te))
         # Voting over EVERY edge of the test slices (labeled or not).
         e_all = np.nonzero(in_test)[0]
         a_all, b_all = edges["a"][e_all], edges["b"][e_all]
-        p_all = predict_pdiff(em, est, X, a_all, b_all, edges["saddle"][e_all], ext, emb=emb)
+        p_all = predict_pdiff(em, est, X, a_all, b_all, edges["saddle"][e_all], ext, emb=emb,
+                              contact=None if lengths is None else lengths[e_all])
         refined = vote(P, classes, a_all, b_all, p_all, spec.lam, spec.rounds)
         before.append(pred[te_rows]); after.append(refined[te_rows]); truth.append(cls[te_rows])
         rb = _region_score(cls[te_rows], pred[te_rows])

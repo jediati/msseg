@@ -41,6 +41,13 @@ MAX_CLASSES = len(CLASS_COLORS)      # includes class 0
 # region -- so accepted predictions stay geometric and re-resolve after a
 # recompute like every other gesture. It is not offered in the tool selector.
 TOOLS = ("squiggle", "box", "polygon", "taps")
+# Seam gestures (docs/seam_labeling.md) label the polylines BETWEEN regions,
+# not regions, and live in ``LabelStore.seams``, a separate list: a "scope"
+# is a box inside which every seam is labelled (interior unless a trace says
+# otherwise) and a "trace" is a livewire path along seams (class boundary).
+# Kept apart from ``interactions`` so an older reader, which rasterizes any
+# unknown tool as a squiggle, never paints a trace onto regions.
+SEAM_TOOLS = ("scope", "trace")
 
 
 def class_color_hex(class_id):
@@ -84,6 +91,7 @@ class LabelStore:
     def __init__(self, n_classes=3):
         self.n_classes = int(n_classes)
         self.interactions = []                   # uid order == creation order
+        self.seams = []                          # seam gestures (SEAM_TOOLS), same uid space
         self.colors = {}                         # class_id -> "#rrggbb" override
         self.rev = 0
         self._next_uid = 1
@@ -125,11 +133,40 @@ class LabelStore:
         self.rev += 1
         return it
 
+    def add_seam(self, tool, points, class_id, slice_key, si=None, li=None, meta=None):
+        """A seam gesture (``SEAM_TOOLS``). Seam classes are their own space
+        (``seams.SEAM_CLASSES``: 1 interior, 2 boundary), independent of the
+        region class count; uids are shared with the region gestures."""
+        if tool not in SEAM_TOOLS:
+            raise ValueError(f"unknown seam tool {tool!r}")
+        if int(class_id) < 1:
+            raise ValueError(f"seam class {class_id} must be >= 1")
+        it = Interaction(self._next_uid, slice_key, si, li, tool, points, class_id,
+                         meta=meta)
+        self._next_uid += 1
+        self.seams.append(it)
+        self.rev += 1
+        return it
+
     def remove(self, uid):
-        n = len(self.interactions)
+        n = len(self.interactions) + len(self.seams)
         self.interactions = [it for it in self.interactions if it.uid != uid]
-        if len(self.interactions) != n:
+        self.seams = [it for it in self.seams if it.uid != uid]
+        if len(self.interactions) + len(self.seams) != n:
             self.rev += 1
+
+    def remove_many(self, uids):
+        """Drop several interactions (region or seam gestures) as ONE mutation
+        (one rev bump, so the render caches rebuild once, not per gesture).
+        Returns how many went."""
+        uids = {int(u) for u in uids}
+        n = len(self.interactions) + len(self.seams)
+        self.interactions = [it for it in self.interactions if it.uid not in uids]
+        self.seams = [it for it in self.seams if it.uid not in uids]
+        removed = n - len(self.interactions) - len(self.seams)
+        if removed:
+            self.rev += 1
+        return removed
 
     def set_class(self, uid, class_id):
         if not (1 <= int(class_id) < self.n_classes):
@@ -161,8 +198,19 @@ class LabelStore:
         """The slice's interactions in creation (= resolution) order."""
         return [it for it in self.interactions if it.slice_key == slice_key]
 
+    def for_class(self, class_id):
+        """Every interaction of one class, across all slices."""
+        return [it for it in self.interactions if it.class_id == int(class_id)]
+
+    def for_slice_seams(self, slice_key):
+        """The slice's seam gestures in creation order."""
+        return [it for it in self.seams if it.slice_key == slice_key]
+
     def get(self, uid):
         for it in self.interactions:
+            if it.uid == uid:
+                return it
+        for it in self.seams:
             if it.uid == uid:
                 return it
         return None
@@ -170,23 +218,31 @@ class LabelStore:
     # -- persistence ---------------------------------------------------- #
     # version 2: slice keys are folder-qualified ("folder/basename"); v1 files
     # carried bare basenames and are migrated on rebind() when unambiguous.
+    # version 3: a "seams" list of seam gestures -- written, and the version
+    # raised, ONLY when there are any, so a store without seams serializes
+    # byte-identically to v2 and an older reader (which ignores the key)
+    # still loads everything it understands.
+    @staticmethod
+    def _row(it):
+        return {"uid": it.uid, "slice": it.slice_key, "si": it.si, "li": it.li,
+                "tool": it.tool, "class": it.class_id,
+                "points": [[x, y] for x, y in it.points],
+                # "meta" only when present: a file without it is byte-identical
+                # to what older versions wrote, and older readers ignore it.
+                **({"meta": it.meta} if it.meta else {})}
+
     def to_json(self):
-        return {
-            "version": 2,
+        doc = {
+            "version": 3 if self.seams else 2,
             "app": "mscoupon-labeler",
             "n_classes": self.n_classes,
             "classes": [{"id": k, "color": self.color(k)}
                         for k in range(1, self.n_classes)],
-            "interactions": [
-                {"uid": it.uid, "slice": it.slice_key, "si": it.si, "li": it.li,
-                 "tool": it.tool, "class": it.class_id,
-                 "points": [[x, y] for x, y in it.points],
-                 # "meta" only when present: a file without it is byte-identical
-                 # to what older versions wrote, and older readers ignore it.
-                 **({"meta": it.meta} if it.meta else {})}
-                for it in self.interactions
-            ],
+            "interactions": [self._row(it) for it in self.interactions],
         }
+        if self.seams:
+            doc["seams"] = [self._row(it) for it in self.seams]
+        return doc
 
     @classmethod
     def from_json(cls, doc):
@@ -204,11 +260,22 @@ class LabelStore:
             it.class_id = min(max(it.class_id, 1), store.n_classes - 1)
             store.interactions.append(it)
         store.interactions.sort(key=lambda it: it.uid)
-        store._next_uid = 1 + max((it.uid for it in store.interactions), default=0)
+        for d in doc.get("seams") or []:
+            if not isinstance(d, dict) or d.get("tool") not in SEAM_TOOLS:
+                continue
+            meta = d.get("meta")
+            it = Interaction(d["uid"], d["slice"], d.get("si"), d.get("li"),
+                             d["tool"], d.get("points", []), d.get("class", 2),
+                             meta=meta if isinstance(meta, dict) else None)
+            it.class_id = max(it.class_id, 1)
+            store.seams.append(it)
+        store.seams.sort(key=lambda it: it.uid)
+        store._next_uid = 1 + max((it.uid for it in store.interactions + store.seams),
+                                  default=0)
         store.rev += 1
         return store
 
-    def rebind(self, subsequences):
+    def rebind(self, subsequences, resolve=None):
         """Re-derive the (si, li) hints by matching each interaction's
         folder-qualified slice key (``"folder/basename"``) against
         ``subsequences`` ([{"name", "folder", "files"}]).
@@ -218,7 +285,13 @@ class LabelStore:
         to the qualified form -- the next save writes v2 keys. An ambiguous or
         missing key leaves the interaction unbound (kept, shown greyed) rather
         than silently binding to the first match, which is what the old
-        first-wins behaviour did. Returns the number left unbound."""
+        first-wins behaviour did. Returns the number left unbound.
+
+        ``resolve(key) -> (si, li) | None`` is asked about a key the file
+        matching cannot place -- an app whose item keys are not
+        ``"folder/basename"`` (a slide's ``"folder/name@level#rect"``) binds
+        through its catalogue this way; without it every such key stays
+        unbound for good."""
         by_key = {}                      # "folder/basename" -> (si, li)
         by_base = {}                     # basename -> [(qualified_key, si, li)]
         for si, s in enumerate(subsequences):
@@ -229,7 +302,7 @@ class LabelStore:
                 by_key.setdefault(key, (si, li))
                 by_base.setdefault(base, []).append((key, si, li))
         unbound = 0
-        for it in self.interactions:
+        for it in self.interactions + self.seams:
             hit = by_key.get(it.slice_key)
             if hit is None and "/" not in it.slice_key:
                 candidates = by_base.get(it.slice_key, [])
@@ -237,6 +310,13 @@ class LabelStore:
                     key, si, li = candidates[0]
                     it.slice_key = key
                     hit = (si, li)
+            if hit is None and resolve is not None:
+                try:
+                    found = resolve(it.slice_key)
+                except Exception:
+                    found = None
+                if found is not None:
+                    hit = (int(found[0]), int(found[1]))
             it.si, it.li = hit if hit is not None else (None, None)
             unbound += hit is None
         self.rev += 1

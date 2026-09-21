@@ -105,6 +105,17 @@ def test_pair_features_symmetric_and_barrier_width():
     assert F.shape == (3, 4 + 4 + 2) and np.allclose(F, G)
     assert em.pair_features(emb, a, b, None, ("absdiff",)).shape == (3, 4)
     assert em.n_inputs(8) == 18 and em.n_inputs(8, ("absdiff", "prod")) == 16
+    # The contact column: log1p(length), zeros where unknown; never widens
+    # the input by more than one, and the default feature set leaves it out.
+    assert em.n_inputs(8, em.FEATURE_KINDS) == 19 and em.n_inputs(8, ("contact",)) == 1
+    assert em.DEFAULT_FEATURES == ("absdiff", "prod", "barrier") and em.EdgeSpec().features == em.DEFAULT_FEATURES
+    H = em.pair_features(emb, a, b, bar, em.FEATURE_KINDS, contact=np.array([0.0, 7.0, np.nan]))
+    assert H.shape == (3, 11) and H[0, -1] == 0.0 and np.isclose(H[1, -1], np.log1p(7.0)) and H[2, -1] == 0.0
+    assert np.allclose(H[:, :10], F)
+    assert em.pair_features(emb, a, b, bar, em.FEATURE_KINDS)[:, -1].tolist() == [0.0, 0.0, 0.0]
+    assert em.pair_features(emb, a, b, bar, em.FEATURE_KINDS, contact=np.ones(2))[:, -1].tolist() == [0.0] * 3
+    assert em.contact_column(None, 0).shape == (0, 1)
+    assert em.pair_features(emb, a, b, None, ("contact",), contact=[1, 2, 3]).shape == (3, 1)
 
 
 def test_gather_edges_offsets_sparse_ids_and_masks():
@@ -126,6 +137,14 @@ def test_gather_edges_offsets_sparse_ids_and_masks():
     assert len(e2["a"]) == 12 and e2["n_rows"] == 18
     e3 = em.gather_edges([(fids, {"a": arcs["a"], "b": arcs["b"], "saddle": None}, c, 0)])
     assert np.isnan(e3["saddle"]).all()
+    # Contact lengths ride along under `length` (NaN where the arcs carry none,
+    # or carry an array of the wrong size); a spec with `contact` then reads them.
+    assert np.isnan(edges["length"]).all() and len(edges["length"]) == len(edges["a"])
+    with_len = dict(arcs); with_len["length"] = np.arange(len(arcs["a"]), dtype=float) + 1
+    e4 = em.gather_edges([(fids, with_len, c, 0)])
+    assert np.array_equal(e4["length"], np.arange(12, dtype=float) + 1)
+    wrong = dict(arcs); wrong["length"] = np.ones(3)
+    assert np.isnan(em.gather_edges([(fids, wrong, c, 0)])["length"]).all()
 
 
 def test_fit_predict_pdiff_and_roundtrip():
@@ -173,6 +192,10 @@ def test_spec_round_trip_and_describe():
     assert em.EdgeSpec.from_dict({"model": "nope", "features": ["prod", "bogus"]}) == \
         em.EdgeSpec(model="logistic", features=("prod",))
     assert em.EdgeSpec.from_dict({}) == em.EdgeSpec()
+    # `contact` round-trips, and a saddle-free spec (no barrier) is legal.
+    sf = em.EdgeSpec(features=("absdiff", "prod", "contact"))
+    assert em.EdgeSpec.from_dict(sf.to_dict()) == sf and "contact" in sf.describe()
+    assert em.EdgeSpec.from_dict({"features": ["contact"]}).features == ("contact",)
     assert "previous (16-d)" in s.describe([16, 8]) and "MLP" in s.describe()
     assert "last (8-d)" in em.EdgeSpec().layer_text([16, 8])
 

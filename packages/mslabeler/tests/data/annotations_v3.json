@@ -1,0 +1,176 @@
+{
+  "version": 3,
+  "app": "mscoupon-labeler",
+  "n_classes": 4,
+  "classes": [
+    {
+      "id": 1,
+      "color": "#e6194b"
+    },
+    {
+      "id": 2,
+      "color": "#123456"
+    },
+    {
+      "id": 3,
+      "color": "#4363d8"
+    }
+  ],
+  "interactions": [
+    {
+      "uid": 1,
+      "slice": "data/s0.tiff",
+      "si": 0,
+      "li": 0,
+      "tool": "squiggle",
+      "class": 1,
+      "points": [
+        [
+          3.0,
+          5.0
+        ],
+        [
+          15.0,
+          5.5
+        ]
+      ]
+    },
+    {
+      "uid": 2,
+      "slice": "data/s0.tiff",
+      "si": 0,
+      "li": 0,
+      "tool": "box",
+      "class": 2,
+      "points": [
+        [
+          3.0,
+          3.0
+        ],
+        [
+          16.0,
+          16.0
+        ]
+      ]
+    },
+    {
+      "uid": 3,
+      "slice": "data/s1.tiff",
+      "si": 0,
+      "li": 1,
+      "tool": "polygon",
+      "class": 3,
+      "points": [
+        [
+          2.0,
+          2.0
+        ],
+        [
+          9.0,
+          2.0
+        ],
+        [
+          9.0,
+          9.0
+        ]
+      ]
+    },
+    {
+      "uid": 4,
+      "slice": "data/s1.tiff",
+      "si": 0,
+      "li": 1,
+      "tool": "taps",
+      "class": 1,
+      "points": [
+        [
+          4.0,
+          4.0
+        ],
+        [
+          12.0,
+          12.0
+        ]
+      ],
+      "meta": {
+        "tool": "magic",
+        "seed": [
+          4.0,
+          4.0
+        ],
+        "seed_id": 0,
+        "threshold": 0.5,
+        "metric": "mean",
+        "mode": "anchor",
+        "channels": [
+          "base"
+        ],
+        "hop_gain": 1.1,
+        "n_regions": 2,
+        "arcs": "msc"
+      }
+    },
+    {
+      "uid": 5,
+      "slice": "other/unbound.tiff",
+      "si": null,
+      "li": null,
+      "tool": "squiggle",
+      "class": 1,
+      "points": [
+        [
+          1.0,
+          1.0
+        ]
+      ]
+    }
+  ],
+  "seams": [
+    {
+      "uid": 6,
+      "slice": "data/s0.tiff",
+      "si": 0,
+      "li": 0,
+      "tool": "scope",
+      "class": 1,
+      "points": [
+        [
+          2.0,
+          2.0
+        ],
+        [
+          18.0,
+          18.0
+        ]
+      ]
+    },
+    {
+      "uid": 7,
+      "slice": "data/s0.tiff",
+      "si": 0,
+      "li": 0,
+      "tool": "trace",
+      "class": 2,
+      "points": [
+        [
+          10.0,
+          2.0
+        ],
+        [
+          10.0,
+          10.0
+        ],
+        [
+          18.0,
+          10.0
+        ]
+      ],
+      "meta": {
+        "tool": "trace",
+        "toll": "feature",
+        "anchors": 2,
+        "seams": 2
+      }
+    }
+  ]
+}

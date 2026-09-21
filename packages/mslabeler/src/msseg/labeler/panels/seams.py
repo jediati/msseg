@@ -1,0 +1,412 @@
+"""The Seams cluster of the annotation pane: the trace / scope tools, the
+toll, the overlay (class colours or boundaryness), the current item's seam
+gestures, and the seam model buttons. Also the per-item caches the overlay
+and the tools share -- the seam graph comes from the provider
+(``regions.seams``), the pixel raster is rebuilt per commit, the resolved
+classes per (commit, store.rev). See docs/seam_labeling.md.
+"""
+from __future__ import annotations
+
+import tkinter as tk
+from tkinter import ttk
+
+from .. import seam_labeling, seam_path
+from ..seams import (SEAM_CLASSES, SEAM_BOUNDARY, SEAM_INTERIOR, seam_class_lut,
+                     seam_pixel_raster, seam_scalar_lut)
+from ..widgets import attach_tooltip
+from ..defaults import *  # noqa: F401,F403
+
+_SEAM_CLASS_KEYS = ((SEAM_BOUNDARY, "boundary"), (SEAM_INTERIOR, "interior"))
+
+
+class SeamPanelMixin:
+    # ------------------------------------------------------------------ #
+    # UI
+    # ------------------------------------------------------------------ #
+    def _build_seam_panel(self, parent):
+        f = ttk.LabelFrame(parent, text="Seams (boundaries between regions)")
+        f.pack(side="bottom", fill="x", padx=4, pady=(2, 2))
+        self.seam_frame = f
+
+        row = ttk.Frame(f); row.pack(side="top", fill="x", padx=4, pady=(4, 2))
+        ttk.Label(row, text="Tool:").pack(side="left")
+        for value, txt in _SEAM_TOOL_LABELS:
+            rb = ttk.Radiobutton(row, text=txt, variable=self.tool_var, value=value)
+            rb.pack(side="left", padx=2)
+            if value == "trace":
+                attach_tooltip(rb, "Trace (key T): click near a seam to anchor, move to "
+                                   "see the cheapest path along the seams, click to add "
+                                   "an anchor, Enter or double-click to commit as "
+                                   "boundary, BackSpace drops the last leg, Escape "
+                                   "abandons.")
+            else:
+                attach_tooltip(rb, "Scope (key S): drag a box; every seam fully inside "
+                                   "it is labelled interior unless a trace says "
+                                   "boundary. A trace anchored inside a scope stays "
+                                   "inside it.")
+        ttk.Label(row, text="  as:").pack(side="left")
+        for value, txt in _SEAM_CLASS_KEYS:
+            ttk.Radiobutton(row, text=txt, variable=self.seam_class_var,
+                            value=value).pack(side="left", padx=2)
+
+        row = ttk.Frame(f); row.pack(side="top", fill="x", padx=4, pady=2)
+        ttk.Label(row, text="Toll:").pack(side="left")
+        cb = ttk.Combobox(row, textvariable=self.seam_toll_var,
+                          values=list(seam_path.TOLLS), state="readonly", width=13)
+        cb.pack(side="left", padx=2)
+        cb.bind("<<ComboboxSelected>>", self._unfocus_entries)
+        attach_tooltip(cb, "Cost per crack of walking a seam = eps + (1 - affinity).\n"
+                           "geometric: length only. feature: z-scored mean dissimilarity "
+                           "of the two flanks over the channels. bhattacharyya: their "
+                           "Gaussian overlap. barrier: the arc's saddle depth (MSC arcs). "
+                           "edges: the '-> edges' model's p(diff). model: the trained "
+                           "seam model's boundaryness.")
+        ttk.Label(row, text="on").pack(side="left", padx=(6, 2))
+        ent = ttk.Entry(row, textvariable=self.seam_channels_var, width=10)
+        ent.pack(side="left")
+        ent.bind("<Return>", self._unfocus_entries)
+        attach_tooltip(ent, "Channels for the feature / bhattacharyya tolls "
+                            "(comma-separated; 'base' by default).")
+
+        row = ttk.Frame(f); row.pack(side="top", fill="x", padx=4, pady=2)
+        chk = ttk.Checkbutton(row, text="show seams (E)", variable=self.show_seams_var,
+                              command=self._refresh_render)
+        chk.pack(side="left")
+        ttk.Label(row, text="  colour:").pack(side="left")
+        self.seam_mode_combo = ttk.Combobox(row, textvariable=self.seam_color_var,
+                                            values=list(_SEAM_MODES), state="readonly",
+                                            width=13)
+        self.seam_mode_combo.pack(side="left", padx=2)
+        self.seam_mode_combo.bind("<<ComboboxSelected>>", self._on_seam_mode_change)
+
+        row = ttk.Frame(f); row.pack(side="top", fill="x", padx=4, pady=2)
+        self.seam_train_btn = ttk.Button(row, text="Train seams", width=11,
+                                         command=self._train_seam_model)
+        self.seam_train_btn.pack(side="left")
+        attach_tooltip(self.seam_train_btn, "Fit the seam model (boundary vs interior) on "
+                                            "every labelled seam, then score every seam of "
+                                            "every item: the 'model' toll and the "
+                                            "boundaryness colouring.")
+        self.seam_eval_btn = ttk.Button(row, text="Evaluate", width=9,
+                                        command=self._evaluate_seams)
+        self.seam_eval_btn.pack(side="left", padx=2)
+        attach_tooltip(self.seam_eval_btn, "Leave-items-out cross-validation of the seam "
+                                           "model (held-out log-loss, balanced accuracy).")
+        self.seam_export_btn = ttk.Button(row, text="Export…", width=8,
+                                          command=self._export_seams)
+        self.seam_export_btn.pack(side="left", padx=2)
+        attach_tooltip(self.seam_export_btn, "Write every item's seams with their class "
+                                             "and boundaryness (seams_<item>.json + "
+                                             "seams_summary.csv).")
+
+        self.seam_readout_var = tk.StringVar(master=self.root, value="")
+        lab = ttk.Label(f, textvariable=self.seam_readout_var, justify="left",
+                        wraplength=280)
+        lab.pack(side="top", fill="x", padx=6, pady=(2, 2))
+
+        self.seam_list = ttk.Frame(f)
+        self.seam_list.pack(side="top", fill="x", padx=4, pady=(0, 4))
+        self._seam_rows = {}
+
+    def _on_seam_mode_change(self, _e=None):
+        self._unfocus_entries()
+        self._refresh_render()
+
+    # ------------------------------------------------------------------ #
+    # Caches (per item)
+    # ------------------------------------------------------------------ #
+    def _clear_seam_caches(self):
+        self._seam_caches.clear()
+        self._seam_rasters.clear()
+
+    def _seam_graph_for(self, si, li, np):
+        key = self.catalogue.key_of(si, li)
+        return None if key is None else self.regions.seams(key, np)
+
+    def _seam_raster_for(self, si, li, rec, graph, np):
+        hit = self._seam_rasters.get((si, li))
+        if hit is not None and hit[0] == rec.get("commit") and hit[1] is graph:
+            return hit[2]
+        raster = seam_pixel_raster(graph, np)
+        self._seam_rasters[(si, li)] = (rec.get("commit"), graph, raster)
+        return raster
+
+    def _seam_cache_for(self, si, li, rec, graph, np):
+        """(commit, store.rev, seam class uint8[S], [(gesture, mask)]) for one
+        item, memoized on (commit, rev) like the region class LUTs."""
+        hit = self._seam_caches.get((si, li))
+        if (hit is not None and hit[0] == rec.get("commit") and hit[1] == self.store.rev
+                and hit[4] is graph):
+            return hit
+        key = self.catalogue.key_of(si, li)
+        sets = seam_labeling.seam_sets(self.store.for_slice_seams(key), graph, np)
+        cls = seam_labeling.resolve_seams(None, graph, np, sets=sets)
+        entry = (rec.get("commit"), self.store.rev, cls, sets, graph)
+        self._seam_caches[(si, li)] = entry
+        return entry
+
+    def _seam_classes_for(self, si, li, np):
+        """The resolved seam classes of an item (None without a record)."""
+        rec = self.regions.record(self.catalogue.key_of(si, li))
+        if rec is None or rec.get("labels") is None:
+            return None, None
+        graph = self._seam_graph_for(si, li, np)
+        if graph is None:
+            return None, None
+        return graph, self._seam_cache_for(si, li, rec, graph, np)[2]
+
+    # ------------------------------------------------------------------ #
+    # Overlay
+    # ------------------------------------------------------------------ #
+    def _seam_overlay(self, si, li, rec, np):
+        """The seam layer for the class stack: seam classes in their colours,
+        or boundaryness on the ramp when a seam model has scored this commit."""
+        if rec is None or rec.get("labels") is None:
+            return None
+        graph = self._seam_graph_for(si, li, np)
+        if graph is None or graph.n_seams == 0:
+            return None
+        lut = None
+        if self.seam_color_var.get() == _SEAM_MODE_BOUNDARYNESS:
+            entry = self._seam_pred.get(self.catalogue.key_of(si, li))
+            if entry is not None and entry[0] == rec.get("commit") and len(entry[1]) == graph.n_seams:
+                lut = seam_scalar_lut(entry[1], np, _SCALAR_ALPHA)
+        if lut is None:
+            cls = self._seam_cache_for(si, li, rec, graph, np)[2]
+            if not cls.any():
+                return None            # nothing labelled: no layer to composite
+            lut = seam_class_lut(cls, np)
+        # The raster (both flank pixels of every crack) is built only now, once
+        # there is something to show, and cached per commit.
+        raster = self._seam_raster_for(si, li, rec, graph, np)
+        return self._region_overlay(raster, lut, np)
+
+    # ------------------------------------------------------------------ #
+    # Tolls for the trace tool
+    # ------------------------------------------------------------------ #
+    def _seam_channels(self):
+        want = [c.strip() for c in self.seam_channels_var.get().split(",") if c.strip()]
+        return want or ["base"]
+
+    def _seam_tolls_for(self, key, rec, graph, np):
+        """The toll per seam for the picked toll, or a ValueError naming what
+        is missing (shown in the status line; the press is refused)."""
+        toll = self.seam_toll_var.get()
+        table = rec.get("stats")
+        arcs = self.regions.arcs(key, np) if toll in seam_path.ARC_TOLLS else None
+        pdiff = None
+        boundaryness = None
+        if toll == "edges":
+            pr = self._pred.get(key)
+            aux = self._pred_aux(pr) if pr is not None and pr[0] == rec.get("commit") else None
+            pdiff = None if aux is None else aux.get("pdiff")
+        elif toll == "model":
+            entry = self._seam_pred.get(key)
+            if entry is not None and entry[0] == rec.get("commit"):
+                boundaryness = entry[1]
+        chans = self._seam_channels()
+        if table is not None and toll in ("feature", "bhattacharyya"):
+            avail = self.FIELDS.channel_names(table)
+            chans = [c for c in chans if c in avail] or (["base"] if "base" in avail else avail[:1])
+        aff = seam_path.seam_affinity(graph, toll, np, table=table, arcs=arcs, channels=chans,
+                                      pdiff=pdiff, boundaryness=boundaryness, conv=self.FIELDS)
+        return seam_path.seam_tolls(aff, np)
+
+    def _scope_restrict(self, si, li, rec, graph, seam, np):
+        """The union of the scopes containing `seam` as a seam mask, or None
+        when the anchor lies in no scope."""
+        sets = self._seam_cache_for(si, li, rec, graph, np)[3]
+        masks = [m for it, m in sets if it.tool == "scope" and m[seam]]
+        if not masks:
+            return None
+        out = masks[0].copy()
+        for m in masks[1:]:
+            out |= m
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Geometry on the canvas
+    # ------------------------------------------------------------------ #
+    def _seam_color_hex(self, class_id):
+        from ..seams import SEAM_COLORS
+        k = int(class_id)
+        r, g, b, _a = SEAM_COLORS[k] if 0 <= k < len(SEAM_COLORS) else SEAM_COLORS[-1]
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _visible_seam_gestures(self):
+        cur = self._current()
+        if cur is None:
+            return list(self.store.seams)
+        key = self._slice_key(*cur)
+        return [it for it in self.store.seams if it.slice_key == key]
+
+    def _draw_seam_geometry(self, it, tags=("draw", "ihover")):
+        """A seam gesture's geometry over the item: a trace as its polyline,
+        a scope as its rectangle, in the seam class colour."""
+        v = self.viewer
+        if it is None or v is None or not it.points or not it.bound:
+            return
+        if self._current() != (it.si, it.li):
+            return
+        c = v.canvas
+        color = self._seam_color_hex(it.class_id)
+        scr = [((x - v.view_x) / v.scale, (y - v.view_y) / v.scale) for x, y in it.points]
+        if it.tool == "scope" and len(scr) >= 2:
+            (x0, y0), (x1, y1) = scr[0], scr[-1]
+            c.create_rectangle(x0, y0, x1, y1, outline=color, width=2, dash=(6, 3), tags=tags)
+        elif len(scr) >= 2:
+            flat = [coord for pt in scr for coord in pt]
+            c.create_line(*flat, fill=color, width=3, tags=tags)
+        else:
+            x, y = scr[0]
+            c.create_oval(x - 4, y - 4, x + 4, y + 4, outline=color, width=3, tags=tags)
+
+    # ------------------------------------------------------------------ #
+    # Readout + gesture list
+    # ------------------------------------------------------------------ #
+    def _seam_counts_text(self):
+        cur = self._current()
+        if cur is None:
+            return "no item on screen"
+        its = self._visible_seam_gestures()
+        n_tr = sum(1 for it in its if it.tool == "trace")
+        n_sc = sum(1 for it in its if it.tool == "scope")
+        head = f"{n_tr} trace{'s' if n_tr != 1 else ''}, {n_sc} scope{'s' if n_sc != 1 else ''} here"
+        try:
+            import numpy as np
+            graph, cls = self._seam_classes_for(cur[0], cur[1], np)
+        except Exception:
+            graph, cls = None, None
+        if graph is None:
+            return head + " · no regions yet"
+        nb = int((cls == SEAM_BOUNDARY).sum())
+        ni = int((cls == SEAM_INTERIOR).sum())
+        nu = int(graph.n_seams) - nb - ni
+        text = f"{head} · {graph.n_seams} seams: {nb} boundary, {ni} interior, {nu} unknown"
+        model = getattr(self, "_seam_model", None)
+        text += " · model: " + (model.brief() if model is not None else "none")
+        return text
+
+    def _refresh_seam_panel(self):
+        var = getattr(self, "seam_readout_var", None)
+        if var is None:
+            return
+        var.set(self._seam_counts_text())
+        self._sync_seam_rows()
+
+    def _seam_row_text(self, it):
+        name = SEAM_CLASSES[it.class_id] if 0 <= it.class_id < len(SEAM_CLASSES) else str(it.class_id)
+        n = ""
+        meta = it.meta or {}
+        if it.tool == "trace" and meta.get("seams") is not None:
+            n = f"  ({meta['seams']} seams, {meta.get('toll', '?')})"
+        where = "" if it.bound else f"  [{it.slice_key} (unbound)]"
+        return f"#{it.uid} {it.tool} → {name}{n}{where}"
+
+    def _sync_seam_rows(self):
+        lst = getattr(self, "seam_list", None)
+        if lst is None:
+            return
+        want = {it.uid: it for it in self._visible_seam_gestures()}
+        for uid in [u for u in self._seam_rows if u not in want]:
+            self._seam_rows.pop(uid)["frame"].destroy()
+        for uid, it in want.items():
+            row = self._seam_rows.get(uid)
+            if row is None:
+                fr = ttk.Frame(lst)
+                fr.pack(side="top", fill="x")
+                lab = ttk.Label(fr, text=self._seam_row_text(it), anchor="w")
+                lab.pack(side="left", fill="x", expand=True)
+                btn = ttk.Button(fr, text="✕", width=2,
+                                 command=lambda u=uid: self._delete_interaction(u))
+                btn.pack(side="right")
+                for w in (fr, lab):
+                    w.bind("<Enter>", lambda _e, u=uid: self._show_seam_geometry(u))
+                    w.bind("<Leave>", lambda _e: self._hide_interaction_geometry())
+                    w.bind("<Button-1>", lambda _e, u=uid: self._on_row_click(u))
+                row = {"frame": fr, "label": lab}
+                self._seam_rows[uid] = row
+            else:
+                row["label"].config(text=self._seam_row_text(it))
+
+    def _show_seam_geometry(self, uid):
+        if self.viewer is None:
+            return
+        self.viewer.canvas.delete("ihover")
+        self._hover_key = None
+        self._hover_uid = uid
+        self._draw_seam_geometry(self.store.get(uid))
+
+    # ------------------------------------------------------------------ #
+    # Session view state
+    # ------------------------------------------------------------------ #
+    def _seams_view_state(self):
+        return {"toll": self.seam_toll_var.get(),
+                "channels": self.seam_channels_var.get(),
+                "show": bool(self.show_seams_var.get()),
+                "coloring": self.seam_color_var.get(),
+                "class": int(self.seam_class_var.get())}
+
+    def _apply_seams_view(self, d):
+        if not isinstance(d, dict):
+            return
+        if d.get("toll") in seam_path.TOLLS:
+            self.seam_toll_var.set(d["toll"])
+        if isinstance(d.get("channels"), str) and d["channels"].strip():
+            self.seam_channels_var.set(d["channels"])
+        if isinstance(d.get("show"), bool):
+            self.show_seams_var.set(d["show"])
+        if d.get("coloring") in _SEAM_MODES:
+            self.seam_color_var.set(d["coloring"])
+        if d.get("class") in (SEAM_BOUNDARY, SEAM_INTERIOR):
+            self.seam_class_var.set(int(d["class"]))
+
+    # ------------------------------------------------------------------ #
+    # Hotkeys
+    # ------------------------------------------------------------------ #
+    def _on_trace_key(self, _e=None):
+        if self._typing():
+            return
+        self.tool_var.set("trace")
+
+    def _on_scope_key(self, _e=None):
+        if self._typing():
+            return
+        self.tool_var.set("scope")
+
+    def _on_seams_toggle_key(self, _e=None):
+        if self._typing():
+            return
+        self.show_seams_var.set(not self.show_seams_var.get())
+        self._refresh_render()
+
+    def _trace_controller(self):
+        tool = self.viewer.tool if self.viewer is not None else None
+        return getattr(tool, "trace", None)
+
+    def _on_trace_commit_key(self, e=None):
+        """Enter commits the trace in flight. Entries bind Return to
+        _unfocus_entries at widget level and this toplevel binding fires
+        after focus moved, so the guard reads the EVENT's widget."""
+        try:
+            if e is not None and e.widget.winfo_class() in _TYPING_CLASSES:
+                return
+        except (AttributeError, tk.TclError):
+            pass
+        tc = self._trace_controller()
+        if tc is not None and tc.active:
+            tc.commit()
+            return "break"
+        return None
+
+    def _on_trace_back_key(self, e=None):
+        try:
+            if e is not None and e.widget.winfo_class() in _TYPING_CLASSES:
+                return
+        except (AttributeError, tk.TclError):
+            pass
+        tc = self._trace_controller()
+        if tc is not None and tc.active:
+            tc.drop_last()
+            return "break"
+        return None
