@@ -98,9 +98,15 @@ class TrainingSetBuilder:
         interactions' identities, classes and shapes. Undo, a repaint or a
         class change on the item all change it; a retrain after edits
         elsewhere does not."""
+        def meta_sig(it):
+            # The meta keys that change how the geometry is applied off its
+            # drawing level (labeling.py); a rebind may set them in place.
+            m = getattr(it, "meta", None) or {}
+            outline = m.get("outline") or ()
+            return (m.get("level"), m.get("scale"), m.get("px"), len(outline))
         return tuple((getattr(it, "uid", None), getattr(it, "class_id", None),
                       getattr(it, "tool", None), len(getattr(it, "points", ()) or ()),
-                      id(getattr(it, "meta", None)))
+                      meta_sig(it))
                      for it in interactions)
 
     def _classes_for(self, key, rec, table, interactions, fids, np, layer):
@@ -130,7 +136,7 @@ class TrainingSetBuilder:
             self._class_memo.pop(key, None)
 
     def labeled_set(self, items, store, np, id_field: Optional[str] = None,
-                    layer_of=None):
+                    layer_of=None, gestures_of=None):
         """``(X, y, groups, names)`` over every labeled region of every item.
 
         `layer_of(key, rec)` supplies the item's ``LabelLayer`` when its region
@@ -145,8 +151,8 @@ class TrainingSetBuilder:
             if fids is None:
                 raise TrainingProblem(
                     f"Training stopped: incomplete statistics on slice {label}.")
-            cls = self._classes_for(key, rec, table, store.for_slice(key), fids, np,
-                                    None if layer_of is None else layer_of(key, rec))
+            cls = self._classes_for(key, rec, table, (gestures_of or store.for_slice)(key),
+                                    fids, np, None if layer_of is None else layer_of(key, rec))
             m = cls > 0
             if not m.any():
                 if self.feature_matrix(table, names, np, rows=slice(0, 0)) is None:
@@ -183,7 +189,7 @@ class TrainingSetBuilder:
 
     def edge_set(self, items, store, names: Sequence[str], arcs_of: Callable[[Any], Any], np,
                  id_field: Optional[str] = None, ext_field: Optional[str] = None,
-                 layer_of=None):
+                 layer_of=None, gestures_of=None):
         """Every region of every item (class 0 = unlabeled) with its group and
         extremum value, plus the region-graph edges as global row pairs:
         ``(X, cls, groups, ext | None, edges, names)``. ``arcs_of(key, record)``
@@ -208,8 +214,8 @@ class TrainingSetBuilder:
             arcs = arcs_of(key, rec)
             sig_parts.append((key, id(table), rec.get("commit"), id(rec.get("labels")), group,
                               id(arcs), None if arcs is None else "length" in arcs))
-            c = self._classes_for(key, rec, table, store.for_slice(key), fids, np,
-                                  None if layer_of is None else layer_of(key, rec))
+            c = self._classes_for(key, rec, table, (gestures_of or store.for_slice)(key),
+                                  fids, np, None if layer_of is None else layer_of(key, rec))
             cls.append(c)
             per_fids.append(np.asarray(fids).astype(int))
             per_arcs.append(arcs)

@@ -75,7 +75,16 @@ from slide coordinates.
 ## Annotations are geometry, and re-resolve by crack coverage
 
 Seam gestures are `labeling.Interaction`s in image coordinates like every
-other gesture (`meta` is never read by resolution). They live in a
+other gesture, keyed by the SLIDE and seen by every item covering them
+(docs/design_multi_model_tasks.md §8). On the lattice a gesture was drawn on
+`meta` is never read by resolution; off it -- a trace drawn on the level-4
+overview resolved against a level-0 ROI, whose lattice is sixteen times finer
+-- `meta["scale"]` (the drawing item's slide px per raster px, recorded by
+the app's `_draw_meta`) switches a trace from exact crack ids to a
+**corridor**: a seam is covered when at least `SEAM_COVER_TAU` of its corner
+points lie within one pixel of the coarser lattice of the trace's polyline
+(`seam_labeling.corridor_coverage`, `tests/test_seam_corridor.py`). A scope
+needs nothing: bbox containment is scale-invariant. They live in a
 **separate list**, `LabelStore.seams`, and serialize under a `"seams"` key
 with `"version": 3` -- written, and the version raised, **only when there
 are any**, so a store without seams is byte-identical to v2

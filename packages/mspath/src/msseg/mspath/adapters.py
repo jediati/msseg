@@ -61,6 +61,13 @@ class SlideCatalogue:
             item = self.item_of(si, li)
             if item is not None and item.key == key:
                 return (si, li)
+        # A slide key (what a gesture is bound to) resolves to the slide's
+        # first row -- its overview -- so `bound` means "the slide is here".
+        if parse_key(key) is None:
+            for si in range(len(self.app.subsequences)):
+                sid, _path = self.app._slide_of(si)
+                if sid == key:
+                    return (si, 0)
         return None
 
     def label(self, key):
@@ -73,6 +80,32 @@ class SlideCatalogue:
         measures memorisation, not generalisation."""
         item = parse_key(key)
         return item.slide if item is not None else key
+
+    def binding_of(self, key):
+        """Gestures are keyed by the SLIDE (``items.slide_id``), and an item
+        sees those meeting its place: an ROI's rect in slide pixels, the
+        whole slide for the overview. A bare slide key binds to itself."""
+        item = parse_key(key)
+        if item is None:
+            return key, None
+        return item.slide, item.rect
+
+    def rebase(self, key):
+        """An item key from a store written before gestures were slide-bound
+        -> the slide, and the item's level and slide-px-per-raster-px as the
+        gesture's scale of intent. A slide key is not rebased."""
+        item = parse_key(key)
+        if item is None:
+            return None
+        scale = None
+        try:
+            src = self.app.engine.source(item.slide)
+            scale = float(src.level_scale(item.level)) if src is not None else None
+        except Exception:
+            scale = None
+        if scale is None:
+            scale = float(2 ** int(item.level))
+        return item.slide, int(item.level), scale
 
     def tree(self):
         out = []

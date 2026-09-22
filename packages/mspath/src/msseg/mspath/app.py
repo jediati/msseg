@@ -645,9 +645,13 @@ class MsPathApp(ViewerShell):
         was cut away earlier and whose annotations were kept for a re-cut;
         they go with the slide."""
         if li is None:
-            item = parse_key(key)
             sid, _path = self._slide_of(si)
-            return item is not None and sid is not None and item.slide == sid
+            if sid is None:
+                return False
+            if key == sid:                    # a gesture's key: the slide itself
+                return True
+            item = parse_key(key)
+            return item is not None and item.slide == sid
         return super()._row_owns_key(si, li, key)
 
     def _goto_row(self, si, li):

@@ -139,7 +139,7 @@ class SeamPanelMixin:
                 and hit[4] is graph):
             return hit
         key = self.catalogue.key_of(si, li)
-        sets = seam_labeling.seam_sets(self.store.for_slice_seams(key), graph, np)
+        sets = seam_labeling.seam_sets(self._seam_gestures_for_key(key), graph, np)
         cls = seam_labeling.resolve_seams(None, graph, np, sets=sets)
         entry = (rec.get("commit"), self.store.rev, cls, sets, graph)
         self._seam_caches[(si, li)] = entry
@@ -237,8 +237,7 @@ class SeamPanelMixin:
         cur = self._current()
         if cur is None:
             return list(self.store.seams)
-        key = self._slice_key(*cur)
-        return [it for it in self.store.seams if it.slice_key == key]
+        return self._seam_gestures_for(*cur)
 
     def _draw_seam_geometry(self, it, tags=("draw", "ihover")):
         """A seam gesture's geometry over the item: a trace as its polyline,
@@ -246,7 +245,8 @@ class SeamPanelMixin:
         v = self.viewer
         if it is None or v is None or not it.points or not it.bound:
             return
-        if self._current() != (it.si, it.li):
+        cur = self._current()
+        if cur is None or not self._gesture_on_item(it, *cur):
             return
         c = v.canvas
         color = self._seam_color_hex(it.class_id)

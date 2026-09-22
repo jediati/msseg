@@ -66,6 +66,15 @@ class SequenceCatalogue:
         pos = self._pos.get(key)
         return pos if pos is not None else key
 
+    def binding_of(self, key):
+        """A slice IS its slide: gestures are keyed by the item key, over the
+        whole image."""
+        return key, None
+
+    def rebase(self, key):
+        """No key of the coupon's was ever an item-within-a-slide key."""
+        return None
+
     def tree(self):
         out = []
         for si, s in enumerate(self.app.subsequences):

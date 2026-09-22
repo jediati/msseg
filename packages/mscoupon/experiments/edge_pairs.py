@@ -48,7 +48,7 @@ for k, (si, li, key, rec, table) in enumerate(slices):
         names = [n for n in table.names if n not in _NON_FEATURE_FIELDS]
     mat = app._feature_matrix(table, names, np)
     fids = table.column("feature_id").astype(int)
-    rc = resolve_slice(app.store.for_slice(key), rec["labels"], np)
+    rc = resolve_slice(app._gestures_for_key(key), rec["labels"], np)
     c = np.zeros(len(fids), int); ok = (fids >= 0) & (fids < len(rc)); c[ok] = rc[fids[ok]]
     base = len(np.concatenate(cls)) if cls else 0
     X.append(mat); cls.append(c); grp.append(np.full(len(c), k))

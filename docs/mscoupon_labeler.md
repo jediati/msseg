@@ -140,6 +140,23 @@ left column as plain titled boxes -- and the same live filter preview.
 
 ## Annotations are gestures, not region ids
 
+A gesture is keyed by the **slide** it was drawn on -- for a coupon the slice
+file, which is its own slide; for `mspath` the slide id, never the ROI or the
+overview it happened to be drawn on -- because it is a statement about tissue
+at a location, and every item covering that location, at any level, should
+see it (design note §8). In mspath that means a stroke on the overview is
+there when you cut an ROI under it, a stroke in an ROI stays on the overview
+when the ROI is removed and is back when the rect is re-cut, and the same
+gestures serve a level study. Each new gesture records the level and zoom it
+was drawn at (`meta.level` / `meta.scale` / `meta.px`); on its own level that
+metadata is never read, off it a stroke keeps the width the user saw, a magic
+fill / blob / accepted prediction resolves by its **outline** rather than by
+seeds (which would land in different regions), and a trace resolves by a
+corridor. An item showing gestures drawn two or more levels coarser gets a
+`!` on its annot cell and one notice: a warning, not a refusal -- whether
+*gland* at level 4 means *gland including lumen* at level 0 is the task's
+call. Older sessions (gestures keyed by item) rebase on load.
+
 An annotation (`labeling.Interaction`) is one gesture in **image coordinates**
 bound to one item key and one class -- for the coupon labeler the key is the
 slice's `"folder/basename"` (`adapters.SequenceCatalogue.key_of`). Nothing stores a region

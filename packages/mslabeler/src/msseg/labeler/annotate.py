@@ -26,7 +26,7 @@ from . import bundle as model_bundle
 from . import session_doc
 from .labeling import (LabelStore, MAX_CLASSES, TOOLS, resolve_slice, resolve_sets,
                           touched_sets, class_lut, scalar_lut, line_pixels, polygon_mask,
-                          preview_lut)
+                          preview_lut, gesture_meets)
 from .training import TrainingSetBuilder, TrainingProblem
 from .widgets import ScrollFrame, Collapsible, attach_tooltip
 from .defaults import *  # noqa: F401,F403
@@ -454,34 +454,153 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
             self._update_class_titles()       # a new record can change counts
 
     def _goto_slice(self, idx):
-        cur = self._current()
-        before = self._slice_key(*cur) if cur is not None else None
+        # By ITEM key: two items of one slide share a gesture key, but list
+        # different gestures (those meeting each item's rect).
+        before = self._current_key()
         super()._goto_slice(idx)
-        cur = self._current()
-        after = self._slice_key(*cur) if cur is not None else None
+        after = self._current_key()
         if after != before:
-            # The class panels list the ON-SLICE interactions only; swap them
-            # with the slice.
+            # The class panels list the ON-ITEM interactions only; swap them
+            # with the item.
             self._rebuild_class_panels()
             self._refresh_edge_readout()
+            cur = self._current()
+            if cur is not None:
+                self._coarse_notice(*cur)
 
-    def _annotation_count(self, si, li):
-        key = self._slice_key(si, li)
-        return len(self.store.for_slice(key)) if key else 0
+    # -- what a gesture is keyed by, and which gestures an item sees ------- #
+    # A gesture is a statement about tissue at a location, so it is keyed by
+    # the SLIDE (coupon: the slice file, which is its own slide) and every
+    # item covering that location -- an ROI, the overview, the same rect at
+    # another level -- queries it by rect (docs/design_multi_model_tasks.md
+    # §8). The catalogue says what the binding is (`binding_of`); a catalogue
+    # without the method binds by item, as before.
+    def _binding_of(self, key):
+        fn = getattr(self.catalogue, "binding_of", None)
+        if key is None or fn is None:
+            return key, None
+        return fn(key)
+
+    def _rebase_key(self, key):
+        fn = getattr(self.catalogue, "rebase", None)
+        return None if fn is None else fn(key)
 
     def _slice_key(self, si, li):
-        """The item key of slice (si, li): the catalogue's folder-qualified
-        "folder/basename" (see adapters.SequenceCatalogue)."""
-        return self.catalogue.key_of(si, li)
+        """The key gestures drawn on item (si, li) are stored under: its
+        slide (coupon: the folder-qualified "folder/basename", which is the
+        item key too)."""
+        return self._binding_of(self.catalogue.key_of(si, li))[0]
 
     def _current_key(self):
         cur = self._current()
         return self.catalogue.key_of(*cur) if cur is not None else None
 
+    def _gestures_for_key(self, key):
+        """The region gestures item `key` sees, in creation order."""
+        slide, rect = self._binding_of(key)
+        return self.store.for_item(slide, rect) if slide is not None else []
+
+    def _seam_gestures_for_key(self, key):
+        slide, rect = self._binding_of(key)
+        return self.store.for_item_seams(slide, rect) if slide is not None else []
+
+    def _gestures_for(self, si, li):
+        return self._gestures_for_key(self.catalogue.key_of(si, li))
+
+    def _seam_gestures_for(self, si, li):
+        return self._seam_gestures_for_key(self.catalogue.key_of(si, li))
+
+    def _gesture_on_item(self, it, si, li):
+        """Whether a gesture belongs to item (si, li): same slide, and its
+        extent meets the item's place. This replaces the old
+        ``(it.si, it.li) == current`` test everywhere -- the hints now name
+        the slide's first row, which is the same for every item of a slide."""
+        slide, rect = self._binding_of(self.catalogue.key_of(si, li))
+        return slide is not None and it.slice_key == slide and gesture_meets(it, rect)
+
+    def _rebind_store(self, store):
+        """Bind a store's gestures against the session: file keys through
+        the sequences, item keys of an older store rebased to their slide
+        (`rebase`), anything else through the catalogue (`resolve`). The one
+        place the three callbacks are wired. Returns the unbound count."""
+        return store.rebind(self.subsequences, resolve=self.catalogue.index_of,
+                            rebase=self._rebase_key)
+
+    def _annotation_count(self, si, li):
+        return len(self._gestures_for(si, li))
+
+    def _sequence_annotation_count(self, si, counts):
+        """Distinct gestures over the sequence's items: a gesture inside an
+        ROI is seen by the ROI and the overview, and counts once."""
+        seen = set()
+        for li in range(len(self._sequence_item_labels(si))):
+            seen.update(it.uid for it in self._gestures_for(si, li))
+        return len(seen)
+
+    # Levels coarser than the item's at which a gesture counts as drawn
+    # "much coarser": its scale of intent is >= 4x the item's pixel.
+    COARSE_LEVELS = 2
+
+    def _coarse_gestures(self, si, li):
+        """The item's gestures drawn at least ``COARSE_LEVELS`` levels coarser
+        than it works at -- a stroke meant at gland scale applied to a
+        decomposition where the lumen is its own regions. Empty for an app
+        without levels (no `_draw_meta`)."""
+        draw = self._draw_meta(si, li)
+        if not draw or draw.get("level") is None:
+            return []
+        here = int(draw["level"])
+        out = []
+        for it in self._gestures_for(si, li) + self._seam_gestures_for(si, li):
+            lvl = (it.meta or {}).get("level")
+            if isinstance(lvl, (int, float)) and not isinstance(lvl, bool) \
+                    and int(lvl) - here >= self.COARSE_LEVELS:
+                out.append(it)
+        return out
+
+    def _annotation_mark(self, si, li, count):
+        mark = super()._annotation_mark(si, li, count)
+        if count and self._coarse_gestures(si, li):
+            mark += "!"
+        return mark
+
+    def _coarse_notice(self, si, li):
+        """Once per item and task: say that some of what it shows was drawn
+        much coarser (a warning, never a refusal -- whether *gland* at level
+        4 means *gland including lumen* at level 0 is the task's call)."""
+        key = self.catalogue.key_of(si, li)
+        if key is None or key in self._task.caches.coarse_noticed:
+            return
+        coarse = self._coarse_gestures(si, li)
+        if not coarse:
+            return
+        self._task.caches.coarse_noticed.add(key)
+        levels = sorted({int((it.meta or {}).get("level")) for it in coarse})
+        self._notify(f"{len(coarse)} annotation(s) here were drawn at level "
+                     f"{'/'.join(str(l) for l in levels)}, much coarser than this item "
+                     "- they mark the swath the user saw, not this level's regions.")
+
     # ------------------------------------------------------------------ #
     # Interactions
     # ------------------------------------------------------------------ #
-    def _commit_interaction(self, tool, points):
+    def _hints_for(self, slice_key, si, li):
+        """The (si, li) hints a new gesture stores: where its key binds
+        (mspath: the slide's first row), so a gesture drawn on an ROI
+        carries the same hints before and after a save / load."""
+        found = self.catalogue.index_of(slice_key)
+        return (int(found[0]), int(found[1])) if found is not None else (si, li)
+
+    def _with_draw_meta(self, meta, si, li):
+        """`meta` plus the item's scale of intent (`_draw_meta`: level, scale,
+        px) for the keys it does not set itself; None when there is nothing
+        -- a labeler without levels keeps writing meta-less gestures."""
+        out = dict(meta or {})
+        draw = self._draw_meta(si, li) or {}
+        for k, v in draw.items():
+            out.setdefault(k, v)
+        return out or None
+
+    def _commit_interaction(self, tool, points, meta=None):
         cur = self._current()
         if cur is None:
             return
@@ -491,7 +610,9 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         if slice_key is None or not (1 <= cls < self.store.n_classes):
             return
         self._push_history()
-        it = self.store.add(tool, points, cls, slice_key, si, li)
+        hsi, hli = self._hints_for(slice_key, si, li)
+        it = self.store.add(tool, points, cls, slice_key, hsi, hli,
+                            meta=self._with_draw_meta(meta, si, li))
         self._rebuild_class_panels()
         self._refresh_render()
         self.status_var.set(f"#{it.uid} {tool} -> class {cls} ({slice_key})")
@@ -507,7 +628,9 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         if slice_key is None or int(class_id) < 1:
             return
         self._push_history()
-        it = self.store.add_seam(tool, points, int(class_id), slice_key, si, li, meta=meta)
+        hsi, hli = self._hints_for(slice_key, si, li)
+        it = self.store.add_seam(tool, points, int(class_id), slice_key, hsi, hli,
+                                 meta=self._with_draw_meta(meta, si, li))
         self._rebuild_class_panels()
         self._refresh_render()
         name = SEAM_CLASSES[it.class_id] if it.class_id < len(SEAM_CLASSES) else str(it.class_id)
@@ -558,21 +681,30 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         if slice_key is None:
             return
         import numpy as np
+        from .extents import default_ext, outline_of_ids
         rec = self.regions.record(self.catalogue.key_of(si, li))
         table = rec.get("stats") if rec is not None else None
+        place = self._region_placement()
         added = []
         for ids, cls, meta in parts:
             ids = [int(i) for i in ids]
             if not ids or not (1 <= int(cls) < self.store.n_classes):
                 continue
-            pts = _extremum_points(labels, ids, table, np, self.FIELDS,
-                                   self._region_placement())
+            pts = _extremum_points(labels, ids, table, np, self.FIELDS, place)
             if not pts:
                 continue
             if not added:
                 self._push_history()
-            added.append(self.store.add("taps", pts, int(cls), slice_key, si, li,
-                                        meta=meta))
+            hsi, hli = self._hints_for(slice_key, si, li)
+            # The set IS the object (an extent): its outline, in image
+            # coordinates, is what crosses a level; the seeds re-resolve here.
+            meta = dict(meta or {})
+            try:
+                meta["outline"] = outline_of_ids(labels, ids, np, place, ext=default_ext())
+            except Exception as exc:               # never lose the fill over its outline
+                self._log(f"outline not recorded: {type(exc).__name__}: {exc}")
+            added.append(self.store.add("taps", pts, int(cls), slice_key, hsi, hli,
+                                        meta=self._with_draw_meta(meta, si, li)))
         if not added:
             return
         self._rebuild_class_panels()
@@ -604,7 +736,11 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         labels = rec["labels"]
         region_class = pr[1]
         h, w = labels.shape
-        (x0, y0), (x1, y1) = pts[0], pts[-1]
+        # The box arrives in image coordinates; the raster may be a placed
+        # item (an ROI at an origin, an overview at 1/16), so both the
+        # indexing and the recorded points go through the placement.
+        place = self._region_placement()
+        (x0, y0), (x1, y1) = place.to_raster(*pts[0]), place.to_raster(*pts[-1])
         xa, xb = sorted((int(round(x0)), int(round(x1))))
         ya, yb = sorted((int(round(y0)), int(round(y1))))
         xa, xb = max(xa, 0), min(xb, w - 1)
@@ -613,6 +749,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
             return
         sub = labels[ya:yb + 1, xa:xb + 1]
         by_class = {}
+        ids_by_class = {}
         for r in np.unique(sub):
             r = int(r)
             if r < 0 or r >= len(region_class):
@@ -621,15 +758,27 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
             if not (1 <= k < self.store.n_classes):
                 continue
             yy, xx = np.argwhere(sub == r)[0]     # a pixel of r inside the box
-            by_class.setdefault(k, []).append((float(xa + xx), float(ya + yy)))
+            px, py = place.to_image(float(xa + xx), float(ya + yy))
+            by_class.setdefault(k, []).append((float(px), float(py)))
+            ids_by_class.setdefault(k, []).append(r)
         if not by_class:
             self.status_var.set("No predicted classes under the box.")
             return
         slice_key = self._slice_key(si, li)
         self._push_history()
         n = 0
+        hsi, hli = self._hints_for(slice_key, si, li)
+        from .extents import default_ext, outline_of_ids
         for k in sorted(by_class):
-            self.store.add("taps", by_class[k], k, slice_key, si, li)
+            # The accepted set is an extent: its outline crosses a level.
+            meta = {"tool": "accept"}
+            try:
+                meta["outline"] = outline_of_ids(labels, ids_by_class[k], np, place,
+                                                 ext=default_ext())
+            except Exception as exc:
+                self._log(f"outline not recorded: {type(exc).__name__}: {exc}")
+            self.store.add("taps", by_class[k], k, slice_key, hsi, hli,
+                           meta=self._with_draw_meta(meta, si, li))
             n += len(by_class[k])
         self._rebuild_class_panels()
         self._refresh_render()
@@ -660,8 +809,10 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         """Every interaction on a tree row (an item's own; all of a
         sequence's items' for a sequence row -- and, where the app says so,
         those on items of the sequence that are no longer listed)."""
-        return [it for it in self.store.interactions + self.store.seams
-                if self._row_owns_key(si, li, it.slice_key)]
+        if li is None:
+            return [it for it in self.store.interactions + self.store.seams
+                    if self._row_owns_key(si, li, it.slice_key)]
+        return self._gestures_for(si, li) + self._seam_gestures_for(si, li)
 
     def _seq_tree_menu_entries(self, si, li):
         entries = super()._seq_tree_menu_entries(si, li)
@@ -719,6 +870,15 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         msg = super()._remove_rows_message(rows)
         n = len(self._doomed_interactions(rows))
         if not n:
+            # An ITEM row whose gestures survive it (an ROI: they are the
+            # slide's, visible on the overview and back on a re-cut). A
+            # sequence row keeps the old wording -- a coupon slice held by a
+            # second sequence is that sequence's business.
+            on = {it.uid for si, li in rows if li is not None
+                  for it in self._row_interactions(si, li)}
+            if on:
+                return msg + (f"\n\nThe {len(on)} annotation(s) on it are kept: they "
+                              "belong to the slide, not to this row.")
             return msg + "\n\nNo annotations are on it."
         return (msg + f"\n\nThe {n} annotation(s) on it go too (Ctrl+Z brings the "
                       "annotations back, greyed until the data is added again).")
@@ -744,7 +904,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self._hover_key = None
         self._hover_uid = None
         super()._after_rows_removed(cur_key, pos)
-        self.store.rebind(self.subsequences, resolve=self.catalogue.index_of)
+        self._rebind_store(self.store)
         for key in [k for k in self._pred if self.catalogue.index_of(k) is None]:
             self._pred.pop(key, None)
         self._rebuild_class_panels()
@@ -766,7 +926,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self.store = store
         # The file lists bind "folder/basename" keys; the catalogue binds
         # whatever else an app calls an item (a slide's "...@level#rect").
-        unbound = store.rebind(self.subsequences, resolve=self.catalogue.index_of)
+        unbound = self._rebind_store(store)
         self._class_luts.clear()
         self._clear_seam_caches()
         if clear_history:
@@ -1184,7 +1344,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         # migrates legacy bare-basename keys against the qualified identity).
         self.tasks = [Task.from_doc(td, notes) for td in sdoc["tasks"]]
         for t in self.tasks:
-            unbound = t.store.rebind(self.subsequences, resolve=self.catalogue.index_of)
+            unbound = self._rebind_store(t.store)
             if unbound:
                 notes.append(f"task {t.name!r}: {unbound} annotation(s) reference "
                              f"{self.ITEM_NOUN}s not in the session (kept, greyed)")
@@ -1309,7 +1469,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self._apply_task_view(task.view)
         # Rows may have come or gone while the task was inactive: rebind its
         # gestures, and drop predictions made under another row layout.
-        task.store.rebind(self.subsequences, resolve=self.catalogue.index_of)
+        self._rebind_store(task.store)
         sig = tuple(self.catalogue.keys())
         if task.caches.keys_sig is not None and task.caches.keys_sig != sig:
             task.caches.pred.clear()

@@ -15,12 +15,24 @@ geometry (annotations.json -- labels.json before the rename; the document
 itself is unchanged, so old files still load). Note the two senses of "label"
 that rename separated: the ANNOTATIONS here are gestures, while ``labels`` in
 the compute path is the MSC label raster this module rasterizes them onto.
-The file basename is the authoritative slice identity
-so a session survives folder moves; ``(si, li)`` are session-local hints,
-recomputed by ``rebind()``.
+A gesture is keyed by the SLIDE it was drawn on (coupon: the folder-qualified
+slice file, which is its own slide; mspath: ``"folder/slide.svs"``), never by
+the item -- a place at a resolution -- it happened to be drawn on: the
+geometry is a statement about tissue at a location, so every item covering
+that location, at any level, queries it (``for_item``). ``(si, li)`` are
+session-local hints, recomputed by ``rebind()``.
+
+``meta`` never selects WHAT a gesture paints on the level it was drawn at;
+the geometry alone does. Off that level, ``meta["level"]`` / ``["scale"]`` /
+``["px"]`` (the scale of intent: the drawing item's level, its slide pixels
+per raster pixel, and the slide pixels per screen pixel at draw time) and
+``meta["outline"]`` (an extent's closed loops) choose HOW the same geometry
+is applied -- a stroke keeps the width the user saw, an extent resolves by
+its outline rather than by seeds that would land in different regions.
 """
 from __future__ import annotations
 
+import math
 import os
 
 # Class 0 is "no label" (transparent). Classes 1..4 get fixed, saturated colors
@@ -64,17 +76,19 @@ class Interaction:
 
     def __init__(self, uid, slice_key, si, li, tool, points, class_id, meta=None):
         self.uid = int(uid)
-        self.slice_key = str(slice_key)          # file basename
+        self.slice_key = str(slice_key)          # the slide (coupon: the slice file)
         self.si = si                             # session-local hints (or None)
         self.li = li
         self.tool = str(tool)
         self.points = [(float(x), float(y)) for x, y in points]
         self.class_id = int(class_id)
-        # Optional provenance, JSON-safe values only (a magic fill records the
-        # tool that produced its taps, the seed, threshold and metric). Display
-        # and export read it; resolution never does -- the geometry alone
-        # decides what a gesture paints, so a re-decomposition cannot be
-        # steered by stale metadata.
+        # Optional provenance and scale of intent, JSON-safe values only (a
+        # magic fill records the tool that produced its taps, the seed,
+        # threshold and metric; a placed labeler records level / scale / px;
+        # an extent records its outline). On the drawing level resolution
+        # never reads it -- the geometry alone decides what a gesture paints,
+        # so a re-decomposition cannot be steered by stale metadata. Off that
+        # level it only chooses how the geometry is applied (module docstring).
         self.meta = dict(meta) if meta else None
 
     @property
@@ -231,6 +245,20 @@ class LabelStore:
         """The slice's seam gestures in creation order."""
         return [it for it in self.seams if it.slice_key == slice_key]
 
+    def for_item(self, slice_key, rect=None):
+        """The gestures an ITEM sees: those keyed by its slide whose extent
+        (points, outline, stroke width) meets `rect` -- ``(x, y, w, h)`` in
+        image pixels, the item's place on the slide -- or every one of the
+        slide's when `rect` is None (a whole slice / the overview). Creation
+        order, like ``for_slice``."""
+        return [it for it in self.interactions
+                if it.slice_key == slice_key and gesture_meets(it, rect)]
+
+    def for_item_seams(self, slice_key, rect=None):
+        """``for_item`` over the seam gestures."""
+        return [it for it in self.seams
+                if it.slice_key == slice_key and gesture_meets(it, rect)]
+
     def get(self, uid):
         for it in self.interactions:
             if it.uid == uid:
@@ -307,7 +335,7 @@ class LabelStore:
         store.rev += 1
         return store
 
-    def rebind(self, subsequences, resolve=None):
+    def rebind(self, subsequences, resolve=None, rebase=None):
         """Re-derive the (si, li) hints by matching each interaction's
         folder-qualified slice key (``"folder/basename"``) against
         ``subsequences`` ([{"name", "folder", "files"}]).
@@ -319,11 +347,16 @@ class LabelStore:
         than silently binding to the first match, which is what the old
         first-wins behaviour did. Returns the number left unbound.
 
-        ``resolve(key) -> (si, li) | None`` is asked about a key the file
-        matching cannot place -- an app whose item keys are not
-        ``"folder/basename"`` (a slide's ``"folder/name@level#rect"``) binds
-        through its catalogue this way; without it every such key stays
-        unbound for good."""
+        ``rebase(key) -> (slide_key, level, scale) | None`` upgrades a key
+        written when gestures were bound to ITEMS (a slide's
+        ``"folder/name@level#rect"``) to the slide's own key, in place, the
+        way v1 basenames are -- and records the item's level and scale as
+        the gesture's scale of intent (``meta``) unless it already has one.
+        ``resolve(key) -> (si, li) | None`` is then asked about a key the
+        file matching cannot place -- an app whose keys are not
+        ``"folder/basename"`` binds through its catalogue this way; without
+        it every such key stays unbound for good. Both are idempotent, so a
+        second pass (an undo snapshot, a task switch) changes nothing."""
         by_key = {}                      # "folder/basename" -> (si, li)
         by_base = {}                     # basename -> [(qualified_key, si, li)]
         for si, s in enumerate(subsequences):
@@ -342,6 +375,21 @@ class LabelStore:
                     key, si, li = candidates[0]
                     it.slice_key = key
                     hit = (si, li)
+            if hit is None and rebase is not None:
+                try:
+                    rb = rebase(it.slice_key)
+                except Exception:
+                    rb = None
+                if rb is not None:                  # an item key: move to its slide
+                    new_key, level, scale = rb
+                    it.slice_key = str(new_key)
+                    meta = dict(it.meta or {})
+                    if level is not None:
+                        meta.setdefault("level", int(level))
+                    if scale is not None:
+                        meta.setdefault("scale", float(scale))
+                    it.meta = meta or None
+                    hit = by_key.get(it.slice_key)
             if hit is None and resolve is not None:
                 try:
                     found = resolve(it.slice_key)
@@ -394,22 +442,66 @@ def polygon_mask(pts, w, h, np):
     return np.asarray(im, dtype=bool), ya, xa
 
 
-def touched_ids(interaction, labels, np):
+def stroke_mask(pts, width, w, h, np):
+    """The polyline drawn `width` raster pixels wide with round joints and
+    ends (a click is a disk), as ``(mask, ya, xa)`` over its own bbox crop of
+    an ``h x w`` raster -- or None when the crop is empty. PIL draws it, as
+    it does the lasso, so the cost is the area and not the width."""
+    from PIL import Image, ImageDraw
+    if not pts:
+        return None
+    r = float(width) / 2.0
+    xs = [x for x, _ in pts]
+    ys = [y for _, y in pts]
+    xa = max(0, int(math.floor(min(xs) - r)) - 1)
+    ya = max(0, int(math.floor(min(ys) - r)) - 1)
+    xb = min(int(w), int(math.ceil(max(xs) + r)) + 2)
+    yb = min(int(h), int(math.ceil(max(ys) + r)) + 2)
+    if xb <= xa or yb <= ya:
+        return None
+    img = Image.new("L", (xb - xa, yb - ya), 0)
+    d = ImageDraw.Draw(img)
+    local = [(x - xa, y - ya) for x, y in pts]
+    if len(local) > 1:
+        d.line(local, fill=1, width=max(1, int(round(width))), joint="curve")
+    for x, y in local:
+        d.ellipse([x - r, y - r, x + r, y + r], fill=1)
+    return np.asarray(img, dtype=bool), ya, xa
+
+
+def touched_ids(interaction, labels, np, width=None, off_level=False):
     """The set of region ids the gesture touches on `labels` (background -1
     is never included).
 
-    squiggle: every pixel under the polyline's segments.
+    squiggle: every pixel under the polyline's segments -- a hairline, or a
+              stroke `width` raster pixels wide when that exceeds 1.5 (the
+              width the user saw: ``meta["px"]`` slide px per screen px,
+              divided by the raster's scale; ``touched_ids_over`` passes it).
     box:      every region intersecting the rectangle spanned by the first and
               last point (a region merely overlapping the box counts).
     polygon:  every region under the filled (auto-closed) lasso, outline
               included so a degenerate sliver still picks what it was drawn on.
-    taps:     each point sampled independently (no connecting segments).
+    taps:     each point sampled independently (no connecting segments); an
+              extent (``meta["outline"]``) applied `off_level` -- on a raster
+              other than the one it was drawn on -- resolves by its outline
+              instead, since seeds land in different regions at another level.
     """
     h, w = labels.shape
     pts = interaction.points
     if not pts:
         return set()
-    if interaction.tool == "taps":
+    meta = interaction.meta or {}
+    if interaction.tool == "taps" and off_level and meta.get("outline"):
+        from .extents import extent_mask
+        em = extent_mask(meta["outline"], w, h, np)
+        if em is None:
+            return set()
+        mask, ya, xa = em
+        if not mask.any():
+            return set()
+        sub = labels[ya:ya + mask.shape[0], xa:xa + mask.shape[1]]
+        vals = np.unique(sub[mask])
+    elif interaction.tool == "taps":
         vals = []
         for (x, y) in pts:
             ys, xs = line_pixels(x, y, x, y, w, h, np)
@@ -438,7 +530,16 @@ def touched_ids(interaction, labels, np):
             return set()
         sub = labels[ya:ya + mask.shape[0], xa:xa + mask.shape[1]]
         vals = np.unique(sub[mask])
-    else:  # squiggle
+    elif width is not None and float(width) > 1.5:   # a squiggle with its width
+        sm = stroke_mask(pts, float(width), w, h, np)
+        if sm is None:
+            return set()
+        mask, ya, xa = sm
+        if not mask.any():
+            return set()
+        sub = labels[ya:ya + mask.shape[0], xa:xa + mask.shape[1]]
+        vals = np.unique(sub[mask])
+    else:  # squiggle, a hairline
         vals = []
         for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
             ys, xs = line_pixels(x0, y0, x1, y1, w, h, np)
@@ -500,28 +601,89 @@ class Placement:
 IDENTITY = Placement()
 
 
-def gesture_bbox(interaction, np, pad=1):
-    """(x, y, w, h) covering a gesture's points, or None when it has none.
-
-    `pad` widens it by a pixel on every side so a click, a horizontal squiggle
-    or a zero-area box still names a rect with something in it.
-    """
-    pts = interaction.points
+def gesture_extent(interaction, pad=1):
+    """Inclusive ``(x0, y0, x1, y1)`` in image pixels covering everything the
+    gesture can touch -- its points, every ``meta["outline"]`` loop, and half
+    its recorded stroke width (``meta["px"]``) -- or None when it has no
+    points. `pad` widens it by a pixel on every side so a click, a horizontal
+    squiggle or a zero-area box still names a rect with something in it; a
+    gesture without a recorded width or outline gets exactly that pad, so
+    the numbers older callers saw are unchanged."""
+    pts = list(interaction.points)
+    meta = interaction.meta or {}
+    for loop in meta.get("outline") or ():
+        pts.extend((float(x), float(y)) for x, y in loop)
     if not pts:
         return None
-    xs = [int(np.floor(x)) for x, _ in pts]
-    ys = [int(np.floor(y)) for _, y in pts]
-    x0, x1 = min(xs) - pad, max(xs) + pad
-    y0, y1 = min(ys) - pad, max(ys) + pad
+    px = meta.get("px")
+    if isinstance(px, (int, float)) and not isinstance(px, bool) and px > 0:
+        pad = max(pad, 1 + int(math.ceil(px / 2.0)))
+    xs = [int(math.floor(x)) for x, _ in pts]
+    ys = [int(math.floor(y)) for _, y in pts]
+    return min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad
+
+
+def gesture_meets(interaction, rect):
+    """Whether the gesture's extent meets `rect` ``(x, y, w, h)``; a None
+    rect (a whole slide) meets everything that has geometry."""
+    ext = gesture_extent(interaction)
+    if ext is None:
+        return False
+    if rect is None:
+        return True
+    x, y, w, h = rect
+    x0, y0, x1, y1 = ext
+    return x0 < x + w and x1 >= x and y0 < y + h and y1 >= y
+
+
+def gesture_bbox(interaction, np, pad=1):
+    """(x, y, w, h) covering a gesture's extent, or None when it has none
+    (see ``gesture_extent``; `np` is kept for the callers' sake)."""
+    ext = gesture_extent(interaction, pad)
+    if ext is None:
+        return None
+    x0, y0, x1, y1 = ext
     return x0, y0, x1 - x0 + 1, y1 - y0 + 1
+
+
+def transformed(interaction, fn):
+    """The same gesture with every point -- its own and its outline's --
+    mapped through ``fn(x, y) -> (x, y)``: how a gesture in image coordinates
+    becomes one in a raster crop's."""
+    meta = interaction.meta
+    if meta and meta.get("outline"):
+        meta = dict(meta)
+        meta["outline"] = [[list(fn(float(x), float(y))) for x, y in loop]
+                           for loop in meta["outline"]]
+    return Interaction(interaction.uid, interaction.slice_key, interaction.si,
+                       interaction.li, interaction.tool,
+                       [fn(x, y) for x, y in interaction.points],
+                       interaction.class_id, meta)
 
 
 def shifted(interaction, dx, dy):
     """The same gesture with its points moved by (dx, dy)."""
-    return Interaction(interaction.uid, interaction.slice_key, interaction.si,
-                       interaction.li, interaction.tool,
-                       [(x + dx, y + dy) for x, y in interaction.points],
-                       interaction.class_id, interaction.meta)
+    return transformed(interaction, lambda x, y: (x + dx, y + dy))
+
+
+def resolve_opts(interaction, raster_scale):
+    """How a gesture's geometry applies on a raster of `raster_scale`
+    (image px per raster px), from its scale of intent: the stroke width in
+    raster px (``meta["px"]``, slide px per screen px at draw time), and
+    whether this is a raster other than the one it was drawn on (its
+    ``meta["scale"]``), where an extent resolves by outline. A gesture with
+    no such meta -- every coupon gesture, every older one -- gets the
+    hairline and the seeds it always had."""
+    meta = interaction.meta or {}
+    sc = float(raster_scale) or 1.0
+    width = None
+    px = meta.get("px")
+    if isinstance(px, (int, float)) and not isinstance(px, bool) and px > 0:
+        width = float(px) / sc
+    drawn = meta.get("scale")
+    off_level = (isinstance(drawn, (int, float)) and not isinstance(drawn, bool)
+                 and not math.isclose(float(drawn), sc, rel_tol=1e-6))
+    return {"width": width, "off_level": off_level}
 
 
 def touched_ids_over(interaction, layer, np):
@@ -537,7 +699,7 @@ def touched_ids_over(interaction, layer, np):
     """
     full = layer.full()
     if full is not None:
-        return touched_ids(interaction, full, np)
+        return touched_ids(interaction, full, np, **resolve_opts(interaction, 1.0))
     box = gesture_bbox(interaction, np)
     if box is None:
         return set()
@@ -565,12 +727,9 @@ def touched_ids_over(interaction, layer, np):
         sub = crop_raster(rx0, ry0, rx1 - rx0, ry1 - ry0)
         if sub is None or sub.size == 0:
             return set()
-        exact = Interaction(interaction.uid, interaction.slice_key, interaction.si,
-                            interaction.li, interaction.tool,
-                            [((px - ox) / sc - rx0, (py - oy) / sc - ry0)
-                             for px, py in interaction.points],
-                            interaction.class_id, interaction.meta)
-        return touched_ids(exact, sub, np)
+        exact = transformed(interaction,
+                            lambda px, py: ((px - ox) / sc - rx0, (py - oy) / sc - ry0))
+        return touched_ids(exact, sub, np, **resolve_opts(interaction, sc))
     # Otherwise crop at the RASTER's resolution, not the image's. A layer whose ids live
     # at 1/128 of the image (a coarse overview) would otherwise be asked for
     # its bbox at level 0: a box over the whole item is the whole slide,
@@ -589,12 +748,10 @@ def touched_ids_over(interaction, layer, np):
         return set()
     sub = layer.crop(level, lx0, ly0, lx1 - lx0, ly1 - ly0)
     if s == 1.0:
-        return touched_ids(shifted(interaction, -lx0, -ly0), sub, np)
-    scaled = Interaction(interaction.uid, interaction.slice_key, interaction.si,
-                         interaction.li, interaction.tool,
-                         [(px / s - lx0, py / s - ly0) for px, py in interaction.points],
-                         interaction.class_id, interaction.meta)
-    return touched_ids(scaled, sub, np)
+        return touched_ids(shifted(interaction, -lx0, -ly0), sub, np,
+                           **resolve_opts(interaction, s))
+    scaled = transformed(interaction, lambda px, py: (px / s - lx0, py / s - ly0))
+    return touched_ids(scaled, sub, np, **resolve_opts(interaction, s))
 
 
 def touched_sets(interactions, labels, np, layer=None):

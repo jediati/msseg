@@ -567,8 +567,7 @@ class ClassPanelMixin:
         cur = self._current()
         if cur is None:
             return list(self.store.interactions)
-        key = self._slice_key(*cur)
-        return [it for it in self.store.interactions if it.slice_key == key]
+        return self._gestures_for(*cur)
 
     def _class_totals(self):
         """ALL-slice totals per class: (annotations, labeled regions). Region
@@ -577,15 +576,19 @@ class ClassPanelMixin:
         nothing to count yet)."""
         import numpy as np
         annot = {}
-        slices = {}                      # slice_key -> (si, li), bound only
         for it in self.store.interactions:
             annot[it.class_id] = annot.get(it.class_id, 0) + 1
-            if it.bound:
-                slices.setdefault(it.slice_key, (it.si, it.li))
+        # Per ITEM (a gesture is the slide's, and every item that sees it
+        # resolves it on its own decomposition), over the items that have a
+        # record and see at least one gesture.
         regions = {}
-        for _key, (si, li) in slices.items():
-            rec = self.regions.record(self.catalogue.key_of(si, li))
-            if rec is None or rec.get("labels") is None:
+        for key in self.catalogue.keys():
+            pos = self.catalogue.index_of(key)
+            if pos is None:
+                continue
+            si, li = pos
+            rec = self.regions.record(key)
+            if rec is None or rec.get("labels") is None or not self._gestures_for_key(key):
                 continue
             counts = self._labels_cache_for(si, li, rec, np)[4]
             for k in range(1, self.store.n_classes):
@@ -663,10 +666,9 @@ class ClassPanelMixin:
         all. Depends on the current slice, so a surviving row can need it
         rewritten even though the interaction did not change."""
         cur = self._current()
-        cur_key = self._slice_key(*cur) if cur is not None else None
         if not it.bound:
             where = f"  [{it.slice_key} (unbound)]"
-        elif it.slice_key != cur_key:
+        elif cur is None or not self._gesture_on_item(it, *cur):
             where = f"  [{it.slice_key}]"
         else:
             where = ""
@@ -807,7 +809,7 @@ class ClassPanelMixin:
         import numpy as np
         touch = self._touch_map_for(si, li, rec, np)
         best = None
-        for it in self.store.for_slice(self._slice_key(si, li)):
+        for it in self._gestures_for(si, li):
             ids = touch.get(it.uid)
             if ids and region in ids and (best is None or it.uid > best):
                 best = it.uid
@@ -836,7 +838,8 @@ class ClassPanelMixin:
         v = self.viewer
         if it is None or v is None or not it.points or not it.bound:
             return
-        if self._current() != (it.si, it.li):
+        cur = self._current()
+        if cur is None or not self._gesture_on_item(it, *cur):
             return
         c = v.canvas
         color = self._class_color_hex(it.class_id)
@@ -924,7 +927,7 @@ class ClassPanelMixin:
                 return
             import numpy as np
             touch = self._touch_map_for(si, li, rec, np)
-            for it in self.store.for_slice(self._slice_key(si, li)):
+            for it in self._gestures_for(si, li):
                 ids = touch.get(it.uid)
                 if ids and region in ids:
                     self._draw_interaction_geometry(it)
@@ -982,7 +985,7 @@ class ClassPanelMixin:
             return
         import numpy as np
         touch = self._touch_map_for(cur[0], cur[1], rec, np)
-        for it in self.store.for_slice(self._slice_key(*cur)):
+        for it in self._gestures_for(*cur):
             ids = touch.get(it.uid)
             if ids and region in ids:
                 self._draw_interaction_geometry(it)
@@ -994,7 +997,10 @@ class ClassPanelMixin:
         v = self.viewer
         if it is None or v is None or not it.points or not it.bound:
             return
-        if self._current() != (it.si, it.li):
+        cur = self._current()
+        if cur is None or not self._gesture_on_item(it, *cur):
+            # Its hints name the slide's first row (the overview), which
+            # always covers the gesture.
             try:
                 idx = self.flat_slices.index((it.si, it.li))
             except ValueError:

@@ -145,6 +145,8 @@ extremum's position and value columns. The magic fill, `TrainingSetBuilder`,
 | `_run_settings()` / `_apply_run_settings` / `_apply_view_state` | `{}` / none / none | cores + concurrency / the coupon view keys |
 | `_session_doc_from_json` / `_import_legacy_docs` / `_profile_to_file_doc` / `_profile_from_file_doc` / `_profile_from_ui` / `_apply_profile_to_ui` | passthrough | `session.*` |
 | `_session_doc_kwargs()` / `PROFILE_SECTION_TITLE` / `_left_section_parent("tasks")` | `{}` / `"0. Compute profile"` / `self.left` | the annotation shell passes its `tasks` + `active_task` (the document becomes v3), titles the box `"0. Workflow"` and packs the Tasks list above the session lists |
+| `_draw_meta(si, li)` / `_annotation_mark(si, li, count)` / `_sequence_annotation_count(si, counts)` | None / `str(count)` / `sum(counts)` | mspath records `{"level", "scale", "px"}` on every new gesture (its scale of intent); the labeler appends `!` when an item shows gestures drawn `COARSE_LEVELS` (2) or more levels coarser and counts distinct gestures per sequence (a gesture inside an ROI is seen by the ROI and the overview) |
+| `ItemCatalogue.binding_of(key)` / `rebase(key)` | (protocol) | coupon `(key, None)` / None; mspath `(slide, rect)` / `(slide, level, scale)` for an item key -- and `index_of` resolves a bare slide key to the slide's first row |
 
 **Tasks** (`task.py`, `AnnotationShell`): a session holds several named
 detectors and one is active. Every attribute the mixins, the tools and the
@@ -194,9 +196,31 @@ reach the app only through `viewer`, `regions`, `catalogue`, `store`,
 
 ## Contracts that must not break
 
-* **annotations.json v2** (`LabelStore.to_json`): raw gesture geometry per
-  item key; v1 bare-basename keys migrate on `rebind()` when unambiguous.
-  `tests/test_compat_docs.py` pins the byte-identical round trip.
+* **annotations.json v2** (`LabelStore.to_json`): raw gesture geometry,
+  keyed by the SLIDE (coupon: the folder-qualified slice file, which is its
+  own slide; mspath: `items.slide_id`); v1 bare-basename keys migrate on
+  `rebind()` when unambiguous, and item keys of a store written before
+  gestures were slide-bound (`slide@level#rect`) rebase to the slide through
+  the catalogue's `rebase`, recording the item's level / scale as the
+  gesture's scale of intent. `tests/test_compat_docs.py` pins the
+  byte-identical round trip; `tests/test_slide_binding.py` the rebase.
+* **Gestures are the slide's; items query them** (`LabelStore.for_item`,
+  the shell's `_gestures_for_key` / `_gesture_on_item`): an item sees the
+  gestures whose extent (`gesture_extent`: points, outline, half the stroke
+  width) meets its rect (`ItemCatalogue.binding_of`). Never select by
+  `it.slice_key == item key` or by the `(si, li)` hints -- the hints name
+  the slide's first row.
+* **`meta` and resolution.** On the level a gesture was drawn at the
+  geometry alone decides what it paints (a re-decomposition cannot be
+  steered by stale metadata). Off that level, `meta["px"]` (slide px per
+  screen px at draw time) keeps a stroke the width the user saw
+  (`stroke_mask`, when it exceeds 1.5 raster px -- also on the drawing
+  level for gestures that carry it), `meta["outline"]` (an extent's closed
+  loops, `extents.py`) resolves a magic fill / blob / accepted prediction
+  by its outline instead of its seeds, and `meta["scale"]` switches a trace
+  from exact crack ids to a corridor (`seam_labeling.corridor_coverage`).
+  Gestures without these keys -- every coupon gesture, every older one --
+  behave exactly as before. `_draw_meta` is where an app records them.
 * **Classifier pickle** (`ModelBundle`): v4 written, v1-v4 read by feature
   detection. The old module paths `msseg.mscoupon.model_search.FeatureSubset`
   and `msseg.mscoupon.torch_mlp.TorchMLPClassifier` resolve through the shims

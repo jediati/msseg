@@ -80,6 +80,24 @@ class ItemCatalogue(Protocol):
         navigation tree; a node with a None key is a container."""
         ...
 
+    # -- binding: what a gesture on an item is keyed by ------------------ #
+    def binding_of(self, key: ItemKey) -> Tuple[str, Optional[Tuple[int, int, int, int]]]:
+        """``(slide_key, rect)``: the key gestures drawn on `key` are stored
+        under -- the SLIDE, so every item covering the same place shares
+        them -- and the item's place on it as ``(x, y, w, h)`` in image
+        pixels, or None for the whole slide. An app whose item IS its slide
+        (coupon: a slice file) returns ``(key, None)``. ``index_of`` must
+        resolve a slide key too (to the slide's first row)."""
+        ...
+
+    def rebase(self, key: str) -> Optional[Tuple[str, Optional[int], Optional[float]]]:
+        """For a key written when gestures were keyed by ITEM (mspath:
+        ``"folder/slide.svs@level#rect"``): ``(slide_key, level, scale)`` --
+        the slide's key and the item's level and slide-pixels-per-raster-pixel,
+        recorded on the gesture as its scale of intent. None when `key` is
+        not such a key (a slide key, a slice file)."""
+        ...
+
 
 @runtime_checkable
 class RegionProvider(Protocol):

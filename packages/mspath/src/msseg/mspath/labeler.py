@@ -76,6 +76,32 @@ class LabelerApp(AnnotationShell, MsPathApp):
             return Placement()
         return Placement(origin=rec["origin"], scale=rec["scale"])
 
+    def _draw_meta(self, si, li):
+        """The scale of intent a gesture drawn on item (si, li) records: the
+        item's level, its slide pixels per raster pixel, and the slide pixels
+        per screen pixel at draw time. A gesture is the SLIDE's, so an item
+        at another level applying it needs to know how coarse it was."""
+        item = self._item_at(si, li)
+        if item is None:
+            return None
+        rec = self.engine.record(item.key)
+        level = int(rec["level"]) if rec is not None else int(item.level)
+        if rec is not None:
+            scale = float(rec["scale"])
+        else:
+            try:
+                scale = float(self.engine.source(item.slide).level_scale(level))
+            except Exception:
+                scale = float(2 ** level)
+        meta = {"level": level, "scale": scale}
+        v = self.viewer
+        if v is not None:
+            try:
+                meta["px"] = float(v.scale)
+            except (AttributeError, TypeError, ValueError):
+                pass
+        return meta
+
     # ------------------------------------------------------------------ #
     # The compatibility gate
     # ------------------------------------------------------------------ #
@@ -279,7 +305,7 @@ class LabelerApp(AnnotationShell, MsPathApp):
             if pr is not None and pr[0] == rec.get("commit"):
                 take = min(len(pr[1]), n_ids)
                 region_class[:take] = np.asarray(pr[1][:take], np.uint8)
-            drawn = resolve_slice(self.store.for_slice(key), labels, np,
+            drawn = resolve_slice(self._gestures_for_key(key), labels, np,
                                   self.regions.label_layer(key))
             take = min(len(drawn), n_ids)
             m = np.asarray(drawn[:take]) > 0
@@ -332,7 +358,7 @@ class LabelerApp(AnnotationShell, MsPathApp):
                 table = None if rec is None else rec.get("stats")
                 if rec is None or getattr(table, "values", None) is None:
                     continue
-                drawn = resolve_slice(self.store.for_slice(key), rec["labels"], np,
+                drawn = resolve_slice(self._gestures_for_key(key), rec["labels"], np,
                                       self.regions.label_layer(key))
                 fid = table.column(self.FIELDS.id_field)
                 if fid is None:

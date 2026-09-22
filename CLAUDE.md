@@ -236,6 +236,37 @@ greyed on activation); `MAX_CLASSES` still bounds every vocabulary.
 Tests: `test_task.py`, `test_class_names.py`, `test_session_doc_tasks.py`,
 plus task sections in both labeler selftests.
 
+**Slide-bound gestures** (2026-09-21, stage 2 of the same design note, §8):
+a gesture is a statement about tissue at a location, so it is keyed by the
+**slide** (`Interaction.slice_key` = `items.slide_id` in mspath; the coupon
+slice is its own slide, unchanged), NOT by the item (`slide@level#rect`) it
+was drawn on; every item covering the location -- an ROI, the overview, the
+same rect at another level -- queries it by rect (`LabelStore.for_item`,
+`gesture_extent`; `ItemCatalogue.binding_of(key) -> (slide, rect)`). The
+shell's `_gestures_for_key` / `_gestures_for` / `_gesture_on_item` replace
+every `for_slice(item key)` and `(it.si, it.li) == current` test (view,
+class panel, seams panel, training/classifier, exports); the `(si, li)`
+hints of a gesture name the slide's first row. Removing an ROI dooms no
+gesture (they stay visible on the overview, back on a re-cut); removing the
+slide dooms all. An older store's item keys **rebase** on load
+(`rebind(rebase=catalogue.rebase)`: key -> slide, the item's level/scale
+recorded in `meta`). Every new gesture records its **scale of intent**
+(`_draw_meta`: `meta.level`, `meta.scale` = slide px per raster px,
+`meta.px` = slide px per screen px; the coupon records nothing, so its
+documents are unchanged) and the meta rule is amended: on the drawing level
+geometry alone decides; off it, `px` keeps a stroke the width the user saw
+(`stroke_mask`, PIL, applied always for new gestures when > 1.5 raster px),
+`outline` (an extent's closed loops, `extents.py`: the seam graph of the
+0/1 mask, Euler-chained, even-odd fill on a 2x centre grid) resolves a
+magic fill / blob / SHIFT-accept by outline instead of seeds, and `scale`
+switches a trace to a corridor (`seam_labeling.corridor_coverage`, r = the
+coarser of the two pixels; exact crack ids on its own lattice). Also fixed:
+`_accept_predictions` now goes through `_region_placement()`. A `!` on the
+tree's annot cell and one notice per item flag gestures drawn >= 2 levels
+coarser. mpp / physical units deferred. Tests: `test_slide_binding.py`,
+`test_catalogue_binding.py`, `test_stroke_width.py`, `test_extents.py`,
+`test_seam_corridor.py`; the mspath selftest's tree-rows block rewritten.
+
 **mscoupon labeler magic fill + gesture previews** (`mscoupon-labeler`, see
 [docs/mscoupon_labeler.md](docs/mscoupon_labeler.md)): every drawing gesture now
 previews the regions it WILL paint on a transient canvas layer (brightened class

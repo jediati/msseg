@@ -110,7 +110,7 @@ class ClassifierMixin:
         if with_labels:
             ids = table.column(self.FIELDS.id_field)
             rc = self._training_builder.row_classes(
-                self.store.for_slice(key), labels, ids, np, self.regions.label_layer(key))
+                self._gestures_for_key(key), labels, ids, np, self.regions.label_layer(key))
             rng = None
             if training:
                 import zlib
@@ -294,7 +294,8 @@ class ClassifierMixin:
         try:
             return self._training_builder.labeled_set(
                 items, self.store, np,
-                layer_of=lambda key, rec: self.regions.label_layer(key))
+                layer_of=lambda key, rec: self.regions.label_layer(key),
+                gestures_of=self._gestures_for_key)
         except TrainingProblem as problem:
             self.status_var.set(str(problem))
             return None
@@ -369,7 +370,8 @@ class ClassifierMixin:
         try:
             return self._training_builder.edge_set(
                 items, self.store, names, arcs_of, np,
-                layer_of=lambda key, rec: self.regions.label_layer(key))
+                layer_of=lambda key, rec: self.regions.label_layer(key),
+                gestures_of=self._gestures_for_key)
         except TrainingProblem as problem:
             self.status_var.set(str(problem))
             return None

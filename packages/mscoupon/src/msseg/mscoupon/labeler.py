@@ -235,7 +235,7 @@ class LabelerApp(AnnotationShell, MscouponApp):
                         pred = self._predict_slice(si, li, rec, np)
                         if pred is not None:
                             combined = pred.copy()
-                    user = resolve_slice(self.store.for_slice(key), labels, np)
+                    user = resolve_slice(self._gestures_for_key(key), labels, np)
                     combined[user > 0] = user[user > 0]    # annotations win
                     if not combined.any():
                         skipped += 1                       # nothing to teach
@@ -300,7 +300,7 @@ class LabelerApp(AnnotationShell, MscouponApp):
                     skipped += 1
                     continue
                 labels = rec["labels"]
-                rc = resolve_slice(self.store.for_slice(key), labels, np)
+                rc = resolve_slice(self._gestures_for_key(key), labels, np)
                 # Classifier predictions ride along when they exist for this
                 # commit; blank otherwise (a prediction of class 0 never
                 # happens -- the model only knows labeled classes).

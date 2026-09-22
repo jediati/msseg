@@ -90,7 +90,7 @@ def design(spec, training=True, zero_labels=False):
         arcs = app.regions.arcs(key, np)
         extra = None
         if spec.labels is not None:
-            rc = builder.row_classes(app.store.for_slice(key), rec["labels"],
+            rc = builder.row_classes(app._gestures_for_key(key), rec["labels"],
                                      table.column(conv.id_field), np, app.regions.label_layer(key))
             if zero_labels:
                 rc = np.zeros_like(rc)

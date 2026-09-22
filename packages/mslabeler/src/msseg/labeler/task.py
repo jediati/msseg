@@ -105,6 +105,9 @@ class TaskCaches:
     # are keyed by row position, so a row layout that changed while the task
     # was inactive invalidates them on activation.
     keys_sig: Any = None
+    # Item keys whose "drawn much coarser" notice was shown this session (a
+    # UI memory, so it survives ``clear``).
+    coarse_noticed: set = field(default_factory=set)
 
     def clear(self) -> None:
         self.pred.clear()

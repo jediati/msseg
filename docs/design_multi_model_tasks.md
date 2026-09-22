@@ -1,9 +1,11 @@
 # Design note: many task-specific models over one set of slides
 
-Status: **third draft; stage 1 built** (2026-09-21; first draft 2026-09-18).
+Status: **third draft; stages 1-2 built** (2026-09-21; first draft 2026-09-18).
 Stage 1 of §12 -- the task object with a stack, the Tasks list, session v3 --
-is implemented (`msseg.labeler.task`, `AnnotationShell`; see "What exists"
-at the end of §12). Stages 2-8 remain proposals. The second draft was a
+and stage 2 -- slide-bound gestures with a scale of intent, stroke width,
+extent outlines and the trace corridor (§8) -- are implemented
+(`msseg.labeler.task`, `extents`, `AnnotationShell`; see "What exists" at
+the end of §12). Stages 3-8 remain proposals. The second draft was a
 critique-and-rewrite of the first (§1); the third adds §8, which reverses one
 of the first draft's "load-bearing" claims -- that a gesture should bind to an
 item -- after the observation that a squiggle saying *inside gland* is a
@@ -519,14 +521,40 @@ labeler selftests. Not done, by design: places/enrolment, slide-bound
 gestures, layered cache keys (a cross-workflow switch still drops primes),
 subscriptions, multi-task display.
 
+**What exists (stage 2, 2026-09-21).** Gestures are keyed by the slide
+(`ItemCatalogue.binding_of` / `rebase`, `LabelStore.for_item` /
+`gesture_extent`, the shell's `_gestures_for_key` / `_gesture_on_item`
+replacing every item-key and hint-equality selection; hints name the
+slide's first row); an ROI's removal dooms nothing, the slide's dooms all;
+older item-keyed stores rebase on load with the item's level / scale
+recorded. `_draw_meta` records the scale of intent (`level`, `scale`,
+`px`; mspath only). Width-aware strokes (`stroke_mask`, PIL; always for new
+gestures, > 1.5 raster px). Extents (`extents.py`): the outline of a magic
+fill / blob / accepted prediction as closed loops via the seam graph of the
+0/1 mask, Euler-chained, even-odd filled on a 2x centre grid; consulted off
+the drawing level only. Trace corridor (`seam_labeling.corridor_coverage`,
+radius = the coarser of the two pixels; exact ids on the own lattice).
+`_accept_predictions` fixed to honour the placement. Coarse-gesture mark
+(`!`, `COARSE_LEVELS = 2`) and a once-per-item notice. Decisions taken on
+the way: width applies always for new gestures (§8.2.2), mpp deferred
+(§8.3, still recommended as a per-slide frame later), `meta` keys are read
+only to choose HOW geometry applies off its level (§8.1's rule made exact),
+the seam-graph-of-the-mask outline rather than a contour tracer (§13.3
+closed: polygon loops, holes as loops). Tests: `test_slide_binding.py`,
+`test_catalogue_binding.py`, `test_stroke_width.py`, `test_extents.py`,
+`test_seam_corridor.py`; the mspath selftest's tree-rows block rewritten
+(no orphan concept). One-way compatibility: a store written by stage 2
+(slide keys) loaded by stage-1 code binds nothing in mspath (kept greyed).
+
 Stage 1 touched `session_doc.py`, the new `msseg/labeler/task.py`,
 `labeling.py`, `annotate.py`, `shell.py`, `panels/classpanel.py`,
-`mspath/labeler.py` (`_profile_from_model`). Stage 2 touches `labeling.py`
+`mspath/labeler.py` (`_profile_from_model`). Stage 2 touched `labeling.py`
 (binding, bbox, width), `seam_labeling.py` (corridor), `annotate.py`
 (`_slice_key`, counts, dooming), `mspath/labeler.py`, and the magic-fill /
-blobber commit path (outlines). The four protocols are untouched through
-stage 4; stage 5 changes `RegionProvider.commit` to a record key; stage 8
-needs several providers' layers live at once.
+blobber commit path (outlines) -- plus `protocols.py`: `ItemCatalogue` grew
+`binding_of` and `rebase` (and `index_of` resolves a slide key), the one
+protocol change before stage 5, which changes `RegionProvider.commit` to a
+record key; stage 8 needs several providers' layers live at once.
 
 ## 13. Open questions
 

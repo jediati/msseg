@@ -286,14 +286,15 @@ class ViewControlsMixin:
             return cached
         lut, touch, region_class = None, {}, None
         counts = np.zeros(MAX_CLASSES, np.int64)
-        slice_key = self._slice_key(si, li)
-        if slice_key is not None:
-            its = self.store.for_slice(slice_key)
+        item_key = self.catalogue.key_of(si, li)
+        if item_key is not None:
+            # The gestures the ITEM sees (its slide's, meeting its rect).
+            its = self._gestures_for_key(item_key)
             if its:
                 # Through the LAYER, not the raster: the gestures are in image
                 # coordinates and the layer is what knows where the ids sit.
                 sets = touched_sets(its, rec["labels"], np,
-                                    self.regions.label_layer(slice_key))
+                                    self.regions.label_layer(item_key))
                 touch = {it.uid: ids for it, ids in sets}
                 region_class = resolve_sets(sets, rec["labels"], np)
                 lut = class_lut(region_class, np, self._class_colors_rgba(np))

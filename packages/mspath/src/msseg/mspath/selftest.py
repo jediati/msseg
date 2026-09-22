@@ -676,8 +676,27 @@ def run_labeler_selftest():
     app._commit_interaction("taps", [(px, py)])
     assert len(app.store.interactions) == 1
     it = app.store.interactions[0]
-    assert it.slice_key == item.key, it.slice_key
+    # Keyed by the SLIDE, with the drawing item's scale of intent recorded.
+    assert it.slice_key == item.slide, it.slice_key
+    assert (it.si, it.li) == (0, 0) and it.bound
+    assert it.meta["level"] == item.level and it.meta["scale"] == rec["scale"]
+    assert it.meta["px"] == v.scale
+    assert app._gestures_for_key(item.key) == [it] and app._gesture_on_item(it, 0, 0)
     assert touched_ids_over(it, layer, np) == {target}, "the gesture missed its region"
+    # A gesture drawn much coarser than this item works at is marked, and
+    # said once: a warning, not a refusal.
+    assert app._annotation_mark(0, 0, 1) == "1"
+    coarse = app.store.add("taps", [(px, py)], 1, item.slide, 0, 0,
+                           meta={"level": item.level + 2, "scale": 4.0 * rec["scale"]})
+    assert app._annotation_mark(0, 0, 2) == "2!" and len(app._coarse_gestures(0, 0)) == 1
+    app.status_var.set("")
+    app._coarse_notice(0, 0)
+    assert "coarser" in app.status_var.get()
+    app.status_var.set("")
+    app._coarse_notice(0, 0)
+    assert app.status_var.get() == "", "once per item and task"
+    app.store.remove(coarse.uid)
+    app._rebuild_class_panels()
 
     # the class LUT resolves the same way the commit did
     entry = app._labels_cache_for(0, 0, rec, np)
@@ -698,7 +717,7 @@ def run_labeler_selftest():
     # -- a training row carries the drawn class --------------------------- #
     from msseg.labeler.training import TrainingSetBuilder
     builder = TrainingSetBuilder(app.FIELDS)
-    cls = builder.row_classes(app.store.for_slice(item.key), rec["labels"], fid, np, layer)
+    cls = builder.row_classes(app._gestures_for_key(item.key), rec["labels"], fid, np, layer)
     assert (cls > 0).any(), "no training row picked up a label"
     assert int(cls[0]) == 2, "the later gesture must win on a region both touch"
 
@@ -834,27 +853,44 @@ def run_labeler_selftest():
     assert labels == ["Go to", None, "Clear annotations", "Remove slide\u2026"], labels
     assert [e[0] for e in app._seq_tree_menu_entries(0, li) if e][-1] == "Remove ROI\u2026"
     assert "ROI" in app._row_description(0, li) and "overview" in app._row_description(0, None)
-    # one annotation on the overview, one on the ROI, one orphan on the slide
-    # (an ROI cut away earlier, whose annotations were kept for a re-cut)
+    # one annotation on the overview, one inside the ROI: both are the
+    # SLIDE's (docs/design_multi_model_tasks.md \u00a78) -- each item sees those
+    # meeting its place -- and a row keyed by an item, as an older store
+    # wrote them, rebases to the slide with the item's level recorded
     app.active_class_var.set(1)
     app._goto_slice(app.flat_slices.index((0, 0)))
     app._commit_interaction("taps", [(px, py)])
     app._goto_slice(app.flat_slices.index((0, li)))
-    rs = app.engine.record(cut.key)["stats"]
-    app._commit_interaction("taps", [(float(rs.column("ext_x")[0]),
-                                      float(rs.column("ext_y")[0]))])
-    orphan = app.store.add("taps", [(1.0, 1.0)], 1, f"{item.slide}@{lvl}#1,2,64,64")
-    assert len(app.store.for_slice(cut.key)) == 1 and len(app.store.for_slice(item.key)) == 1
-    assert app._row_owns_key(0, None, cut.key) and app._row_owns_key(0, None, orphan.slice_key)
-    assert app._row_owns_key(0, li, cut.key) and not app._row_owns_key(0, 0, cut.key)
-    assert len(app._row_interactions(0, None)) == 3 and len(app._row_interactions(0, li)) == 1
+    # Inside the ROI's rect (an extremum can sit in the compute halo, which
+    # the rect query rightly does not count as the ROI's).
+    cx, cy = cut.rect[0] + cut.rect[2] / 2.0, cut.rect[1] + cut.rect[3] / 2.0
+    app._commit_interaction("taps", [(float(cx), float(cy))])
+    a_ovw, a_roi = app.store.interactions[-2:]
+    assert a_ovw.slice_key == a_roi.slice_key == item.slide, "gestures are the slide's"
+    assert (a_roi.si, a_roi.li) == (0, 0), "the hints name the slide's first row"
+    assert a_roi.meta["level"] == lvl and a_roi.meta["scale"] == app.engine.record(cut.key)["scale"]
+    assert a_roi.meta["px"] == app.viewer.scale
+    old = app.store.add("taps", [(1.0, 1.0)], 1, f"{item.slide}@{lvl}#1,2,64,64")
+    app._rebind_store(app.store)
+    assert old.slice_key == item.slide and old.bound, "an item-keyed row moves to its slide"
+    assert old.meta["level"] == lvl and \
+        old.meta["scale"] == float(app.engine.source(item.slide).level_scale(lvl))
+    n_roi = len(app._gestures_for(0, li))
+    assert n_roi >= 2 and app._gesture_on_item(a_roi, 0, li) and app._gesture_on_item(old, 0, li)
+    assert len(app._gestures_for(0, 0)) == 3 and app._gesture_on_item(a_ovw, 0, 0), \
+        "the overview sees every gesture on the slide"
+    assert app._row_owns_key(0, None, item.slide) and not app._row_owns_key(0, li, item.slide)
+    assert app._row_owns_key(0, None, cut.key), "a slide row still owns item keys"
+    assert len(app._row_interactions(0, None)) == 3 and len(app._row_interactions(0, li)) == n_roi
     labels = [e[0] if e else None for e in app._seq_tree_menu_entries(0, None)]
     assert labels == ["Go to", None, "Clear annotations\u2026 (3)", "Remove slide\u2026"], labels
-    # the ROI: its annotation goes with it, the engine forgets it, the view
-    # lands on a neighbour; undo brings the annotation back unbound, and a
-    # re-cut of the same rect (the same key) binds it again
+    # the ROI: removing it dooms nothing -- its gestures are the slide's and
+    # stay, visible on the overview -- the engine forgets it and the view
+    # lands on a neighbour; a re-cut of the same rect sees them again with no
+    # rebind at all
     msg = app._remove_rows_message([(0, li)])
-    assert "ROI" in msg and "The 1 annotation(s)" in msg, msg
+    assert "ROI" in msg and "belong to the slide" in msg, msg
+    assert app._doomed_interactions([(0, li)]) == []
     with _mock.patch.object(messagebox, "askyesno", return_value=False):
         assert not app._remove_rows_guarded([(0, li)])
     assert len(app._rois_of(0)) == n_rois + 1
@@ -863,22 +899,21 @@ def run_labeler_selftest():
     _settle(app)
     assert len(app._rois_of(0)) == n_rois
     assert app.engine.record(cut.key) is None and cut.key not in app.engine.primed
-    assert not app.store.for_slice(cut.key) and len(app.store.interactions) == 2
+    assert len(app.store.interactions) == 3 and all(it.bound for it in app.store.interactions)
+    assert len(app._gestures_for(0, 0)) == 3, "still the slide's, still on the overview"
     cur = app._current()
     assert cur is not None and cur[0] == 0 and cur[1] < li
-    app._undo()
-    back = app.store.for_slice(cut.key)
-    assert len(back) == 1 and not back[0].bound, "restored, greyed: its ROI is gone"
     again = app._add_roi(0, lvl, 0, 0, side, side)
     assert again is not None and again.key == cut.key, "the key is the place"
     _settle(app)
-    app._install_store(LabelStore.from_json(app.store.to_json()))
-    assert all(it.bound for it in app.store.for_slice(cut.key)), "a re-cut binds again"
-    assert all(it.bound for it in app.store.for_slice(item.key)), \
+    assert len(app._gestures_for(0, li)) == n_roi, "a re-cut sees its gestures again"
+    doc_before = app.store.to_json()
+    app._install_store(LabelStore.from_json(doc_before))
+    assert all(it.bound for it in app.store.interactions), \
         "slide keys bind through the catalogue on a load"
-    assert not app.store.get(orphan.uid).bound
-    # the slide: everything on it goes, the orphan included, the pyramid is
-    # closed and the canvas cleared
+    assert app.store.to_json() == doc_before, "a load of slide-keyed rows changes nothing"
+    # the slide: everything on it goes, the pyramid is closed and the canvas
+    # cleared
     assert len(app._doomed_interactions([(0, None)])) == 3
     with _mock.patch.object(messagebox, "askyesno", return_value=True):
         assert app._remove_rows_guarded([app._remove_target(0, 0)])
@@ -921,7 +956,9 @@ def run_labeler_selftest():
           "box over the item, training rows, level-scoped compat gate, "
           "classify + propose ROIs, refusal notice on the HUD, "
           "predictions survive an incremental prime, undo, tree rows: "
-          "slide/overview/ROI menu + guarded removal + orphan annotations, "
+          "slide/overview/ROI menu + guarded removal, slide-bound gestures: "
+          "the slide's key + scale of intent + rect query + item-key rebase + "
+          "an ROI's removal keeps them + the coarse mark, "
           "seam tools in slide coordinates, tasks: own store + model, "
           "profile-from-model binds the active task, two tasks into a fresh window")
     return 0

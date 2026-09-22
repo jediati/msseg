@@ -1,7 +1,9 @@
 """Resolving seam gestures against a seam graph.
 
 A seam gesture is geometry in image coordinates, like every other gesture
-(``labeling.Interaction``; ``meta`` is never read here): a **scope** is a
+(``labeling.Interaction``; on the lattice it was drawn on ``meta`` is never
+read -- off it, ``meta["scale"]`` switches a trace from exact crack ids to a
+corridor, see ``trace_mask``): a **scope** is a
 box -- every seam whose corners all lie inside it is labelled, interior by
 default -- and a **trace** is a polyline of corners along seams, whose cracks
 are matched against the graph by their label-independent ids: a seam takes
@@ -18,6 +20,8 @@ This is the one deliberate departure from ``resolve_slice``'s pure uid order.
 Pure numpy, ``np`` passed in.
 """
 from __future__ import annotations
+
+import math
 
 from .labeling import SEAM_TOOLS
 from .seams import SEAM_COVER_TAU, SEAM_UNKNOWN, cracks_of_polyline
@@ -65,11 +69,69 @@ def coverage(graph, crack_ids, np):
     return counts / np.maximum(graph.lengths(np), 1)
 
 
+def corridor_coverage(interaction, graph, r_image, np):
+    """float64 ``[S]``: the fraction of each seam's corner points within
+    `r_image` (image units) of the trace's polyline -- for a trace drawn on
+    ANOTHER lattice, where exact crack ids mean nothing (a level-0 lattice is
+    sixteen times finer than the level-4 one it was drawn on, and its seams
+    meander around a straight coarse trace). The polyline is taken as float
+    raster coordinates, never rounded to this lattice."""
+    S = graph.n_seams
+    out = np.zeros(S, np.float64)
+    if S == 0 or len(interaction.points) < 2:
+        return out
+    pl = graph.placement
+    pts = np.asarray([pl.to_raster(x, y) for x, y in interaction.points],
+                     np.float64).reshape(-1, 2)
+    r = float(r_image) / (float(pl.scale) or 1.0)
+    bb = graph.bboxes(np)
+    px0, py0 = pts.min(axis=0)
+    px1, py1 = pts.max(axis=0)
+    cand = np.flatnonzero((bb[:, 0] - r <= px1) & (bb[:, 2] + r >= px0)
+                          & (bb[:, 1] - r <= py1) & (bb[:, 3] + r >= py0))
+    if len(cand) == 0:
+        return out
+    starts = graph.offsets[cand].astype(np.int64)
+    counts = (graph.offsets[cand + 1] - graph.offsets[cand]).astype(np.int64)
+    idx = np.repeat(starts - np.cumsum(counts) + counts, counts) + np.arange(int(counts.sum()))
+    P = graph.points[idx].astype(np.float64)
+    owner = np.repeat(np.arange(len(cand)), counts)
+    A, B = pts[:-1], pts[1:]
+    AB = B - A
+    L2 = (AB ** 2).sum(axis=1)
+    L2 = np.where(L2 == 0, 1.0, L2)
+    best = np.full(len(P), np.inf)
+    chunk = max(1, 2_000_000 // max(1, len(A)))
+    for i in range(0, len(P), chunk):
+        Q = P[i:i + chunk]
+        t = ((Q[:, None, :] - A[None, :, :]) * AB[None, :, :]).sum(axis=2) / L2[None, :]
+        t = np.clip(t, 0.0, 1.0)
+        proj = A[None, :, :] + t[:, :, None] * AB[None, :, :]
+        best[i:i + chunk] = ((Q[:, None, :] - proj) ** 2).sum(axis=2).min(axis=1)
+    within = best <= r * r
+    hits = np.bincount(owner[within], minlength=len(cand)).astype(np.float64)
+    out[cand] = hits / np.maximum(counts, 1)
+    return out
+
+
 def trace_mask(interaction, graph, np, tau=SEAM_COVER_TAU):
-    """bool ``[S]``: the seams a trace labels (coverage >= tau)."""
+    """bool ``[S]``: the seams a trace labels (coverage >= tau).
+
+    On the lattice the trace was drawn on -- no ``meta["scale"]``, or one
+    equal to the graph's -- coverage is by exact crack ids, byte for byte
+    what it always was. On another lattice it is by corridor, with a radius
+    of one drawing-level pixel or one pixel of this lattice, whichever is
+    coarser, so the test works in both directions."""
     if graph.n_seams == 0:
         return np.zeros(0, bool)
-    cov = coverage(graph, trace_cracks(interaction, graph, np), np)
+    meta = interaction.meta or {}
+    drawn = meta.get("scale")
+    own = float(graph.placement.scale) or 1.0
+    if (isinstance(drawn, (int, float)) and not isinstance(drawn, bool)
+            and not math.isclose(float(drawn), own, rel_tol=1e-6)):
+        cov = corridor_coverage(interaction, graph, max(float(drawn), own), np)
+    else:
+        cov = coverage(graph, trace_cracks(interaction, graph, np), np)
     return cov >= float(tau)
 
 

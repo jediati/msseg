@@ -185,10 +185,17 @@ class DrawController:
             if pr is None or pr[0] != rec.get("commit"):
                 return             # nothing would be accepted: no preview
             pred = pr[1]
+        place = app._region_placement()
+        # The stroke width the commit will use (resolve_opts): one screen
+        # pixel in raster pixels, when the app records a scale of intent.
+        cur = app._current()
+        draw = (app._draw_meta(*cur) if cur is not None else None) or {}
+        px = draw.get("px")
+        width = float(px) / (place.scale or 1.0) if isinstance(px, (int, float)) and px > 0 else None
         self._pv = {"labels": labels,
                     "K": int(labels.max()) + 1 if labels.size else 1,
                     "ids": set(), "shown": None, "pred": pred,
-                    "place": app._region_placement(),
+                    "place": place, "width": width,
                     "rgba": app.store.rgba(int(app.active_class_var.get()))}
         app._begin_preview()
 
@@ -205,11 +212,22 @@ class DrawController:
         pts = self._pts if place.identity else place.points_to_raster(self._pts)
         tool = self._tool()
         if tool == "squiggle":
-            # Incremental and exact: only the newest segment is rasterized.
+            # Incremental and exact: only the newest segment is rasterized --
+            # at the width the commit will use, so the preview promises what
+            # the commit paints.
             (x0, y0), (x1, y1) = (pts[-2], pts[-1]) if len(pts) > 1 else (pts[0], pts[0])
-            ys, xs = line_pixels(x0, y0, x1, y1, w, h, np)
-            if len(ys):
-                pv["ids"].update(int(v) for v in np.unique(labels[ys, xs]) if v >= 0)
+            width = pv.get("width")
+            if width is not None and width > 1.5:
+                from .labeling import stroke_mask
+                sm = stroke_mask([(x0, y0), (x1, y1)], width, w, h, np)
+                if sm is not None:
+                    mask, ya, xa = sm
+                    sub = labels[ya:ya + mask.shape[0], xa:xa + mask.shape[1]]
+                    pv["ids"].update(int(v) for v in np.unique(sub[mask]) if v >= 0)
+            else:
+                ys, xs = line_pixels(x0, y0, x1, y1, w, h, np)
+                if len(ys):
+                    pv["ids"].update(int(v) for v in np.unique(labels[ys, xs]) if v >= 0)
         elif tool == "box":
             pv["ids"] = self._slab_ids(labels, pts[0], pts[-1], np)   # already raster
         elif len(pts) >= 3:                     # polygon

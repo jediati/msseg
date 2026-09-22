@@ -332,6 +332,19 @@ class ViewerShell:
         from .labeling import IDENTITY
         return IDENTITY
 
+    def _draw_meta(self, si, li):
+        """The scale of intent a gesture drawn on item (si, li) records in
+        its ``meta`` -- ``level`` (the item's pyramid level), ``scale``
+        (slide pixels per raster pixel) and ``px`` (slide pixels per screen
+        pixel at draw time) -- or None for an app without levels, whose
+        gestures then carry no meta at all, as they always have. A gesture is
+        keyed by its SLIDE, so an item at another level applying it needs to
+        know how coarse it was (a stroke keeps the width the user saw, an
+        extent resolves by its outline, a trace by a corridor). Lives here,
+        beside the other placement hooks, for the MRO reason `_feature_scope`
+        gives."""
+        return None
+
     def _region_overlay(self, labels, lut, np, visible=True):
         """One overlay dict for a raster of the CURRENT item's region ids.
 
@@ -1046,7 +1059,7 @@ class ViewerShell:
             marks = [(self._slice_msc_mark(si, li), self._annotation_count(si, li))
                      for li in range(len(rows))]
             seq_msc = "Y" if marks and all(m[0] == "Y" for m in marks) else ""
-            seq_annot = sum(m[1] for m in marks)
+            seq_annot = self._sequence_annotation_count(si, [m[1] for m in marks])
             iid = f"q{si}"
             tree.insert("", "end", iid=iid, text=self._sequence_row_text(s),
                         values=(seq_msc, str(seq_annot) if seq_annot else ""),
@@ -1054,7 +1067,7 @@ class ViewerShell:
             for li, text in enumerate(rows):
                 msc, annot = marks[li]
                 tree.insert(iid, "end", iid=f"q{si}:{li}", text=text,
-                            values=(msc, str(annot) if annot else ""))
+                            values=(msc, self._annotation_mark(si, li, annot)))
 
     def _update_subseq_values(self):
         """Rewrite the tree's "msc"/"annot" values in place, or return False if
@@ -1078,7 +1091,7 @@ class ViewerShell:
             marks = [(self._slice_msc_mark(si, li), self._annotation_count(si, li))
                      for li in range(len(rows))]
             seq_msc = "Y" if marks and all(m[0] == "Y" for m in marks) else ""
-            seq_annot = sum(m[1] for m in marks)
+            seq_annot = self._sequence_annotation_count(si, [m[1] for m in marks])
             self._set_row_values(iid, seq_msc, str(seq_annot) if seq_annot else "")
             for li, (msc, annot) in enumerate(marks):
                 child = f"q{si}:{li}"
@@ -1086,7 +1099,7 @@ class ViewerShell:
                 # the row's own name is checked, not just the count of rows.
                 if tree.item(child, "text") != rows[li]:
                     return False
-                self._set_row_values(child, msc, str(annot) if annot else "")
+                self._set_row_values(child, msc, self._annotation_mark(si, li, annot))
         return True
 
     def _set_row_values(self, iid, msc, annot):
@@ -1115,6 +1128,17 @@ class ViewerShell:
         """Interactions on one slice; the labeler overrides this (the viewer
         has no annotations, so its column stays blank)."""
         return 0
+
+    def _sequence_annotation_count(self, si, counts):
+        """The sequence row's total from its items' counts. The labeler
+        counts distinct gestures instead: a gesture inside an ROI is seen by
+        the ROI and by the overview, and is one annotation."""
+        return sum(counts)
+
+    def _annotation_mark(self, si, li, count):
+        """The item row's annot cell for `count` gestures. The labeler adds a
+        ``!`` when some were drawn much coarser than the item works at."""
+        return str(count) if count else ""
 
     def _on_seq_tree_select(self, _event=None):
         sel = self.subseq_list.selection()
