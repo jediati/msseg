@@ -273,6 +273,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self._proc_groups = {}
         self.workflow_hint_var = tk.StringVar(master=root, value="")
         self.model_hint_var = tk.StringVar(master=root, value="")
+        self.features_hint_var = tk.StringVar(master=root, value="")
         self._hint_after = None
         super().__init__(root, initial=initial, autosave=autosave)
         # The profiles exist now: the first task's workflow is the active one.
@@ -312,6 +313,10 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self.center = ttk.Notebook(self.paned, width=420)
         self.paned.add(self.center, weight=0)
         self.processing_tab = ttk.Frame(self.center)
+        # Features: the statistics each region is measured by. Apart from
+        # Processing because an edit here costs a re-measure of the item on
+        # screen (the MSC is kept), where an edit there needs a Run.
+        self.features_tab = ttk.Frame(self.center)
         # Annotation: what the user draws and the classifier that learns it.
         # Filled by _build_label_panel after the base constructor returns.
         self.annot_tab = ttk.Frame(self.center)
@@ -320,6 +325,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         # list behind a confusion cell, the size sweep -- and, later, plots.
         self.analysis_tab = ttk.Frame(self.center)
         self._center_tabs = {"Processing": self.processing_tab,
+                             "Features": self.features_tab,
                              "Annotation": self.annot_tab,
                              "Model": self.model_tab,
                              "Analysis": self.analysis_tab}
@@ -338,6 +344,14 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self.proc_scroll.pack(side="top", fill="both", expand=True)
         self.proc_col = self.proc_scroll.inner
         self._proc_groups = {}               # key -> Collapsible
+        ttk.Label(self.features_tab, foreground="#666", wraplength=400, justify="left",
+                  text="What each region is measured by. An edit re-measures the item "
+                       "on screen -- the regions stay, only their statistics are "
+                       "rebuilt; no Run needed.").pack(side="top", anchor="w",
+                                                        padx=6, pady=(4, 0))
+        self.feat_scroll = ScrollFrame(self.features_tab, width=420, canvas_width=400)
+        self.feat_scroll.pack(side="top", fill="both", expand=True)
+        self.feat_col = self.feat_scroll.inner
 
         self._build_model_tab(self.model_tab)
         self._build_analysis_tab(self.analysis_tab)
@@ -441,7 +455,13 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
                 btn.pack_configure(side="bottom", before=above)
         self._build_workflow_hint()
 
+    # The sections that measure rather than build the field: they go on the
+    # Features tab.
+    _FEATURE_SECTIONS = ("stats",)
+
     def _processing_parent(self, section):
+        if section in self._FEATURE_SECTIONS:
+            return self.feat_col
         return self.proc_col
 
     def _handle_event(self, ev):
@@ -1549,6 +1569,36 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         """After a session's tasks install: bring a task's enrolment to the
         app's rules (mspath: a task written before enrolment works its
         places, never the overview). Nothing to do without enrolment."""
+
+    # ------------------------------------------------------------------ #
+    # Statistics edits re-measure; they never re-prime
+    # ------------------------------------------------------------------ #
+    def _on_stat_spec_change(self):
+        """The Features tab's statistics changed. The viewer's answer is a
+        badge and a Rerun; the labeler's is to settle (a sigma typed digit by
+        digit is ONE edit) and re-measure the item on screen -- the MSC, its
+        labels and arcs are kept, only the rows are rebuilt -- so the next
+        Train or Classify reads the new columns without a Run."""
+        super()._on_stat_spec_change()
+        after = getattr(self, "_stat_edit_after", None)
+        if after is not None:
+            try:
+                self.root.after_cancel(after)
+            except tk.TclError:
+                pass
+        self._stat_edit_after = None
+        try:
+            self._stat_edit_after = self.root.after(_PREVIEW_SETTLE_MS,
+                                                    self._stat_edit_settled)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _stat_edit_settled(self):
+        self._stat_edit_after = None
+        try:
+            self._remeasure_current()
+        except Exception as exc:
+            self._log(f"re-measure after a statistics edit failed: {exc}")
 
     def _reload_task_model(self, task):
         """Load the newest of the task's recorded pickles that still exists

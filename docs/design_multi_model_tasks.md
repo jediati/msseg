@@ -1,8 +1,11 @@
 # Design note: many task-specific models over one set of slides
 
-Status: **third draft; stages 1-4 built** (2026-09-24; first draft 2026-09-18).
-Stage 4 -- places, enrolment, a split Run and the on-demand fast path -- is
-described where §5 and §12 now say "as built".
+Status: **third draft; stages 1-4 built, and the first half of stage 5**
+(2026-09-24; first draft 2026-09-18). Stage 4 -- places, enrolment, a split
+Run and the on-demand fast path -- is described where §5 and §12 now say "as
+built". Of stage 5, the measurement split landed: the re-measure question
+(§6, §13.1) is answered yes, and the field and the statistics are keyed and
+cached apart.
 Stage 1 of §12 -- the task object with a stack, the Tasks list, session v3 --
 stage 2 -- slide-bound gestures with a scale of intent, stroke width, extent
 outlines and the trace corridor (§8) -- and stage 3 -- the derivation module
@@ -204,12 +207,16 @@ their keys agree up to it:
 
 * **Same field, different persistence**: one pipeline, two records,
   milliseconds. The *normal* way two tasks should differ.
-* **Same field, different measurement**: today L4 is computed inside
-  `Msc2DPipeline::build` with the bank handed in, so a different stats spec is
-  a rebuild. Whether the pipeline can be **re-measured in place** (~1 s CPU,
-  ~170 ms on the GPU stats path, against the live base labelling) is the
-  most valuable engine question here (§13.1). If not, steer tasks to share a
-  superset spec: an unused column costs one column.
+* **Same field, different measurement**: **re-measured in place** (as built,
+  2026-09-24). L4 was computed inside `Msc2DPipeline::build`, so a different
+  stats spec was a rebuild; `build` is now the MSC phases followed by one
+  `measure` step, and `Msc2DPipeline::remeasure` runs that step alone against
+  the live base labelling, then re-selects at the current persistence. The
+  labels and arcs are untouched and the rows equal a fresh build's. Measured
+  on a 2048² level-0 ROI (CPU, merge forest): switching base-only -> twelve
+  derived channels costs 0.90 s against a 1.47 s prime, and back costs 0.19 s
+  against 0.91 s -- a re-measure is a prime minus its MSC, so the saving grows
+  with the MSC (~4 s on a 3232² coupon slice, more on the MSC hierarchy).
 * **Different field**: two pipelines, ~1 GB each, against an LRU of three.
   The genuinely expensive case; live side-by-side across fields is bounded by
   the LRU, and many tasks on many items across fields is batch.
@@ -228,7 +235,7 @@ follows from identity of content. Switching tasks never *drops* a prime
 | Change | L3 pipeline | L5 record | region gestures | seam gestures | region model | arc / seam heads |
 |---|---|---|---|---|---|---|
 | persistence moved | kept | recomputed (ms) | re-resolve | re-resolve by coverage | kept | kept |
-| statistics edited | kept if re-measurable, else rebuilt | recomputed | re-resolve | re-resolve | **refused** (names) | dropped with it |
+| statistics edited | **kept** (re-measured) | recomputed | re-resolve | re-resolve | **refused** (names) | dropped with it |
 | chain / MSC mode edited | rebuilt | recomputed | re-resolve | re-resolve | refused | dropped |
 | level changed | new item | new item | **kept**; applied with a scale warning; extents via outline | kept via corridor (§8.2); exact coverage at own level | refused (`scope`) | dropped |
 | task renamed | -- | -- | -- | -- | -- | -- |
@@ -608,6 +615,45 @@ stage-3 code reading a stage-4 document drops the uids and ignores
 enrolment block. Pre-existing limit made easier to hit: `_feature_scope`
 still names only the overview level.
 
+**What exists (stage 5, first half: the measurement split, 2026-09-24).**
+C++: `Msc2DPipeline::build` = the MSC phases + one `measure_leaves` step
+(relevance, GPU or CPU accumulation, extremum; byte-identical output, same
+phase order), and `remeasure(base, filtered, cfg, color)` runs that step
+alone on a built pipeline -- shape-checked, then `select_persistence` at the
+current persistence, its phases in `build_timings()` (no `msc`). pybind:
+`pipe.remeasure(params_json, base, filtered, color=None)`. Two fingerprints
+over the params document (`msseg/mscoupon/fingerprints.py`; `session.
+field_fingerprint` / `measure_fingerprint`): the **field** is the chains, the
+colour input minus its plane count, and the MSC keys minus the result-free
+ones (cores, builder, GPU flags) and minus the sample radius, with the
+persistence percentage reduced to the cancellation cap `max(10 %, pct)`;
+the **measurement** is the `statistics` block, the sample radius and the
+plane count. Engines keep both stamps: the coupon `ComputeEngine` stamps
+`measured[]` per primed slice and re-measures lazily inside `_slice_result`
+from the rasters it already holds; `SlideEngine` stamps each `Primed` with
+`field` / `measured` / the chains it was primed with, re-measures in
+`ensure_record` (and on the worker for navigation, `remeasure_only`), and
+re-reads the item through those chains -- never the panel's, since an
+un-Run chain edit is a preview. A Run keeps what the field can reuse (the
+coupon by the field fingerprint per sequence, mspath by `keep_field`, pins
+kept when anything was); a profile switch -- hence a task switch and
+`_profile_from_model` -- resets only when the field differs
+(`_keep_compute_for` / `_after_profile_kept` / `_remeasure_current` in the
+shell). The labeler moved the statistics (and the ext sample radius, which is
+a measurement) to a **Features** tab, re-measures the item on screen after a
+settled edit, and heads the classifier section with a `stats:` link to it.
+Tests: `test_msc2d_remeasure` (C++), `test_gpu_stats_parity.py`
+(remeasure == fresh prime, CPU and GPU), `test_engine_remeasure.py`,
+`test_slide_engine.py` (re-measure keeps labels, `keep_field`, the chains
+the pipe was primed with, `remeasure_only` never primes), the fingerprint
+test in `test_session_model.py`; the mspath labeler selftest re-measures a
+real item and keeps it across a statistics-only profile switch. Still open
+for stage 5: records keyed by `(field, measurement, persistence, item)` so
+two tasks on different statistics keep BOTH rows live (today the last one
+measured wins, and a switch re-measures), `base_filters` on the measurement
+side (needs the raw slice kept; a base-chain edit still re-primes), and
+`RegionProvider.commit` becoming a record key.
+
 Stage 1 touched `session_doc.py`, the new `msseg/labeler/task.py`,
 `labeling.py`, `annotate.py`, `shell.py`, `panels/classpanel.py`,
 `mspath/labeler.py` (`_profile_from_model`). Stage 2 touched `labeling.py`
@@ -620,9 +666,10 @@ record key; stage 8 needs several providers' layers live at once.
 
 ## 13. Open questions
 
-1. **Can `Msc2DPipeline` be re-measured in place?** Decides whether
-   measurement is a cheap axis like persistence or an expensive one like the
-   field.
+1. ~~**Can `Msc2DPipeline` be re-measured in place?**~~ Closed 2026-09-24:
+   yes (`Msc2DPipeline::remeasure`, §6). Measurement is a cheap axis -- a
+   prime minus its MSC -- though not as cheap as persistence: the channel
+   bank is most of it (0.6 s of 0.9 s for twelve channels on 2048²).
 2. ~~**Extent by tool or by modifier?**~~ Closed in stage 3: the blob's core
    is always an extent (its ring never), the magic fill by an `extent`
    checkbox (default on), the lasso unless Ctrl-dragged, an accepted

@@ -269,6 +269,24 @@ class ViewerShell:
         the parameters that produced it."""
         self._hover_ctx = None
 
+    def _keep_compute_for(self, profile):
+        """A profile is about to become active: keep what is primed if
+        `profile` can reuse it (the same field -- chains, colour input, MSC --
+        whatever its statistics), dropping anything it cannot. True when
+        something was kept; the switch then re-measures instead of resetting
+        (``_after_profile_kept``). Default: nothing is ever kept."""
+        return False
+
+    def _after_profile_kept(self):
+        """The new profile is on the widgets and the primes were kept: bring
+        the item on screen up to its statistics (a new generation, a
+        re-measure where they moved)."""
+        self._remeasure_current()
+
+    def _remeasure_current(self):
+        """Make the item on screen current under the panel's statistics
+        without re-priming it (the app's; default nothing)."""
+
     def _settle_controls(self):
         try:
             self.run_btn.config(state="normal")
@@ -1434,7 +1452,12 @@ class ViewerShell:
             self._refresh_profile_combo()
             return
         self._snapshot_active_profile()
-        self._reset_compute()
+        # Primes belong to the FIELD, not to the profile: a profile that
+        # differs only in its statistics keeps them and re-measures.
+        kept = bool(self._keep_compute_for(self.profiles[idx]))
+        if not kept:
+            self._reset_compute()
+        here = self._current() if kept else None
         self.active_profile_idx = idx
         notes = []
 
@@ -1447,7 +1470,15 @@ class ViewerShell:
         self._apply_profile_to_ui_quietly(self.profiles[idx], setvar, notes)
         self._refresh_profile_combo()
         self._rebuild_flat_slices()
+        if here is not None and here in self.flat_slices:
+            self.slice_var.set(self.flat_slices.index(here))
+            self._sync_slice_combo()
         self._settle_controls()
+        if kept:
+            try:
+                self._after_profile_kept()
+            except Exception as exc:
+                self._log(f"re-measure after profile switch failed: {exc}")
         try:
             self._update_busy()
             self._refresh_render()
@@ -1455,8 +1486,10 @@ class ViewerShell:
             self._log(f"redraw after profile switch failed: {exc}")
         for msg in notes:
             self._log(msg)
-        self.status_var.set(f"Profile '{self.profiles[idx]['name']}' active - "
-                            "Run to prime.")
+        self.status_var.set(
+            f"Profile '{self.profiles[idx]['name']}' active - " +
+            ("same field, primes kept (statistics re-measured as needed)." if kept
+             else "Run to prime."))
 
     def _on_profile_selected(self, _event=None):
         name = self.profile_var.get()

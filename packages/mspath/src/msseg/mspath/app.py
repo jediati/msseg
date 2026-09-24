@@ -46,6 +46,7 @@ from msseg.mscoupon.common import _format_sigmas, _parse_sigmas
 from msseg.mscoupon.config_io import (FILTER_OPERATIONS, FILTER_SCHEMA, COLOR_METHODS,
                                       filter_param_schema, filters_to_json)
 from msseg.mscoupon.engine import preview_job, preview_raster
+from msseg.mscoupon.fingerprints import field_fingerprint_of
 from msseg.labeler.defaults import _PREVIEW_PUMP_MS
 
 from .adapters import SlideCatalogue, SlideRegionProvider
@@ -1095,10 +1096,12 @@ class MsPathApp(ViewerShell):
     def _on_stat_spec_change(self):
         """The measurement spec changed: anything primed under the old spec
         measures the wrong things. Nothing is dropped -- the records stay on
-        screen -- but the next Run is what makes the new spec real."""
+        screen -- and the next Run re-measures the live items rather than
+        priming them (the labeler re-measures the item on screen at once)."""
         self._refresh_stat_summary()
         if self.engine.primed:
-            self.status_var.set("Statistics changed - Run again to measure the new channels.")
+            self.status_var.set("Statistics changed - Run re-measures the new channels "
+                                "(no re-prime).")
 
     def _build_run_section(self):
         parent = self._left_section_parent("run")
@@ -1823,7 +1826,10 @@ class MsPathApp(ViewerShell):
                                 "(enrol the overview or cut an ROI).")
             return
         profile = self._profile_for_compute()
-        self.engine.reset()
+        # A live pipe built under this field (chains, colour, MSC, halo) is
+        # kept -- re-measured on the worker if only the statistics moved --
+        # and everything else is dropped, as a reset would.
+        kept = self.engine.keep_field(profile, self._halo())
         self._run_active = True
         self._set_run_buttons("disabled")
         self._set_load_enabled(False)
@@ -1833,7 +1839,11 @@ class MsPathApp(ViewerShell):
             f"{len(items_to_prime) - n_ov} ROI(s), halo {self._halo()}")
         log(f"  filters: {[f['operation'] for f in profile['filters']] or ['(none)']}")
         log(f"  base_filters: {[f['operation'] for f in profile['base_filters']] or ['(none)']}")
-        if not self.engine.start_run(items_to_prime, profile, halo=self._halo()):
+        if kept:
+            log(f"  {kept} live item(s) kept (same field): re-measured where the "
+                "statistics moved, not primed")
+        if not self.engine.start_run(items_to_prime, profile, halo=self._halo(),
+                                     reset_pins=not kept):
             self.status_var.set("A prime is already running.")
             return
         self._ensure_pump()
@@ -1850,6 +1860,17 @@ class MsPathApp(ViewerShell):
             return
         p = self.engine.primed.get(key)
         if p is not None and p.live:
+            profile = self._profile_for_compute()
+            if self.engine.measure_stale(key, profile) and self.engine.can_remeasure(key):
+                # The statistics moved under a live pipe: re-measure it on the
+                # worker (a read and the chains, then the rows -- no MSC).
+                self.status_var.set(f"Measuring {p.item.label()}…")
+                if self.engine.start_run([p.item], profile, halo=self._halo(),
+                                         reset_pins=False, incremental=True,
+                                         remeasure_only=True):
+                    self._ensure_pump()
+                    self._update_busy()
+                return
             try:
                 self.engine.ensure_record(key, self._profile_for_compute())
             except Exception as exc:
@@ -1904,6 +1925,36 @@ class MsPathApp(ViewerShell):
             self._refresh_subseq_list()
             self._update_busy()
 
+    def _keep_compute_for(self, profile):
+        """Keep the live items the new profile's field can reuse (see
+        ``SlideEngine.keep_field``); a statistics-only difference then costs a
+        re-measure of the item on screen, not a Run."""
+        if self._run_active or self.engine.pending_work() or not self.engine.primed:
+            return False
+        try:
+            doc = json.loads(coupon_session.profile_params_json(profile, 1, SLIDE_PLANES))
+        except Exception:
+            return False
+        return self.engine.keep_field(doc, self._halo()) > 0
+
+    def _remeasure_current(self):
+        """A new generation; the item on screen is re-selected, or re-measured
+        on the worker when the statistics moved (``_request_item``)."""
+        if not self.engine.primed or self.engine.pending_work():
+            return
+        profile = self._profile_for_compute()
+        cur = self._current()
+        key = self.catalogue.key_of(*cur) if cur is not None else None
+        p = self.engine.primed.get(key) if key is not None else None
+        if p is not None and p.field == field_fingerprint_of(profile):
+            # The primed items follow the panel's statistics from here on.
+            self._primed_chain = self._chain_fingerprint()
+        self.engine.commit_selection()
+        if key is not None:
+            self._request_item(key)
+        self._update_busy()
+        self._refresh_render()
+
     def _reset_compute(self):
         self.engine.reset()
         # Nothing is primed, so there is nothing for a preview to be stale
@@ -1926,7 +1977,8 @@ class MsPathApp(ViewerShell):
         cur = self._current()
         key = self.catalogue.key_of(*cur) if cur is not None else None
         if key is not None and self.engine.pending_work() and key in self.engine.running_keys:
-            self.viewer.set_hud("busy", "Priming")
+            self.viewer.set_hud("busy", "Measuring" if self.engine.running_kind == "measure"
+                                else "Priming")
         elif self.engine.pending_work() and self._run_active:
             self.viewer.set_hud("busy", "Priming")
         elif self._preview_pending is not None:

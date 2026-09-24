@@ -47,13 +47,20 @@ class HintsMixin:
         self.workflow_hint.pack(fill="x", padx=6, pady=(4, 2), before=first)
 
     def _build_model_hint(self, ml):
-        """Into the classifier section; packed first, so above Train/Classify."""
+        """Into the classifier section; packed first, so above Train/Classify:
+        what the regions are measured by (-> Features), then the model."""
+        self.features_hint = self._hint_label(
+            ml, self.features_hint_var, "Features",
+            "The statistics every region is measured by -- the classifier's "
+            "input columns. Click to open the Features tab; an edit there "
+            "re-measures the item on screen, no Run needed.")
+        self.features_hint.pack(side="top", fill="x", padx=6, pady=(4, 0))
         self.model_hint = self._hint_label(
             ml, self.model_hint_var, "Model",
             "The classifier: the kind Train builds until a model exists, then "
             "the trained/loaded model and its feature count. Click to open "
             "the Model tab.")
-        self.model_hint.pack(side="top", fill="x", padx=6, pady=(4, 0))
+        self.model_hint.pack(side="top", fill="x", padx=6, pady=(2, 0))
 
     def _show_center_tab(self, name):
         tab = getattr(self, "_center_tabs", {}).get(name)
@@ -70,6 +77,13 @@ class HintsMixin:
         except Exception:
             return "workflow: ?"
         return self._workflow_summary(profile)
+
+    def _features_hint_text(self):
+        """The `stats:` line of the workflow summary, alone."""
+        for line in self._workflow_hint_text().splitlines():
+            if line.startswith("stats:"):
+                return line
+        return "stats: ?"
 
     def _model_hint_text(self):
         if self._clf is None:
@@ -95,6 +109,7 @@ class HintsMixin:
         if wv is None or not hasattr(self, "filter_cards"):
             return
         for var, text in ((wv, self._workflow_hint_text()),
+                          (self.features_hint_var, self._features_hint_text()),
                           (self.model_hint_var, self._model_hint_text())):
             if var.get() != text:
                 var.set(text)

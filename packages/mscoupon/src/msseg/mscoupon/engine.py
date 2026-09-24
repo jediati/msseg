@@ -30,6 +30,7 @@ import threading
 import time
 
 from .common import log, FeatureTable
+from .fingerprints import measure_fingerprint_of
 from .session import DEFAULT_SIMPLIFICATION
 
 
@@ -433,6 +434,7 @@ class ComputeEngine:
             params_serial = json.dumps({**{k: v for k, v in p.items() if k != "msc"},
                                         "msc": msc_serial})
             use_serial = "compute_algorithm" not in msc
+            measure_fp = measure_fingerprint_of(p)
             n_reused = sum(1 for s in subseqs if s.get("_reuse") is not None)
             total = sum(len(s["files"]) for s in subseqs
                         if s.get("_reuse") is None)
@@ -555,9 +557,13 @@ class ComputeEngine:
                     norms.append(slice_norms); color_slices.append(color)
                     done += 1
                     self.work_q.put(("progress", (done, total)))
+                # Which statistics each pipe's rows were measured under: a
+                # later spec change re-measures (pipe.remeasure) instead of
+                # re-priming, lazily, slice by slice (_slice_result).
                 primed.append({"files": s["files"], "base": base_slices,
                                "filtered": filt_slices, "pipes": pipes,
-                               "normalizers": norms, "color": color_slices})
+                               "normalizers": norms, "color": color_slices,
+                               "measured": [measure_fp] * len(pipes)})
             log(f"RUN complete: primed {total} slices")
             self.work_q.put(("done", primed))
         except Exception as exc:  # surfaced on the UI thread
@@ -798,6 +804,11 @@ class ComputeEngine:
             applied[li] = pct
         tm["persist"] += time.perf_counter() - t
 
+        if params.get("json"):
+            t = time.perf_counter()
+            if self._ensure_measured(si, li, params["json"], engine, np):
+                tm["measure"] = tm.get("measure", 0.0) + (time.perf_counter() - t)
+
         t = time.perf_counter()
         lab = np.asarray(pipe.labels())
         tm["labels"] += time.perf_counter() - t
@@ -851,6 +862,49 @@ class ComputeEngine:
 
         return {"commit": params.get("commit", 0), "labels": lab, "stats": table,
                 "kept": kept, "cc": None, "n_feat": n_feat, "arcs": arcs}
+
+    def measure_stale(self, si, li, params_json):
+        """True iff slice `li`'s rows were measured under other statistics
+        than `params_json` asks for (a re-measure is due before they are read)."""
+        try:
+            p = self.primed[si]
+        except (IndexError, TypeError):
+            return False
+        measured = p.get("measured")
+        if measured is None or li >= len(measured):
+            return False
+        return measured[li] != measure_fingerprint_of(params_json)
+
+    def _ensure_measured(self, si, li, params_json, engine, np):
+        """Re-measure slice `li` in place when its statistics are stale: the
+        MSC, labels and arcs are kept and only the rows are rebuilt, from the
+        base / filtered / colour rasters the slice was primed from. Returns
+        True when it re-measured. A record without a stamp (an older priming,
+        a test's fake) is taken as current; an extension without
+        ``remeasure`` keeps the old rows, as before this existed."""
+        p = self.primed[si]
+        fp = measure_fingerprint_of(params_json)
+        measured = p.get("measured")
+        if measured is None:
+            p["measured"] = [fp] * len(p["pipes"])
+            return False
+        if measured[li] == fp:
+            return False
+        pipe = p["pipes"][li]
+        if pipe is None or not hasattr(pipe, "remeasure"):
+            return False
+        t0 = time.perf_counter()
+        base = np.ascontiguousarray(p["base"][li], dtype=np.float32)
+        filt = np.ascontiguousarray(p["filtered"][li], dtype=np.float32)
+        planes = color_planes(p, li, np)
+        if planes is None:
+            pipe.remeasure(params_json, base, filt)
+        else:
+            pipe.remeasure(params_json, base, filt, planes)
+        measured[li] = fp
+        log(f"  slice {li}: re-measured the statistics "
+            f"({1e3 * (time.perf_counter() - t0):.0f}ms){build_timings_brief(pipe)}")
+        return True
 
     def _release_inactive_gpu(self, si, li):
         """Keep only the ACTIVE slice's GPU residue resident.

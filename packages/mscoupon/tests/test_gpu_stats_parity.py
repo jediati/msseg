@@ -71,3 +71,65 @@ def test_device_path_matches_host_loop(spec):
             assert np.array_equal(tab_c[:, j], tab_g[:, j]), name
         else:
             assert np.allclose(tab_c[:, j], tab_g[:, j], rtol=1e-5, atol=1e-6), name
+
+
+_REMEASURE_SPECS = [
+    {"channels": ["base"], "reductions": ["mean"], "extremum": False},
+    {"channels": ["base", "color", {"kind": "blur", "sigmas": [1.0, 2.5], "source": "color"},
+                  {"kind": "hessian", "sigmas": [2.0]}],
+     "reductions": ["mean", "min", "max", "std"], "extremum": True},
+    {"channels": ["base", {"kind": "edges", "sigmas": [1.5]}],
+     "reductions": ["mean", "max"], "extremum": True, "extremum_sample_radius": 1,
+     "histogram": {"bins": 6, "channels": ["base"], "ranges": {"*": [0.0, 1.0]}}},
+]
+
+
+@pytest.mark.parametrize("gpu", [False, True])
+def test_remeasure_matches_a_fresh_prime(gpu):
+    """Swapping the statistics on a primed pipeline: the labels, arcs and
+    persistence stay, and every spec's table equals a fresh prime's."""
+    engine = pytest.importorskip("msseg.mscoupon")
+    if not hasattr(engine.Msc2DPipeline, "remeasure"):
+        pytest.skip("extension predates Msc2DPipeline.remeasure")
+    rng = np.random.default_rng(11)
+    h, w = 80, 112
+    planes = rng.random((3, h, w), dtype=np.float32)
+    base = planes.mean(axis=0).astype(np.float32)
+    yy, xx = np.mgrid[0:h, 0:w]
+    filt = (np.sin(xx / 6.0) * np.cos(yy / 4.0) + 0.05 * rng.random((h, w))).astype(np.float32)
+    live = _prime(engine, base, filt, planes, _REMEASURE_SPECS[0], gpu)
+    labels0 = live.labels().copy()
+    arcs0 = [np.asarray(a).copy() for a in live.region_arcs()]
+    pers0 = live.current_persistence()
+    for spec in _REMEASURE_SPECS[1:] + _REMEASURE_SPECS[:1]:
+        params = {"msc": {"manifold": "ascending", "persistence_percent": 5.0,
+                          "accurate_ascending": False, "accurate_descending": False,
+                          "use_gpu_gradient": gpu, "use_gpu_stats": gpu},
+                  "input": {"color": {"channels": 3}},
+                  "statistics": spec}
+        live.remeasure(json.dumps(params), base, filt, planes)
+        assert "msc" not in live.build_timings(), "a re-measure does not run the MSC"
+        assert np.array_equal(live.labels(), labels0)
+        assert live.current_persistence() == pers0
+        for a, b in zip(live.region_arcs(), arcs0):
+            assert np.array_equal(np.asarray(a), b)
+        fresh = _prime(engine, base, filt, planes, spec, gpu)
+        names_l, tab_l = live.feature_table()
+        names_f, tab_f = fresh.feature_table()
+        assert list(names_l) == list(names_f)
+        assert tab_l.shape == tab_f.shape and tab_l.shape[0] > 3
+        if gpu:
+            assert np.allclose(tab_l, tab_f, rtol=1e-5, atol=1e-6, equal_nan=True)
+        else:
+            assert np.array_equal(tab_l, tab_f, equal_nan=True)
+
+
+def test_remeasure_refuses_other_dimensions():
+    engine = pytest.importorskip("msseg.mscoupon")
+    if not hasattr(engine.Msc2DPipeline, "remeasure"):
+        pytest.skip("extension predates Msc2DPipeline.remeasure")
+    img = np.random.default_rng(3).random((40, 50), dtype=np.float32)
+    pipe = engine.prime_slice(img, img, json.dumps({"msc": {"persistence_percent": 5.0}}))
+    other = np.zeros((41, 50), np.float32)
+    with pytest.raises(Exception):
+        pipe.remeasure("{}", other, other)

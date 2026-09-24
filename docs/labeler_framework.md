@@ -151,6 +151,8 @@ extremum's position and value columns. The magic fill, `TrainingSetBuilder`,
 | `ENROLMENT` / `_row_tags(si, li)` / `_enrolment_changed()` / `_normalize_enrolment(task)` | False / `()` / no-op / no-op | mspath: a task works only what it enrols (`Task.enrolled`); rows it does not are greyed (`UNENROLLED_TAG`) and *browsed* (no item current); the switch rebuilds navigation without priming; a legacy task materialises to its places. **`catalogue.keys()` is therefore per task** in an enrolment app. |
 | `_stream_ready(key)` / `CLASSIFY_ON_ARRIVAL` / `_classify_current()` | True / False / -- | the fast path: model operations never prime (mspath skips uncomputed items and says how many); `C` / `R` classify the item on screen, *Classify all* the rest; mspath classifies an item when it is selected |
 | `_prime_items(scope)` (mspath) | every listed item | the labeler's **Run task** (active task's items) / **Run all tasks** (union over tasks on the active workflow) |
+| `_keep_compute_for(profile)` / `_after_profile_kept()` / `_remeasure_current()` | False / calls `_remeasure_current` / no-op | the field / measurement split: `_switch_profile` resets only when `_keep_compute_for` says the new profile's FIELD cannot reuse what is primed (coupon: the stack's field fingerprint; mspath: `SlideEngine.keep_field`), and otherwise re-measures the item on screen. `AnnotationShell._on_stat_spec_change` settles and calls `_remeasure_current` (coupon: `_rerun_selection`; mspath: a new commit + `_request_item`, which re-measures on the worker with `remeasure_only`) |
+| `_processing_parent("stats")` | the Processing column | the labeler's **Features** tab (`feat_col`; `_FEATURE_SECTIONS`) -- the statistics are what a region is measured by, and an edit there costs a re-measure, not a Run |
 | `ItemCatalogue.binding_of(key)` / `rebase(key)` | (protocol) | coupon `(key, None)` / None; mspath `(slide, rect)` / `(slide, level, scale)` for an item key -- and `index_of` resolves a bare slide key to the slide's first row |
 
 **Tasks** (`task.py`, `AnnotationShell`): a session holds several named
@@ -163,7 +165,7 @@ is one assignment and nothing downstream knows there is more than one.
 (`_task_view_from_ui`: kind, search, neighbours, context), clears the
 rev-keyed caches (`_class_luts`, the seam caches, `_ctx_cache`), switches to
 the task's workflow through `_switch_profile` (a no-op when shared, so the
-primes survive), loads its newest saved pickle **lazily** (the load runs the
+primes survive; a workflow on the same field keeps them too and re-measures), loads its newest saved pickle **lazily** (the load runs the
 compatibility gate against the ACTIVE workflow, which is why it cannot happen
 at restore time for an inactive task), pushes its view and repaints; it is
 refused while an Optimize / sweep / evaluate worker runs, because the finish

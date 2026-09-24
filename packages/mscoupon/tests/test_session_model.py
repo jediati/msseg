@@ -274,3 +274,53 @@ def test_profile_summary_compact_chain():
     assert session.stage_code({"operation": "none"}) == ""
     assert session.chain_text([]) == "base"
     assert session.profile_summary({}).startswith("topo field: base→msc(asc, 10%, mf)\nstats: base→")
+
+
+def test_field_and_measure_fingerprints_split_the_profile():
+    """A statistics edit moves only the measure fingerprint; a chain, MSC or
+    colour-method edit moves the field one; result-free flags move neither."""
+    import copy
+    from msseg.mscoupon.fingerprints import field_fingerprint_of, measure_fingerprint_of
+    base = default_profile("p")
+    f0, m0 = session.field_fingerprint(base), session.measure_fingerprint(base)
+
+    stats = copy.deepcopy(base)
+    stats["statistics"]["channels"].append({"kind": "blur", "sigmas": [1.5]})
+    assert session.field_fingerprint(stats) == f0
+    assert session.measure_fingerprint(stats) != m0
+
+    radius = copy.deepcopy(base)
+    radius["msc"]["extremum_sample_radius"] = 2
+    assert session.field_fingerprint(radius) == f0
+    assert session.measure_fingerprint(radius) != m0
+
+    for edit in (lambda p: p["filters"].append({"operation": "blur", "params": {"sigma": 1.0}}),
+                 lambda p: p["base_filters"].append({"operation": "blur", "params": {"sigma": 1.0}}),
+                 lambda p: p["msc"].__setitem__("manifold", "descending"),
+                 lambda p: p["msc"].__setitem__("accurate", True),
+                 lambda p: p["input"]["color"].__setitem__("default_method", "max")):
+        q = copy.deepcopy(base)
+        edit(q)
+        assert session.field_fingerprint(q) != f0
+        assert session.measure_fingerprint(q) == m0
+
+    gpu = copy.deepcopy(base)
+    gpu["msc"]["use_gpu_gradient"] = True
+    assert session.field_fingerprint(gpu) == f0
+    assert session.measure_fingerprint(gpu) == m0
+
+    # The percentage reaches the build only as the cancellation cap, max(10, pct).
+    low = copy.deepcopy(base)
+    low["msc"]["persistence_percent"] = 3.0
+    assert session.field_fingerprint(low) == f0
+    high = copy.deepcopy(base)
+    high["msc"]["persistence_percent"] = 25.0
+    assert session.field_fingerprint(high) != f0
+
+    # Cores and builder choice are result-free; the declared plane count is a
+    # measurement fact (it resolves the statistics schema).
+    doc = json.loads(session.profile_params_json(base, cores=4, color_channels=3))
+    assert field_fingerprint_of(doc) == f0
+    assert measure_fingerprint_of(doc) != m0
+    assert field_fingerprint_of(json.dumps(doc)) == field_fingerprint_of(doc)
+    assert field_fingerprint_of("not json") == field_fingerprint_of(None)

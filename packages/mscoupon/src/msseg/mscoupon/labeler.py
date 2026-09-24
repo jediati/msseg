@@ -161,9 +161,9 @@ class LabelerApp(AnnotationShell, MscouponApp):
         but MEASURES what the model was trained on, and activate it.
 
         A new profile rather than an edit of the active one: profiles have no
-        undo stack, and _switch_profile already drops the primed data -- which
-        a statistics change needs, since the per-slice feature table is baked
-        at prime time (a selection rerun would not rebuild it)."""
+        undo stack. The new profile shares the active one's FIELD, so the
+        switch keeps the primed stack and the slices re-measure under the
+        model's statistics as they are read -- no Run."""
         self._snapshot_active_profile()
         base = {}
         if 0 <= self.active_profile_idx < len(self.profiles):
@@ -431,8 +431,8 @@ def _selftest():
         return False
 
     tabs = [str(app.center.tab(t, "text")) for t in app.center.tabs()]
-    assert tabs == list(_CENTER_TABS) == ["Processing", "Annotation", "Model",
-                                          "Analysis"], tabs
+    assert tabs == list(_CENTER_TABS) == ["Processing", "Features", "Annotation",
+                                          "Model", "Analysis"], tabs
     assert [str(p) for p in app.paned.panes()] \
         == [str(app.left_pane), str(app.right), str(app.center)], "data | view | tabs"
     assert _under(app.viewer.canvas, app.right), "the canvas is the middle column"
@@ -458,13 +458,25 @@ def _selftest():
     assert not app._panes_collapsed
     assert app._pane_fractions() == [0.2, 0.5], "F9 remembers where they were"
     # Processing is ONE column of collapsible groups, and which are folded
-    # rides the session.
-    for w in (app.filters_frame, app.base_frame, app.msc_frame, app.stats_frame,
-              app.profile_load_btn):
+    # rides the session. The statistics are on the Features tab (still a
+    # folding group under the same key), and so is the ext sample radius.
+    for w in (app.filters_frame, app.base_frame, app.msc_frame, app.profile_load_btn):
         assert _under(w, app.processing_tab), w
-    for w in (app.filters_frame, app.base_frame, app.msc_frame, app.stats_frame):
+    for w in (app.filters_frame, app.base_frame, app.msc_frame):
         assert _under(w, app.proc_col), w
+    assert _under(app.stats_frame, app.feat_col) and _under(app.stats_frame, app.features_tab)
+    assert not _under(app.stats_frame, app.processing_tab)
+    radius_entries = [w for w in app.stats_frame.winfo_children()
+                      for w in w.winfo_children()
+                      if isinstance(w, ttk.Entry)
+                      and str(w.cget("textvariable")) == str(app.ext_radius_var)]
+    assert len(radius_entries) == 1, "the ext sample radius is a statistics field"
     assert set(app._proc_groups) >= {"filters", "base", "msc", "stats"}
+    app._refresh_hints()
+    assert app.features_hint_var.get() == "stats: base→1ch×4", app.features_hint_var.get()
+    app._show_center_tab("Features")
+    assert app._center_tab_name() == "Features"
+    app._show_center_tab("Processing")
     assert app._proc_open_state() == {}, "everything starts open"
     app._proc_groups["msc"].toggle()
     assert not app._proc_groups["msc"].is_open()
@@ -547,8 +559,10 @@ def _selftest():
     assert app.workflow_hint.master is app.run_frame
     assert app.run_frame.pack_slaves()[0] is app.workflow_hint
     ml = app.confusion_holder.master
-    assert app.model_hint.master is ml and ml.pack_slaves()[0] is app.model_hint
-    train_row = ml.pack_slaves()[1]
+    # What the regions are measured by (-> Features), then the model (-> Model).
+    assert ml.pack_slaves()[0] is app.features_hint
+    assert app.model_hint.master is ml and ml.pack_slaves()[1] is app.model_hint
+    train_row = ml.pack_slaves()[2]
     assert any(isinstance(w, ttk.Button) and str(w.cget("text")).startswith("Train")
                for w in train_row.winfo_children()), "Train/Classify right under the hint"
 
@@ -1682,8 +1696,8 @@ def _selftest():
                 return out
 
             def _reprime():
-                """The engine.reset() inside the profile switch drops the fake
-                primed stack; put it back for the rest of the selftest."""
+                """Put the fake primed stack back, its record at the current
+                commit, for the rest of the selftest."""
                 app.primed = [{"files": files, "base": [zeros],
                                "filtered": [zeros], "pipes": [None],
                                "normalizers": [[]]}]
@@ -1707,8 +1721,17 @@ def _selftest():
                     pass
             assert len(app.profiles) == n_prof, "declining creates no profile"
             assert app._clf is None, "nothing installed when the offer is declined"
-            with _mock.patch.object(messagebox, "askyesno", return_value=True):
+            # The primed stack's field is the new profile's (only the
+            # statistics differ), so the switch keeps it and re-assembles --
+            # re-measures -- the slice on screen instead of dropping it.
+            from . import fingerprints as _fp
+            app._primed_fingerprint = _fp.field_fingerprint_of(app._params_json(cores=1))
+            primed_before = app.primed
+            with _mock.patch.object(messagebox, "askyesno", return_value=True), \
+                    _mock.patch.object(app, "_request_assembly") as _req:
                 app._load_classifier_from(clf_path, interactive=True)
+            assert app.primed is primed_before, "a statistics-only switch keeps the primes"
+            assert _req.called, "the slice on screen is re-assembled under the new statistics"
             assert len(app.profiles) == n_prof + 1, "accepting adds a profile"
             assert app.active_profile_idx == n_prof, "and switches to it"
             assert app.profiles[-1]["name"] == "from classifier.pkl"

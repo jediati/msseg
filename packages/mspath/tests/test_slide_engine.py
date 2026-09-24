@@ -233,3 +233,125 @@ def test_an_incremental_run_ends_with_item_primed_not_primed(monkeypatch):
     eng._incremental = False
     eng._run_worker([item], {}, 0)
     assert [ev[0] for ev in eng.poll()][-1] == "primed"
+
+
+# --------------------------------------------------------------------------- #
+# the measurement, separately from the field (a real prime on a synthetic slide)
+# --------------------------------------------------------------------------- #
+def _slide_profile(channels=("base",), filters=None, pct=5.0):
+    return {"filters": filters if filters is not None else [
+                {"operation": "color", "params": {"method": "luminance"}},
+                {"operation": "blur", "params": {"sigma": 1.0}}],
+            "base_filters": [],
+            "input": {"color": {"channels": 3}},
+            "msc": {"manifold": "ascending", "persistence_percent": pct,
+                    "accurate_ascending": False, "accurate_descending": False,
+                    "simplification": "merge_forest"},
+            "statistics": {"channels": list(channels), "reductions": ["mean", "std"],
+                           "extremum": True}}
+
+
+@pytest.fixture(scope="module")
+def synthetic(tmp_path_factory):
+    pytest.importorskip("tifffile")
+    ext = pytest.importorskip("msseg.mscoupon.mscoupon_py")
+    if not hasattr(ext.Msc2DPipeline, "remeasure"):
+        pytest.skip("extension predates Msc2DPipeline.remeasure")
+    from msseg.mspath.selftest import _synthetic_slide
+    folder = tmp_path_factory.mktemp("slides")
+    return _synthetic_slide(str(folder))
+
+
+def _engine_on(path):
+    eng = E.SlideEngine()
+    eng.register("f/s.tiff", path)
+    return eng, I.roi("f/s.tiff", 0, 64, 64, 256, 192)
+
+
+def test_a_statistics_change_remeasures_a_live_item(synthetic, monkeypatch):
+    eng, item = _engine_on(synthetic)
+    a = _slide_profile()
+    b = _slide_profile(("base", {"kind": "blur", "sigmas": [2.0], "source": "color"}))
+    eng.prime_item(item, a, halo=8)
+    rec_a = eng.ensure_record(item.key, a)
+    labels_a = np.array(rec_a["labels"], copy=True)
+    assert not eng.measure_stale(item.key, a)
+    assert eng.measure_stale(item.key, b) and not eng.needs_prime(item.key, b, 8)
+
+    primes = []
+    orig = E.SlideEngine.prime_item
+    monkeypatch.setattr(E.SlideEngine, "prime_item",
+                        lambda self, *x, **k: primes.append(1) or orig(self, *x, **k))
+    eng.commit_selection()
+    rec_b = eng.ensure_record(item.key, b)
+    assert primes == [], "a statistics change re-measures, it does not prime"
+    assert np.array_equal(rec_b["labels"], labels_a), "the MSC and its labels are kept"
+    assert "mean_blur_c0_s2" in rec_b["stats"].names
+    assert "mean_blur_c0_s2" not in rec_a["stats"].names
+    assert not eng.measure_stale(item.key, b)
+
+    # ... and the rows are what a fresh prime under b measures
+    fresh, _ = _engine_on(synthetic)
+    fresh.level_range = dict(eng.level_range)
+    monkeypatch.setattr(E.SlideEngine, "prime_item", orig)
+    fresh.prime_item(item, b, halo=8)
+    rec_f = fresh.ensure_record(item.key, b)
+    assert rec_f["stats"].names == rec_b["stats"].names
+    assert np.array_equal(rec_f["labels"], rec_b["labels"])
+    assert np.allclose(rec_f["stats"].values, rec_b["stats"].values, equal_nan=True)
+
+
+def test_keep_field_keeps_only_what_the_profile_can_reuse(synthetic):
+    eng, item = _engine_on(synthetic)
+    a = _slide_profile()
+    eng.prime_item(item, a, halo=8)
+    eng.level_range = {0: 1.0}
+    stats_only = _slide_profile(("base", "color"))
+    assert eng.keep_field(stats_only, halo=8) == 1
+    assert eng.primed[item.key].live and eng.level_range == {0: 1.0}
+    assert eng.keep_field(a, halo=4) == 0, "a different halo is a different read"
+    assert item.key not in eng.primed and eng.level_range == {}
+
+    eng.prime_item(item, a, halo=8)
+    other_chain = _slide_profile(filters=[{"operation": "color", "params": {"method": "luminance"}}])
+    assert eng.keep_field(other_chain, halo=8) == 0
+    assert not eng.primed
+
+
+def test_remeasure_reads_the_chains_the_pipe_was_primed_with(synthetic, monkeypatch):
+    """An edited but un-Run chain is a preview: a re-measure must feed the
+    pipe the rasters its MSC saw, not the panel's new ones."""
+    eng, item = _engine_on(synthetic)
+    a = _slide_profile()
+    eng.prime_item(item, a, halo=8)
+    seen = []
+    from msseg.mscoupon.engine import ComputeEngine
+    orig = ComputeEngine._leading_color
+
+    def spy(arr, chain, *x, **k):
+        seen.append([c["operation"] for c in chain])
+        return orig(arr, chain, *x, **k)
+    monkeypatch.setattr(ComputeEngine, "_leading_color", staticmethod(spy))
+    edited = _slide_profile(("base", "color"), filters=[
+        {"operation": "color", "params": {"method": "luminance"}}])
+    eng.remeasure_item(item.key, edited)
+    assert seen[0] == ["color", "blur"], "the topology chain the pipe was primed with"
+
+
+def test_a_remeasure_only_run_never_primes(monkeypatch):
+    eng = E.SlideEngine()
+    item = I.roi("f/a.svs", 0, 0, 0, 64, 64)
+    p = E.Primed(item, FakePipe(), None, None, (0, 0), 1.0, 0, (64, 64), 0)
+    p.measured = "old"
+    eng.primed[item.key] = p
+    calls = []
+    monkeypatch.setattr(eng, "prime_item", lambda *a, **k: calls.append("prime"))
+    monkeypatch.setattr(eng, "remeasure_item", lambda *a, **k: calls.append("measure"))
+    monkeypatch.setattr(eng, "can_remeasure", lambda key: True)
+    eng._remeasure_only = True
+    eng._run_worker([item], {"statistics": {"channels": ["base"]}}, 0)
+    assert calls == ["measure"]
+    dead = I.roi("f/a.svs", 0, 64, 0, 64, 64)
+    calls.clear()
+    eng._run_worker([dead], {}, 0)
+    assert calls == [], "a released item is skipped, not primed"

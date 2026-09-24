@@ -166,7 +166,10 @@ class SlideRegionProvider:
             return None
         profile = self.app._profile_for_compute()
         p = self.engine.primed.get(key)
-        if p is None or not p.live:
+        # A live pipe is served as it is -- its rows re-measured by the
+        # engine when the statistics moved -- unless it cannot re-measure.
+        if (p is None or not p.live or (self.engine.measure_stale(key, profile)
+                                        and not self.engine.can_remeasure(key))):
             try:
                 self.engine.prime_item(item, profile, halo=self.app._halo())
             except Exception as exc:

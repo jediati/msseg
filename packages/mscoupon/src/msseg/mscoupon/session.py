@@ -24,7 +24,7 @@ import json
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from . import config_io
+from . import config_io, fingerprints
 from .config_io import _as_dict, _as_int, _as_list, _note, _opt_float
 
 from msseg.labeler.session_doc import SESSION_DOC_VERSION  # noqa: F401
@@ -211,6 +211,18 @@ def profile_params_json(profile: Dict[str, Any], cores: int = 1,
     if block:
         doc["input"] = {"color": block}
     return json.dumps(doc)
+
+
+def field_fingerprint(profile: Dict[str, Any]) -> str:
+    """What a primed slice's MSC and labels depend on (see fingerprints.py):
+    two profiles with the same field fingerprint share their primes."""
+    return fingerprints.field_fingerprint_of(profile_params_json(profile))
+
+
+def measure_fingerprint(profile: Dict[str, Any]) -> str:
+    """What a primed slice's statistics rows depend on: a profile that differs
+    from the primed one only here costs a re-measure, not a re-prime."""
+    return fingerprints.measure_fingerprint_of(profile_params_json(profile))
 
 
 def profile_file_doc(profile: Dict[str, Any]) -> Dict[str, Any]:

@@ -122,10 +122,23 @@ class Msc2DPipeline {
              const Msc2DParams& cfg, const StatChannelBank* bank = nullptr,
              const diffg::MultiImage<float>* color = nullptr);
 
+  // Re-run ONLY the statistics half of build() under `cfg.stats`, keeping the
+  // MSC, the base labelling, the living labels and the arcs: relevance, the
+  // leaf accumulation and the seeding extremum are recomputed from the same
+  // three rasters build() was given (same dimensions), then the rows are
+  // rolled up again at the current persistence. The feature table afterwards
+  // equals a fresh build() under the same cfg; a statistics edit costs the
+  // measurement (~0.2-2 s on 3232^2) instead of the MSC (~4 s). Only
+  // cfg.stats, cfg.extremum_sample_radius and the GPU/parallelism flags are
+  // read -- the topology keys are ignored, since nothing topological is
+  // recomputed. Records its phases in build_timings(). Throws before build().
+  void remeasure(const diffg::Image<float>& base, const diffg::Image<float>& filtered,
+                 const Msc2DParams& cfg, const diffg::MultiImage<float>* color = nullptr);
+
   int width() const;
   int height() const;
-  // Wall time per phase of the last build(), in the order they ran, "total"
-  // last. A caller can only time build() as a whole, and the MSC's own stderr
+  // Wall time per phase of the last build() or remeasure(), in the order they
+  // ran, "total" last. A caller can only time build() as a whole, and the MSC's own stderr
   // lines cover its forest, not the gradient before it or the statistics
   // after -- so a 34 s prime whose visible lines summed to 2 s had no
   // explanation. Also printed, one line per phase, unless MSSEG_TIME_MSC=0.

@@ -37,7 +37,8 @@ things you edit.
 |---|---|
 | **left** | the workflow (compute-profile) picker, the **Tasks** list, the session browser (folders, files, sequences) and Run |
 | **middle** | the slice canvas, hover readout, slice navigation, image/overlay/alpha controls and the persistence entry |
-| **Processing** (default tab) | the profile tools (New/Dup/Rename/Delete, Save/Load profile) and the profile being edited, as one column of collapsible groups: colour input, filter chain, base channel, MSC parameters, statistics channels |
+| **Processing** (default tab) | the profile tools (New/Dup/Rename/Delete, Save/Load profile) and the profile being edited, as one column of collapsible groups: colour input, filter chain, base channel, MSC parameters |
+| **Features** | the statistics every region is measured by -- the channels, reductions, seeding extremum and its sample radius, histograms -- i.e. the classifier's input columns (see "Features: an edit re-measures" below) |
 | **Annotation** | classes, tools, the Magic rows, the per-class interaction lists, Save/Load annotations, and the classifier (Train/Classify, the model strip, the confusion matrix, exports, Save/Load classifier) |
 | **Model** | the classifier kind, a read-only description of its architecture, the **Edge model** panel (the `-> edges` kinds) and the **Optimize network** search (trials, time limit, seed, feature-subset toggle, progress line) |
 | **Analysis** | **Predictions vs annotations** (the regions behind a confusion cell; double-click a row to go there) and the **Size sweep** report; a home for plots later |
@@ -48,8 +49,8 @@ change the proportions -- they are remembered with the session as fractions of
 the width, so they restore sanely into a differently sized window -- and press
 **F9** to fold the tab column away entirely, F9 again to bring it back.
 
-Each Processing group folds away behind its title, and which ones are shut is
-remembered too. That is what makes one column work: the filter chain alone
+Each Processing (and Features) group folds away behind its title, and which
+ones are shut is remembered too. That is what makes one column work: the filter chain alone
 grows a card per stage, so all five groups open is about 850 px of panel and
 all five shut is 135 px.
 
@@ -117,15 +118,35 @@ badge reads `Preview - filters changed, Run to re-prime`. Undo the edit and the
 primed view comes straight back from the cache; Run and the overlays are about
 the picture again.
 
-Two link-labels say what is in effect: the Run section is headed by the
+### Features: an edit re-measures, it never re-primes
+
+A prime is two computations: the **field** (the chains, the colour input, the
+MSC, the base manifolds) and the **measurement** (the per-region rows). They
+are keyed and cached apart. Editing anything on the Features tab settles for a
+quarter second and then re-measures the slice on screen -- the canvas says
+`Measuring` -- keeping its MSC, its regions and its arcs, and rebuilding only
+the rows; other slices re-measure when something reads them (a Rerun, a Train,
+navigating there). No Run. The same holds for a profile or task switch whose
+profile differs only in its statistics (or selection): the primed stack is
+kept and re-measured, where a different field still drops it, and for
+**Create a profile from the model's statistics** after loading a classifier.
+A Run reuses every sequence primed under the same field, re-measuring the ones
+whose statistics moved. What a re-measure costs is a prime minus its MSC: on a
+2048² item, 0.2 s for base-only and 0.9 s for twelve derived channels (the
+channel bank is most of that), against the MSC's own 0.5-4 s. Predictions
+still fall stale -- the rows changed -- and a model trained on other columns
+is refused by the compat gate as before. The base chain (`base_filters`) is
+still on the field side: the raw slice is not kept, so editing it needs a Run.
+
+Three link-labels say what is in effect: the Run section is headed by the
 **selected workflow** as two compact chains --
 `topo field: base→b(1.5)→e(0.7)→msc(asc, 10%)` (the field the MSC runs on,
 then manifold and persistence, `mf` for merge forest) and
 `stats: base→norm(gmm)→12ch×4` (the base chain the statistics are measured
 on, then channels × reductions); hover for the code table -- and the classifier
-section, above Train/Classify, by the **active model** (the kind Train will
-build, or the trained model and its feature count); clicking either opens its
-tab. The selected tab rides the session as
+section, above Train/Classify, by the `stats:` line alone (opens **Features**)
+and the **active model** (the kind Train will build, or the trained model and
+its feature count; opens **Model**); clicking any of them opens its tab. The selected tab rides the session as
 `view.center_tab` (with the sashes as `view.panes` and the folded Processing
 groups as `view.proc_open`) and is restored by name, and so does the picked
 model kind

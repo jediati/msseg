@@ -146,7 +146,10 @@ def _model_description(kind, spec=None, n_features=None):
 # middle one, so the picture is on screen whichever tab is being edited
 # (there was a "View" tab until the filter-edit loop made looking and editing
 # the same act).
-_CENTER_TABS = ("Processing", "Annotation", "Model", "Analysis")
+# Features holds the statistics -- what a region is MEASURED by -- apart from
+# Processing, which builds the field it is found in: a statistics edit
+# re-measures the item on screen, a Processing edit needs a Run.
+_CENTER_TABS = ("Processing", "Features", "Annotation", "Model", "Analysis")
 # The labeler's three columns -- data navigation, the viewer, the tabs -- as
 # the fractions of the width its two sashes sit at: roughly 1:3:2. Only the
 # viewer pane carries a weight, so window growth goes to the picture and the

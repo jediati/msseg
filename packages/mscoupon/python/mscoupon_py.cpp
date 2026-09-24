@@ -396,6 +396,22 @@ msseg::Msc2DPipeline prime_slice(const FloatArray& base, const FloatArray& filte
   return pipe;
 }
 
+// Re-measure a primed pipeline under params_json's statistics block, keeping its
+// MSC, labels and arcs. The rasters must be the ones it was primed from (same
+// shape); only `statistics` and the measurement flags are read.
+void pipeline_remeasure(msseg::Msc2DPipeline& pipe, const std::string& params_json,
+                        const FloatArray& base, const FloatArray& filtered,
+                        const py::object& color) {
+  std::size_t bh = 0, bw = 0, fh = 0, fw = 0;
+  const diffg::Image<float> base_img = to_image(base, bh, bw);
+  const diffg::Image<float> filt_img = to_image(filtered, fh, fw);
+  if (bh != fh || bw != fw) throw std::runtime_error("base and filtered must share shape");
+  const diffg::MultiImage<float> color_planes = optional_planes(color, bh, bw);
+  const msseg::Msc2DParams msc = parse_msc(parse_params(params_json));
+  py::gil_scoped_release release;
+  pipe.remeasure(base_img, filt_img, msc, color_planes.channels() ? &color_planes : nullptr);
+}
+
 // Feature id per pixel (int32 h,w) at the pipeline's current persistence.
 py::array_t<std::int32_t> pipeline_labels(const msseg::Msc2DPipeline& pipe) {
   const std::vector<int>& labels = pipe.labels();
@@ -812,6 +828,12 @@ PYBIND11_MODULE(mscoupon_py, m) {
       .def("select_persistence", &msseg::Msc2DPipeline::select_persistence, py::arg("persistence_absolute"),
            py::call_guard<py::gil_scoped_release>(),
            "Re-threshold to an absolute persistence (remap labels + re-aggregate stats).")
+      .def("remeasure", &pipeline_remeasure, py::arg("params_json"), py::arg("base"),
+           py::arg("filtered"), py::arg("color") = py::none(),
+           "Recompute ONLY the statistics under params_json's `statistics` block, from the "
+           "rasters this pipeline was primed from: the MSC, labels(), region_arcs() and the "
+           "persistence are kept, feature_table() afterwards equals a fresh prime_slice() "
+           "under the same params. build_timings() then holds the re-measure's phases.")
       .def("release_gpu", &msseg::Msc2DPipeline::release_gpu,
            "Free this slice's GPU residue (device label context); host results stay, "
            "the next select re-uploads lazily. Call when the slice stops being active.")

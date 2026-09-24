@@ -33,7 +33,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from . import config_io
+from . import config_io, fingerprints
 from .config_io import (FILTER_SCHEMA, FILTER_OPERATIONS, COLOR_METHODS, QUERY_OPS,
                         filter_param_schema, query_fields)
 # Shared helpers live in common.py (re-exported here so existing imports of
@@ -431,6 +431,16 @@ class MscouponApp(ViewerShell):
         ttk.Checkbutton(c, text="seeding extremum (ext_* per channel)",
                         variable=self.stat_extremum_var,
                         command=self._on_stat_spec_change).pack(anchor="w", padx=4)
+        # The window the ext_* samples average over: a measurement, so it
+        # lives with the statistics (it used to sit among the MSC parameters,
+        # where an edit looked like it needed a re-prime; it never did).
+        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
+        ttk.Label(row, text="ext sample radius:").pack(side="left")
+        e = ttk.Entry(row, textvariable=self.ext_radius_var, width=8)
+        e.pack(side="left", padx=4)
+        e.bind("<Return>", lambda ev: self._on_stat_spec_change())
+        e.bind("<FocusOut>", lambda ev: self._on_stat_spec_change())
+        ttk.Label(row, text="(0 = the critical pixel)").pack(side="left")
         # Histograms: a fixed range per channel (or "*" for all), so the bins
         # add across slices and mean the same thing on every slice.
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=(4, 1))
@@ -722,10 +732,6 @@ class MscouponApp(ViewerShell):
                           "corner minima, which the MSC keeps alive at every "
                           "persistence. MSC arcs are still built on demand.",
                   foreground="#666").pack(anchor="w", padx=4)
-        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
-        ttk.Label(row, text="ext sample radius:").pack(side="left")
-        ttk.Entry(row, textvariable=self.ext_radius_var, width=8).pack(side="left", padx=4)
-        ttk.Label(row, text="(0 = the critical pixel)").pack(side="left")
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="Per-slice min area:").pack(side="left")
         ttk.Entry(row, textvariable=self.min_area_var, width=8).pack(side="left", padx=4)
@@ -1884,15 +1890,14 @@ class MscouponApp(ViewerShell):
         self.run_btn.config(state="disabled")
         params = self._params_json()
         subseqs = [dict(s) for s in self.subsequences]
-        # Incremental priming: a sequence already primed under the SAME compute
-        # parameters (cores and the GPU-gradient flag excluded -- neither
-        # changes results, the GPU pairing is bit-identical) and the same files
-        # is reused instead of recomputed, so adding a sequence never re-primes
-        # the rest. Any parameter/statistics change misses the fingerprint and
-        # re-primes everything.
-        fp_doc = json.loads(self._params_json(cores=1))
-        fp_doc.get("msc", {}).pop("use_gpu_gradient", None)
-        fingerprint = json.dumps(fp_doc, sort_keys=True)
+        # Incremental priming: a sequence already primed under the SAME field
+        # (chains, colour input, MSC; cores and the GPU flags excluded --
+        # neither changes results) and the same files is reused instead of
+        # recomputed, so adding a sequence never re-primes the rest. The
+        # statistics are not part of it: a reused slice whose statistics
+        # moved is re-measured, lazily, the first time its record is built
+        # (ComputeEngine._ensure_measured). A field change re-primes everything.
+        fingerprint = fingerprints.field_fingerprint_of(self._params_json(cores=1))
         reused = 0
         if fingerprint == getattr(self, "_primed_fingerprint", None) and self.primed:
             by_files = {tuple(p["files"]): p for p in self.primed}
@@ -2144,7 +2149,8 @@ class MscouponApp(ViewerShell):
         if self.viewer is None:
             return
         if self._is_current_busy():
-            self.viewer.set_hud("busy", "Recomputing")
+            self.viewer.set_hud("busy", "Measuring" if self._current_measure_stale()
+                                else "Recomputing")
         elif self._preview_pending is not None:
             self.viewer.set_hud("busy", f"Previewing {self._preview_pending[1]}")
         elif self._preview_override is not None:
@@ -2153,6 +2159,15 @@ class MscouponApp(ViewerShell):
             self.viewer.set_hud("stale", "Out of date - click Rerun")
         else:
             self.viewer.set_hud(None)
+
+    def _current_measure_stale(self):
+        cur = self._current()
+        if cur is None or not self.primed:
+            return False
+        try:
+            return self.engine.measure_stale(cur[0], cur[1], self._params_json())
+        except Exception:
+            return False
 
     def _on_assembly_done(self, si, accepted):
         """UI half of an "assembly_done" event: the result (if accepted) is
@@ -2464,6 +2479,29 @@ class MscouponApp(ViewerShell):
         self._preview_override = None
         self._preview_shown_key = None
         self._preview_chan_cache.budget = _PREVIEW_CHAN_BUDGET
+
+    def _keep_compute_for(self, profile):
+        """Keep the primed stack across a profile switch when the new
+        profile's FIELD is the one it was primed under: only its statistics
+        (or selection) differ, and those re-measure / re-select."""
+        if not self.primed or self.engine.run_active:
+            return False
+        return (getattr(self, "_primed_fingerprint", None)
+                == fingerprints.field_fingerprint_of(session.profile_params_json(profile)))
+
+    def _remeasure_current(self):
+        """A new generation for the panel's statistics and selection, and the
+        slice on screen re-assembled (its rows re-measured on the worker when
+        the statistics moved). Other slices follow when they are needed."""
+        if not self.primed:
+            return
+        self._chan_cache.clear()
+        # The primed stack follows the panel's statistics from here on, so a
+        # statistics-only difference is not a stale preview.
+        if (getattr(self, "_primed_fingerprint", None)
+                == fingerprints.field_fingerprint_of(self._params_json(cores=1))):
+            self._primed_chain = self._chain_fingerprint()
+        self._rerun_selection()
 
     def _settle_controls(self):
         try:

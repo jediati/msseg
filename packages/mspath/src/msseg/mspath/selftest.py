@@ -1067,6 +1067,59 @@ def run_labeler_selftest():
     assert app3._rois_of(0) == [] and all(not t.enrolled for t in app3.tasks)
     assert p1.key not in app3.engine.primed and kB not in app3.engine.primed
 
+    # -- the MSC and the statistics are cached apart ------------------------ #
+    # The statistics live on the Features tab. An edit there re-measures the
+    # item on screen on the worker: its labels stay, its columns follow the
+    # spec, and nothing is primed; a profile that differs only in its
+    # statistics keeps the live items across the switch.
+    app = LabelerApp(tk.Toplevel(root), autosave=False)
+    assert app._add_slide_path(slide) and app._enrol_row(0, 0)
+    app.level_var.set(deepest)
+    app._on_level_change()
+    app._goto_slice(0)
+    assert app.stats_frame.master.master is app._processing_parent("stats")   # a Collapsible
+    assert app._processing_parent("stats") is app.feat_col
+    assert app._processing_parent("filters") is app.proc_col
+    kk = app.catalogue.key_of(*app._current())
+    app.engine.prime_item(app._item_at(*app._current()), app._profile_for_compute(), halo=0)
+    if app.engine.can_remeasure(kk):
+        rec0 = app.engine.ensure_record(kk, app._profile_for_compute())
+        labels0 = np.array(rec0["labels"], copy=True)
+        live0 = app.engine.primed[kk]
+        primes, seen = [], []
+        orig_prime, orig_handle = app.engine.prime_item, app._handle_event
+        app.engine.prime_item = lambda *a, **k: primes.append(1) or orig_prime(*a, **k)
+        app._handle_event = lambda ev: seen.append(ev[0]) or orig_handle(ev)
+        blur_on, blur_sig, _src = app.stat_kind_vars["blur"]
+        blur_on.set(True); blur_sig.set("2.0")
+        app._on_stat_spec_change()
+        assert app._stat_edit_after is not None, "the edit settles before it measures"
+        app.root.after_cancel(app._stat_edit_after)
+        app._stat_edit_settled()
+        assert app.engine.running_kind == "measure" or not app.engine.pending_work()
+        _settle(app)
+        rec1 = app.engine.record(kk) or app.engine.ensure_record(kk, app._profile_for_compute())
+        assert "mean_blur_s2" in rec1["stats"].names, rec1["stats"].names[:8]
+        assert np.array_equal(rec1["labels"], labels0), "a re-measure keeps the regions"
+        assert primes == [] and "primed" not in seen, (primes, seen)
+        assert app.engine.primed[kk] is live0 and live0.live
+        # A profile that differs only in its statistics: kept, re-measured.
+        app._snapshot_active_profile()
+        other = _json.loads(_json.dumps(app.profiles[app.active_profile_idx]))
+        other["name"] = "stats only"
+        other["statistics"]["channels"] = ["base"]
+        app.profiles.append(other)
+        app._switch_profile(len(app.profiles) - 1)
+        _settle(app)
+        assert app.engine.primed.get(kk) is live0 and live0.live, "the switch kept the pipe"
+        rec2 = app.engine.record(kk) or app.engine.ensure_record(kk, app._profile_for_compute())
+        assert "mean_blur_s2" not in rec2["stats"].names
+        assert np.array_equal(rec2["labels"], labels0) and primes == []
+        app.engine.prime_item, app._handle_event = orig_prime, orig_handle
+        remeasured = "statistics re-measured without a prime, stats-only switch keeps pipes"
+    else:
+        remeasured = "re-measure SKIPPED (extension predates it)"
+
     root.destroy()
     print("labeler selftest OK: placement, slide-coordinate gestures, class layer, "
           "box over the item, training rows, level-scoped compat gate, "
@@ -1077,6 +1130,7 @@ def run_labeler_selftest():
           "an ROI's removal keeps them + the coarse mark, "
           "seam tools in slide coordinates, tasks: own store + model, "
           "profile-from-model binds the active task, two tasks into a fresh window, "
+          f"{remeasured}, "
           "places + enrolment: nothing worked until enrolled, browse, outlines, "
           "one place at two levels, Run task / all, round trip + legacy, removal")
     return 0

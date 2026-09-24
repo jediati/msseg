@@ -2421,6 +2421,108 @@ void test_color_stat_channels() {
 
 // Per-region histograms: the accumulator, the projection (after ext_filtered,
 // summing to one), the 3D merge, and the CSV.
+void test_msc2d_remeasure() {
+  // remeasure() swaps the statistics under a live MSC: the labels and arcs are
+  // untouched, and the feature table equals a fresh build() under the new spec
+  // -- base-only, derived channels, histograms, extremum off, both directions.
+  const int w = 40, h = 36;
+  const diffg::Image<float> field = make_wells(w, h);
+  diffg::Image<float> base(diffg::Dimensions{static_cast<std::size_t>(w), static_cast<std::size_t>(h), 1});
+  for (std::size_t i = 0; i < field.size(); ++i) base.data()[i] = 0.5f * field.data()[i] + 0.1f;
+
+  std::vector<msseg::StatsSpec> specs;
+  specs.emplace_back();  // base only, extremum on (the default)
+  {
+    msseg::StatsSpec s;
+    s.derived.push_back(stat_req("blur", {0.7, 1.5}, "base"));
+    s.derived.push_back(stat_req("hessian", {1.0}, "base"));
+    specs.push_back(s);
+  }
+  {
+    msseg::StatsSpec s;
+    s.std = false;
+    s.derived.push_back(stat_req("edges", {1.0}, "base"));
+    s.hist.bins = 6;
+    s.hist.channels = {"base"};
+    s.hist.ranges["*"] = {0.0f, 1.0f};
+    specs.push_back(s);
+  }
+  {
+    msseg::StatsSpec s;
+    s.extremum = false;
+    s.extremum_sample_radius = 1;
+    specs.push_back(s);
+  }
+
+  const auto same_table = [&](const msseg::Msc2DPipeline& a, const msseg::Msc2DPipeline& b,
+                              const msseg::StatsSpec& spec, const char* what) {
+    const auto ta = mscoupon::feature_table(a.feature_stats(), a.feature_channels(), a.channels(), spec);
+    const auto tb = mscoupon::feature_table(b.feature_stats(), b.feature_channels(), b.channels(), spec);
+    expect(ta.n_rows == tb.n_rows && ta.n_cols() == tb.n_cols(), what);
+    for (std::size_t c = 0; c < ta.n_cols() && c < tb.n_cols(); ++c) {
+      expect(ta.fields[c].name == tb.fields[c].name, "remeasure: same column names");
+    }
+    for (std::size_t i = 0; i < ta.values.size() && i < tb.values.size(); ++i) {
+      const double x = ta.values[i], y = tb.values[i];
+      const bool ok = (std::isnan(x) && std::isnan(y)) || std::abs(x - y) <= 1e-6 * (1.0 + std::abs(x));
+      if (!ok) { expect(false, what); break; }
+    }
+  };
+
+  for (const char* manifold : {"ascending", "descending"}) {
+    msseg::Msc2DParams cfg;
+    cfg.manifold = manifold;
+    cfg.persistence_percent = 5.0f;
+    cfg.persistence_absolute.reset();
+    msseg::Msc2DPipeline live;
+    live.build(base, field, cfg);
+    const std::vector<int> labels0 = live.labels();
+    const std::vector<msseg::Msc2DRegionArc> arcs0 = live.region_arcs();
+    const float pers0 = live.current_persistence();
+    for (const auto& spec : specs) {
+      msseg::Msc2DParams next = cfg;
+      next.stats = spec;
+      live.remeasure(base, field, next);
+      msseg::Msc2DPipeline fresh;
+      fresh.build(base, field, next);
+      expect(live.labels() == labels0, "remeasure keeps the living labels");
+      expect(live.current_persistence() == pers0, "remeasure keeps the persistence");
+      const auto& arcs = live.region_arcs();
+      expect(arcs.size() == arcs0.size(), "remeasure keeps the arcs");
+      for (std::size_t i = 0; i < arcs.size() && i < arcs0.size(); ++i) {
+        expect(arcs[i].a == arcs0[i].a && arcs[i].b == arcs0[i].b && arcs[i].count == arcs0[i].count,
+               "remeasure keeps each arc");
+      }
+      expect(live.labels() == fresh.labels(), "a fresh build labels the same");
+      same_table(live, fresh, spec, "remeasure's table equals a fresh build's");
+      expect(!live.build_timings().empty() && live.build_timings().back().phase == "total",
+             "remeasure records its timings");
+      for (const auto& t : live.build_timings()) {
+        expect(t.phase != "msc", "remeasure does not run the MSC");
+      }
+    }
+  }
+
+  bool threw = false;
+  try {
+    msseg::Msc2DPipeline empty;
+    empty.remeasure(base, field, msseg::Msc2DParams{});
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  expect(threw, "remeasure before build throws");
+  threw = false;
+  try {
+    msseg::Msc2DPipeline live;
+    live.build(base, field, msseg::Msc2DParams{});
+    const diffg::Image<float> other = make_wells(w + 2, h);
+    live.remeasure(other, other, msseg::Msc2DParams{});
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  expect(threw, "remeasure on other dimensions throws");
+}
+
 void test_histogram_stats() {
   msseg::StatsSpec spec;
   spec.std = false;
@@ -2577,6 +2679,7 @@ int main() try {
   RUN(test_tiff_planes_roundtrip);
   RUN(test_color_stat_channels);
   RUN(test_histogram_stats);
+  RUN(test_msc2d_remeasure);
   std::cout << "mscoupon tests passed\n";
   return 0;
 } catch (const std::exception& e) {

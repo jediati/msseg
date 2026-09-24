@@ -44,6 +44,8 @@ import time
 from msseg.labeler.pyramid import PyramidImageSource
 from msseg.labeler.table import FeatureTable
 
+from msseg.mscoupon.fingerprints import field_fingerprint_of, measure_fingerprint_of
+
 from .common import log
 from .items import Item, parse_key
 
@@ -80,7 +82,7 @@ class Primed:
     """One item's live compute state."""
 
     __slots__ = ("item", "pipe", "base", "filtered", "origin", "scale", "level",
-                 "shape", "value_range", "halo", "channel_sources")
+                 "shape", "value_range", "halo", "channel_sources", "field", "measured", "chains")
 
     def __init__(self, item, pipe, base, filtered, origin, scale, level, shape, halo=0):
         self.item = item
@@ -94,6 +96,15 @@ class Primed:
         self.level = int(level)
         self.shape = shape                # (h, w) of the item's raster
         self.value_range = float(pipe.value_range()) if pipe is not None else 0.0
+        # What the pipe was built and measured under (fingerprints.py): the
+        # field decides whether the pipe can be kept at all, the measurement
+        # whether its rows are current or need a re-measure.
+        self.field = None
+        self.measured = None
+        # The chains the pipe was primed with (filters, base_filters, input):
+        # a re-measure must read the rasters the MSC saw, not whatever the
+        # panel says now -- an edited, un-Run chain is a preview, not a prime.
+        self.chains = None
 
     @property
     def live(self):
@@ -135,6 +146,10 @@ class SlideEngine:
         self._worker = None
         self._busy = False
         self.running_keys = ()           # the keys the worker is priming right now
+        # "prime" or "measure": what the worker is doing to running_keys, for
+        # the badge. A run that primes anything says "prime".
+        self.running_kind = "prime"
+        self._remeasure_only = False
 
     # ------------------------------------------------------------------ #
     # slides
@@ -235,12 +250,107 @@ class SlideEngine:
             base = np.ascontiguousarray(base[halo:halo + lh, halo:halo + lw])
             filtered = np.ascontiguousarray(filtered[halo:halo + lh, halo:halo + lw])
         p = Primed(item, pipe, base, filtered, origin, scale, level, (lh, lw), halo)
+        p.field = field_fingerprint_of(profile)
+        p.measured = measure_fingerprint_of(profile)
+        p.chains = {k: profile.get(k) for k in ("filters", "base_filters", "input")}
         log(f"primed {item.key}: {lw}x{lh} @L{level} (halo {halo}) "
             f"read={1e3 * (t_read - t0):.0f}ms filters={1e3 * (t_filter - t_read):.0f}ms "
             f"prime={1e3 * (t_prime - t_filter):.0f}ms{build_timings_brief(pipe)} "
             f"range={p.value_range:.4g}")
         self._install(item.key, p)
         return p
+
+    # ------------------------------------------------------------------ #
+    # the measurement, separately from the field
+    # ------------------------------------------------------------------ #
+    def can_remeasure(self, key):
+        p = self.primed.get(key)
+        return p is not None and p.live and hasattr(p.pipe, "remeasure")
+
+    def measure_stale(self, key, profile):
+        """True iff the item is live and its rows were measured under other
+        statistics than `profile` asks for."""
+        p = self.primed.get(key)
+        if p is None or not p.live or p.measured is None:
+            return False
+        return p.measured != measure_fingerprint_of(profile)
+
+    def needs_prime(self, key, profile, halo=None):
+        """True iff the item has no pipe that can serve `profile`: not primed,
+        released, built under another field (or halo), or measured under other
+        statistics on an extension that cannot re-measure."""
+        p = self.primed.get(key)
+        if p is None or not p.live:
+            return True
+        if p.field is not None and p.field != field_fingerprint_of(profile):
+            return True
+        if halo is not None and not p.item.is_overview and p.halo != int(halo):
+            return True
+        return self.measure_stale(key, profile) and not hasattr(p.pipe, "remeasure")
+
+    def remeasure_item(self, key, profile, quiet=True):
+        """Rebuild the item's statistics under `profile` on its live pipe: the
+        MSC, labels and arcs stay. The rasters are re-read and re-filtered
+        (the pipe saw the padded raster and the colour planes, neither of
+        which is kept) -- the read is most of the cost, and still well under
+        a prime. Synchronous; the caller picks the thread."""
+        from msseg.mscoupon import mscoupon_py as ext
+        from msseg.mscoupon.engine import ComputeEngine, build_timings_brief
+        import numpy as np
+
+        p = self.primed.get(key)
+        if p is None or not p.live:
+            raise RuntimeError(f"{key}: no live pipeline to re-measure")
+        say = (lambda _m: None) if quiet else log
+        chains = p.chains or profile
+        t0 = time.perf_counter()
+        arr, _geom, _dt = self.read_item(p.item, p.halo)
+        method = default_color_method(chains)
+        cur, rest = ComputeEngine._leading_color(arr, chains.get("filters") or [], ext, say,
+                                                 method)
+        if rest:
+            cur = ext.filter_chain(cur, json.dumps({"filters": rest}), method)
+        filtered = np.ascontiguousarray(cur, dtype=np.float32)
+        base, _norms = ComputeEngine._apply_base_chain(
+            arr, chains.get("base_filters") or [], ext, say, method)
+        t_read = time.perf_counter()
+        planes = arr if arr.ndim == 3 else None
+        if planes is None:
+            p.pipe.remeasure(json.dumps(profile), base, filtered)
+        else:
+            p.pipe.remeasure(json.dumps(profile), base, filtered, planes)
+        p.measured = measure_fingerprint_of(profile)
+        p.channel_sources = {}
+        self.slices.pop(key, None)
+        self.touch(key)
+        log(f"re-measured {key}: read+filters={1e3 * (t_read - t0):.0f}ms "
+            f"measure={1e3 * (time.perf_counter() - t_read):.0f}ms{build_timings_brief(p.pipe)}")
+        return p
+
+    def keep_field(self, profile, halo=0):
+        """Keep the live pipes that `profile` can reuse -- same field, same
+        halo -- and drop everything else, like ``reset`` does. Records go
+        either way (a new generation). Returns how many items were kept; the
+        per-level pins stay only if something was kept."""
+        field = field_fingerprint_of(profile)
+        kept = 0
+        for key in list(self.primed):
+            p = self.primed[key]
+            keep = (p.live and p.field == field
+                    and (p.item.is_overview or p.halo == int(halo)))
+            if keep:
+                kept += 1
+                continue
+            p.release()
+            del self.primed[key]
+            if key in self._order:
+                self._order.remove(key)
+        self.slices.clear()
+        if not kept:
+            self.level_range = {}
+            self.persistence_abs = {}
+        self.commit_id += 1
+        return kept
 
     def _install(self, key, p):
         old = self.primed.get(key)
@@ -320,6 +430,10 @@ class SlideEngine:
         p = self.primed.get(key)
         if p is None or not p.live:
             return None
+        if self.measure_stale(key, profile):
+            if not hasattr(p.pipe, "remeasure"):
+                return None            # the caller re-primes under the new spec
+            self.remeasure_item(key, profile)
         self.touch(key)
         t0 = time.perf_counter()
         p.pipe.select_persistence(self.resolve_persistence(p, profile))
@@ -473,7 +587,8 @@ class SlideEngine:
             out.append(ev)
         return out
 
-    def start_run(self, items, profile, halo=0, reset_pins=True, incremental=False):
+    def start_run(self, items, profile, halo=0, reset_pins=True, incremental=False,
+                  remeasure_only=False):
         """Prime `items` in order on one worker thread. Serial on purpose: the
         pipelines are stateful and each one is most of a gigabyte.
 
@@ -487,6 +602,13 @@ class SlideEngine:
         prediction and class LUT on "primed", which is right when a Run has
         recomputed everything and wrong when one ROI was added to a session
         whose other items are exactly as they were.
+
+        A live pipe the profile's field can serve is never primed again: it is
+        re-measured when the statistics moved and otherwise left alone.
+        `remeasure_only` goes further and never primes at all -- a live pipe
+        is re-measured whatever its field, a dead one skipped -- which is what
+        navigation wants while the chains are being edited (a preview is not
+        a Run).
         """
         if self._busy:
             return False
@@ -496,6 +618,9 @@ class SlideEngine:
             self.persistence_abs = {}
         self.running_keys = tuple(it.key for it in items)
         self._incremental = bool(incremental)
+        self._remeasure_only = bool(remeasure_only)
+        self.running_kind = ("measure" if remeasure_only or (items and all(
+            not self.needs_prime(it.key, profile, halo) for it in items)) else "prime")
         self._worker = threading.Thread(target=self._run_worker, name="mspath-prime",
                                         args=(list(items), dict(profile), int(halo)),
                                         daemon=True)
@@ -507,6 +632,15 @@ class SlideEngine:
         failed = []
         for n, item in enumerate(items, start=1):
             try:
+                # A live pipe built under this field is kept: its rows are
+                # re-measured if the statistics moved, else it is left alone.
+                # Only what cannot be served is primed.
+                if self._remeasure_only or not self.needs_prime(item.key, profile, halo):
+                    if self.measure_stale(item.key, profile) and self.can_remeasure(item.key):
+                        self.remeasure_item(item.key, profile)
+                    self.work_q.put(("item_done", item.key))
+                    self.work_q.put(("progress", (n, total)))
+                    continue
                 # The overview is a whole level: there is nothing beyond its
                 # edges to borrow, so it takes no halo whatever the profile says.
                 self.prime_item(item, profile, halo=0 if item.is_overview else halo)

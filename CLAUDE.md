@@ -740,6 +740,30 @@ and rides the classifier pickle under `ModelBundle.seam`; **Export** writes
 `seams_<item>.json` + `seams_summary.csv`. The overlay paints both flank
 pixels of every crack through `_region_overlay` (mspath places it).
 
+**The MSC and the statistics are cached apart** (2026-09-24, first half of
+stage 5 of the multi-model design note): `Msc2DPipeline::build` is the MSC
+phases then ONE measure step (`measure_leaves`), and
+`Msc2DPipeline::remeasure(base, filtered, cfg, color)` / pybind
+`pipe.remeasure(params_json, base, filtered, color=None)` re-runs only that
+step on a built pipe -- labels, arcs and persistence kept, rows equal to a
+fresh build's (`test_msc2d_remeasure`, `test_gpu_stats_parity.py`). Two
+fingerprints over the params document (`msseg/mscoupon/fingerprints.py`,
+`session.field_fingerprint` / `measure_fingerprint`): **field** = chains +
+colour input (minus plane count) + MSC keys (minus cores / builder / GPU
+flags / sample radius; the percentage only as the cap `max(10, pct)`);
+**measurement** = `statistics` + sample radius + plane count. The coupon
+engine stamps `measured[]` per primed slice and re-measures lazily in
+`_slice_result`; `SlideEngine` stamps `Primed.field` / `.measured` /
+`.chains` and re-measures in `ensure_record` (navigation: on the worker,
+`start_run(remeasure_only=True)`), re-reading through the chains the pipe
+was PRIMED with (an un-Run edit is a preview). A Run keeps what the field can
+reuse (coupon per sequence, mspath `keep_field`); a profile / task switch
+resets only when the field differs (shell `_keep_compute_for`). The labeler's
+statistics and ext sample radius moved to a **Features** tab; a settled edit
+re-measures the item on screen. 2048² ROI: base-only -> 12 channels 0.90 s vs
+a 1.47 s prime. `base_filters` stays on the field side (the raw slice is not
+kept).
+
 **Region encoder, offline** (2026-09-15, [docs/design_region_autoencoder.md](docs/design_region_autoencoder.md)):
 a task-free latent of the statistics ROW, so the labeler's head is not the
 only thing that ever compresses it. `mspath-embed harvest --tiff-folder DIR
