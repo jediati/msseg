@@ -178,12 +178,25 @@ today only the magic fill writes it. Resolution never reads it, so a stale
 |---|---|---|
 | squiggle | polyline (a click is a tap) | every region under the line |
 | box | drag a rectangle | every region overlapping it |
-| lasso | drag a closed polygon | every region under the filled polygon |
-| magic | press, drag up/down, release | a similarity flood from the pressed region |
-| blobber | as magic | the flood in the active class **and** its bounding regions in the ring class |
-| *SHIFT + drag* | a box, any tool | **accepts** the classifier's predictions under it as `taps` |
-| trace | click to anchor, move, click to extend, Enter / double-click | a livewire path along the **seams** (the boundaries between regions), labelled `boundary` -- see [seam_labeling.md](seam_labeling.md) |
+| lasso | drag a closed polygon | every region under the filled polygon -- an **extent** (below); *Ctrl*-drag for a sample |
+| magic | press, drag up/down, release | a similarity flood from the pressed region -- an **extent** while the `extent` box in the Magic rows is ticked |
+| blobber | as magic | the flood in the active class **and** its bounding regions in the ring class; the core is always an **extent**, the ring a sample |
+| *SHIFT + drag* | a box, any tool | **accepts** the classifier's predictions under it as `taps` (never an extent) |
+| trace | click to anchor, move, click to extend, Enter / double-click | a livewire path along the **seams** (the boundaries between regions), labelled `boundary` -- see [seam_labeling.md](seam_labeling.md). Clicking the **first anchor again closes** the loop and commits it; a tap inside with a class armed then names the **enclosure** |
 | scope | drag a rectangle | every seam fully inside it labelled `interior` (unless a trace says boundary) |
+
+**Samples and extents.** A squiggle, a box or a tap is a *sample*: "these
+regions are class k", nothing about their neighbours. An *extent* -- a
+lasso, a released magic fill, a blob's core, an enclosure -- says "this set
+IS the object": its outer seams are boundaries and its unlabelled neighbours
+are not it. Nothing else changes about how they paint regions; the
+difference is what the **seam and edge models learn** from them
+(`derive.py`, [seam_labeling.md](seam_labeling.md) "Derived labels"): a
+fill on a gland teaches the seam model the gland's edge with no trace drawn.
+An extent only speaks about *unlabelled* neighbours, so filling twice on the
+same gland, or patching a fill with a squiggle, never derives a boundary
+inside it -- an instance boundary between two touching same-class objects is
+a trace's job. Extents show ` ext` in the class panel's rows.
 
 Hotkeys: `1..4` arm a class, `0`/Escape disarm, `M` selects magic, `B` the
 blobber, `T` the trace and `S` the scope (seam tools; `E` toggles the seam
@@ -235,7 +248,9 @@ Press on a region (the **seed**) with a class armed. The fill grows over the
 when there is a path from the seed whose every hop is under the threshold.
 Drag **up** to raise the threshold (more regions), **down** to lower it;
 the canvas HUD shows `t`, how many regions are in, and their pixel count.
-Release paints; Escape abandons.
+Release paints; Escape abandons. The **`extent`** box (second Magic row, on
+by default, remembered with the session) makes the released set an extent
+-- untick it to release a partial fill as a sample.
 
 *What is compared* (the **Magic:** row under the tool selector):
 

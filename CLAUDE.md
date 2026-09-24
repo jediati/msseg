@@ -267,6 +267,41 @@ coarser. mpp / physical units deferred. Tests: `test_slide_binding.py`,
 `test_catalogue_binding.py`, `test_stroke_width.py`, `test_extents.py`,
 `test_seam_corridor.py`; the mspath selftest's tree-rows block rewritten.
 
+**Derived labels, extents and the enclosure** (2026-09-21, stage 3 of the
+design note, §7): `msseg.labeler.derive` is the ONE label derivation --
+gestures -> region classes (`resolve_slice`, unchanged), arc same/diff
+(`arc_labels`) and seam boundary/interior (`seam_labels`), the §7.2 matrix
+in three passes: samples (both flanks labelled -> boundary iff the classes
+differ), **extents** (a lasso, a released magic fill, a blob's CORE, an
+enclosure -- `meta["extent"]`, `derive.is_extent`; older fills with an
+outline count, blob rings and accepted predictions never): one flank in the
+extent and the other flank UNLABELLED -> boundary / different -- only
+unlabelled neighbours, so filling a gland twice or patching a fill never
+derives a boundary inside it and the seam and arc targets agree
+(`EXTENT_EDGE_VS_SAME_CLASS = None` holds the instance-boundary reading);
+then the explicit seam gestures overwrite (scopes -> same/interior, boundary
+traces -> different/boundary). Consumers: `panels/seams._seam_cache_for`
+(entry gains `[5] = derived`; the overlay and readout show derived labels,
+the seam model trains on them) and `training.edge_set(arc_labels_of=)`
+(`classifier._arc_labels_for`; `_classes_rc_sets_for` memoizes the touched
+sets beside the row classes) -- gestures drawn `COARSE_LEVELS` coarser are
+left out. Producers: blob core `extent=True`; magic fill by the `extent`
+checkbox (Magic row 2, `magic_extent_var`, `view.magic.extent`, default
+`_DEFAULT_MAGIC_EXTENT = True`); lasso `{"extent": True}` unless **Ctrl**
+at press (`DrawController._sample`; Windows/X11 only). **Enclosure**: a
+trace closed by clicking its first anchor commits at once and parks
+(`TraceController._pending`; `derive.enclosed_ids` via `extent_mask`, exact
+on the crack lattice where a polygon fill leaks); the next press inside with
+a class armed calls `_commit_enclosure` -> `_commit_blob` with
+`{"tool": "enclosure", "extent": True, "trace": uid}` (seeds + outline, one
+undo step, row `enclosure (n) ext`); outside -> a new trace; Esc drops it. A
+return leg after one leg retraces (Dijkstra is symmetric): two intermediate
+anchors at least. `_commit_seam` now returns the Interaction. Tests:
+`test_derive.py`, `test_edge_hook.py`; coupon selftest sections (extent
+meta, checkbox + view, Ctrl-lasso, derived seams after a blob, the closed
+trace / outside / arm-a-class / name / Esc flow; its overlay counts grew by
+the derived seams layer).
+
 **mscoupon labeler magic fill + gesture previews** (`mscoupon-labeler`, see
 [docs/mscoupon_labeler.md](docs/mscoupon_labeler.md)): every drawing gesture now
 previews the regions it WILL paint on a transient canvas layer (brightened class

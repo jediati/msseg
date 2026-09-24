@@ -105,6 +105,50 @@ and the sequence tree's "Clear annotations" take seam gestures along.
   a scope widened *after* a trace does not erase it. This is the one
   deliberate departure from `resolve_slice`'s pure uid order.
 
+## Derived labels: every gesture speaks to the seams
+
+Seam gestures are not the only source of seam labels. `derive.seam_labels`
+(`msseg.labeler.derive`, the one label derivation for regions, arcs and
+seams -- design note §7.2) runs three passes over an item's seam graph:
+
+1. **samples** -- a seam whose two flanks both carry a region class is
+   `boundary` when the classes differ and `interior` when they agree;
+2. **extents** -- a lasso, a released magic fill, a blob's core, an
+   enclosure (`meta["extent"]`; older fills with an outline count too, blob
+   rings never, accepted predictions never): a seam with one flank in the
+   extent and the other flank *unlabelled* is `boundary`. Only unlabelled
+   neighbours: a same-class sample next to an extent stays `interior` (and
+   the arc "same"), so filling a gland twice, or patching a fill with a
+   squiggle, never derives a boundary inside it. The instance boundary
+   between two touching same-class objects is a trace's job
+   (`derive.EXTENT_EDGE_VS_SAME_CLASS` keeps the other reading one constant
+   away);
+3. the **explicit seam gestures**, scopes then traces, overwrite.
+
+The arc target gets the mirror image (`derive.arc_labels`, through the
+edge set's `arc_labels_of` hook): both endpoints labelled -> same / diff,
+extent | unlabelled -> different, a scope's seams -> same, a boundary
+trace's seams -> different. Region labels stay what the region gestures
+paint. The seam overlay and the Seams readout show derived labels as they
+show drawn ones (the readout adds `(n derived)`), the seam model trains on
+them, and gestures drawn much coarser than the item are left out of the
+derivation (a swath's edges are not boundaries).
+
+### The enclosure: trace the gland, tap it once
+
+A trace whose **first anchor is clicked again** closes and commits at once;
+the HUD then says the loop encloses *n* regions and waits: the next press
+**inside** it with a class armed stores the enclosure as ONE extent of that
+class -- the same `taps` + outline a magic fill writes
+(`meta = {"tool": "enclosure", "extent": True, "trace": <the trace's uid>}`),
+so it re-resolves and undoes like a fill and reads `enclosure (n) ext` in
+the class panel -- while the trace itself stays a boundary. A press outside
+starts a new trace; Escape leaves the boundary only. The inside test is the
+even-odd fill of the loop's cracks (`extents.extent_mask`), which is exact
+on the crack lattice where a polygon fill would leak a pixel outward; a loop
+needs at least two intermediate anchors, since a return leg after a single
+leg retraces it (the search is symmetric) and encloses nothing.
+
 After a persistence change the graph is rebuilt and the same gestures
 re-resolve: a seam that merged into a longer one keeps its label while it is
 still half covered, and one that vanished simply has no successor

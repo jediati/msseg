@@ -139,9 +139,31 @@ class SeamPanelMixin:
                 and hit[4] is graph):
             return hit
         key = self.catalogue.key_of(si, li)
-        sets = seam_labeling.seam_sets(self._seam_gestures_for_key(key), graph, np)
-        cls = seam_labeling.resolve_seams(None, graph, np, sets=sets)
-        entry = (rec.get("commit"), self.store.rev, cls, sets, graph)
+        # Every gesture speaks to the seams (derive.py): region samples label
+        # the seam between two labelled flanks, extents their outer seams,
+        # and the explicit seam gestures overwrite. The region rasterization
+        # is the class layer's own (one pass per item and rev); gestures drawn
+        # much coarser than this item are left out, or a swath's edges would
+        # read as boundaries.
+        from .. import derive
+        from ..labeling import resolve_sets
+        gestures = self._gestures_for_key(key)
+        coarse = {it.uid for it in self._coarse_gestures(si, li)}
+        keep = [it for it in gestures if it.uid not in coarse]
+        region_class, touch = None, {}
+        cache = getattr(self, "_labels_cache_for", None)
+        if cache is not None and keep:
+            lc = cache(si, li, rec, np)
+            touch = lc[3]
+            if len(keep) == len(gestures):
+                region_class = lc[5]
+            else:                                # the same sets, minus the coarse ones
+                region_class = resolve_sets([(it, touch.get(it.uid, set())) for it in keep],
+                                            rec["labels"], np)
+        extents = [(it, touch.get(it.uid, set())) for it in keep if derive.is_extent(it)]
+        res = derive.seam_labels(graph, np, region_class, extents,
+                                 self._seam_gestures_for_key(key))
+        entry = (rec.get("commit"), self.store.rev, res.cls, res.sets, graph, res.derived)
         self._seam_caches[(si, li)] = entry
         return entry
 
@@ -283,6 +305,11 @@ class SeamPanelMixin:
         ni = int((cls == SEAM_INTERIOR).sum())
         nu = int(graph.n_seams) - nb - ni
         text = f"{head} · {graph.n_seams} seams: {nb} boundary, {ni} interior, {nu} unknown"
+        # Labels the region gestures derived (derive.py), no seam gesture needed.
+        entry = self._seam_caches.get((cur[0], cur[1]))
+        derived = entry[5] if entry is not None and len(entry) > 5 else None
+        if derived is not None and derived.any():
+            text += f" ({int(derived.sum())} derived)"
         model = getattr(self, "_seam_model", None)
         text += " · model: " + (model.brief() if model is not None else "none")
         return text

@@ -371,10 +371,30 @@ class ClassifierMixin:
             return self._training_builder.edge_set(
                 items, self.store, names, arcs_of, np,
                 layer_of=lambda key, rec: self.regions.label_layer(key),
-                gestures_of=self._gestures_for_key)
+                gestures_of=self._gestures_for_key,
+                arc_labels_of=self._arc_labels_for)
         except TrainingProblem as problem:
             self.status_var.set(str(problem))
             return None
+
+    def _arc_labels_for(self, key, rec, arcs, region_class, sets):
+        """The edge set's ``arc_labels_of`` hook: ``(both, diff)`` over the
+        item's arcs from EVERY gesture (derive.py) -- extents' outside
+        neighbours, scopes (same) and traces (different) on top of the two
+        endpoints' classes. The seam graph is built only when the item has
+        seam gestures (it costs seconds on the numpy path); gestures drawn
+        much coarser than the item are left out."""
+        import numpy as np
+        from . import derive
+        from .labeling import resolve_sets
+        sg = self._seam_gestures_for_key(key)
+        graph = self.regions.seams(key, np) if sg else None
+        pos = self.catalogue.index_of(key)
+        coarse = {it.uid for it in self._coarse_gestures(*pos)} if pos is not None else set()
+        keep = [(it, ids) for it, ids in sets if it.uid not in coarse]
+        if len(keep) != len(sets):
+            region_class = resolve_sets(keep, rec["labels"], np)
+        return derive.arc_labels(arcs, np, region_class, derive.extent_sets(keep), sg, graph)
 
     def _fit_edge_model_now(self, clf, names, spec=None):
         """Fit the pair model on top of `clf`: (EdgeModel | None, status note).

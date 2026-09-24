@@ -48,7 +48,10 @@ class DrawController:
     delegated whole (press, drag, release) to a MagicFillController."""
 
     MIN_SCREEN_PX = 3      # squiggle/lasso point spacing (screen px)
-    _SHIFT = 0x0001        # Tk event.state modifier bit
+    _SHIFT = 0x0001
+    # Ctrl at press makes a lasso a SAMPLE rather than an extent (derive.py).
+    # (Windows / X11: Tk on macOS turns Ctrl-click into another button.)
+    _CTRL = 0x0004        # Tk event.state modifier bit
     # Box/lasso previews sample their slab with a stride once it exceeds this
     # many pixels: a full-image box on 3232^2 then costs ~10 ms per move
     # instead of ~100. The commit itself is still exact (touched_ids).
@@ -78,8 +81,9 @@ class DrawController:
         # SHIFT = the accept tool: a box, regardless of the selected tool or
         # armed class, that turns the predictions under it into real labels.
         self._accept = bool(e.state & self._SHIFT)
+        self._sample = bool(e.state & self._CTRL)
         tool = self.app.tool_var.get()
-        if self.trace.active and (self._accept or tool not in SEAM_TOOLS):
+        if (self.trace.active or self.trace.pending) and (self._accept or tool not in SEAM_TOOLS):
             self.trace.cancel("trace abandoned (tool changed)")
         if not self._accept and tool in SEAM_TOOLS:
             # Before the armed-class test: seam gestures carry their own class.
@@ -142,14 +146,18 @@ class DrawController:
         # A single-click tap IS a squiggle (the polyline's start point is always
         # part of the gesture); box/lasso need an actual drag to mean anything.
         need = 1 if tool == "squiggle" else 2
+        sample, self._sample = getattr(self, "_sample", False), False
         if len(pts) >= need:
-            self.app._commit_interaction(tool, pts)
+            # A lasso is drawn AROUND an object: an extent (derive.py) unless
+            # Ctrl was held at press, which makes it a sample of what it holds.
+            meta = {"extent": True} if tool == "polygon" and not sample else None
+            self.app._commit_interaction(tool, pts, meta)
         return True
 
     def cancel(self):
         """Escape: abandon whatever is in flight (any tool) without committing.
         Returns True when there was something to abandon."""
-        if self.trace.active:
+        if self.trace.active or self.trace.pending:
             return self.trace.cancel()
         if self.magic.active:
             return self.magic.cancel()
@@ -157,6 +165,7 @@ class DrawController:
             return False
         self._pts = None
         self._accept = False
+        self._sample = False
         self._preview_end()
         self.app.viewer.canvas.delete("draw")
         self.app.status_var.set("gesture cancelled")
@@ -547,6 +556,11 @@ class MagicFillController:
         core_meta = dict(meta, n_regions=int(len(ids)))
         if s["ring_cls"] is not None:
             core_meta["part"] = "core"
+        # The core is an EXTENT -- "this set IS the object" (derive.py):
+        # always for a blob, for a fill unless the Magic row says sample.
+        # The ring never is: its outer edge is where the ring stopped.
+        core_meta["extent"] = (True if s["ring_cls"] is not None
+                               else bool(self.app.magic_extent_var.get()))
         parts.append(([int(i) for i in ids], s["cls"], core_meta))
         self.app._commit_blob(s["si"], s["li"], s["labels"], parts)
         return True
@@ -588,7 +602,12 @@ class TraceController:
     and the search run on the item's raster through ``_region_placement``.
     """
 
-    SNAP_RADIUS = 8            # raster px around the pointer searched for a crack
+    SNAP_RADIUS = 8
+    # A CLOSED trace just committed (its first anchor clicked again), waiting
+    # to be named: the next press inside it with a class armed stores the
+    # enclosure as an extent (derive.py); a press outside starts a new
+    # trace; Escape leaves it a boundary only.
+    _pending = None            # raster px around the pointer searched for a crack
     DOUBLE_CLICK_S = 0.35      # a second click on the same point commits
 
     def __init__(self, app):
@@ -652,9 +671,46 @@ class TraceController:
             self._finish(s["hud"])
             self.app.status_var.set(why or "trace cancelled")
             return True
+        if self._pending is not None:
+            p, self._pending = self._pending, None
+            self._clear_pending(p)
+            self.app.status_var.set(why or "enclosure dropped - the trace stays a boundary")
+            return True
         return False
 
+    # -- the pending enclosure ------------------------------------------ #
+    @property
+    def pending(self):
+        return self._pending is not None
+
+    def _trace_alive(self, uid):
+        it = self.app.store.get(uid)
+        return it is not None and it.tool == "trace"
+
+    def _clear_pending(self, p):
+        v = self.app.viewer
+        if v is not None:
+            v.canvas.delete("pending")
+            if v.hud[0] == "info":
+                v.set_hud(*p["hud"])
+
+    def _draw_pending(self):
+        """The closed loop, dashed, until it is named or dropped."""
+        p = self._pending
+        v = self.app.viewer
+        if p is None or v is None:
+            return
+        c = v.canvas
+        c.delete("pending")
+        flat = []
+        for x, y in p["loop"]:
+            flat.extend(((x - v.view_x) / v.scale, (y - v.view_y) / v.scale))
+        if len(flat) >= 4:
+            c.create_line(*flat, fill="#ffffff", width=2, dash=(4, 4),
+                          tags=("draw", "pending"))
+
     def redraw(self):
+        self._draw_pending()
         if self._s is not None:
             self._draw_trace()
         elif self._box is not None:
@@ -749,6 +805,28 @@ class TraceController:
             app._notify("Trace needs computed regions - Run first.")
             return False
         cur, key, rec, graph, np = ctx
+        p = self._pending
+        if p is not None:
+            # A closed trace waits to be named: inside it with a class armed
+            # -> the enclosure; outside (or stale) -> an ordinary press.
+            self._pending = None
+            alive = (p["commit"] == rec.get("commit") and (p["si"], p["li"]) == cur
+                     and self._trace_alive(p["uid"]))
+            if alive:
+                x, y = self._image_pt(e)
+                rx, ry = p["place"].to_raster(x, y)
+                ix, iy = int(np.floor(rx)) - p["xa"], int(np.floor(ry)) - p["ya"]
+                m = p["mask"]
+                if 0 <= iy < m.shape[0] and 0 <= ix < m.shape[1] and bool(m[iy, ix]):
+                    cls = int(app.active_class_var.get())
+                    if cls <= 0:
+                        self._pending = p
+                        app._notify("Arm a class (1-4) to name the enclosure")
+                        return True
+                    self._clear_pending(p)
+                    app._commit_enclosure(p, cls)
+                    return True
+            self._clear_pending(p)
         s = self._s
         if s is not None and (s["commit"] != rec.get("commit") or (s["si"], s["li"]) != cur):
             self.cancel("trace cancelled: regions changed under it")
@@ -791,6 +869,10 @@ class TraceController:
         if not lw.extend(*hit):
             app._notify("Unreachable along the seams"
                         + (" inside the scope" if s["restricted"] else ""))
+            return True
+        if len(lw.anchors) >= 3 and lw.anchors[0] == lw.anchors[-1]:
+            # Back on the first anchor: the loop is closed -- commit it.
+            self.commit()
             return True
         s["hover"] = None
         self._hud()
@@ -865,6 +947,7 @@ class TraceController:
             return False
         lw = s["lw"]
         pts = lw.commit_points()
+        raw = lw.points()                 # every corner, for the enclosure test
         self._s = None
         self._finish(s["hud"])
         if len(pts) < 2:
@@ -873,7 +956,28 @@ class TraceController:
         meta = {"tool": "trace", "toll": s["toll"], "anchors": int(len(lw.anchors)),
                 "seams": int(len(lw.seams_on_path)), "cost": round(lw.total_cost, 4),
                 "scoped": bool(s["restricted"])}
-        self.app._commit_seam("trace", s["graph"].to_image(pts), s["cls"], meta=meta)
+        it = self.app._commit_seam("trace", s["graph"].to_image(pts), s["cls"], meta=meta)
+        from . import derive
+        if it is not None and derive.is_closed(pts):
+            # "Trace the gland, tap it once": a closed trace is an extent of
+            # unknown class until a tap inside names it (derive.py).
+            enc = derive.enclosed_ids(raw, s["labels"], s["np"])
+            if enc is None:
+                self.app.status_var.set("closed trace encloses no region (retraced?) - "
+                                        "committed as a boundary")
+            else:
+                ids, mask, ya, xa = enc
+                self._pending = {"uid": int(it.uid), "si": s["si"], "li": s["li"],
+                                 "commit": s["commit"], "ids": ids, "mask": mask,
+                                 "ya": int(ya), "xa": int(xa), "place": s["place"],
+                                 "loop": s["graph"].to_image(pts), "hud": s["hud"]}
+                v = self.app.viewer
+                if v is not None:
+                    v.set_hud("info", f"closed trace ({len(ids)} region(s)) - tap inside "
+                                      "with a class armed to name it - Esc: boundary only")
+                self.app.status_var.set(f"#{it.uid} closed trace: {len(ids)} region(s) "
+                                        "inside - tap inside to name them")
+                self._draw_pending()
         return True
 
     def drop_last(self):

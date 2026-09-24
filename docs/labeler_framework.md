@@ -29,7 +29,9 @@ Extras: `classify` (scikit-learn), `optimize` (+ optuna), `torch`, `pyramid`
 | `labeling.py` | `LabelStore` / `Interaction`: gestures in image coordinates, rasterized against a label raster on demand; the LUT builders | no |
 | `magic_fill.py` | the region-graph flood (join ladder, hop gain, ring), metrics over a `FeatureTableLike` | no |
 | `seams.py` | the seam graph -- the crack polylines between regions: `SeamGraph`, the numpy reference of `msseg::extract_seam_graph`, snapping, the pixel raster, LUTs (see [seam_labeling.md](seam_labeling.md)) | no |
-| `seam_labeling.py` | scopes and traces resolved against a seam graph by crack coverage | no |
+| `seam_labeling.py` | scopes and traces resolved against a seam graph by crack coverage (exact ids on their own lattice, a corridor off it) | no |
+| `derive.py` | **the one label derivation**: gestures -> region classes, arc same/diff, seam boundary/interior (the §7.2 matrix of the design note: samples, then extents' unlabelled neighbours, then the explicit seam gestures); `is_extent`, `enclosed_ids` | no |
+| `extents.py` | a region set's outline as closed loops (the seam graph of the 0/1 mask) and the even-odd fill -- how a fill / blob / enclosure crosses a level | no |
 | `seam_path.py` | tolls and the livewire (one Dijkstra over the junction graph per anchor) | no |
 | `seam_model.py`, `seam_export.py` | the seam model (boundary vs interior from a seam descriptor) and the classified-seam export | no |
 | `training.py` | `TrainingSetBuilder`: annotations + tables -> `(X, y, groups, names)` and the edge model's arrays | no |

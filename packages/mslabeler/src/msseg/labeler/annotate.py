@@ -228,6 +228,8 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self.blob_ring_var = tk.StringVar(master=root, value="next")
         self.magic_gain_var = tk.StringVar(master=root, value=f"{_DEFAULT_HOP_GAIN:g}")
         self.magic_drag_var = tk.StringVar(master=root, value=f"{_DEFAULT_DRAG_PX:g}")
+        # A released fill is an extent (derive.py) unless this is off.
+        self.magic_extent_var = tk.BooleanVar(master=root, value=_DEFAULT_MAGIC_EXTENT)
         # Seam tools (docs/seam_labeling.md): the class a trace / scope
         # paints, the trace's toll and channels, the overlay and its colouring,
         # and the per-item caches the overlay and the tools share.
@@ -637,6 +639,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         n = (meta or {}).get("seams")
         self.status_var.set(f"#{it.uid} {tool} -> {name}"
                             + (f" ({n} seams)" if n is not None else "") + f" ({slice_key})")
+        return it
 
     # -- "will be painted" preview (shared by every drawing tool) ---------- #
     def _begin_preview(self):
@@ -713,8 +716,23 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
                           f"-> class {it.class_id} ({len(it.points)})"
                           for it in added)
         tool = (added[-1].meta or {}).get("tool", "magic")
-        t = (added[-1].meta or {}).get("threshold", 0.0)
-        self.status_var.set(f"{tool}: {what} at t={t:.3g}")
+        t = (added[-1].meta or {}).get("threshold")
+        self.status_var.set(f"{tool}: {what}" + (f" at t={t:.3g}" if t is not None else ""))
+
+    def _commit_enclosure(self, pending, cls):
+        """"Trace the gland, tap it once": the regions inside a closed trace
+        become ONE extent of class `cls`, stored the way a fill is (taps at
+        the seeding extrema + the outline, derive.py reads the extent), with
+        the trace's uid as provenance. The trace itself stays a boundary."""
+        si, li = pending["si"], pending["li"]
+        rec = self.regions.record(self.catalogue.key_of(si, li))
+        if rec is None or rec.get("labels") is None:
+            self.status_var.set("enclosure not stored: the regions are gone")
+            return
+        ids = [int(i) for i in pending["ids"]]
+        meta = {"tool": "enclosure", "extent": True, "trace": int(pending["uid"]),
+                "n_regions": len(ids)}
+        self._commit_blob(si, li, rec["labels"], [(ids, int(cls), meta)])
 
     def _accept_predictions(self, pts):
         """SHIFT-box release: turn the classifier's predictions under the box
@@ -1122,7 +1140,8 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
                       "hop_gain": _bounded_float(self.magic_gain_var.get(),
                                                  _DEFAULT_HOP_GAIN, *_HOP_GAIN_RANGE),
                       "drag_px": _bounded_float(self.magic_drag_var.get(),
-                                                _DEFAULT_DRAG_PX, *_DRAG_PX_RANGE)}
+                                                _DEFAULT_DRAG_PX, *_DRAG_PX_RANGE),
+                      "extent": bool(self.magic_extent_var.get())}
         d["center_tab"] = self._center_tab_name()
         # The sashes as FRACTIONS, not pixels: a session restored into a
         # differently sized window should divide it the same way. The folded
@@ -1217,6 +1236,8 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
             if (isinstance(val, (int, float)) and not isinstance(val, bool)
                     and lo <= val <= hi):
                 var.set(f"{float(val):g}")
+        if isinstance(magic.get("extent"), bool):
+            self.magic_extent_var.set(magic["extent"])
 
     def _session_doc_kwargs(self):
         """The tasks (the document becomes v3): every task's gestures, saved

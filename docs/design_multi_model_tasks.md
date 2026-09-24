@@ -1,11 +1,12 @@
 # Design note: many task-specific models over one set of slides
 
-Status: **third draft; stages 1-2 built** (2026-09-21; first draft 2026-09-18).
+Status: **third draft; stages 1-3 built** (2026-09-21; first draft 2026-09-18).
 Stage 1 of §12 -- the task object with a stack, the Tasks list, session v3 --
-and stage 2 -- slide-bound gestures with a scale of intent, stroke width,
-extent outlines and the trace corridor (§8) -- are implemented
-(`msseg.labeler.task`, `extents`, `AnnotationShell`; see "What exists" at
-the end of §12). Stages 3-8 remain proposals. The second draft was a
+stage 2 -- slide-bound gestures with a scale of intent, stroke width, extent
+outlines and the trace corridor (§8) -- and stage 3 -- the derivation module
+(§7.2), the extent flag and the enclosure gesture -- are implemented
+(`msseg.labeler.task`, `extents`, `derive`, `AnnotationShell`; see "What
+exists" at the end of §12). Stages 4-8 remain proposals. The second draft was a
 critique-and-rewrite of the first (§1); the third adds §8, which reverses one
 of the first draft's "load-bearing" claims -- that a gesture should bind to an
 item -- after the observation that a squiggle saying *inside gland* is a
@@ -546,6 +547,32 @@ closed: polygon loops, holes as loops). Tests: `test_slide_binding.py`,
 (no orphan concept). One-way compatibility: a store written by stage 2
 (slide keys) loaded by stage-1 code binds nothing in mspath (kept greyed).
 
+**What exists (stage 3, 2026-09-21).** `msseg/labeler/derive.py` is the one
+label derivation: `region_labels` (= `resolve_slice`), `seam_labels` and
+`arc_labels` implement the §7.2 matrix in three passes -- samples, extents,
+explicit seam gestures -- with `is_extent`, `extent_sets`, `enclosed_ids`,
+`is_closed`, `labels_for_item`. Consumers: `panels/seams._seam_cache_for`
+(derived labels reach the overlay, the readout `(n derived)` and the seam
+model), `training.edge_set(arc_labels_of=)` via `classifier._arc_labels_for`.
+Producers of the flag: the blob core always, the magic fill by an `extent`
+checkbox (default on, in `view.magic`), the lasso unless Ctrl-dragged;
+SHIFT-accept never. The enclosure gesture: a trace closed on its first anchor
+auto-commits and parks; a tap inside with a class armed stores the enclosure
+as a fill-shaped extent (`_commit_enclosure` -> `_commit_blob`, meta
+`enclosure` + `trace` uid); outside starts a new trace; Esc leaves the
+boundary. Three amendments to the matrix as written above, taken during the
+design pass: (1) an extent speaks only about UNLABELLED neighbours (a
+same-class sample next to it stays interior / same), so fill-then-patch
+never derives a boundary inside an object and the seam and arc targets agree
+-- the instance boundary is a trace's job (`EXTENT_EDGE_VS_SAME_CLASS`);
+(2) only the blob's core is an extent, its ring is a sample; (3) the
+enclosure is stored as `taps` + outline, not as a `polygon` gesture, because
+a polygon fill on a crack-aligned loop leaks one pixel outward while the
+even-odd fill of `extents.extent_mask` is exact. §13.2 is closed (blob
+always, fill by checkbox, lasso by Ctrl). Tests: `test_derive.py`,
+`test_edge_hook.py`; coupon selftest sections for the flag, the derived
+seams and the enclosure flow.
+
 Stage 1 touched `session_doc.py`, the new `msseg/labeler/task.py`,
 `labeling.py`, `annotate.py`, `shell.py`, `panels/classpanel.py`,
 `mspath/labeler.py` (`_profile_from_model`). Stage 2 touched `labeling.py`
@@ -561,8 +588,12 @@ record key; stage 8 needs several providers' layers live at once.
 1. **Can `Msc2DPipeline` be re-measured in place?** Decides whether
    measurement is a cheap axis like persistence or an expensive one like the
    field.
-2. **Extent by tool or by modifier?** The blobber is always an extent; magic
-   fill and polygon are ambiguous.
+2. ~~**Extent by tool or by modifier?**~~ Closed in stage 3: the blob's core
+   is always an extent (its ring never), the magic fill by an `extent`
+   checkbox (default on), the lasso unless Ctrl-dragged, an accepted
+   prediction never. Open in its place: whether an extent's edge against a
+   same-class *labelled* neighbour should ever read as an instance boundary
+   (`derive.EXTENT_EDGE_VS_SAME_CLASS`, off; a trace does it today).
 3. **Outline representation for extents**: polygon (compact, may
    self-intersect after a re-resolution) vs run-length mask in slide
    coordinates (exact, larger). Polygon first.

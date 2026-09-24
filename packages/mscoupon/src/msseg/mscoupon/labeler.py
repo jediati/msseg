@@ -1105,7 +1105,10 @@ def _selftest():
         if app.viewer is not None:
             assert app.viewer._hud_mode is None, "computing badge cleared"
         ovs = app._seg_overlays(0, 0, rec3, None, np, _mc)
-        assert len(ovs) == 3, "regions + prediction layer + drawn labels"
+        # ...plus the seam overlay: two classes drawn on adjacent regions
+        # derive boundary / interior seam labels (derive.py) with no seam
+        # gesture at all, and the seams layer shows them.
+        assert len(ovs) == 4, "regions + prediction layer + drawn labels + derived seams"
         assert int(ovs[1]["lut"][:, 3].max()) < 255, "prediction layer is translucent"
 
         # Probabilities ride the same cache; the hard label IS their argmax.
@@ -1135,7 +1138,7 @@ def _selftest():
             ovs_m = app._seg_overlays(0, 0, rec3, None, np, _mc)
             # The scalar layer REPLACES the id layer, so the stack is the same
             # height; it is the bottom one, and only living regions are opaque.
-            assert len(ovs_m) == 3, mode
+            assert len(ovs_m) == 4, mode
             lut_m = ovs_m[0]["lut"]
             assert lut_m.shape == (10, 4)
             assert int(lut_m[[0, 2, 5, 9], 3].min()) > 0, mode
@@ -1370,11 +1373,11 @@ def _selftest():
         assert (f"{before['current'].get(moved, 0)} on this slice / "
                 f"{before['all'].get(moved, 0)} total") in app.status_var.get()
         ovs_h = app._seg_overlays(0, 0, rec3, None, np, _mc)
-        assert len(ovs_h) == 4, "highlight rides on top"
+        assert len(ovs_h) == 5, "highlight rides on top (of regions, prediction, labels, seams)"
         assert set(np.nonzero(ovs_h[-1]["lut"][:, 3])[0].tolist()) == hits
         app._on_confusion_click(*moved)                       # click again clears
         assert app._cm_cell is None
-        assert len(app._seg_overlays(0, 0, rec3, None, np, _mc)) == 3
+        assert len(app._seg_overlays(0, 0, rec3, None, np, _mc)) == 4
 
         # Navigating changes only the current-slice table; the all-slice table
         # remains the aggregate over both records.
@@ -1851,6 +1854,7 @@ def _selftest():
     it_m = app.store.interactions[-1]
     assert it_m.tool == "taps" and it_m.meta and it_m.meta["tool"] == "magic"
     assert it_m.meta["n_regions"] == 4 and it_m.meta["seed_id"] == 0
+    assert it_m.meta["extent"] is True, "a released fill is an extent by default"
     assert len(it_m.points) == 4
     rc_m = labeling.resolve_slice([it_m], lab, np)
     assert all(rc_m[r] == 1 for r in (0, 2, 5, 9))
@@ -1915,10 +1919,28 @@ def _selftest():
         and ring_it.meta["tool"] == "blobber" and len(ring_it.points) == 2
     assert core_it.class_id == 1 and core_it.meta["part"] == "core" \
         and len(core_it.points) == 1
+    # The core is an extent, the ring a sample (derive.py).
+    assert core_it.meta["extent"] is True and "extent" not in ring_it.meta
     rc_b = labeling.resolve_slice([ring_it, core_it], lab, np)
     assert rc_b[0] == 1 and rc_b[2] == 2 and rc_b[5] == 2 and rc_b[9] == 0
     app._rebuild_class_panels()
     assert app._session_doc()["view"]["magic"]["ring"] == "next"
+    # ...and with no seam gesture at all the seams between the core and its
+    # ring are boundaries, derived from the region gestures (derive.py);
+    # the ring's outer seams stay unknown (a sample says nothing about its
+    # neighbours), and the readout says so.
+    from msseg.labeler import derive as _derive
+    from msseg.labeler.seams import SEAM_BOUNDARY as _SB
+    _gb, cls_b = app._seam_classes_for(0, 0, np)
+    idx_b = {(int(a), int(b)): i for i, (a, b) in enumerate(zip(_gb.a, _gb.b))}
+    assert cls_b[idx_b[(0, 2)]] == _SB and cls_b[idx_b[(0, 5)]] == _SB, "core | ring"
+    # The other seams follow the gestures earlier sections left on this
+    # slice; the app's answer is the derivation module's, exactly.
+    key_b = app.catalogue.key_of(0, 0)
+    _rc, sl_b, _bo, _di = _derive.labels_for_item(
+        app._gestures_for_key(key_b), app._seam_gestures_for_key(key_b), lab, _gb, None, np)
+    assert cls_b.tolist() == sl_b.cls.tolist(), (cls_b.tolist(), sl_b.cls.tolist())
+    assert sl_b.derived.any() and "derived" in app._seam_counts_text(), app._seam_counts_text()
     app._undo()
     assert len(app.store.interactions) == n0, "one undo step removes ring + core"
     # Grown to everything: no ring left, only the core commits.
@@ -1941,6 +1963,7 @@ def _selftest():
     app.magic_gain_var.set("1.5"); app.magic_drag_var.set("8")
     vs = app._session_doc()["view"]["magic"]
     assert vs["hop_gain"] == 1.5 and vs["drag_px"] == 8.0
+    assert vs["extent"] is True, "the extent checkbox rides the view"
     n0 = len(app.store.interactions)
     assert ctrl.on_press(_FakeEvent(5, 5))
     assert "g1.5" in v._hud_text, v._hud_text
@@ -1959,12 +1982,46 @@ def _selftest():
     app._apply_magic_view({"hop_gain": "abc", "drag_px": 0.5, "metric": "nope"})
     assert app.magic_gain_var.get() == "1.25" and app.magic_drag_var.get() == "6"
     assert app.magic_metric_var.get() == "cosine"
+    app._apply_magic_view({"extent": False})
+    assert app.magic_extent_var.get() is False
+    app._apply_magic_view({"extent": "no"})              # not a bool: ignored
+    assert app.magic_extent_var.get() is False
+    # With the checkbox off a fill is a sample: no `extent` on its taps.
+    app.magic_gain_var.set("1")
+    n0 = len(app.store.interactions)
+    assert ctrl.on_press(_FakeEvent(5, 5))
+    assert ctrl.on_move(_FakeEvent(5, 5 - 400))
+    assert ctrl.on_release(_FakeEvent(5, 5 - 400))
+    assert len(app.store.interactions) == n0 + 1
+    assert app.store.interactions[-1].meta["extent"] is False
+    app._undo()
+    app._apply_magic_view({"extent": True})
+    assert app.magic_extent_var.get() is True
     # cosine runs on the whole row (here area + mean_base) without channels.
     app.magic_gain_var.set("1")
     assert ctrl.on_press(_FakeEvent(5, 5))
     assert ctrl.magic._s["ladder"].metric == "cosine"
     assert ctrl.magic.cancel()
     app.magic_mode_var.set("anchor")
+
+    # A lasso is an extent unless Ctrl was held at press (derive.py).
+    app.tool_var.set("polygon"); app.active_class_var.set(1)
+    n0 = len(app.store.interactions)
+    assert ctrl.on_press(_FakeEvent(3, 3))
+    assert ctrl.on_move(_FakeEvent(16, 3)) and ctrl.on_move(_FakeEvent(16, 16))
+    assert ctrl.on_release(_FakeEvent(16, 16))
+    assert len(app.store.interactions) == n0 + 1
+    it_l = app.store.interactions[-1]
+    assert it_l.tool == "polygon" and it_l.meta == {"extent": True}, it_l.meta
+    assert app._interaction_row_text(it_l).endswith(" ext")
+    app._undo()
+    assert ctrl.on_press(_FakeEvent(3, 3, state=0x0004))        # Ctrl: a sample
+    assert ctrl.on_move(_FakeEvent(16, 3)) and ctrl.on_move(_FakeEvent(16, 16))
+    assert ctrl.on_release(_FakeEvent(16, 16))
+    assert app.store.interactions[-1].tool == "polygon" and app.store.interactions[-1].meta is None
+    app._undo()
+    assert len(app.store.interactions) == n0
+    app.tool_var.set("magic")
 
     # proba: refused without predictions or with stale ones; with a fake
     # prediction the seed's class joins first, unscored regions last.
@@ -2404,6 +2461,89 @@ def _selftest():
     assert len(app._row_interactions(0, 0)) >= 2
     app.tool_var.set("squiggle")
 
+    # -- "Trace the gland, tap it once": a closed trace names its enclosure -- #
+    # A 3x3 grid of blocks (ids 0..8) so a loop of seams exists: the centre
+    # block 4 is ringed by the seams 1|4, 4|5, 4|7 and 3|4, with junctions
+    # at the four corners. (The earlier scope + trace go first: a scope
+    # containing the anchor would confine the search.)
+    from msseg.labeler import derive as _derive
+    app.store.remove_many([s.uid for s in app.store.seams])
+    lab_e = np.full((32, 32), -1, np.int32)
+    for r_ in range(3):
+        for c_ in range(3):
+            lab_e[1 + 10 * r_:11 + 10 * r_, 1 + 10 * c_:11 + 10 * c_] = 3 * r_ + c_
+    ids_e = np.arange(9, dtype=np.float64)
+    table_e = _FT(["feature_id", "area", "mean_base", "std_base", "ext_filtered",
+                   "ext_x", "ext_y"],
+                  np.stack([ids_e, np.full(9, 100.0), ids_e, np.ones(9), ids_e,
+                            np.array([6 + 10 * (i % 3) for i in range(9)], float),
+                            np.array([6 + 10 * (i // 3) for i in range(9)], float)], axis=1))
+    rec_e = {"commit": app._commit_id, "labels": lab_e, "stats": table_e,
+             "kept": set(), "cc": None, "n_feat": 9}
+    app._slices[(0, 0)] = rec_e
+    app._pred = {}
+    app._clear_seam_caches(); app._class_luts.clear()
+    g_e = app.regions.seams(key_s, np)
+    assert g_e is not None and g_e.n_seams == 12, g_e.n_seams
+    n_i0, n_s0 = len(app.store.interactions), len(app.store.seams)
+    app.tool_var.set("trace"); app.seam_class_var.set(SEAM_BOUNDARY)
+    app.seam_toll_var.set("geometric")
+
+    def _loop():
+        assert ctrl.on_press(_FakeEvent(16, 11)) and tc.active              # on 1|4 (y = 11)
+        assert ctrl.on_press(_FakeEvent(21, 16)) and len(tc._s["lw"].legs) == 1   # 4|5
+        assert ctrl.on_press(_FakeEvent(16, 21)) and len(tc._s["lw"].legs) == 2   # 4|7
+        assert ctrl.on_press(_FakeEvent(11, 16)) and len(tc._s["lw"].legs) == 3   # 3|4
+        assert ctrl.on_press(_FakeEvent(16, 11))            # the first anchor again: closed
+    _loop()
+    assert not tc.active and tc.pending, "a closed trace commits and waits to be named"
+    assert v._hud_mode == "info" and "closed" in v._hud_text, v._hud_text
+    assert len(app.store.seams) == n_s0 + 1 and _derive.is_closed(app.store.seams[-1].points)
+    assert app.store.seams[-1].meta["anchors"] == 5
+    # A press outside drops it and is an ordinary trace press.
+    app.active_class_var.set(0)
+    assert ctrl.on_press(_FakeEvent(6, 6)) and tc.active and not tc.pending
+    app._on_escape()
+    assert not tc.active and v._hud_mode is None
+    # Inside without a class armed: still pending, told to arm one.
+    _loop()
+    assert tc.pending
+    assert ctrl.on_press(_FakeEvent(16, 16)) and tc.pending
+    assert "Arm a class" in app.status_var.get(), app.status_var.get()
+    # Inside with class 1: the enclosure, stored like a fill.
+    app.active_class_var.set(1)
+    assert ctrl.on_press(_FakeEvent(16, 16)) and not tc.pending
+    assert len(app.store.interactions) == n_i0 + 1
+    enc = app.store.interactions[-1]
+    assert enc.tool == "taps" and enc.class_id == 1 and len(enc.points) == 1
+    assert enc.meta["tool"] == "enclosure" and enc.meta["extent"] is True
+    assert enc.meta["trace"] == app.store.seams[-1].uid and enc.meta["n_regions"] == 1
+    assert enc.meta.get("outline"), "the loop rides along as the outline"
+    assert labeling.resolve_slice([enc], lab_e, np)[4] == 1
+    assert "enclosure (1) ext" in app._interaction_row_text(enc)
+    _g2, cls_e = app._seam_classes_for(0, 0, np)
+    idx_e = {(int(a), int(b)): i for i, (a, b) in enumerate(zip(_g2.a, _g2.b))}
+    for pair in ((1, 4), (4, 5), (4, 7), (3, 4)):
+        assert cls_e[idx_e[pair]] == SEAM_BOUNDARY, pair
+    # The rest follow whatever region gestures earlier sections left on the
+    # slice, as the derivation module says.
+    _rc, sl_e, _bo, _di = _derive.labels_for_item(
+        app._gestures_for_key(key_s), app._seam_gestures_for_key(key_s), lab_e, _g2, None, np)
+    assert cls_e.tolist() == sl_e.cls.tolist()
+    # Escape with a closed trace pending leaves it a boundary, class still armed.
+    _loop()
+    assert tc.pending
+    app._on_escape()
+    assert not tc.pending and app.active_class_var.get() == 1
+    assert len(app.store.seams) == n_s0 + 3 and len(app.store.interactions) == n_i0 + 1
+    # Back to the four-block fixture, without the gestures of this block.
+    app.store.remove_many([s.uid for s in app.store.seams] + [enc.uid])
+    app._slices[(0, 0)] = rec_s
+    app._pred = {}
+    app._clear_seam_caches(); app._class_luts.clear()
+    app.seam_toll_var.set("feature"); app.tool_var.set("squiggle")
+    app._rebuild_class_panels()
+
     # New session: data, sequences, primed stacks and annotations go; the
     # profiles and the model selection stay when asked to, and the model in
     # memory survives the apply (it is not in the document).
@@ -2465,7 +2605,9 @@ def _selftest():
           "saddle-free contact edges, latent ring head, labels as context, "
           "seam tools: scope + livewire trace + resolution + overlay + seam model + export, "
           "tasks: per-task stores / vocabularies / Model tabs, session v3 + v2-as-one-task, "
-          "workflow binding through profile rename / delete, New session keeps tasks")
+          "workflow binding through profile rename / delete, New session keeps tasks, "
+          "extents: fill / blob core / lasso (Ctrl = sample) + the checkbox in the view, "
+          "derived seam labels with no seam gesture, the closed trace -> enclosure flow")
     return 0
 
 

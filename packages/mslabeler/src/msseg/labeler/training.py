@@ -103,7 +103,8 @@ class TrainingSetBuilder:
             # drawing level (labeling.py); a rebind may set them in place.
             m = getattr(it, "meta", None) or {}
             outline = m.get("outline") or ()
-            return (m.get("level"), m.get("scale"), m.get("px"), len(outline))
+            return (m.get("level"), m.get("scale"), m.get("px"), len(outline),
+                    m.get("extent"))
         return tuple((getattr(it, "uid", None), getattr(it, "class_id", None),
                       getattr(it, "tool", None), len(getattr(it, "points", ()) or ()),
                       meta_sig(it))
@@ -116,15 +117,36 @@ class TrainingSetBuilder:
         own annotations or its record changed; every other item on a retrain
         is a dictionary hit. The record is identified by its commit AND its
         label raster (a re-prime at the same commit is a new raster)."""
+        return self._classes_rc_sets_for(key, rec, table, interactions, fids, np, layer)[0]
+
+    def _classes_and_sets_for(self, key, rec, table, interactions, fids, np, layer):
+        """``(cls per row, region_class per label id, touched sets)`` for the
+        item, one memo: the sets and the per-id classes are what the label
+        derivation (derive.py) reads for the arc target, so the edge set
+        never rasterizes a gesture twice."""
+        return self._classes_rc_sets_for(key, rec, table, interactions, fids, np, layer,
+                                         want_sets=True)
+
+    def _classes_rc_sets_for(self, key, rec, table, interactions, fids, np, layer,
+                             want_sets=False):
+        """The memo behind `_classes_for`: ``(cls, rc, sets)`` with `rc` and
+        `sets` filled in (one more pass over the gestures, memoized alike)
+        only when `want_sets` -- the edge set's label hook is the reader."""
+        from .labeling import resolve_sets, touched_sets
         labels = rec.get("labels")
         sig = (rec.get("commit"), id(labels), id(table), len(fids),
                self._annotation_signature(interactions))
         hit = self._class_memo.get(key)
         if hit is not None and hit[0] == sig:
-            return hit[1]
-        cls = self.row_classes(interactions, labels, fids, np, layer)
-        self._class_memo[key] = (sig, cls)
-        return cls
+            cls, rc, sets = hit[1], hit[2], hit[3]
+        else:
+            cls = self.row_classes(interactions, labels, fids, np, layer)
+            rc = sets = None
+        if want_sets and sets is None:
+            sets = touched_sets(interactions, labels, np, layer)
+            rc = resolve_sets(sets, labels, np)
+        self._class_memo[key] = (sig, cls, rc, sets)
+        return cls, rc, sets
 
     def forget(self, key=None):
         """Drop the memoized classes for `key` (None: every item) and the
@@ -189,7 +211,7 @@ class TrainingSetBuilder:
 
     def edge_set(self, items, store, names: Sequence[str], arcs_of: Callable[[Any], Any], np,
                  id_field: Optional[str] = None, ext_field: Optional[str] = None,
-                 layer_of=None, gestures_of=None):
+                 layer_of=None, gestures_of=None, arc_labels_of=None):
         """Every region of every item (class 0 = unlabeled) with its group and
         extremum value, plus the region-graph edges as global row pairs:
         ``(X, cls, groups, ext | None, edges, names)``. ``arcs_of(key, record)``
@@ -206,7 +228,7 @@ class TrainingSetBuilder:
         names = list(names)
         ext_col = names.index(ext_field) if ext_field in names else None
         items = list(items)
-        sig_parts, cls, per_fids, per_arcs = [], [], [], []
+        sig_parts, cls, per_fids, per_arcs, per_rc, per_sets = [], [], [], [], [], []
         for key, rec, table, group, label in items:
             fids = table.column(id_field)
             if fids is None:
@@ -214,11 +236,15 @@ class TrainingSetBuilder:
             arcs = arcs_of(key, rec)
             sig_parts.append((key, id(table), rec.get("commit"), id(rec.get("labels")), group,
                               id(arcs), None if arcs is None else "length" in arcs))
-            c = self._classes_for(key, rec, table, (gestures_of or store.for_slice)(key),
-                                  fids, np, None if layer_of is None else layer_of(key, rec))
+            c, rc, sets = self._classes_rc_sets_for(
+                key, rec, table, (gestures_of or store.for_slice)(key), fids, np,
+                None if layer_of is None else layer_of(key, rec),
+                want_sets=arc_labels_of is not None)
             cls.append(c)
             per_fids.append(np.asarray(fids).astype(int))
             per_arcs.append(arcs)
+            per_rc.append(rc)
+            per_sets.append(sets)
         sig = (tuple(sig_parts), tuple(names))
         cls_all = np.concatenate(cls) if cls else np.zeros(0, int)
 
@@ -249,4 +275,30 @@ class TrainingSetBuilder:
         edges["both"] = (cls_all[a] > 0) & (cls_all[b] > 0) if len(a) else np.zeros(0, bool)
         edges["diff"] = (edges["both"] & (cls_all[a] != cls_all[b]) if len(a)
                          else np.zeros(0, bool))
+        # ``arc_labels_of(key, rec, arcs, region_class, sets) -> (both, diff)
+        # | None`` in the ARCS' own order lets the label derivation
+        # (derive.py: extents, scopes, traces) say more than the two
+        # endpoints' classes do. Its arrays are filtered the way gather_edges
+        # filtered the arcs (ids absent from the table, self-loops) and land
+        # in the item's contiguous range of the global edge arrays.
+        if arc_labels_of is not None and len(a):
+            from . import magic_fill
+            both = np.array(edges["both"], bool)
+            diff = np.array(edges["diff"], bool)
+            pos = 0
+            for (key, rec, table, group, label), fid, arcs, rc, sets in zip(
+                    items, per_fids, per_arcs, per_rc, per_sets):
+                if arcs is None or not len(arcs.get("a", ())):
+                    continue
+                ia, ib, keep = magic_fill.index_arcs(arcs, fid, np)
+                ok = ia != ib
+                n_item = int(ok.sum())
+                res = arc_labels_of(key, rec, arcs, rc, sets)
+                if res is not None:
+                    b_i, d_i = res
+                    both[pos:pos + n_item] = np.asarray(b_i, bool)[keep][ok]
+                    diff[pos:pos + n_item] = np.asarray(d_i, bool)[keep][ok]
+                pos += n_item
+            assert pos == len(a), "edge ranges drifted from gather_edges"
+            edges["both"], edges["diff"] = both, diff & both
         return X_all, cls_all, grp_all, ext_all, edges, names

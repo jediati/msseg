@@ -135,6 +135,13 @@ class ClassPanelMixin:
         attach_tooltip(en, "Drag sensitivity: screen pixels of vertical drag per "
                            "region near the start of the drag (1..64); longer drags "
                            "accelerate.")
+        cb = ttk.Checkbutton(row, text="extent", variable=self.magic_extent_var)
+        cb.pack(side="left", padx=(8, 0))
+        attach_tooltip(cb, "On: a released fill is the whole object -- its outer seams "
+                           "become boundary labels and its unlabelled neighbours 'not "
+                           "it' (the seam and edge models learn from it). Off: a sample "
+                           "of regions, for a partial release. A blob's core is always "
+                           "an extent, a lasso too unless Ctrl-dragged.")
 
         # Packed before the class holder (side="bottom") so it lands directly
         # under the class panels, leaving the holder the cavity between.
@@ -679,6 +686,9 @@ class ClassPanelMixin:
                 name += f" {it.meta['part']}"    # blobber: core / ring
             if it.meta.get("n_regions") is not None:
                 name += f" ({it.meta['n_regions']})"
+        from ..derive import is_extent
+        if is_extent(it):
+            name += " ext"                       # an extent: its edges are boundaries
         return f"#{it.uid} {name}{where}"
 
     def _update_interaction_row(self, row, it):
