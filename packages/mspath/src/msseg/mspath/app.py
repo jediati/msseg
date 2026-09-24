@@ -100,6 +100,15 @@ def _clean_rois(raw, notes=None):
                 notes.append(f"unusable ROI dropped: {r!r}")
             continue
         if rec["w"] > 0 and rec["h"] > 0 and rec["level"] >= 0:
+            # A PLACE's identity and provenance ride along when present
+            # (docs/design_multi_model_tasks.md §5): a record without them is
+            # the ROI it always was.
+            if isinstance(r.get("uid"), str) and r["uid"]:
+                rec["uid"] = r["uid"]
+            if isinstance(r.get("note"), str) and r["note"]:
+                rec["note"] = r["note"]
+            if isinstance(r.get("origin"), dict) and r["origin"]:
+                rec["origin"] = dict(r["origin"])
             out.append(rec)
         elif notes is not None:
             notes.append(f"empty ROI dropped: {rec}")
@@ -503,13 +512,30 @@ class MsPathApp(ViewerShell):
         if li - 1 >= len(rois):
             return None
         r = rois[li - 1]
-        return roi_item(sid, int(r["level"]), int(r["x"]), int(r["y"]),
+        return roi_item(sid, self._place_level(si, li), int(r["x"]), int(r["y"]),
                         int(r["w"]), int(r["h"]))
+
+    # -- which places are worked, at which level --------------------------- #
+    # A place (an ROI record) belongs to the slide; the level it is worked at
+    # and whether it is worked at all belong to whoever works it. The viewer
+    # works everything at the place's own level; the labeler asks the active
+    # task (docs/design_multi_model_tasks.md §5).
+    def _place_enrolled(self, si, li):
+        """Whether item (si, li) -- li 0 the overview -- is worked."""
+        return True
+
+    def _place_level(self, si, li):
+        """The level place (si, li >= 1) is worked at: its own by default."""
+        try:
+            return int(self._rois_of(si)[li - 1]["level"])
+        except (IndexError, KeyError, TypeError, ValueError):
+            return 0
 
     def _enumerate_items(self):
         for si, _s in enumerate(self.subsequences):
             for li in range(1 + len(self._rois_of(si))):
-                yield (si, li)
+                if self._place_enrolled(si, li):
+                    yield (si, li)
 
     def _sequence_item_labels(self, si):
         out = []
@@ -595,7 +621,9 @@ class MsPathApp(ViewerShell):
             idx = self.flat_slices.index((si, li))
             if idx != int(round(float(self.slice_var.get()))):
                 self._goto_slice(idx)
-        self._view_item(si, li)
+            self._view_item(si, li)
+        else:
+            self._browse(si, li)          # not worked: look, do not work
         return "break"
 
     def _view_item(self, si, li):
@@ -654,12 +682,69 @@ class MsPathApp(ViewerShell):
             return item is not None and item.slide == sid
         return super()._row_owns_key(si, li, key)
 
+    _browse_row = None
+
     def _goto_row(self, si, li):
-        """Go there AND bring it into view, as a double-click does."""
+        """Go there AND bring it into view, as a double-click does. A row
+        that is not worked (the labeler's active task does not enrol it) is
+        BROWSED instead: see `_browse`."""
+        if (si, 0 if li is None else li) not in self.flat_slices:
+            return self._browse(si, li)
         ok = super()._goto_row(si, li)
         if ok:
             self._view_item(si, 0 if li is None else li)
         return ok
+
+    def _browse(self, si, li):
+        """Look at slide `si` -- fitted to row `li`'s place -- without working
+        it: no item is current (`_current()` is None, so no gesture can be
+        stored and nothing is primed or classified), the region overlays are
+        off, and the view is the slide's own pyramid. A click on any worked
+        row ends it (`_goto_slice`)."""
+        sid, path = self._slide_of(si)
+        if sid is None:
+            return False
+        self._browse_row = (si, li)
+        self.slice_var.set(-1)
+        self._sync_slice_combo()
+        self._hover_ctx = None
+        v = self.viewer
+        if v is not None:
+            try:
+                src = self.engine.source(sid)
+            except Exception as exc:
+                self.status_var.set(f"{type(exc).__name__}: {exc}")
+                return False
+            v.set_source(src, path=path)
+            v.set_overlays([])
+            v.set_window(*self._window_for("slide"))
+            if li is None or li <= 0:
+                v.fit()
+            else:
+                self._view_item(si, li)
+        self._after_browse(si, li)
+        what = "the slide" if li is None or li <= 0 else "this place"
+        self.status_var.set(f"Browsing {os.path.basename(str(path))} - {what} is not worked "
+                            "here (nothing is computed or annotated on it).")
+        return True
+
+    def _after_browse(self, si, li):
+        """Hook: the labeler draws the places' outlines on a browsed slide."""
+
+    def _browsed_slide(self):
+        """The slide index being browsed, or None."""
+        return None if self._browse_row is None else self._browse_row[0]
+
+    def _goto_slice(self, idx):
+        self._browse_row = None
+        super()._goto_slice(idx)
+
+    def _rebuild_flat_slices(self):
+        browsing = self._browse_row is not None
+        super()._rebuild_flat_slices()
+        if browsing:                      # the rebuild resets to row 0; stay put
+            self.slice_var.set(-1)
+            self._sync_slice_combo()
 
     def _remove_item_at(self, si, li):
         if li <= 0:
@@ -725,8 +810,11 @@ class MsPathApp(ViewerShell):
         # The first slide of a session goes on screen at once: a session with
         # slides in it and a blank canvas reads as broken, and there is nothing
         # to wait for -- the pyramid is the preview.
-        if self.viewer is not None and not self.viewer.has_base and self.flat_slices:
-            self._goto_slice(0)
+        if self.viewer is not None and not self.viewer.has_base:
+            if self.flat_slices:
+                self._goto_slice(0)
+            else:                          # nothing worked yet (the labeler): look at it
+                self._browse(len(self.subsequences) - 1, None)
         return True
 
     def _add_folder_path(self, path):
@@ -1018,10 +1106,28 @@ class MsPathApp(ViewerShell):
         # workflow hint packs itself above this section's first child.
         self.run_frame = frame = ttk.LabelFrame(parent, text="6. Run")
         frame.pack(fill="x", padx=4, pady=4)
-        ttk.Label(frame, text="Primes the overview of every listed slide.",
-                  foreground="#666").pack(anchor="w", padx=6, pady=(2, 0))
+        self.run_note = ttk.Label(frame, text="Primes every listed slide's overview and ROIs.",
+                                  foreground="#666")
+        self.run_note.pack(anchor="w", padx=6, pady=(2, 0))
         self.run_btn = ttk.Button(frame, text="Run", command=self._run)
         self.run_btn.pack(fill="x", padx=6, pady=4)
+        self.run_all_btn = None           # the labeler adds "Run all tasks"
+
+    def _set_run_buttons(self, state):
+        for b in (getattr(self, "run_btn", None), getattr(self, "run_all_btn", None)):
+            if b is not None:
+                b.config(state=state)
+
+    def _prime_items(self, scope="task"):
+        """The items a Run primes. The viewer primes everything it lists;
+        the labeler's "task" scope is the items the active task works and
+        its "all" scope the union over the tasks on the active workflow."""
+        out = []
+        for si, li in self._enumerate_items():
+            item = self._item_at(si, li)
+            if item is not None:
+                out.append(item)
+        return out
 
     def _build_left(self):
         super()._build_left()
@@ -1057,7 +1163,9 @@ class MsPathApp(ViewerShell):
         slide at level 0 is a request for half an hour of compute.
         """
         cur = self._current()
-        si = cur[0] if cur is not None else (0 if self.subsequences else None)
+        si = (cur[0] if cur is not None else self._browsed_slide())
+        if si is None:
+            si = 0 if self.subsequences else None
         if si is None:
             self.status_var.set("Add a slide first.")
             return
@@ -1079,12 +1187,25 @@ class MsPathApp(ViewerShell):
         self._add_roi(si, max(0, int(self.roi_level_var.get())),
                       x0, y0, max(1, x1 - x0), max(1, y1 - y0))
 
-    def _add_roi(self, si, level, x, y, w, h):
+    def _find_place(self, si, rect, level):
+        """An existing place to reuse for a new ROI of this rect, as its index
+        in the slide's list, or None to append one. The viewer never reuses
+        (a rect at a second level is a second record, as it always was); the
+        labeler reuses the place and enrols it at the level asked for."""
+        return None
+
+    def _on_place_added(self, si, li, level, origin):
+        """A place was added or reused at tree row (si, li): the labeler
+        enrols it in the active task. Runs before the rebuild and the
+        navigation, so the new item is already worked when they look."""
+
+    def _add_roi(self, si, level, x, y, w, h, origin=None):
         """Add one ROI to slide `si`, in slide coordinates. Headless-callable;
         `_add_roi_from_view` is the UI that computes the rect.
 
         Refuses a rect that is degenerate at its own level and caps one that is
-        too big; returns the new item, or None."""
+        too big; returns the new item, or None. `origin` (``{"task",
+        "reason"[, "score"]}``) records who asked for the place."""
         sid, _path = self._slide_of(si)
         if sid is None:
             return None
@@ -1112,15 +1233,25 @@ class MsPathApp(ViewerShell):
             self.status_var.set(
                 f"ROI capped to {lw:.0f}x{lh:.0f} px at level {level} "
                 f"({MAX_ROI_PX / 1e6:.0f} Mpx budget).")
-        self._rois_of(si).append({"level": level, "x": x, "y": y, "w": w, "h": h})
+        rois = self._rois_of(si)
+        found = self._find_place(si, (x, y, w, h), level)
+        if found is None:
+            rec = {"level": level, "x": x, "y": y, "w": w, "h": h}
+            if origin:
+                rec["origin"] = dict(origin)
+            rois.append(rec)
+            li = len(rois)
+        else:
+            li = int(found) + 1
+        self._on_place_added(si, li, level, origin)
         self._rebuild_flat_slices()
         self._refresh_subseq_list()
         self._update_roi_hint()
-        log(f"ROI added on {sid}: L{level} ({x},{y}) {w}x{h} slide px "
-            f"= {lw:.0f}x{lh:.0f} at the level")
-        item = self._item_at(si, len(self._rois_of(si)))
+        log(f"ROI {'added' if found is None else 'reused'} on {sid}: L{level} ({x},{y}) "
+            f"{w}x{h} slide px = {lw:.0f}x{lh:.0f} at the level")
+        item = self._item_at(si, li)
         try:
-            self._goto_slice(self.flat_slices.index((si, len(self._rois_of(si)))))
+            self._goto_slice(self.flat_slices.index((si, li)))
         except ValueError:
             pass
         return item
@@ -1682,22 +1813,19 @@ class MsPathApp(ViewerShell):
                 self.slice_var.set(self.flat_slices.index(idx))
                 self._sync_slice_combo()
 
-    def _run(self):
+    def _run(self, scope="task"):
         if not self.subsequences:
             self.status_var.set("Add a folder and make a slide list first.")
             return
-        items_to_prime = []
-        for si, li in self._enumerate_items():
-            item = self._item_at(si, li)
-            if item is not None:
-                items_to_prime.append(item)
+        items_to_prime = self._prime_items(scope)
         if not items_to_prime:
-            self.status_var.set("Nothing to prime.")
+            self.status_var.set("Nothing to prime - no item is worked "
+                                "(enrol the overview or cut an ROI).")
             return
         profile = self._profile_for_compute()
         self.engine.reset()
         self._run_active = True
-        self.run_btn.config(state="disabled")
+        self._set_run_buttons("disabled")
         self._set_load_enabled(False)
         self.status_var.set(f"Priming {len(items_to_prime)} item(s)…")
         n_ov = sum(1 for it in items_to_prime if it.is_overview)
@@ -1748,7 +1876,7 @@ class MsPathApp(ViewerShell):
         kind = ev[0]
         if kind in ("primed", "item_primed"):
             self._run_active = False
-            self.run_btn.config(state="normal")
+            self._set_run_buttons("normal")
             self._set_load_enabled(True)
             # The shell's rebuild resets the navigation to item 0. For a coupon
             # run that is the first slice of a fresh stack; here it is the
@@ -1786,8 +1914,7 @@ class MsPathApp(ViewerShell):
         self._preview_chan.clear()
 
     def _settle_controls(self):
-        if getattr(self, "run_btn", None) is not None:
-            self.run_btn.config(state="disabled" if self._run_active else "normal")
+        self._set_run_buttons("disabled" if self._run_active else "normal")
 
     def _update_busy(self):
         """The canvas badge: 'Priming' while the item on screen is being

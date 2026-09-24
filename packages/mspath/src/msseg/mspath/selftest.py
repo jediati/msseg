@@ -586,6 +586,12 @@ def run_labeler_selftest():
     app = LabelerApp(root, autosave=False)
 
     assert app._add_slide_path(slide)
+    # Adding a slide works nothing (design note §5): the first task starts
+    # empty, and the overview is enrolled only by choice.
+    assert app._task.enrolled == {} and app.flat_slices == [] and app._current() is None
+    assert app._browse_row == (0, None), "a new slide is browsed, not worked"
+    assert app._enrol_row(0, 0) and app.flat_slices == [(0, 0)]
+    assert app._task.enrolled == {app._item_at(0, 0).slide: {"overview": None}}
     src = app.engine.source(app._item_at(0, 0).slide)
     deepest = max(0, src.levels - 3)
     app.level_var.set(deepest)
@@ -772,6 +778,11 @@ def run_labeler_selftest():
             assert r["level"] == app.roi_level_var.get()
             assert 0 <= r["x"] and r["x"] + r["w"] <= sw0
             assert 0 <= r["y"] and r["y"] + r["h"] <= sh0
+            # a place asked for by THIS task's model, and worked by it
+            o = r["origin"]
+            assert o["task"] == app._task.uid and o["reason"] == app.propose_method_var.get()
+            assert isinstance(o["score"], float)
+            assert app._task.enrolled[app._item_at(0, 0).slide][r["uid"]] == r["level"]
         keys = [app._item_at(0, li).key for li in range(1, 1 + len(app._rois_of(0)))]
         assert len(set(keys)) == len(keys), "a proposal duplicated an existing item"
 
@@ -850,8 +861,11 @@ def run_labeler_selftest():
     assert app._remove_target(0, 0) == (0, None), "the overview goes with its slide"
     assert app._remove_target(0, li) == (0, li)
     labels = [e[0] if e else None for e in app._seq_tree_menu_entries(0, 0)]
-    assert labels == ["Go to", None, "Clear annotations", "Remove slide\u2026"], labels
-    assert [e[0] for e in app._seq_tree_menu_entries(0, li) if e][-1] == "Remove ROI\u2026"
+    assert labels == ["Go to", "Unenrol from 'task 1'", None, "Clear annotations",
+                      "Remove slide\u2026"], labels
+    roi_labels = [e[0] for e in app._seq_tree_menu_entries(0, li) if e]
+    assert roi_labels[-1] == "Remove ROI\u2026" and "Unenrol from 'task 1'" in roi_labels
+    assert "Note\u2026" in roi_labels and any(l.startswith("Work at L") for l in roi_labels)
     assert "ROI" in app._row_description(0, li) and "overview" in app._row_description(0, None)
     # one annotation on the overview, one inside the ROI: both are the
     # SLIDE's (docs/design_multi_model_tasks.md \u00a78) -- each item sees those
@@ -883,7 +897,8 @@ def run_labeler_selftest():
     assert app._row_owns_key(0, None, cut.key), "a slide row still owns item keys"
     assert len(app._row_interactions(0, None)) == 3 and len(app._row_interactions(0, li)) == n_roi
     labels = [e[0] if e else None for e in app._seq_tree_menu_entries(0, None)]
-    assert labels == ["Go to", None, "Clear annotations\u2026 (3)", "Remove slide\u2026"], labels
+    assert labels == ["Go to", "Enrol every place in 'task 1'", None,
+                      "Clear annotations\u2026 (3)", "Remove slide\u2026"], labels
     # the ROI: removing it dooms nothing -- its gestures are the slide's and
     # stay, visible on the overview -- the engine forgets it and the view
     # lands on a neighbour; a re-cut of the same rect sees them again with no
@@ -951,6 +966,107 @@ def run_labeler_selftest():
     assert app2.profiles[app2.active_profile_idx]["name"] == prof["name"]
     assert app2._feature_scope() == app._feature_scope()
 
+    # -- Places and enrolment (design note §5): a place is the slide's, the
+    # work on it the task's; nothing is worked unless enrolled ------------- #
+    import json as _json
+    import re as _re
+    from . import places as _places
+    app3 = LabelerApp(tk.Toplevel(root), autosave=False)
+    assert app3._add_slide_path(slide)
+    tA = app3._task
+    assert tA.enrolled == {} and app3.flat_slices == [] and app3._browse_row == (0, None)
+    app3.active_class_var.set(1)
+    app3._commit_interaction("taps", [(10.0, 10.0)])
+    assert app3.store.interactions == [], "nothing is annotated on a browsed slide"
+    src3 = app3.engine.source(app3._item_at(0, 0).slide)
+    lvl = max(1, src3.levels - 2)
+    side = int(96 * src3.level_scale(lvl))
+    p1 = app3._add_roi(0, lvl, 0, 0, side, side)       # cut from the view: enrols A only
+    _settle(app3)
+    assert p1 is not None and app3.flat_slices == [(0, 1)] and app3._current() == (0, 1)
+    place = app3._rois_of(0)[0]
+    uid = place["uid"]
+    assert _re.fullmatch(r"p_[0-9a-f]{6}", uid)
+    assert place["origin"] == {"reason": "view", "task": tA.uid}
+    sid3 = p1.slide
+    assert tA.enrolled == {sid3: {uid: lvl}}
+    again3 = app3._add_roi(0, lvl, 0, 0, side, side)
+    assert again3.key == p1.key and len(app3._rois_of(0)) == 1, "the same rect is one place"
+    # The whole slide shows the places: the task's solid with its level.
+    app3._browse(0, None)
+    assert app3._current() is None
+    c3 = app3.viewer.canvas
+    assert len(c3.find_withtag("place_worked")) == 1 and not c3.find_withtag("place_other")
+    assert c3.itemcget(c3.find_withtag("place_label")[0], "text") == f"L{lvl}"
+    x0, y0, x1, y1 = c3.coords(c3.find_withtag("place_worked")[0])
+    app3.viewer.set_view(scale=app3.viewer.scale / 2.0)
+    app3._redraw_hover_geometry()
+    X0, Y0, X1, Y1 = c3.coords(c3.find_withtag("place_worked")[0])
+    assert abs((X1 - X0) - 2 * (x1 - x0)) < 2, "the outline follows a zoom"
+    # Task B works nothing: the place is listed greyed, drawn dashed, and a
+    # click on it browses -- no current item, nothing primed.
+    tB = app3._task_new("stroma")
+    assert tB.enrolled == {} and app3.flat_slices == [] and app3._current() is None
+    assert app3._row_tags(0, 1) == (app3.UNENROLLED_TAG,)
+    assert app3._row_tags(0, None) == (app3.UNENROLLED_TAG,)
+    app3._browse(0, None)
+    assert len(c3.find_withtag("place_other")) == 1 and not c3.find_withtag("place_worked")
+    assert app3._goto_row(0, 1) and app3._current() is None and app3._browse_row == (0, 1)
+    # Enrolled at another level in B: one place, two items.
+    lvl2 = lvl - 1
+    assert app3._enrol_row(0, 1, lvl2)
+    _settle(app3)
+    assert app3.flat_slices == [(0, 1)] and app3._current() == (0, 1), "enrolling a browsed row selects it"
+    kB = app3.catalogue.key_of(0, 1)
+    assert kB != p1.key and f"@{lvl2}#" in kB and tB.enrolled == {sid3: {uid: lvl2}}
+    assert app3._row_tags(0, 1) == () and app3._tasks_working(0, 1) == [tA.name, tB.name]
+    # A level that makes a place degenerate is refused, not shrunk.
+    app3._rois_of(0).append({"level": 0, "x": 400, "y": 300, "w": 40, "h": 40})
+    app3._ensure_place_uids()
+    assert not app3._enrol_row(0, 2, src3.levels - 1)
+    assert "too small" in app3.status_var.get(), app3.status_var.get()
+    app3._rois_of(0).pop()
+    app3._rebuild_flat_slices()
+    # A's work is untouched, and its caches survive a switch away and back.
+    assert app3._activate_task(tA) and app3.catalogue.key_of(0, 1) == p1.key
+    app3._pred[p1.key] = ("kept",)
+    assert app3._activate_task(tB) and app3._activate_task(tA)
+    assert app3._pred.get(p1.key) == ("kept",), "a switch does not drop predictions"
+    app3._pred.clear()
+    # Run task primes the active task's items, Run all every task's on the workflow.
+    assert [i.key for i in app3._prime_items("task")] == [p1.key]
+    assert sorted(i.key for i in app3._prime_items("all")) == sorted([p1.key, kB])
+    # The session keeps places and enrolments; a document written before
+    # enrolment reads as "works its places", never the overview.
+    doc3 = app3._session_doc()
+    assert doc3["sequences"][0]["rois"][0]["uid"] == uid
+    assert [t.get("enrolled") for t in doc3["tasks"]] == [{sid3: {uid: lvl}}, {sid3: {uid: lvl2}}]
+    app4 = LabelerApp(tk.Toplevel(root), autosave=False)
+    app4._apply_session_doc(_json.loads(_json.dumps(doc3)), "enrolment")
+    assert app4._rois_of(0)[0]["uid"] == uid
+    assert [t.enrolled for t in app4.tasks] == [{sid3: {uid: lvl}}, {sid3: {uid: lvl2}}]
+    legacy = _json.loads(_json.dumps(doc3))
+    for t in legacy["tasks"]:
+        t.pop("enrolled")
+    for r in legacy["sequences"][0]["rois"]:
+        r.pop("uid")
+    notes4 = []
+    app5 = LabelerApp(tk.Toplevel(root), autosave=False)
+    app5._apply_session_doc(legacy, "legacy", notes4)
+    uid5 = app5._rois_of(0)[0]["uid"]
+    assert [t.enrolled for t in app5.tasks] == [{sid3: {uid5: lvl}}] * 2, \
+        "a legacy task works its places at their own level"
+    assert not _places.overview_enrolled(app5.tasks[0].enrolled, sid3)
+    assert any("overview" in n for n in notes4), notes4
+    # Removing the place removes it for every task, and says who worked it.
+    msg3 = app3._remove_rows_message([(0, 1)])
+    assert f"'{tA.name}'" in msg3 and f"'{tB.name}'" in msg3, msg3
+    with _mock.patch.object(messagebox, "askyesno", return_value=True):
+        assert app3._remove_rows_guarded([(0, 1)])
+    _settle(app3)
+    assert app3._rois_of(0) == [] and all(not t.enrolled for t in app3.tasks)
+    assert p1.key not in app3.engine.primed and kB not in app3.engine.primed
+
     root.destroy()
     print("labeler selftest OK: placement, slide-coordinate gestures, class layer, "
           "box over the item, training rows, level-scoped compat gate, "
@@ -960,5 +1076,7 @@ def run_labeler_selftest():
           "the slide's key + scale of intent + rect query + item-key rebase + "
           "an ROI's removal keeps them + the coarse mark, "
           "seam tools in slide coordinates, tasks: own store + model, "
-          "profile-from-model binds the active task, two tasks into a fresh window")
+          "profile-from-model binds the active task, two tasks into a fresh window, "
+          "places + enrolment: nothing worked until enrolled, browse, outlines, "
+          "one place at two levels, Run task / all, round trip + legacy, removal")
     return 0

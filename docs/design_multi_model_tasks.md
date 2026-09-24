@@ -1,6 +1,8 @@
 # Design note: many task-specific models over one set of slides
 
-Status: **third draft; stages 1-3 built** (2026-09-21; first draft 2026-09-18).
+Status: **third draft; stages 1-4 built** (2026-09-24; first draft 2026-09-18).
+Stage 4 -- places, enrolment, a split Run and the on-demand fast path -- is
+described where §5 and §12 now say "as built".
 Stage 1 of §12 -- the task object with a stack, the Tasks list, session v3 --
 stage 2 -- slide-bound gestures with a scale of intent, stroke width, extent
 outlines and the trace corridor (§8) -- and stage 3 -- the derivation module
@@ -149,14 +151,25 @@ word is `task`, because "gland detector" outlives any trained pickle and
 
 ## 5. Places and enrolment
 
-A place belongs to the slide; the work on it belongs to the task. Today's ROI
-record splits into `slide.places[] = {uid, x, y, w, h, note, origin}` and
-`task.enrolled = {slide: [place uids | "overview"]}`. The item a task works is
-`place x task.workflow.level`, which is exactly today's key. Drawing an ROI
-from a view creates the place and enrols it in the **active task only**;
-other tasks see it as available-not-enrolled; nothing primes until a task
-enrols it. `origin = {task, reason}` records that an uncertainty-driven
-proposal (`propose.py`) was a proposal *for that task's model*.
+A place belongs to the slide; the work on it belongs to the task. **As
+built (stage 4):** the ROI record grew into the place --
+`{uid, level, x, y, w, h[, note][, origin]}` on the slide's list, `level`
+being its default (cut) level -- and the task carries
+`enrolled = {slide_id: {"overview": null, "<place uid>": level}}`: one entry
+per place (the tree has one row per place), the **level on the enrolment**,
+so two tasks can work one place at two levels (two item keys). `None` means
+"every place at its own level" (the coupon, where a slice is its own place,
+and nothing else once loaded); `{}` means nothing. The item a task works is
+`place x its enrolled level` -- today's key grammar, unchanged. Drawing an
+ROI from a view or proposing one creates the place (a rect already on the
+slide is reused) and enrols it in the **active task only**, with
+`origin = {task, reason, [score]}`. **The overview is never enrolled
+automatically** -- not by adding a slide, a new task, a legacy load or a bulk
+action: viewing the whole slide is *browsing* (no item current, nothing
+primed or annotatable), working it is a choice (tree menu). A new task
+enrols nothing. On the whole-slide view every place is outlined -- solid
+with its level for the active task's, dashed grey for the rest. Removing a
+place removes it for every task (the dialog names who worked it).
 
 Rejected: task-owned ROIs (same rect becomes two objects; deleting a task
 destroys a place someone else chose) and shared-and-auto-enrolled (every ROI
@@ -572,6 +585,28 @@ even-odd fill of `extents.extent_mask` is exact. §13.2 is closed (blob
 always, fill by checkbox, lasso by Ctrl). Tests: `test_derive.py`,
 `test_edge_hook.py`; coupon selftest sections for the flag, the derived
 seams and the enclosure flow.
+
+**What exists (stage 4, 2026-09-24).** Places and enrolment as §5 now reads:
+`msseg/mspath/places.py` (uids, rect lookup, enrol / unenrol, legacy
+materialisation, drops), `Task.enrolled` + `session_doc.normalise_enrolled`
+(written only when not None; `{}` written), the viewer hooks
+`_place_enrolled` / `_place_level` behind `_enumerate_items` -- the one choke
+point, so Train / Classify / exports / Run follow the active task -- and a
+**browse** state for rows the task does not work (`slice_var = -1`,
+`_current()` None, so no gesture can land on the wrong item). The Run splits
+into **Run task** and **Run all tasks** (the union over tasks on the active
+workflow; tasks on another workflow wait for stage 5). **The fast path**:
+model operations never prime (`_stream_ready`, uncomputed items are skipped
+and counted), `C` / `R` classify the item on screen, *Classify all* does the
+rest, and an item is classified when it is selected (`CLASSIFY_ON_ARRIVAL`,
+mspath). The per-task cache signature is `(keys, rows)`, stamped on leaving
+a task too, pruning only vanished keys. Legacy note: a v2 / pre-stage-4
+task reads as "works its places" -- never the overview -- with a load note;
+stage-3 code reading a stage-4 document drops the uids and ignores
+`enrolled`, so every task would see everything again. Tests:
+`test_enrolment_doc.py`, `test_places.py`; the mspath labeler selftest's
+enrolment block. Pre-existing limit made easier to hit: `_feature_scope`
+still names only the overview level.
 
 Stage 1 touched `session_doc.py`, the new `msseg/labeler/task.py`,
 `labeling.py`, `annotate.py`, `shell.py`, `panels/classpanel.py`,

@@ -1051,6 +1051,7 @@ class ViewerShell:
         if self._update_subseq_values():
             return
         tree = self.subseq_list
+        self._configure_row_tags(tree)
         open_seqs = {iid for iid in tree.get_children()
                      if tree.item(iid, "open")}
         tree.delete(*tree.get_children())
@@ -1063,11 +1064,12 @@ class ViewerShell:
             iid = f"q{si}"
             tree.insert("", "end", iid=iid, text=self._sequence_row_text(s),
                         values=(seq_msc, str(seq_annot) if seq_annot else ""),
-                        open=iid in open_seqs)
+                        open=iid in open_seqs, tags=self._row_tags(si, None))
             for li, text in enumerate(rows):
                 msc, annot = marks[li]
                 tree.insert(iid, "end", iid=f"q{si}:{li}", text=text,
-                            values=(msc, self._annotation_mark(si, li, annot)))
+                            values=(msc, self._annotation_mark(si, li, annot)),
+                            tags=self._row_tags(si, li))
 
     def _update_subseq_values(self):
         """Rewrite the tree's "msc"/"annot" values in place, or return False if
@@ -1093,6 +1095,7 @@ class ViewerShell:
             seq_msc = "Y" if marks and all(m[0] == "Y" for m in marks) else ""
             seq_annot = self._sequence_annotation_count(si, [m[1] for m in marks])
             self._set_row_values(iid, seq_msc, str(seq_annot) if seq_annot else "")
+            self._set_row_tags(iid, self._row_tags(si, None))
             for li, (msc, annot) in enumerate(marks):
                 child = f"q{si}:{li}"
                 # A sequence can swap an item without changing its length, so
@@ -1100,6 +1103,7 @@ class ViewerShell:
                 if tree.item(child, "text") != rows[li]:
                     return False
                 self._set_row_values(child, msc, self._annotation_mark(si, li, annot))
+                self._set_row_tags(child, self._row_tags(si, li))
         return True
 
     def _set_row_values(self, iid, msc, annot):
@@ -1108,6 +1112,31 @@ class ViewerShell:
             tree.set(iid, "msc", msc)
         if tree.set(iid, "annot") != annot:
             tree.set(iid, "annot", annot)
+
+    # -- row styling ------------------------------------------------------ #
+    # An app whose items a task may not work (mspath, `ENROLMENT`) greys the
+    # rows the active task does not enrol: listed, browsable, not worked.
+    ENROLMENT = False
+    UNENROLLED_TAG = "unenrolled"
+
+    def _row_tags(self, si, li):
+        """Treeview tags for tree row (si, li) -- li None is the sequence row.
+        None by default: every row is worked."""
+        return ()
+
+    def _configure_row_tags(self, tree):
+        try:
+            tree.tag_configure(self.UNENROLLED_TAG, foreground="#9a9a9a")
+        except tk.TclError:
+            pass
+
+    def _set_row_tags(self, iid, tags):
+        tree = self.subseq_list
+        want = tuple(tags or ())
+        have = tree.item(iid, "tags")
+        have = tuple(have) if isinstance(have, (list, tuple)) else (() if not have else (have,))
+        if have != want:
+            tree.item(iid, tags=want)
 
     def _sequence_item_labels(self, si):
         """Row text for each of sequence `si`'s items, in order.

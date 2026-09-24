@@ -170,9 +170,12 @@ class ClassPanelMixin:
         ttk.Button(row, text="Train (R)",
                    command=self._train_classifier).pack(side="left", fill="x",
                                                         expand=True, padx=(0, 2))
-        self.classify_btn = ttk.Button(row, text="Classify (C)",
+        self.classify_btn = ttk.Button(row, text="Classify all",
                                        state="disabled", command=self._classify)
         self.classify_btn.pack(side="left", fill="x", expand=True, padx=2)
+        attach_tooltip(self.classify_btn,
+                       "Every computed item. The fast path is C (and R = train + C): "
+                       "classify only the item on screen.")
 
         # The edge model (the "-> edges" kinds): what it scored, whether
         # voting is on, how many regions it flipped on this slice.
@@ -1010,12 +1013,20 @@ class ClassPanelMixin:
         cur = self._current()
         if cur is None or not self._gesture_on_item(it, *cur):
             # Its hints name the slide's first row (the overview), which
-            # always covers the gesture.
-            try:
-                idx = self.flat_slices.index((it.si, it.li))
-            except ValueError:
-                return
-            self._goto_slice(idx)
+            # always covers the gesture -- when that row is worked. Else the
+            # first worked item on the slide that meets it, else (an app
+            # that can) browse the slide.
+            if (it.si, it.li) in self.flat_slices:
+                self._goto_slice(self.flat_slices.index((it.si, it.li)))
+            else:
+                hit = next((p for p in self.flat_slices
+                            if p[0] == it.si and self._gesture_on_item(it, *p)), None)
+                if hit is not None:
+                    self._goto_slice(self.flat_slices.index(hit))
+                elif hasattr(self, "_browse"):
+                    self._browse(it.si, None)
+                else:
+                    return
         cx = sum(x for x, _y in it.points) / len(it.points)
         cy = sum(y for _x, y in it.points) / len(it.points)
         w = max(v.canvas.winfo_width(), 1)

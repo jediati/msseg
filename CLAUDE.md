@@ -302,6 +302,39 @@ meta, checkbox + view, Ctrl-lasso, derived seams after a blob, the closed
 trace / outside / arm-a-class / name / Esc flow; its overlay counts grew by
 the derived seams layer).
 
+**Places, enrolment and the fast path** (2026-09-24, stage 4 of the design
+note, §5): an mspath ROI record is now a **place** (`{uid, level, x, y, w,
+h[, note][, origin]}` on the slide; `level` = its cut level; `_clean_rois`
+keeps uid/note/origin; `msseg.mspath.places` does the dict work), and a
+task's **enrolment** says what it works: `Task.enrolled = {slide:
+{"overview": None, "<uid>": level}}` (the level lives ON the enrolment, so
+two tasks can work one place at two levels; None = every place at its own
+level, the coupon's and a legacy task's reading, materialised on load in
+mspath -- never including the overview; `{}` = nothing, what a new task and
+the first task get; written by `Task.to_doc` only when not None,
+`session_doc.normalise_enrolled`). The viewer hooks `_place_enrolled` /
+`_place_level` sit behind `_enumerate_items`, the single choke point, so
+flat_slices / catalogue / Train / Classify / exports / Run are the ACTIVE
+task's (`ViewerShell.ENROLMENT`, mspath labeler True). **The overview is
+never enrolled automatically**; adding a slide works nothing. A row the task
+does not work is greyed (`_row_tags`) and **browsed** (`MsPathApp._browse`:
+`slice_var = -1`, `_current()` None -- no gesture, prime or prediction can
+land) and every place is outlined on the whole-slide view (solid + level =
+the active task's, dashed grey = others'; `_redraw_place_outlines`, tag
+`places`). Add-from-view / propose reuse a place with the same rect and
+enrol it in the active task with `origin`; tree menu: Enrol / Unenrol, Work
+at L<n> (refused, never shrunk, when degenerate or over budget), Note…,
+Enrol every place (not the overview); removing a place removes it for every
+task and forgets its keys at every level. `_activate_task` calls
+`_enrolment_changed` (no prime on a switch) and keeps per-task caches by a
+`(keys, rows)` signature stamped on leaving too. Run is **Run task** / **Run
+all tasks** (`_prime_items`; the union over tasks on the active workflow).
+**Fast path** ("retrain, classify what I'm looking at"): streams never prime
+(`_stream_ready`), `C` / `R` classify the current item
+(`_classify_current`), the button is *Classify all*, and mspath classifies
+an item on arrival (`CLASSIFY_ON_ARRIVAL`). Tests: `test_enrolment_doc.py`,
+`test_places.py`, the mspath labeler selftest's enrolment block.
+
 **mscoupon labeler magic fill + gesture previews** (`mscoupon-labeler`, see
 [docs/mscoupon_labeler.md](docs/mscoupon_labeler.md)): every drawing gesture now
 previews the regions it WILL paint on a transient canvas layer (brightened class

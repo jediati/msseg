@@ -138,6 +138,10 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         # the profiles exist (_build_task_section).
         self.tasks = [Task.new("task 1")]
         self._task = self.tasks[0]
+        if self.ENROLMENT:
+            # An app with enrolment starts every task working nothing: what a
+            # task works is chosen (enrol / cut an ROI), never inherited.
+            self._task.enrolled = {}
         self._models_dir_override = _UNSET
         self._task_rows_syncing = False
         self._training_builder = TrainingSetBuilder(self.FIELDS)
@@ -454,6 +458,8 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
             self._rebuild_class_panels()      # slice 0 is now on screen
         elif ev[0] == "assembly_done":
             self._update_class_titles()       # a new record can change counts
+        if ev[0] in ("primed", "item_primed"):
+            self._classify_on_arrival()       # the item on screen, if it can be
 
     def _goto_slice(self, idx):
         # By ITEM key: two items of one slide share a gesture key, but list
@@ -469,6 +475,9 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
             cur = self._current()
             if cur is not None:
                 self._coarse_notice(*cur)
+        # Selected = classified (when a model is loaded and the item is
+        # computed; an uncomputed item is classified when its prime lands).
+        self._classify_on_arrival()
 
     # -- what a gesture is keyed by, and which gestures an item sees ------- #
     # A gesture is a statement about tissue at a location, so it is keyed by
@@ -1278,6 +1287,8 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
             if not keep_model:
                 td["models"] = []
                 td["view"] = {}
+            if self.ENROLMENT:
+                td["enrolled"] = {}           # no slides left to work
             tasks.append(td)
         doc.pop("annotations", None)
         doc.pop("models", None)
@@ -1364,6 +1375,8 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         # The tasks install AFTER sequences exist, so rebind sees them (and
         # migrates legacy bare-basename keys against the qualified identity).
         self.tasks = [Task.from_doc(td, notes) for td in sdoc["tasks"]]
+        for t in self.tasks:
+            self._normalize_enrolment(t, notes)
         for t in self.tasks:
             unbound = self._rebind_store(t.store)
             if unbound:
@@ -1463,6 +1476,9 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
             return False
         if not initial:
             self._stash_task_view(self._task)
+            # Stamp the outgoing task's cache signature too: whatever it
+            # enrolled or saw while active is what its caches are valid for.
+            self._task.caches.keys_sig = self._keys_signature()
         # Caches keyed on the store's rev with no task discriminator: two
         # stores can share a rev with different content, so they clear (each
         # rebuilds in one rasterization pass per visible item).
@@ -1488,13 +1504,22 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         if task.model_pending and task.model.empty:
             self._reload_task_model(task)
         self._apply_task_view(task.view)
+        # The items the task works may differ from the previous task's (an
+        # app with enrolment): the navigation, the catalogue and the tree
+        # follow before anything reads them. Never a prime.
+        self._enrolment_changed()
         # Rows may have come or gone while the task was inactive: rebind its
-        # gestures, and drop predictions made under another row layout.
+        # gestures, and drop predictions whose item is gone or whose row
+        # moved (a prediction is keyed by item, but the confusion cell and
+        # the error rows hold (si, li)).
         self._rebind_store(task.store)
-        sig = tuple(self.catalogue.keys())
-        if task.caches.keys_sig is not None and task.caches.keys_sig != sig:
-            task.caches.pred.clear()
-            task.caches.seam_pred.clear()
+        sig = self._keys_signature()
+        old = task.caches.keys_sig
+        if old is not None and old != sig:
+            live = set(sig[0])
+            for cache in (task.caches.pred, task.caches.seam_pred):
+                for k in [k for k in cache if k not in live]:
+                    cache.pop(k, None)
             task.caches.cm_cell = None
         task.caches.keys_sig = sig
         self.n_classes_var.set(task.store.n_classes)
@@ -1509,6 +1534,21 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         except Exception as exc:
             self._log(f"redraw after task switch failed: {exc}")
         return True
+
+    def _keys_signature(self):
+        """What a task's per-item caches are valid for: the catalogue's item
+        keys and the row addresses they sit at."""
+        return (tuple(self.catalogue.keys()), tuple(tuple(p) for p in self.flat_slices))
+
+    def _enrolment_changed(self):
+        """The active task's items changed (a switch, an enrol / unenrol).
+        An app without enrolment has nothing to redo; mspath rebuilds its
+        navigation, catalogue and tree without priming anything."""
+
+    def _normalize_enrolment(self, task, notes=None):
+        """After a session's tasks install: bring a task's enrolment to the
+        app's rules (mspath: a task written before enrolment works its
+        places, never the overview). Nothing to do without enrolment."""
 
     def _reload_task_model(self, task):
         """Load the newest of the task's recorded pickles that still exists
@@ -1632,6 +1672,8 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
             workflow = self.profiles[self.active_profile_idx]["name"]
         task = Task.new(name, workflow=workflow, n_classes=self.store.n_classes,
                         taken=[t.uid for t in self.tasks])
+        if self.ENROLMENT:
+            task.enrolled = {}             # a new task works nothing yet
         self.tasks.append(task)
         if not self._activate_task(task):
             self.tasks.remove(task)

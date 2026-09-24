@@ -74,6 +74,44 @@ def dedupe_profile_name(name: str, taken: Sequence[str]) -> str:
     return f"{name} ({i})"
 
 
+def normalise_enrolled(raw: Any, notes: Optional[List[str]] = None,
+                       who: str = "task") -> Optional[Dict[str, Dict[str, Optional[int]]]]:
+    """A task's ENROLMENT -- which places it works, at which level -- in its
+    normal form ``{slide_id: {"overview": None, "<place uid>": level}}``.
+
+    None means "everything, each place at its own level": the reading of a
+    task written before enrolment existed, and of every coupon task (a slice
+    is its own place). ``{}`` means nothing. The overview's value is always
+    None: its level is the workflow's. Total: junk is a note and None (so
+    nothing a user had is silently hidden), a bad entry is a note and is
+    dropped. Whether a place uid still names a place is the app's question,
+    not this reader's (the places live on the app's slides)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        _note(notes, f"{who}: enrolment is not a mapping - every place is worked")
+        return None
+    out: Dict[str, Dict[str, Optional[int]]] = {}
+    for slide, entries in raw.items():
+        if not isinstance(slide, str) or not slide or not isinstance(entries, dict):
+            _note(notes, f"{who}: unusable enrolment entry for {slide!r} - skipped")
+            continue
+        e: Dict[str, Optional[int]] = {}
+        for key, level in entries.items():
+            if key == "overview":
+                e["overview"] = None
+                continue
+            lvl = _as_int(level, None)
+            if not isinstance(key, str) or not key or lvl is None or lvl < 0:
+                _note(notes, f"{who}: unusable enrolment {key!r}: {level!r} on "
+                             f"{slide!r} - skipped")
+                continue
+            e[key] = int(lvl)
+        if e:
+            out[slide] = e
+    return out
+
+
 def new_task_uid(taken: Sequence[str] = ()) -> str:
     """A fresh task id, ``t_`` + six hex digits, not in `taken`. A task's
     identity is separate from its display name so a rename can never break a
@@ -275,10 +313,14 @@ def session_doc_from_json(doc: Any, notes: Optional[List[str]] = None, *,
                              f"session - using {active!r}")
                 workflow = active
             tview = _as_dict(td.get("view"))
+            # Enrolment only when written: absent means "every place".
+            enrolled = (normalise_enrolled(td["enrolled"], notes, f"task {name!r}")
+                        if "enrolled" in td else None)
             tasks.append({"uid": uid, "name": name, "workflow": workflow,
                           "annotations": _first_dict(td.get("annotations"), td.get("labels")),
                           "models": _models_from_json(td.get("models")),
-                          "view": {k: tview[k] for k in TASK_VIEW_KEYS if k in tview}})
+                          "view": {k: tview[k] for k in TASK_VIEW_KEYS if k in tview},
+                          **({"enrolled": enrolled} if enrolled is not None else {})})
             uids.append(uid)
             tnames.append(name)
         active_task = str(root.get("active_task") or "")

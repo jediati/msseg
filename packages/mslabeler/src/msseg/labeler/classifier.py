@@ -58,7 +58,26 @@ class ClassifierMixin:
         if self.regions.pending():
             self.status_var.set("Busy computing - try again in a moment.")
             return None
-        return self._stat_slice_iter(action, list(keys), spec, training)
+        # The fast path: a model operation never primes. An item that is not
+        # computed (an ROI nobody has selected since it was cut) is skipped
+        # and counted, not computed on the spot.
+        ready = [k for k in keys if self._stream_ready(k)]
+        self._stream_skipped = len(keys) - len(ready)
+        if not ready:
+            self.status_var.set(f"None of the {len(keys)} item(s) is computed yet - "
+                                "select one (or Run) first.")
+            return None
+        return self._stat_slice_iter(action, ready, spec, training)
+
+    def _stream_ready(self, key):
+        """Whether item `key` can be streamed without priming it. Every item
+        by default (the coupon's records never prime); an app whose
+        `ensure_record` would prime (mspath) says which are computed."""
+        return True
+
+    def _skipped_note(self):
+        n = getattr(self, "_stream_skipped", 0)
+        return f" ({n} uncomputed item(s) skipped)" if n else ""
 
     def _stat_slice_iter(self, action, keys, spec=None, training=False):
         import numpy as np
@@ -602,7 +621,10 @@ class ClassifierMixin:
         # cache. _classify refreshes them against the new predictions.
         self._train_classifier(preserve_view=True)
         if self._clf is not None and self._clf is not before:
-            self._classify()
+            # The fast path: retrain, then classify what is on screen.
+            # Everything else is classified when it is looked at, or by
+            # "Classify all".
+            self._classify_current()
             if not self._pred:            # classification failed after training
                 self._cm_cell = None
                 self._refresh_region_modes()
@@ -1142,10 +1164,83 @@ class ClassifierMixin:
                 btn.config(state=state)
 
     def _on_classify_key(self, _e=None):
-        """'C': classify/reclassify with the current model."""
+        """'C': classify/reclassify the item on screen with the current model
+        (the fast path; "Classify all" does every computed item)."""
         if self._typing() or self._clf is None:
             return
-        self._classify()
+        self._classify_current()
+
+    def _classify_current(self, quiet=False):
+        """Predict the item on screen only -- the one update the user is
+        waiting for. Returns True when a prediction is in place. `quiet`
+        (arrival) skips the dialogs and leaves the status line alone when
+        there is nothing to do."""
+        cur = self._current()
+        if self._clf is None or cur is None:
+            if not quiet:
+                self.status_var.set("Train first." if self._clf is None
+                                    else "Nothing on screen to classify.")
+            return False
+        msg = self._check_model_compat(self._clf_names, "classify")
+        if msg:
+            if not quiet:
+                messagebox.showerror(self.APP_TITLE, msg)
+                self.status_var.set(msg)
+            return False
+        import numpy as np
+        si, li = cur
+        key = self.catalogue.key_of(si, li)
+        rec = self.regions.record(key) if key is not None else None
+        if rec is None and not quiet:
+            rec = self._ensure_slice_record(si, li)
+        if rec is None or rec.get("labels") is None:
+            if not quiet:
+                self.status_var.set("This item is not computed yet.")
+            return False
+        t0 = time.perf_counter()
+        try:
+            ok = self._predict_slice(si, li, rec, np) is not None
+        except TrainingProblem as problem:
+            if not quiet:
+                self.status_var.set(str(problem))
+            return False
+        if not ok:
+            if not quiet:
+                self.status_var.set(f"Classification stopped: incomplete statistics on "
+                                    f"slice {si}:{li}.")
+            return False
+        self._refresh_region_modes()
+        self._refresh_confusion()
+        self._refresh_render()
+        self._refresh_edge_readout()
+        if not quiet:
+            self.status_var.set(f"Classified this item in "
+                                f"{1e3 * (time.perf_counter() - t0):.0f} ms - "
+                                "'Classify all' does every computed item")
+        return True
+
+    # A place is classified when it is selected, not before: arriving at an
+    # item with a model loaded and no current prediction predicts that one
+    # item (off by default; mspath turns it on).
+    CLASSIFY_ON_ARRIVAL = False
+
+    def _classify_on_arrival(self):
+        if not self.CLASSIFY_ON_ARRIVAL or self._clf is None or self._search is not None:
+            return
+        cur = self._current()
+        if cur is None:
+            return
+        key = self.catalogue.key_of(*cur)
+        rec = self.regions.record(key) if key is not None else None
+        if rec is None:
+            return
+        pr = self._pred.get(key)
+        if pr is not None and pr[0] == rec.get("commit"):
+            return
+        try:
+            self._classify_current(quiet=True)
+        except Exception as exc:          # never let a look raise
+            self._log(f"classify on arrival failed: {type(exc).__name__}: {exc}")
 
     # -- computing badge on the image plane (top-left canvas HUD) -------- #
     def _compute_badge(self, text):
@@ -1243,7 +1338,7 @@ class ClassifierMixin:
         self._refresh_edge_readout()
         self.status_var.set(f"Classified {count} slice(s) in "
                             f"{1e3 * (time.perf_counter() - t0):.0f} ms - "
-                            "predictions shown under your labels")
+                            "predictions shown under your labels" + self._skipped_note())
 
     def _predict_slice(self, si, li, rec, np):
         """The slice's region->class predictions at rec's commit, computing

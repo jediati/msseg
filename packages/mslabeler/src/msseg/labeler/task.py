@@ -45,7 +45,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from .context import ContextSpec
 from .labeling import LabelStore
-from .session_doc import TASK_VIEW_KEYS, dedupe_profile_name, new_task_uid
+from .session_doc import TASK_VIEW_KEYS, dedupe_profile_name, new_task_uid, normalise_enrolled
 
 # The Model-tab state that is a property of the task's NEXT model, not of the
 # window: the picked kind, the search settings, the neighbour (edge) settings
@@ -133,6 +133,12 @@ class Task:
     # profile-compatibility gate against the ACTIVE workflow.
     model_pending: bool = False
     load_note: Optional[str] = None
+    # Which places the task works, at which level
+    # (``{slide_id: {"overview": None, "<place uid>": level}}``,
+    # ``session_doc.normalise_enrolled``). None = every place at its own
+    # level -- a task written before enrolment, and every coupon task; {} =
+    # nothing. An app with enrolment (mspath) never leaves it None.
+    enrolled: Optional[Dict[str, Dict[str, Optional[int]]]] = None
 
     # -- construction ------------------------------------------------------ #
     @classmethod
@@ -144,13 +150,14 @@ class Task:
     def duplicate(self, name: str, uid: Optional[str] = None,
                   taken: Sequence[str] = ()) -> "Task":
         """A new task with this one's vocabulary (count, colours, names),
-        workflow and Model-tab settings -- and no gestures, no model, no
-        history."""
+        workflow, Model-tab settings and enrolment (it works the same
+        places) -- and no gestures, no model, no history."""
         store = LabelStore(n_classes=self.store.n_classes)
         store.colors = dict(self.store.colors)
         store.names = dict(self.store.names)
         return Task(uid=uid or new_uid(taken), name=str(name), workflow=self.workflow,
-                    store=store, view=_deep_copy_json(self.view))
+                    store=store, view=_deep_copy_json(self.view),
+                    enrolled=_deep_copy_json(self.enrolled))
 
     # -- counts for display ------------------------------------------------ #
     @property
@@ -165,6 +172,10 @@ class Task:
         doc["annotations"] = self.store.to_json()
         doc["models"] = [dict(m) for m in self.models]
         doc["view"] = {k: self.view[k] for k in TASK_VIEW_KEYS if k in self.view}
+        # Last, and only when there is one: a task without enrolment (every
+        # coupon task) writes the document it always has; {} is written.
+        if self.enrolled is not None:
+            doc["enrolled"] = _deep_copy_json(self.enrolled)
         return doc
 
     @classmethod
@@ -190,8 +201,10 @@ class Task:
         view = d.get("view")
         view = {k: view[k] for k in TASK_VIEW_KEYS if k in view} if isinstance(view, dict) else {}
         pending = any(os.path.isfile(str(m.get("path") or "")) for m in models)
+        enrolled = (normalise_enrolled(d["enrolled"], notes, f"task {name!r}")
+                    if "enrolled" in d else None)
         return cls(uid=uid, name=name, workflow=workflow, store=store, models=models,
-                   view=view, model_pending=pending)
+                   view=view, model_pending=pending, enrolled=enrolled)
 
 
 def _deep_copy_json(value: Any) -> Any:

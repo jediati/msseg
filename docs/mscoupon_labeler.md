@@ -412,6 +412,17 @@ so the list stays open beside the region it just sent you to.
 
 ## Classifier and exports
 
+**The fast path is "retrain, classify what I'm looking at"** (2026-09-24):
+`R` trains and classifies the item on screen, `C` classifies it, and
+**Classify all** (the button) does every computed item. Model operations
+never compute an item that is not computed yet -- in the whole-slide labeler
+an ROI nobody has selected is skipped (and counted in the status line), and
+an item is classified when it is selected. In the whole-slide labeler the
+items are the ones the active **task** works (its enrolled places, greyed
+rows are browsable only), and the Run section offers **Run task** and **Run
+all tasks** (every task on the active workflow) -- see
+[design_multi_model_tasks.md](design_multi_model_tasks.md) §5.
+
 Unchanged by the above: Train/Classify on the per-region statistics table
 (positions excluded), SHIFT-accept to turn predictions into annotations, CSV
 export (one row per living region, class 0 kept as negatives), and the

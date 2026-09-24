@@ -43,7 +43,11 @@ from msseg.labeler.labeling import Placement
 from msseg.mscoupon import session as coupon_session
 
 from . import propose
-from .app import MAX_ROI_PX, MsPathApp
+from msseg.labeler.widgets import attach_tooltip
+
+from . import places
+from .app import MAX_ROI_PX, MIN_ROI_SIDE, MsPathApp
+from .items import roi as roi_item
 from .common import log
 
 
@@ -101,6 +105,467 @@ class LabelerApp(AnnotationShell, MsPathApp):
             except (AttributeError, TypeError, ValueError):
                 pass
         return meta
+
+    # ------------------------------------------------------------------ #
+    # Enrolment: which places the ACTIVE task works (design note §5)
+    # ------------------------------------------------------------------ #
+    # A place (an ROI record, now with a uid) belongs to the slide; the task
+    # says which places it works and at which level. What the task does not
+    # enrol is listed (greyed) and browsable, never worked: not primed, not
+    # trained on, not classified, not annotatable. The overview is enrolled
+    # only by choice -- viewing the whole slide is browsing.
+    ENROLMENT = True
+    # The fast path: a place is classified when it is selected, and model
+    # operations never prime (ensure_record would, synchronously).
+    CLASSIFY_ON_ARRIVAL = True
+
+    def _stream_ready(self, key):
+        """Computed already: a current record, or a live pipeline that can
+        produce one without a prime."""
+        if self.engine.record(key) is not None:
+            return True
+        p = self.engine.primed.get(key)
+        return p is not None and getattr(p, "pipe", None) is not None
+
+    def _slide_places(self):
+        """``{slide id: its places}`` over the session's slides."""
+        out = {}
+        for si in range(len(self.subsequences)):
+            sid, _p = self._slide_of(si)
+            if sid is not None:
+                out[sid] = self._rois_of(si)
+        return out
+
+    def _ensure_place_uids(self, notes=None):
+        """Every place gets a uid, unique over the session (idempotent)."""
+        taken = []
+        for si in range(len(self.subsequences)):
+            rois = self._rois_of(si)
+            places.ensure_uids(rois, taken, notes)
+            taken.extend(r["uid"] for r in rois)
+
+    def _enrolment(self):
+        """The active task's enrolment, materialised if it was None (a task
+        from before enrolment works its places -- never the overview)."""
+        task = self._task
+        if task.enrolled is None:
+            self._ensure_place_uids()
+            task.enrolled = places.materialise_all(self._slide_places())
+        return task.enrolled
+
+    def _place_enrolled(self, si, li):
+        sid, _p = self._slide_of(si)
+        if sid is None:
+            return False
+        en = self._task.enrolled
+        if li <= 0:
+            return places.overview_enrolled(en, sid)
+        rois = self._rois_of(si)
+        if li - 1 >= len(rois):
+            return False
+        return places.level_of(en, sid, rois[li - 1]) is not None
+
+    def _place_level(self, si, li):
+        rois = self._rois_of(si)
+        if not (1 <= li <= len(rois)):
+            return 0
+        place = rois[li - 1]
+        sid, _p = self._slide_of(si)
+        lvl = places.level_of(self._task.enrolled, sid, place) if sid is not None else None
+        return int(place["level"]) if lvl is None else int(lvl)
+
+    def _row_tags(self, si, li):
+        if li is None:
+            n = 1 + len(self._rois_of(si))
+            worked = any(self._place_enrolled(si, k) for k in range(n))
+            return () if worked else (self.UNENROLLED_TAG,)
+        return () if self._place_enrolled(si, li) else (self.UNENROLLED_TAG,)
+
+    def _find_place(self, si, rect, level):
+        """Reuse a place with the same rect: one piece of tissue is one
+        place, whichever tasks work it at whichever levels."""
+        return places.find_by_rect(self._rois_of(si), rect)
+
+    def _on_place_added(self, si, li, level, origin):
+        """A place cut from the view or proposed (or an existing one reused)
+        is enrolled in the ACTIVE task only; its origin names who asked."""
+        self._ensure_place_uids()
+        place = self._rois_of(si)[li - 1]
+        if not isinstance(place.get("origin"), dict):
+            place["origin"] = dict(origin or {"reason": "view"})
+        place["origin"].setdefault("task", self._task.uid)
+        sid, _p = self._slide_of(si)
+        places.enrol(self._enrolment(), sid, place["uid"], level)
+
+    def _normalize_enrolment(self, task, notes=None):
+        """After a session's tasks install: places get uids; a task written
+        before enrolment works its places (the overview is not worked until
+        enrolled -- said once); enrolments of places that are gone drop."""
+        self._ensure_place_uids(notes)
+        slides = self._slide_places()
+        if task.enrolled is None:
+            task.enrolled = places.materialise_all(slides)
+            if notes is not None and slides:
+                n = sum(len(v) for v in task.enrolled.values())
+                notes.append(f"task {task.name!r}: works its {n} place(s); the overview "
+                             "is no longer worked until you enrol it (tree menu)")
+        else:
+            places.drop_dangling(task.enrolled, slides, notes, f"task {task.name!r}")
+
+    def _level_problem(self, si, place, level):
+        """Why `place` cannot be worked at `level` (degenerate or over the
+        pixel budget there), or None. A shared place is never shrunk to fit."""
+        sid, _p = self._slide_of(si)
+        try:
+            src = self.engine.source(sid)
+            level = max(0, min(int(level), src.levels - 1))
+            scale = float(src.level_scale(level))
+        except Exception as exc:
+            return f"{type(exc).__name__}: {exc}"
+        lw, lh = float(place["w"]) / scale, float(place["h"]) / scale
+        if min(lw, lh) < MIN_ROI_SIDE:
+            return (f"At level {level} this place is {lw:.0f}x{lh:.0f} px - too small to "
+                    f"segment (minimum {MIN_ROI_SIDE}).")
+        if lw * lh > MAX_ROI_PX:
+            return (f"At level {level} this place is {lw:.0f}x{lh:.0f} px - over the "
+                    f"{MAX_ROI_PX / 1e6:.0f} Mpx budget; pick a coarser level.")
+        return None
+
+    def _enrolment_busy(self):
+        if self.regions.pending() or self._search is not None:
+            self._notify("Wait for the computation to finish before changing what the task works.")
+            return True
+        return False
+
+    def _enrol_row(self, si, li, level=None):
+        """Enrol tree row (si, li) -- li 0 the overview -- in the active task,
+        an ROI at `level` (default: the place's own). Headless-callable.
+        Returns True when the task now works it."""
+        if self._enrolment_busy():
+            return False
+        sid, _p = self._slide_of(si)
+        if sid is None:
+            return False
+        en = self._enrolment()
+        if li <= 0:
+            places.enrol(en, sid, places.OVERVIEW)
+        else:
+            self._ensure_place_uids()
+            rois = self._rois_of(si)
+            if li - 1 >= len(rois):
+                return False
+            place = rois[li - 1]
+            lvl = int(place["level"]) if level is None else int(level)
+            problem = self._level_problem(si, place, lvl)
+            if problem:
+                self._notify(problem)
+                return False
+            places.enrol(en, sid, place["uid"], lvl)
+        browsing_it = self._browse_row == (si, li)
+        self._enrolment_changed()
+        if browsing_it and (si, li) in self.flat_slices:
+            self._goto_slice(self.flat_slices.index((si, li)))     # selected: work it
+        self.status_var.set(f"Task '{self._task.name}' now works "
+                            f"{self._row_description(si, li)}.")
+        return True
+
+    def _unenrol_row(self, si, li):
+        """Stop working row (si, li) in the active task. The place, its
+        gestures and any prime stay; other tasks are untouched."""
+        if self._enrolment_busy():
+            return False
+        sid, _p = self._slide_of(si)
+        if sid is None:
+            return False
+        en = self._enrolment()
+        if li <= 0:
+            changed = places.unenrol(en, sid, places.OVERVIEW)
+        else:
+            rois = self._rois_of(si)
+            changed = li - 1 < len(rois) and places.unenrol(en, sid, rois[li - 1].get("uid"))
+        if changed:
+            self._enrolment_changed()
+            self.status_var.set(f"Task '{self._task.name}' no longer works "
+                                f"{self._row_description(si, li)}.")
+        return bool(changed)
+
+    def _enrol_slide_places(self, si):
+        """Enrol every place on slide `si` at its own level -- not the
+        overview. Places that cannot be worked at their level are skipped."""
+        if self._enrolment_busy():
+            return 0
+        sid, _p = self._slide_of(si)
+        if sid is None:
+            return 0
+        self._ensure_place_uids()
+        en = self._enrolment()
+        n = 0
+        for place in self._rois_of(si):
+            if self._level_problem(si, place, int(place["level"])) is None:
+                places.enrol(en, sid, place["uid"], int(place["level"]))
+                n += 1
+        self._enrolment_changed()
+        self.status_var.set(f"Task '{self._task.name}' works {n} place(s) on this slide.")
+        return n
+
+    # -- the tree: enrol / unenrol / level / note -------------------------- #
+    def _seq_tree_menu_entries(self, si, li):
+        """The labeler's entries plus what the ACTIVE task works: spliced in
+        after "Go to", so Remove stays last."""
+        entries = super()._seq_tree_menu_entries(si, li)
+        name = self._task.name
+        extra = []
+        if li is None:
+            n = len(self._rois_of(si))
+            extra.append((f"Enrol every place in '{name}'",
+                          lambda: self._enrol_slide_places(si), n > 0))
+        else:
+            if self._place_enrolled(si, li):
+                extra.append((f"Unenrol from '{name}'", lambda: self._unenrol_row(si, li), True))
+            else:
+                extra.append((f"Enrol in '{name}'", lambda: self._enrol_row(si, li), True))
+            if li > 0:
+                lvl = max(0, int(self.roi_level_var.get()))
+                extra.append((f"Work at L{lvl}", lambda: self._enrol_row(si, li, lvl),
+                              self._place_level(si, li) != lvl
+                              or not self._place_enrolled(si, li)))
+                extra.append(("Note…", lambda: self._note_place(si, li), True))
+        return entries[:1] + extra + entries[1:]
+
+    def _note_place(self, si, li, text=None):
+        """Attach a free-text note to a place (every task sees it). `text`
+        given -> no dialog (headless); an empty note clears it."""
+        rois = self._rois_of(si)
+        if not (1 <= li <= len(rois)):
+            return False
+        place = rois[li - 1]
+        if text is None:
+            from tkinter import simpledialog
+            text = simpledialog.askstring(self.APP_TITLE, "Note for this place:",
+                                          initialvalue=place.get("note", ""), parent=self.root)
+            if text is None:
+                return False
+        text = str(text).strip()
+        if text:
+            place["note"] = text
+        else:
+            place.pop("note", None)
+        self._refresh_subseq_list()
+        return True
+
+    def _sequence_item_labels(self, si):
+        """Row text: the place's level for the ACTIVE task, and its note."""
+        rows = super()._sequence_item_labels(si)
+        rois = self._rois_of(si)
+        for k, place in enumerate(rois, start=1):
+            if k < len(rows) and place.get("note"):
+                rows[k] = f"{rows[k]} - {place['note']}"
+        return rows
+
+    # -- the places on the whole-slide view --------------------------------- #
+    PLACE_COLOR = "#00e5ff"
+    PLACE_OTHER_COLOR = "#a0a0a0"
+
+    def _outline_slide(self):
+        """The slide whose places are outlined: the one browsed, or the one
+        whose OVERVIEW is on screen. None on an ROI (it is a place itself)."""
+        if self._browse_row is not None:
+            return self._browse_row[0]
+        cur = self._current()
+        if cur is not None and cur[1] == 0:
+            return cur[0]
+        return None
+
+    def _redraw_place_outlines(self):
+        """Every place on the slide as a box: solid with its level for the
+        places the active task works, dashed grey for the rest. Screen-space
+        canvas items (tag "places"), re-projected on every zoom / pan."""
+        v = self.viewer
+        if v is None:
+            return
+        c = v.canvas
+        c.delete("places")
+        si = self._outline_slide()
+        if si is None:
+            return
+        sid, _p = self._slide_of(si)
+        if sid is None:
+            return
+        en = self._task.enrolled
+        for place in self._rois_of(si):
+            x, y, w, h = places.rect_of(place)
+            x0, y0 = (x - v.view_x) / v.scale, (y - v.view_y) / v.scale
+            x1, y1 = (x + w - v.view_x) / v.scale, (y + h - v.view_y) / v.scale
+            lvl = places.level_of(en, sid, place)
+            if lvl is not None:
+                c.create_rectangle(x0, y0, x1, y1, outline=self.PLACE_COLOR, width=2,
+                                   tags=("draw", "places", "place_worked"))
+                c.create_text(x0 + 3, y0 + 2, text=f"L{lvl}", anchor="nw",
+                              fill=self.PLACE_COLOR, tags=("draw", "places", "place_label"))
+            else:
+                c.create_rectangle(x0, y0, x1, y1, outline=self.PLACE_OTHER_COLOR, width=1,
+                                   dash=(4, 3), tags=("draw", "places", "place_other"))
+
+    def _after_browse(self, si, li):
+        self._redraw_place_outlines()
+
+    def _refresh_render(self):
+        super()._refresh_render()
+        self._redraw_place_outlines()
+
+    def _redraw_hover_geometry(self, *args, **kwargs):
+        out = super()._redraw_hover_geometry(*args, **kwargs)
+        self._redraw_place_outlines()
+        return out
+
+    # -- removal: a place goes for every task ---------------------------- #
+    def _tasks_working(self, si, li):
+        """The names of the tasks that work tree row (si, li)."""
+        sid, _p = self._slide_of(si)
+        if sid is None:
+            return []
+        if li <= 0:
+            return [t.name for t in self.tasks if places.overview_enrolled(t.enrolled, sid)]
+        rois = self._rois_of(si)
+        if li - 1 >= len(rois):
+            return []
+        return [t.name for t in self.tasks
+                if places.level_of(t.enrolled, sid, rois[li - 1]) is not None]
+
+    def _remove_rows_guarded(self, rows):
+        if self._search is not None:
+            self._notify("A search is running - Cancel it before removing places.")
+            return False
+        return super()._remove_rows_guarded(rows)
+
+    def _remove_rows_message(self, rows):
+        msg = super()._remove_rows_message(rows)
+        names = sorted({n for si, li in rows if li is not None and li > 0
+                        for n in self._tasks_working(si, li)})
+        if names:
+            msg += ("\n\nThe place is removed for every task; worked by: "
+                    + ", ".join(repr(n) for n in names) + ".")
+        return msg
+
+    def _remove_item_at(self, si, li):
+        """Removing an ROI removes the PLACE: from every task's enrolment,
+        and its computed items at every level any task worked it at (unless
+        another place with the same rect still needs one)."""
+        rois = self._rois_of(si)
+        if li <= 0 or li - 1 >= len(rois):
+            return super()._remove_item_at(si, li)
+        sid, _p = self._slide_of(si)
+        place = rois[li - 1]
+        rect = places.rect_of(place)
+        levels = {int(place["level"])}
+        for t in self.tasks:
+            lvl = places.level_of(t.enrolled, sid, place)
+            if lvl is not None:
+                levels.add(int(lvl))
+        uid = place.get("uid")
+        super()._remove_item_at(si, li)
+        for t in self.tasks:
+            if uid:
+                places.drop_place(t.enrolled, sid, uid)
+        if places.find_by_rect(rois, rect) is None:
+            for lvl in levels:
+                try:
+                    self.engine.forget(roi_item(sid, lvl, *rect).key)
+                except Exception:
+                    pass
+
+    def _remove_sequence_at(self, si):
+        sid, _p = self._slide_of(si)
+        super()._remove_sequence_at(si)
+        if sid is not None:
+            for t in self.tasks:
+                places.drop_slide(t.enrolled, sid)
+
+    # -- Run: the active task's items, or every task's on this workflow ---- #
+    def _build_run_section(self):
+        from tkinter import ttk
+        super()._build_run_section()
+        self.run_note.config(text="Primes the items the task works: its enrolled "
+                                  "overviews and places.")
+        self.run_btn.config(text="Run task", command=lambda: self._run("task"))
+        self.run_all_btn = ttk.Button(self.run_frame, text="Run all tasks",
+                                      command=lambda: self._run("all"))
+        self.run_all_btn.pack(fill="x", padx=6, pady=(0, 4))
+        attach_tooltip(self.run_all_btn,
+                       "Every item any task on this workflow works, primed once: "
+                       "switching between those tasks then needs no Run, and each "
+                       "level's persistence threshold no longer depends on which "
+                       "task ran first. (Tasks on another workflow wait for their "
+                       "own Run.)")
+
+    def _items_of_task(self, task):
+        """The items `task` works, without making it the active one."""
+        out = []
+        for si in range(len(self.subsequences)):
+            sid, _p = self._slide_of(si)
+            if sid is None:
+                continue
+            if places.overview_enrolled(task.enrolled, sid):
+                item = self._item_at(si, 0)
+                if item is not None:
+                    out.append(item)
+            for place in self._rois_of(si):
+                lvl = places.level_of(task.enrolled, sid, place)
+                if lvl is not None:
+                    out.append(roi_item(sid, lvl, int(place["x"]), int(place["y"]),
+                                        int(place["w"]), int(place["h"])))
+        return out
+
+    def _prime_items(self, scope="task"):
+        if scope != "all":
+            return super()._prime_items(scope)
+        wf = self._task.workflow
+        seen, out, skipped = set(), [], []
+        for t in self.tasks:
+            if t is not self._task and t.workflow != wf:
+                skipped.append(t.name)
+                continue
+            for item in self._items_of_task(t):
+                if item.key not in seen:
+                    seen.add(item.key)
+                    out.append(item)
+        if skipped:
+            log(f"RUN all: skipped task(s) on another workflow: {', '.join(skipped)}")
+        return out
+
+    def _enrolment_changed(self):
+        """The active task's items changed (a switch, enrol / unenrol): the
+        navigation, catalogue and tree follow, the current item is kept when
+        still worked, else the first worked item on the same slide, else the
+        slide is browsed. Never a prime -- a place is primed when it is
+        selected, not when it becomes workable."""
+        cur = self._current()
+        key = self.catalogue.key_of(*cur) if cur is not None else None
+        browse = self._browse_row
+        slide_si = cur[0] if cur is not None else (browse[0] if browse else None)
+        self._browse_row = None
+        self._rebuild_flat_slices()
+        target = None
+        if key is not None:
+            target = self.catalogue.index_of(key)
+            if target is not None and target not in self.flat_slices:
+                target = None
+        if target is None and slide_si is not None:
+            target = next((p for p in self.flat_slices if p[0] == slide_si), None)
+        if target is not None:
+            self.slice_var.set(self.flat_slices.index(target))
+            self._sync_slice_combo()
+        elif slide_si is not None and slide_si < len(self.subsequences):
+            self._browse(slide_si, browse[1] if browse else None)
+        elif not self.flat_slices:
+            self.slice_var.set(-1)
+            self._sync_slice_combo()
+            if self.viewer is not None:
+                self.viewer.set_overlays([])
+        self._refresh_subseq_list()
+        self._update_roi_hint()
+        if self._current() is not None:
+            self._refresh_render()
 
     # ------------------------------------------------------------------ #
     # The compatibility gate
@@ -237,15 +702,20 @@ class LabelerApp(AnnotationShell, MsPathApp):
             level=level, size=int(self.propose_size_var.get()),
             level_scale=src.level_scale(level), slide_shape=src.level_shape(0),
             min_area=4.0, max_px=MAX_ROI_PX)
-        added = 0
+        taken = []
+        method = self.propose_method_var.get()
         for r in rois:
-            if self._add_roi(si, r["level"], r["x"], r["y"], r["w"], r["h"]) is not None:
-                added += 1
+            # A proposal is a place asked for BY this task's model: the
+            # origin says so, with the score, and only this task enrols it.
+            origin = {"task": self._task.uid, "reason": method,
+                      "score": round(float(r["score"]), 4)}
+            if self._add_roi(si, r["level"], r["x"], r["y"], r["w"], r["h"],
+                             origin=origin) is not None:
+                taken.append(r)
                 log(f"  proposed ROI at region {r['region']} "
                     f"(score {r['score']:.3f}): L{r['level']} "
                     f"({r['x']},{r['y']}) {r['w']}x{r['h']}")
-        self.status_var.set(propose.summarise(rois[:added],
-                                              self.propose_method_var.get()))
+        self.status_var.set(propose.summarise(taken, method))
 
     # ------------------------------------------------------------------ #
     # Export: annotations -> per-pixel masks
