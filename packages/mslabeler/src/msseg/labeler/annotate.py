@@ -33,6 +33,7 @@ from .defaults import *  # noqa: F401,F403
 from .tools import DrawController, MagicFillController, _extremum_points
 from .classifier import ClassifierMixin
 from .panels.hints import HintsMixin
+from .panels.stages import StagesMixin
 from .panels.model import ModelPanelMixin
 from .panels.analysis import AnalysisPanelMixin
 from .panels.view import ViewControlsMixin
@@ -83,8 +84,9 @@ def _cache_attr(field, doc):
     return property(get, put, doc=doc)
 
 
-class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewControlsMixin,
-                      ClassPanelMixin, SeamPanelMixin, SeamModelMixin, ClassifierMixin):
+class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMixin,
+                      ViewControlsMixin, ClassPanelMixin, SeamPanelMixin, SeamModelMixin,
+                      ClassifierMixin):
     SESSION_APP = "labeler"
     APP_TITLE = "labeler"
     WINDOW_TITLE = "labeler"
@@ -289,6 +291,8 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
             # Right-CLICK (not right-drag, which still pans) on the image
             # plane offers the same menu as an interaction row.
             self.viewer.on_context = self._canvas_menu
+            # The stage strip's boxes open the tab that edits them.
+            self.viewer.on_stage_click = self._on_stage_click
         self._bind_hotkeys()
         self._hint_tick()          # first paint + the poll
 
@@ -482,11 +486,18 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         if ev[0] in ("primed", "item_primed"):
             self._classify_on_arrival()       # the item on screen, if it can be
 
+    def _update_busy(self):
+        """The app's HUD line, then the stage strip (every engine event,
+        preview and badge ends here, so the strip follows them all)."""
+        super()._update_busy()
+        self._refresh_stages()
+
     def _goto_slice(self, idx):
         # By ITEM key: two items of one slide share a gesture key, but list
         # different gestures (those meeting each item's rect).
         before = self._current_key()
         super()._goto_slice(idx)
+        self._refresh_stages()
         after = self._current_key()
         if after != before:
             # The class panels list the ON-ITEM interactions only; swap them
@@ -1232,6 +1243,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self._labels_changed()
         self._refresh_seam_panel()
         self._update_task_rows()          # the gesture count column
+        self._refresh_stages()            # an edit can make the model stale
 
     def _apply_neighbours_view(self, d):
         if not isinstance(d, dict):

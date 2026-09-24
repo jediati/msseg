@@ -156,6 +156,45 @@ class LabelerApp(AnnotationShell, MscouponApp):
                                       if sig else ""))
         return ",".join(parts) + f" x{len(doc['reductions'])}"
 
+    # -- the stage strip's two app boxes (panels/stages.py) ---------------- #
+    def _measure_key(self):
+        from . import fingerprints
+        try:
+            return fingerprints.measure_fingerprint_of(self._params_json(cores=1))
+        except Exception:
+            return None
+
+    def _stage_field(self, key):
+        from . import fingerprints
+        if self.engine.run_active:
+            return ("busy", "Priming the stack...")
+        idx = self.catalogue.index_of(key)
+        if not self.primed or idx is None or idx[0] >= len(self.primed):
+            return ("none", "Not primed -- Run to prime this sequence.")
+        if (getattr(self, "_primed_fingerprint", None) is not None
+                and fingerprints.field_fingerprint_of(self._params_json(cores=1))
+                != self._primed_fingerprint):
+            return ("stale", "The topology chain or MSC changed since the prime -- "
+                             "Run to re-prime (what is shown is a preview).")
+        return ("ok", "Primed: the MSC and its regions are live.")
+
+    def _stage_measure(self, key):
+        idx = self.catalogue.index_of(key)
+        if not self.primed or idx is None or idx[0] >= len(self.primed):
+            return ("none", "No statistics: not primed.")
+        si, li = idx
+        cur = self._current()
+        if cur is not None and cur == (si, li) and self._is_current_busy():
+            return ("busy", "Re-measuring..." if self._current_measure_stale()
+                    else "Computing regions and statistics...")
+        if self._measurement_moved():
+            return ("stale", "Features edited -- re-measuring.")
+        if self._selection_dirty:
+            return ("stale", "Persistence or selection changed -- click Rerun selection.")
+        if self.engine.record(si, li) is None:
+            return ("none", "Not computed at these parameters yet.")
+        return ("ok", "Regions and statistics current for this workflow's Features.")
+
     def _profile_from_model(self, path, statistics):
         """Append a profile that keeps the active one's filters/MSC/selection
         but MEASURES what the model was trained on, and activate it.
@@ -1745,6 +1784,23 @@ def _selftest():
                 app._switch_profile(n_prof)
             assert c_prev != c_model and app._commit_id == c_model, \
                 "returning to a profile returns its commit"
+            # The stage strip: four boxes; a loaded model makes no claim about
+            # what it was trained on; a stamp that moved turns it stale; a box
+            # opens its tab.
+            app._refresh_stages()
+            assert set(app.viewer.stages) == {"msc", "stats", "model", "classified"}
+            assert app._task.model.trained_rev is None
+            assert "Loaded model" in (app.viewer.stage_tip("model") or "") or \
+                app.viewer.stages["model"] == "stale"
+            app._task.model.trained_rev = app.store.rev - 1
+            app._refresh_stages()
+            assert app.viewer.stages["model"] == "stale"
+            app._task.model.trained_rev = None
+            app._on_stage_click("model")
+            assert app._center_tab_name() == "Model"
+            app._on_stage_click("stats")
+            assert app._center_tab_name() == "Features"
+            app._show_center_tab("Processing")
             assert len(app.profiles) == n_prof + 1, "accepting adds a profile"
             assert app.active_profile_idx == n_prof, "and switches to it"
             assert app.profiles[-1]["name"] == "from classifier.pkl"

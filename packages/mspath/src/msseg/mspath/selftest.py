@@ -1083,6 +1083,56 @@ def run_labeler_selftest():
     assert app._processing_parent("filters") is app.proc_col
     kk = app.catalogue.key_of(*app._current())
     app.engine.prime_item(app._item_at(*app._current()), app._profile_for_compute(), halo=0)
+
+    # -- the stage strip: msc -> stats -> classified <- model --------------- #
+    rec_s = app.engine.ensure_record(kk, app._profile_for_compute())
+    app._refresh_stages()
+    assert app.viewer.stages == {"msc": "ok", "stats": "ok", "model": "none",
+                                 "classified": "none"}, app.viewer.stages
+    for box, tab in (("msc", "Processing"), ("stats", "Features"), ("model", "Model"),
+                     ("classified", "Annotation")):
+        _k, x0, y0, x1, y1, _tip = [b for b in app.viewer._stage_boxes if b[0] == box][0]
+        ev = _types.SimpleNamespace(x=(x0 + x1) // 2, y=(y0 + y1) // 2)
+        app.viewer._drag_start(ev); app.viewer._drag_end(ev)
+        assert app._center_tab_name() == tab, (box, app._center_tab_name())
+    expected = app._expected_names_for(None)
+    if expected is not None:
+        # A model trained here (a stand-in estimator: the strip never predicts).
+        with _mock.patch.object(app, "_refresh_model_readout"), \
+                _mock.patch.object(app, "_refresh_edge_readout"), \
+                _mock.patch.object(app, "_refresh_confusion"):
+            app._install_model(object(), list(expected), "random forest")
+        app._pred[kk] = (rec_s["commit"], np.ones(int(rec_s["n_ids"]), np.int64), None)
+        app._refresh_stages()
+        assert app.viewer.stages == {"msc": "ok", "stats": "ok", "model": "ok",
+                                     "classified": "ok"}, app.viewer.stages
+        # An annotation edit since training: the model, and what it classified,
+        # are out of date.
+        app.store.rev += 1
+        app._refresh_stages()
+        st = app.viewer.stages
+        assert st["model"] == "stale" and st["classified"] == "stale" and st["msc"] == "ok", st
+        assert "Train again" in app.viewer.stage_tip("model")
+        app._task.model.trained_rev = app.store.rev
+        # An un-Run topology edit: msc and everything downstream of it.
+        edited = _json.loads(_json.dumps(app._profile_for_compute()))
+        edited["filters"] = list(edited.get("filters") or []) + [
+            {"operation": "blur", "params": {"sigma": 5.0}}]
+        with _mock.patch.object(app, "_profile_for_compute", return_value=edited):
+            app._refresh_stages()
+            st = app.viewer.stages
+        assert st == {"msc": "stale", "stats": "stale", "model": "ok",
+                      "classified": "stale"}, st
+        assert "Run task" in app.viewer.stage_tip("msc")
+        # A compute badge spins its box, and clears.
+        app._compute_badge("Training 2/5")
+        assert app.viewer.stages["model"] == "busy" and app.viewer.hud[0] is None
+        app._clear_compute_badge()
+        assert app.viewer.stages["model"] == "ok"
+        app._task.model.reset()
+        app._pred.clear()
+        app._refresh_stages()
+    strip_checked = "stage strip: states, clicks -> tabs, staleness, spinner"
     if app.engine.can_remeasure(kk):
         rec0 = app.engine.ensure_record(kk, app._profile_for_compute())
         labels0 = np.array(rec0["labels"], copy=True)
@@ -1094,6 +1144,8 @@ def run_labeler_selftest():
         blur_on, blur_sig, _src = app.stat_kind_vars["blur"]
         blur_on.set(True); blur_sig.set("2.0")
         app._on_stat_spec_change()
+        app._refresh_stages()
+        assert app.viewer.stages["stats"] == "stale", "an unsettled Features edit"
         assert app._stat_edit_after is not None, "the edit settles before it measures"
         app.root.after_cancel(app._stat_edit_after)
         app._stat_edit_settled()
@@ -1104,6 +1156,8 @@ def run_labeler_selftest():
         assert np.array_equal(rec1["labels"], labels0), "a re-measure keeps the regions"
         assert primes == [] and "primed" not in seen, (primes, seen)
         assert app.engine.primed[kk] is live0 and live0.live
+        app._refresh_stages()
+        assert app.viewer.stages["stats"] == "ok", "re-measured: the stats box is green"
         # A profile that differs only in its statistics: kept, re-measured.
         app._snapshot_active_profile()
         other = _json.loads(_json.dumps(app.profiles[app.active_profile_idx]))
@@ -1191,7 +1245,7 @@ def run_labeler_selftest():
           "an ROI's removal keeps them + the coarse mark, "
           "seam tools in slide coordinates, tasks: own store + model, "
           "profile-from-model binds the active task, two tasks into a fresh window, "
-          f"{remeasured}, "
+          f"{strip_checked}, {remeasured}, "
           "places + enrolment: nothing worked until enrolled, browse, outlines, "
           "one place at two levels, Run task / all, round trip + legacy, removal")
     return 0

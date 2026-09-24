@@ -83,6 +83,17 @@ class SliceCanvas(tk.Frame):
         self._hud_text = ""
         self._hud_job = None
         self._hud_phase = 0
+        # The stage strip (set_stages): what the item on screen needs, box by
+        # box, drawn above the HUD line. None = no strip (the viewers).
+        self._stages = None
+        self._stages_sig = None
+        self._stage_boxes = []       # [(key, x0, y0, x1, y1, tip)] for hit-tests
+        self._stage_height = 0       # px the HUD line moves down by
+        self._stage_job = None
+        self._stage_press = False    # a press that landed on a box (no pan, no tool)
+        self._stage_tip = None       # key whose tip is shown
+        # Optional callback(key) fired when a box is clicked.
+        self.on_stage_click = None
         # Where a drag's milliseconds actually go (see perf.py). Off unless
         # MSSEG_CANVAS_PROFILE=1; Ctrl+P toggles it live.
         self.perf = FrameProfiler("canvas")
@@ -321,6 +332,15 @@ class SliceCanvas(tk.Frame):
         self._view_changed()
 
     def _drag_start(self, e):
+        # A press on a stage box is the box's, before any tool or pan sees
+        # it; the strip's gaps stay pannable.
+        hit = self._stage_at(e.x, e.y)
+        if hit is not None:
+            self._stage_press = True
+            self._drag = None
+            if self.on_stage_click is not None:
+                self.on_stage_click(hit)
+            return
         if self.tool is not None:
             t0 = time.perf_counter()
             claimed = self.tool.on_press(e)
@@ -332,6 +352,8 @@ class SliceCanvas(tk.Frame):
         self._pan_start(e)
 
     def _drag_move(self, e):
+        if self._stage_press:
+            return
         self.perf.event("drag")
         if self.tool is not None:
             with self.perf.span("tool.move"):
@@ -341,6 +363,10 @@ class SliceCanvas(tk.Frame):
         self._pan_move(e)
 
     def _drag_end(self, e):
+        if self._stage_press:
+            self._stage_press = False
+            self._drag = None
+            return
         if self.tool is not None:
             with self.perf.span("tool.release"):
                 self.tool.on_release(e)
@@ -395,6 +421,11 @@ class SliceCanvas(tk.Frame):
         return int(self.view_x + sx * self.scale), int(self.view_y + sy * self.scale)
 
     def _on_motion(self, e):
+        hit = self._stage_at(e.x, e.y)
+        if hit is not None or self._stage_tip is not None:
+            self._show_stage_tip(hit)
+        if hit is not None:
+            return                       # over the strip: not a hover on the image
         if self.on_hover is None:
             return
         ix, iy = self.screen_to_image(e.x, e.y)
@@ -446,7 +477,8 @@ class SliceCanvas(tk.Frame):
         else:  # stale
             label = f"⚠  {self._hud_text or 'Out of date'}"
             fill, outline = "#8a5a1e", "#ffcf8a"
-        t = self.canvas.create_text(22, 20, anchor="nw", text=label, fill="#ffffff",
+        t = self.canvas.create_text(22, 20 + self._stage_height, anchor="nw", text=label,
+                                    fill="#ffffff",
                                     font=("TkDefaultFont", 11, "bold"), tags=("hud",))
         box = self.canvas.bbox(t)
         if box:
@@ -457,6 +489,163 @@ class SliceCanvas(tk.Frame):
             self.canvas.tag_lower(r, t)
         if self._hud_mode == "busy":
             self._hud_job = self.after(120, self._hud_tick)   # animate only when busy
+
+    # -- the stage strip: where the item on screen stands, box by box ---- #
+    # (fill, outline, text) per state. "cached" is hollow: the result is kept
+    # but what produced it is not live.
+    _STAGE_STYLE = {
+        "ok": ("#2e7d32", "#a5d6a7", "#ffffff"),
+        "stale": ("#c0641a", "#ffcf8a", "#ffffff"),
+        "none": ("#262626", "#7a7a7a", "#b8b8b8"),
+        "cached": ("#18261a", "#66bb6a", "#c8e6c9"),
+        "busy": ("#1e5a8a", "#8ac0ff", "#ffffff"),
+        "error": ("#8e2020", "#ff9a9a", "#ffffff"),
+    }
+    _STAGE_X0, _STAGE_Y0 = 12, 10
+    _STAGE_GAP, _STAGE_ROW_GAP = 22, 6
+    _STAGE_PAD_X, _STAGE_PAD_Y = 8, 4
+    _STAGE_FONT = ("TkDefaultFont", 9, "bold")
+
+    def set_stages(self, stages):
+        """Show the stage strip: a list of boxes ``{"key", "label", "state",
+        "tip", "text", "row", "col", "feeds"}`` (``state`` one of
+        ``_STAGE_STYLE``; ``feeds`` the keys a box draws a connector to), or
+        None to hide it. Redrawn only when something in it changed; a busy
+        box spins while it is busy. The HUD line sits below the strip."""
+        sig = None
+        if stages:
+            sig = tuple((s.get("key"), s.get("label"), s.get("state"), s.get("tip"),
+                         s.get("text"), s.get("row", 0), s.get("col", 0),
+                         tuple(s.get("feeds") or ())) for s in stages)
+        if sig == self._stages_sig:
+            return
+        self._stages_sig = sig
+        self._stages = [dict(s) for s in stages] if stages else None
+        self._draw_stages()
+        if self._hud_mode is not None and self._hud_job is None:
+            self._hud_tick()             # the HUD line follows the strip's height
+
+    @property
+    def stages(self):
+        """``{key: state}`` of the strip (tests), or {} when none is shown."""
+        return {s["key"]: s.get("state") for s in (self._stages or [])}
+
+    def stage_tip(self, key):
+        for s in self._stages or []:
+            if s["key"] == key:
+                return s.get("tip") or ""
+        return None
+
+    def _stage_at(self, x, y):
+        for key, x0, y0, x1, y1, _tip in self._stage_boxes:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return key
+        return None
+
+    def _draw_stages(self):
+        c = self.canvas
+        c.delete("stages")
+        if self._stage_job is not None:
+            self.after_cancel(self._stage_job)
+            self._stage_job = None
+        self._stage_boxes = []
+        if not self._stages:
+            self._stage_height = 0
+            self._show_stage_tip(None)
+            return
+        busy = False
+        made = []
+        for s in self._stages:
+            state = s.get("state") or "none"
+            fill, outline, fg = self._STAGE_STYLE.get(state, self._STAGE_STYLE["none"])
+            label = str(s.get("label") or s["key"])
+            if s.get("text"):
+                label += f" {s['text']}"
+            if state == "busy":
+                busy = True
+                frame = self._BUSY_FRAMES[self._hud_phase % len(self._BUSY_FRAMES)]
+                label = f"{frame} {label}"
+            t = c.create_text(0, 0, anchor="nw", text=label, fill=fg,
+                              font=self._STAGE_FONT, tags=("stages",))
+            bb = c.bbox(t) or (0, 0, 40, 14)
+            made.append((s, t, bb[2] - bb[0], bb[3] - bb[1], fill, outline))
+        px, py = self._STAGE_PAD_X, self._STAGE_PAD_Y
+        cols = {}
+        rows = {}
+        for s, _t, w, h, _f, _o in made:
+            col, row = int(s.get("col", 0)), int(s.get("row", 0))
+            cols[col] = max(cols.get(col, 0), w + 2 * px)
+            rows[row] = max(rows.get(row, 0), h + 2 * py)
+        col_x, x = {}, self._STAGE_X0
+        for col in sorted(cols):
+            col_x[col] = x
+            x += cols[col] + self._STAGE_GAP
+        row_y, y = {}, self._STAGE_Y0
+        for row in sorted(rows):
+            row_y[row] = y
+            y += rows[row] + self._STAGE_ROW_GAP
+        where = {}
+        for s, t, w, h, fill, outline in made:
+            col, row = int(s.get("col", 0)), int(s.get("row", 0))
+            x0, y0 = col_x[col], row_y[row]
+            x1, y1 = x0 + cols[col], y0 + rows[row]
+            c.coords(t, x0 + (cols[col] - w) / 2.0, y0 + (rows[row] - h) / 2.0)
+            r = c.create_rectangle(x0, y0, x1, y1, fill=fill, outline=outline,
+                                   width=2 if s.get("state") == "cached" else 1,
+                                   tags=("stages",))
+            c.tag_lower(r, t)
+            where[s["key"]] = (x0, y0, x1, y1)
+            self._stage_boxes.append((s["key"], x0, y0, x1, y1, s.get("tip") or ""))
+        for s, *_rest in made:
+            a = where[s["key"]]
+            for target in s.get("feeds") or ():
+                b = where.get(target)
+                if b is None:
+                    continue
+                ax, ay = a[2], (a[1] + a[3]) / 2.0
+                bx, by = b[0], (b[1] + b[3]) / 2.0
+                if abs(ay - by) < 1:
+                    pts = (ax, ay, bx, by)
+                else:                    # an elbow: across, up/down, across
+                    mx = bx - self._STAGE_GAP / 2.0
+                    pts = (ax, ay, mx, ay, mx, by, bx, by)
+                c.create_line(*pts, fill="#9a9a9a", width=2, tags=("stages",))
+        self._stage_height = int(y)
+        c.tag_raise("stages")
+        if self._stage_tip is not None:
+            self._show_stage_tip(self._stage_tip if self._stage_tip in where else None,
+                                 force=True)
+        if busy:
+            self._stage_job = self.after(120, self._stage_spin)
+
+    def _stage_spin(self):
+        self._stage_job = None
+        self._hud_phase += 1
+        self._draw_stages()
+
+    def _show_stage_tip(self, key, force=False):
+        """The hovered box's reason, under the strip; None clears it."""
+        if key == self._stage_tip and not force:
+            return
+        c = self.canvas
+        c.delete("stagetip")
+        self._stage_tip = key
+        try:
+            c.config(cursor="hand2" if key is not None else "")
+        except Exception:
+            pass
+        tip = self.stage_tip(key) if key is not None else None
+        if not tip:
+            return
+        t = c.create_text(self._STAGE_X0 + 4, self._stage_height + 2, anchor="nw", text=tip,
+                          fill="#ffffff", font=("TkDefaultFont", 9), width=460,
+                          tags=("stagetip",))
+        bb = c.bbox(t)
+        if bb:
+            r = c.create_rectangle(bb[0] - 4, bb[1] - 3, bb[2] + 4, bb[3] + 3,
+                                   fill="#1c1c1c", outline="#9a9a9a", tags=("stagetip",))
+            c.tag_lower(r, t)
+        c.tag_raise("stagetip")
 
     # -- rendering ----------------------------------------------------- #
     # Derived blend LUTs kept for this many (LUT, alpha) pairs: a region LUT is
@@ -723,6 +912,9 @@ class SliceCanvas(tk.Frame):
         self.canvas.create_image(screen_x, screen_y, anchor="nw", image=self._photo, tags="view")
         if self._hud_mode is not None:
             self.canvas.tag_raise("hud")   # keep the HUD above the freshly-blitted image
+        if self._stages:
+            self.canvas.tag_raise("stages")
+            self.canvas.tag_raise("stagetip")
         self.canvas.tag_raise("draw")      # tool rubber-band items (no-op when unused)
         perf.mark("canvas")
         t_blit = time.perf_counter()

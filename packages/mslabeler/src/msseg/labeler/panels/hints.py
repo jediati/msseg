@@ -120,6 +120,9 @@ class HintsMixin:
         self._hint_after = None
         try:
             self._refresh_hints()
+            refresh = getattr(self, "_refresh_stages", None)
+            if refresh is not None:
+                refresh()                 # the stage strip's backstop
             self._hint_after = self.root.after(_HINT_POLL_MS, self._hint_tick)
         except tk.TclError:
             pass

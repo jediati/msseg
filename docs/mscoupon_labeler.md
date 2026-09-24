@@ -147,6 +147,31 @@ and back therefore finds the first task's records -- and its predictions --
 again, with no re-measure. A task on another field still needs a Run in the
 coupon labeler: one primed stack is kept at a time.
 
+### The stage strip (top-left of the picture)
+
+```
+[msc]──[stats]──┬──[classified]
+       [model]──┘
+```
+
+Where the slice on screen stands for the active task, box by box: **msc**
+(primed under this workflow's field), **stats** (its regions measured under
+the Features tab's spec at this persistence), **model** (trained, compatible
+with these statistics, and trained on the current annotations) and
+**classified** (predicted from this record by this model). Green is done,
+burnt orange is out of date -- something upstream moved, and hovering says
+what and what to do -- grey is not computed yet, blue spins while that stage
+is working (priming, re-measuring, training, optimizing, classifying), a
+hollow green msc means the regions are kept but the pipeline was released
+(mspath), red means the item could not be primed. A box downstream of an
+orange or spinning one is orange too. The model is a branch because it does
+not depend on this slice's MSC. **Click a box** to open the tab that edits it:
+msc -> Processing, stats -> Features, model -> Model, classified ->
+Annotation. The one-line badge below the strip keeps notices, tool readouts
+and the channel preview. The model's "trained on" stamps are this session's
+knowledge: a model loaded from a file is judged by the compatibility gate
+alone.
+
 Three link-labels say what is in effect: the Run section is headed by the
 **selected workflow** as two compact chains --
 `topo field: base→b(1.5)→e(0.7)→msc(asc, 10%)` (the field the MSC runs on,

@@ -1927,11 +1927,15 @@ class MsPathApp(ViewerShell):
                 self._request_item(self.catalogue.key_of(*cur))
             self._refresh_render()
         elif kind == "item_done":
+            getattr(self, "_item_errors", {}).pop(ev[1], None)
             self._refresh_subseq_list()
             self._update_roi_hint()
             self._update_busy()
         elif kind == "item_error":
             _key, msg = ev[1], ev[2]
+            if not hasattr(self, "_item_errors"):
+                self._item_errors = {}
+            self._item_errors[_key] = msg.splitlines()[0]
             self.status_var.set(f"Could not prime {_key}: {msg.splitlines()[0]}")
             self._refresh_subseq_list()
             self._update_busy()
@@ -2001,16 +2005,22 @@ class MsPathApp(ViewerShell):
             return
         cur = self._current()
         key = self.catalogue.key_of(*cur) if cur is not None else None
-        if key is not None and self.engine.pending_work() and key in self.engine.running_keys:
+        # With a stage strip (the labeler) the item's own stages are its
+        # boxes; the HUD line keeps a Run over other items, a preview and
+        # notices.
+        strip = getattr(self, "STAGE_STRIP", False)
+        mine = (key is not None and self.engine.pending_work()
+                and key in self.engine.running_keys)
+        if mine and not strip:
             self.viewer.set_hud("busy", "Measuring" if self.engine.running_kind == "measure"
                                 else "Priming")
-        elif self.engine.pending_work() and self._run_active:
+        elif self.engine.pending_work() and self._run_active and not mine:
             self.viewer.set_hud("busy", "Priming")
         elif self._preview_pending is not None:
             self.viewer.set_hud("busy", f"Previewing {self._preview_pending[1]}")
         elif self._notice_active():
             return                                  # a _notify is still on screen
-        elif self._preview_is_stale():
+        elif self._preview_is_stale() and not strip:
             self.viewer.set_hud("stale", "Preview - filters changed, Run to re-prime")
         else:
             self.viewer.set_hud(None)

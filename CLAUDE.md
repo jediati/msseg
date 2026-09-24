@@ -782,6 +782,26 @@ the coupon re-reads the slice file -- and the Features tab); a settled edit
 goes through `AnnotationShell._preview_edit_settled` -> the app's
 `_measurement_moved()` -> `_remeasure_current`, a field edit stays a preview.
 
+**Stage strip** (2026-09-24, labelers only, `msseg.labeler.panels.stages`):
+the top-left of the canvas shows `[msc]--[stats]--+--[classified]` with
+`[model]` joining below, for the current task x item, COMPUTED on every
+`_update_busy` / navigation / store edit / model install / prediction and the
+0.7 s hint poll -- never set by the code that changes state. The app judges
+msc and stats (`_stage_field` / `_stage_measure`, from the engines' field and
+measure fingerprints, record ids, running keys; mspath adds `cached` for a
+released pipe with a kept record and `error` from `item_error`), the
+framework judges model (compat gate cached per measure key;
+`ModelStack.trained_rev` / `trained_measure` stamped by `_install_model`,
+None for a loaded pickle) and classified (`pred[key][0] == rec["commit"]`);
+`propagate` makes what is downstream of stale / busy / error stale.
+`SliceCanvas.set_stages` draws it (a press on a box is claimed before tools
+and pan; hover shows the tip), a click opens the box's tab
+(msc Processing, stats Features, model Model, classified Annotation), and
+`_compute_badge(text, stage=)` spins a box instead of the HUD
+(`STAGE_STRIP` makes the apps' `_update_busy` leave stage states to the strip;
+the viewers are unchanged). Tests: `test_stages.py`, the canvas strip test in
+`test_sources.py`, strip blocks in both labeler selftests.
+
 **Region encoder, offline** (2026-09-15, [docs/design_region_autoencoder.md](docs/design_region_autoencoder.md)):
 a task-free latent of the statistics ROW, so the labeler's head is not the
 only thing that ever compresses it. `mspath-embed harvest --tiff-folder DIR

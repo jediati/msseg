@@ -41,6 +41,7 @@ from msseg.labeler import fields
 from msseg.labeler.annotate import AnnotationShell
 from msseg.labeler.labeling import Placement
 from msseg.mscoupon import session as coupon_session
+from msseg.mscoupon.fingerprints import field_fingerprint_of, measure_fingerprint_of
 
 from . import propose
 from msseg.labeler.widgets import attach_tooltip
@@ -515,6 +516,53 @@ class LabelerApp(AnnotationShell, MsPathApp):
                     out.append(roi_item(sid, lvl, int(place["x"]), int(place["y"]),
                                         int(place["w"]), int(place["h"])))
         return out
+
+    # -- the stage strip's two app boxes (panels/stages.py) ---------------- #
+    def _measure_key(self):
+        try:
+            return measure_fingerprint_of(self._profile_for_compute())
+        except Exception:
+            return None
+
+    def _stage_field(self, key):
+        e = self.engine
+        err = getattr(self, "_item_errors", {}).get(key)
+        if err:
+            return ("error", f"Could not prime this item: {err}")
+        if e.pending_work() and key in e.running_keys and e.running_kind == "prime":
+            return ("busy", "Priming this item...")
+        p = e.primed.get(key)
+        if p is None:
+            return ("none", "Not primed in this workflow's field -- Run task (an ROI "
+                            "also primes when you open it).")
+        if p.field is not None and p.field != field_fingerprint_of(self._profile_for_compute()):
+            return ("stale", "The topology chain or MSC changed since this item was "
+                             "primed -- Run task to re-prime (what is shown is a preview).")
+        if not p.live:
+            if e.record(key) is not None:
+                return ("cached", "Pipeline released (the live budget); its regions and "
+                                  "statistics are kept. A persistence change re-primes.")
+            return ("none", "Pipeline released -- Run task, or open it, to re-prime.")
+        return ("ok", f"Primed at level {p.level}: the MSC is live.")
+
+    def _stage_measure(self, key):
+        e = self.engine
+        if e.pending_work() and key in e.running_keys and e.running_kind == "measure":
+            return ("busy", "Re-measuring the statistics...")
+        p = e.primed.get(key)
+        if p is None:
+            return ("none", "No statistics: not primed.")
+        if self._measurement_moved():
+            return ("stale", "Features edited -- re-measuring.")
+        if e.record(key) is not None:
+            return ("ok", "Statistics current for this workflow's Features.")
+        if p.live and e.measure_stale(key, self._profile_for_compute()):
+            return ("stale", "Features changed since this item was measured -- "
+                             "it re-measures when opened.")
+        if not p.live:
+            return ("stale", "Parameters changed and the pipeline was released -- "
+                             "Run task to recompute.")
+        return ("none", "Not computed at this persistence yet.")
 
     def _workflow_params(self, name):
         """The params document a task on workflow `name` primes with (the

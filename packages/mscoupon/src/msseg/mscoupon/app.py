@@ -2163,14 +2163,17 @@ class MscouponApp(ViewerShell):
         nothing."""
         if self.viewer is None:
             return
-        if self._is_current_busy():
+        # With a stage strip (the labeler) the stage states are its boxes; the
+        # HUD line keeps only what is not a stage: a channel preview.
+        strip = getattr(self, "STAGE_STRIP", False)
+        if self._is_current_busy() and not strip:
             self.viewer.set_hud("busy", "Measuring" if self._current_measure_stale()
                                 else "Recomputing")
         elif self._preview_pending is not None:
             self.viewer.set_hud("busy", f"Previewing {self._preview_pending[1]}")
-        elif self._preview_override is not None:
+        elif self._preview_override is not None and not strip:
             self.viewer.set_hud("stale", "Preview - filters changed, Run to re-prime")
-        elif self._selection_dirty:
+        elif self._selection_dirty and not strip:
             self.viewer.set_hud("stale", "Out of date - click Rerun")
         else:
             self.viewer.set_hud(None)

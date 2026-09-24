@@ -82,6 +82,12 @@ class ModelStack:
     edge: Any = None                     # edge_model.EdgeModel
     search_spec: Any = None              # the last Optimize winner
     seam: Any = None                     # seam_model.SeamModel
+    # What the region model was trained on, stamped by Train / Optimize /
+    # sweep (in-session knowledge, not persisted; a loaded pickle leaves both
+    # None): the store rev and the app's measurement key. The stage strip
+    # turns the model box stale when either moves.
+    trained_rev: Any = None
+    trained_measure: Any = None
 
     @property
     def empty(self) -> bool:

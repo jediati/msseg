@@ -320,7 +320,7 @@ class ClassifierMixin:
             return None
 
     def _install_model(self, clf, names, kind, spec=None, preserve_view=False, edge=None,
-                       ctx=None, latent=None):
+                       ctx=None, latent=None, stamp=True):
         """Make `clf` the current model (Train and Optimize share this tail).
         `edge` is the edge model fit on top of it (None drops any old one: an
         edge model belongs to exactly one base net). `ctx` is the ContextSpec
@@ -339,6 +339,12 @@ class ClassifierMixin:
         self._clf_context = ctx if ctx is not None else context.ContextSpec()
         self._context_model = latent
         self._edge_model = edge
+        # What it was trained on, for the stage strip: a model fitted here
+        # knows its annotations and measurement; a loaded one (stamp=False)
+        # does not claim to.
+        stack = self._task.model
+        stack.trained_rev = self.store.rev if stamp else None
+        stack.trained_measure = self._measure_key() if stamp else None
         self._pred.clear()               # predictions belong to the old model
         if not preserve_view:
             self._cm_cell = None
@@ -1242,16 +1248,34 @@ class ClassifierMixin:
         except Exception as exc:          # never let a look raise
             self._log(f"classify on arrival failed: {type(exc).__name__}: {exc}")
 
-    # -- computing badge on the image plane (top-left canvas HUD) -------- #
-    def _compute_badge(self, text):
-        if self.viewer is not None:
+    # -- computing badge: the stage strip's spinner, or the HUD line ------- #
+    # Which box a badge spins, by the text its callers already pass; anything
+    # that is not a stage (an export) stays a HUD line.
+    _BADGE_STAGES = (("Preparing classification", "classified"), ("Classif", "classified"),
+                     ("Export", None))
+
+    def _badge_stage(self, text):
+        for prefix, stage in self._BADGE_STAGES:
+            if text.startswith(prefix):
+                return stage
+        return "model"
+
+    def _compute_badge(self, text, stage=False):
+        if stage is False:
+            stage = self._badge_stage(text)
+        if stage is not None and getattr(self, "STAGE_STRIP", False):
+            head, _sp, tail = text.rpartition(" ")
+            counted = bool(head) and tail.replace("/", "", 1).isdigit() and "/" in tail
+            self._set_stage_busy(stage, head if counted else text, tail if counted else "")
+        elif self.viewer is not None:
             self.viewer.set_hud("busy", text)
-            try:
-                self.root.update_idletasks()   # paint before the blocking fit
-            except tk.TclError:
-                pass
+        try:
+            self.root.update_idletasks()   # paint before the blocking fit
+        except tk.TclError:
+            pass
 
     def _clear_compute_badge(self):
+        self._stage_busy = None
         self._update_busy()      # restores busy/stale/none per engine state
 
     def _expected_names_for(self, spec):
@@ -1447,6 +1471,7 @@ class ClassifierMixin:
                  else (rec.get("commit"), final, region_proba, aux))
         self._pred[self.catalogue.key_of(si, li)] = entry
         self._pred_store_rev = self.store.rev
+        self._refresh_stages()
         return final
 
     # -- training-set export --------------------------------------------- #
@@ -1554,6 +1579,9 @@ class ClassifierMixin:
             raise ValueError(msg)
         self._pred.clear()               # predictions belong to the old model
         self._clf = doc.model
+        # A loaded model does not know what it was trained on in this session.
+        self._task.model.trained_rev = None
+        self._task.model.trained_measure = None
         self._clf_names = list(doc.names)
         self._clf_scope = doc.scope
         self._clf_context = ctx

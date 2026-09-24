@@ -308,3 +308,46 @@ def test_a_fit_before_the_canvas_has_a_size_waits_for_one(canvas_factory):
     sc.canvas.winfo_width = lambda: 200
     sc.fit()
     assert sc.scale == pytest.approx(2.0) and not sc._fit_pending
+
+
+def test_the_stage_strip_draws_hit_tests_and_claims_its_press(canvas_factory):
+    """Boxes draw with their state, a press inside a box goes to the click
+    callback and never pans or reaches a tool, the gaps stay pannable, the
+    hovered box shows its tip, and the HUD line sits below the strip."""
+    import types
+    make, _captured = canvas_factory
+    sc = make()
+    sc.set_base(array=scene()[0])
+    sc.set_hud("info", "readout")
+    y_hud_alone = sc.canvas.bbox("hud")[1]
+    stages = [{"key": "msc", "label": "msc", "state": "ok", "tip": "primed", "col": 0,
+               "feeds": ["stats"]},
+              {"key": "stats", "label": "stats", "state": "stale", "tip": "re-measure",
+               "col": 1, "feeds": ["classified"]},
+              {"key": "model", "label": "model", "state": "busy", "text": "3/10", "row": 1,
+               "col": 1, "feeds": ["classified"]},
+              {"key": "classified", "label": "classified", "state": "none", "col": 2}]
+    sc.set_stages(stages)
+    assert sc.stages == {"msc": "ok", "stats": "stale", "model": "busy", "classified": "none"}
+    assert sc.canvas.bbox("hud")[1] > y_hud_alone, "the HUD line moved below the strip"
+    clicked = []
+    sc.on_stage_click = clicked.append
+    tool_presses = []
+    sc.tool = types.SimpleNamespace(on_press=lambda e: tool_presses.append(e) or True,
+                                    on_move=lambda e: True, on_release=lambda e: None)
+    key, x0, y0, x1, y1, _tip = [b for b in sc._stage_boxes if b[0] == "stats"][0]
+    ev = types.SimpleNamespace(x=(x0 + x1) // 2, y=(y0 + y1) // 2)
+    view = (sc.view_x, sc.view_y)
+    sc._drag_start(ev); sc._drag_move(ev); sc._drag_end(ev)
+    assert clicked == ["stats"] and tool_presses == [] and (sc.view_x, sc.view_y) == view
+    gap = types.SimpleNamespace(x=x1 + 5, y=(y0 + y1) // 2)
+    assert sc._stage_at(gap.x, gap.y) is None
+    sc._drag_start(gap)
+    assert tool_presses, "a press in the strip's gaps is the tool's as before"
+    sc._on_motion(ev)
+    assert sc._stage_tip == "stats" and sc.canvas.find_withtag("stagetip")
+    sc._on_motion(types.SimpleNamespace(x=300, y=230))
+    assert sc._stage_tip is None and not sc.canvas.find_withtag("stagetip")
+    sc.set_stages(None)
+    assert sc.stages == {} and not sc.canvas.find_withtag("stages")
+    assert sc.canvas.bbox("hud")[1] == y_hud_alone
