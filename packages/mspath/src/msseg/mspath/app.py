@@ -46,7 +46,7 @@ from msseg.mscoupon.common import _format_sigmas, _parse_sigmas
 from msseg.mscoupon.config_io import (FILTER_OPERATIONS, FILTER_SCHEMA, COLOR_METHODS,
                                       filter_param_schema, filters_to_json)
 from msseg.mscoupon.engine import preview_job, preview_raster
-from msseg.mscoupon.fingerprints import field_fingerprint_of
+from msseg.mscoupon.fingerprints import field_fingerprint_of, measure_fingerprint_of
 from msseg.labeler.defaults import _PREVIEW_PUMP_MS
 
 from .adapters import SlideCatalogue, SlideRegionProvider
@@ -845,8 +845,10 @@ class MsPathApp(ViewerShell):
         self.filters_frame = ttk.Frame(topo); self.filters_frame.pack(fill="x")
         self._rebuild_filter_cards("topo")
 
-        base = self._group(parent, "3. Base channel (statistics are read from this)",
-                           key="base")
+        # A measurement (the MSC never reads it): the labeler shows it on the
+        # Features tab, beside the statistics it feeds.
+        base = self._group(self._processing_parent("base"),
+                           "3. Base channel (statistics are read from this)", key="base")
         ttk.Label(base, text="Derived from the raw slide, not chained onto the topology field.",
                   foreground="#666").pack(anchor="w", padx=6)
         self.base_frame = ttk.Frame(base); self.base_frame.pack(fill="x")
@@ -1826,17 +1828,24 @@ class MsPathApp(ViewerShell):
                                 "(enrol the overview or cut an ROI).")
             return
         profile = self._profile_for_compute()
-        # A live pipe built under this field (chains, colour, MSC, halo) is
-        # kept -- re-measured on the worker if only the statistics moved --
-        # and everything else is dropped, as a reset would.
-        kept = self.engine.keep_field(profile, self._halo())
+        # The panel's field becomes the active slot. A live pipe built under
+        # it (chains, colour, MSC, halo) is kept -- re-measured on the worker
+        # if only the statistics moved -- and one it cannot serve is released;
+        # other fields' slots (other tasks' workflows) are left alone.
+        kept = self.engine.use_field(profile, self._halo())
+        self.engine.set_params(profile)
         self._run_active = True
         self._set_run_buttons("disabled")
         self._set_load_enabled(False)
         self.status_var.set(f"Priming {len(items_to_prime)} item(s)…")
-        n_ov = sum(1 for it in items_to_prime if it.is_overview)
+        # An entry is an Item (this workflow) or (Item, profile) for a task on
+        # another workflow (the labeler's Run all tasks).
+        own = [e for e in items_to_prime if not isinstance(e[1], dict)]
+        n_ov = sum(1 for it in own if it.is_overview)
         log(f"RUN: {n_ov} overview(s) at level {self._overview_level()} + "
-            f"{len(items_to_prime) - n_ov} ROI(s), halo {self._halo()}")
+            f"{len(own) - n_ov} ROI(s), halo {self._halo()}"
+            + (f", + {len(items_to_prime) - len(own)} item(s) of other workflows"
+               if len(own) < len(items_to_prime) else ""))
         log(f"  filters: {[f['operation'] for f in profile['filters']] or ['(none)']}")
         log(f"  base_filters: {[f['operation'] for f in profile['base_filters']] or ['(none)']}")
         if kept:
@@ -1856,6 +1865,8 @@ class MsPathApp(ViewerShell):
         cut, or one the live-pipeline LRU released -- is primed on the worker,
         because at 2-9 s it is not something to do on the UI thread.
         """
+        if not self.engine.has_params:
+            self.engine.set_params(self._profile_for_compute())
         if self.engine.record(key) is not None or self.engine.pending_work():
             return
         p = self.engine.primed.get(key)
@@ -1926,31 +1937,45 @@ class MsPathApp(ViewerShell):
             self._update_busy()
 
     def _keep_compute_for(self, profile):
-        """Keep the live items the new profile's field can reuse (see
-        ``SlideEngine.keep_field``); a statistics-only difference then costs a
-        re-measure of the item on screen, not a Run."""
-        if self._run_active or self.engine.pending_work() or not self.engine.primed:
+        """A profile switch never drops a prime: the new profile's field
+        becomes the active slot (``SlideEngine.use_field``) and every other
+        field keeps its pipes, pins and records -- switching back is free
+        while the pipes are live, and shows the records after. Only a switch
+        during a Run resets, as before (the worker's items would land in a
+        slot nobody asked for)."""
+        if self._run_active or self.engine.pending_work():
             return False
         try:
             doc = json.loads(coupon_session.profile_params_json(profile, 1, SLIDE_PLANES))
         except Exception:
             return False
-        return self.engine.keep_field(doc, self._halo()) > 0
+        self.engine.use_field(doc, self._halo())
+        return True
+
+    def _measurement_moved(self):
+        if self._run_active or self.engine.pending_work() or not self.engine.primed:
+            return False
+        doc = self._profile_for_compute()
+        if self.engine.active_field != field_fingerprint_of(doc):
+            return False
+        return self.engine.current_measure != measure_fingerprint_of(doc)
 
     def _remeasure_current(self):
-        """A new generation; the item on screen is re-selected, or re-measured
-        on the worker when the statistics moved (``_request_item``)."""
-        if not self.engine.primed or self.engine.pending_work():
-            return
+        """The panel's parameters become the current ones; the item on screen
+        is re-selected, or re-measured on the worker when the statistics
+        moved (``_request_item``). Never a prime: an item with no live pipe
+        in this field shows its record if it has one, else waits for a Run."""
         profile = self._profile_for_compute()
+        self.engine.commit_selection(profile)
+        if self.engine.pending_work():
+            return
         cur = self._current()
         key = self.catalogue.key_of(*cur) if cur is not None else None
         p = self.engine.primed.get(key) if key is not None else None
         if p is not None and p.field == field_fingerprint_of(profile):
             # The primed items follow the panel's statistics from here on.
             self._primed_chain = self._chain_fingerprint()
-        self.engine.commit_selection()
-        if key is not None:
+        if p is not None and p.live:
             self._request_item(key)
         self._update_busy()
         self._refresh_render()
@@ -2003,7 +2028,7 @@ class MsPathApp(ViewerShell):
         if abs(pct - float(self.persist_var.get())) < 1e-9 and self.engine.slices:
             return                                  # nothing changed: no commit bump
         self.persist_var.set(pct)
-        self.engine.commit_selection()
+        self.engine.commit_selection(self._profile_for_compute())
         cur = self._current()
         if cur is not None:
             self._request_item(self.catalogue.key_of(*cur))

@@ -345,9 +345,10 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
         self.proc_col = self.proc_scroll.inner
         self._proc_groups = {}               # key -> Collapsible
         ttk.Label(self.features_tab, foreground="#666", wraplength=400, justify="left",
-                  text="What each region is measured by. An edit re-measures the item "
-                       "on screen -- the regions stay, only their statistics are "
-                       "rebuilt; no Run needed.").pack(side="top", anchor="w",
+                  text="What each region is measured by: the base channel the "
+                       "statistics are read from, and the statistics. An edit "
+                       "re-measures the item on screen -- the regions stay, only "
+                       "their statistics are rebuilt; no Run needed.").pack(side="top", anchor="w",
                                                         padx=6, pady=(4, 0))
         self.feat_scroll = ScrollFrame(self.features_tab, width=420, canvas_width=400)
         self.feat_scroll.pack(side="top", fill="both", expand=True)
@@ -457,7 +458,7 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
 
     # The sections that measure rather than build the field: they go on the
     # Features tab.
-    _FEATURE_SECTIONS = ("stats",)
+    _FEATURE_SECTIONS = ("stats", "base")
 
     def _processing_parent(self, section):
         if section in self._FEATURE_SECTIONS:
@@ -1599,6 +1600,19 @@ class AnnotationShell(HintsMixin, ModelPanelMixin, AnalysisPanelMixin, ViewContr
             self._remeasure_current()
         except Exception as exc:
             self._log(f"re-measure after a statistics edit failed: {exc}")
+
+    def _preview_edit_settled(self):
+        """Every settled profile edit (the chain cards report here): the
+        viewer repaints a preview; the labeler also asks what the edit costs.
+        A field edit (the topology chain, the MSC) stays a preview with its
+        "Run to re-prime" badge; a measurement edit (the base chain, the
+        statistics) re-measures the item on screen now."""
+        super()._preview_edit_settled()
+        try:
+            if self._measurement_moved():
+                self._remeasure_current()
+        except Exception as exc:
+            self._log(f"re-measure after an edit failed: {exc}")
 
     def _reload_task_model(self, task):
         """Load the newest of the task's recorded pickles that still exists

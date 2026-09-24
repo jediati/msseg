@@ -12,8 +12,11 @@ implementation, no inheritance required.
   stable across sessions: they are what ``annotations.json`` stores.
 * ``RegionProvider`` -- the current region decomposition of an item: a label
   raster, its per-region statistics table, the region-adjacency arcs, the
-  seam graph (the polylines between regions), and a ``commit`` generation
-  that every cache keys on.
+  seam graph (the polylines between regions), and a ``commit`` that every
+  cache keys on -- the record's IDENTITY (``record_keys.py``): the interned
+  id of what the record is a function of (the prime that made the labels,
+  the measurement, the persistence, the selection), so equal ids mean equal
+  content and returning to earlier parameters finds the earlier records.
 * ``ImageSource`` -- base pixels by level and region, so a canvas can draw a
   gigapixel image without holding it (an in-memory array has one level).
 * ``LabelLayer`` -- a region-id raster served by crop, for the same reason.
@@ -27,7 +30,9 @@ ItemKey = str
 
 
 class RegionRecord(TypedDict, total=False):
-    """One item's decomposition at one commit. ``labels`` is an int32 raster of
+    """One item's decomposition; ``commit`` is its identity (equal commits,
+    equal labels and rows -- never a hash of parameters alone, since region
+    ids differ from one prime to the next). ``labels`` is an int32 raster of
     region ids (-1 = background); ``stats`` a ``FeatureTableLike`` with one row
     per living region; ``arcs`` the region graph as ``{"a", "b", "saddle" |
     None, "source"}`` parallel arrays, or None when only pixel adjacency is
@@ -103,8 +108,9 @@ class ItemCatalogue(Protocol):
 class RegionProvider(Protocol):
     @property
     def commit(self) -> int:
-        """The current parameter generation; a record is current iff its
-        ``commit`` equals this."""
+        """A generation counter that moves whenever the current parameters
+        may have. Informational: which record is current is decided by
+        ``record(key)``, and caches compare a record's own ``commit``."""
         ...
 
     def keys(self) -> List[ItemKey]:

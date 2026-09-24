@@ -761,8 +761,26 @@ reuse (coupon per sequence, mspath `keep_field`); a profile / task switch
 resets only when the field differs (shell `_keep_compute_for`). The labeler's
 statistics and ext sample radius moved to a **Features** tab; a settled edit
 re-measures the item on screen. 2048² ROI: base-only -> 12 channels 0.90 s vs
-a 1.47 s prime. `base_filters` stays on the field side (the raw slice is not
-kept).
+a 1.47 s prime.
+
+**Layered cache keys** (2026-09-24, second half of stage 5): a record's
+`commit` is its **identity** -- the interned id (`msseg.labeler.record_keys`:
+`Interner`, `RecordCache`) of what it is a function of: mspath `(item, prime
+id, measurement, persistence)`, coupon `(stack_gen, _selection_snapshot())`.
+Never a parameter hash alone (region ids differ per prime). Every framework
+cache already compared `entry[0] == rec["commit"]`, so nothing downstream
+changed, and a task switched back to finds its records AND predictions.
+Records are kept a few per item (`MSSEG_RECORDS_PER_ITEM`, 4; mspath shares
+one label raster across measurements; the coupon's `_ByCommit` maps read as
+the current record and keep 2 assemblies). mspath pipes live per **field
+slot** (`SlideEngine.use_field`; `primed` / `level_range` /
+`persistence_abs` are properties over the active slot; one LRU across all;
+pins per field) and `start_run` takes `(item, profile)` jobs, so **Run all
+tasks** primes every task under its own workflow. The coupon keeps one field
+live. **The base chain is a measurement** (fingerprints, both re-measures --
+the coupon re-reads the slice file -- and the Features tab); a settled edit
+goes through `AnnotationShell._preview_edit_settled` -> the app's
+`_measurement_moved()` -> `_remeasure_current`, a field edit stays a preview.
 
 **Region encoder, offline** (2026-09-15, [docs/design_region_autoencoder.md](docs/design_region_autoencoder.md)):
 a task-free latent of the statistics ROW, so the labeler's head is not the

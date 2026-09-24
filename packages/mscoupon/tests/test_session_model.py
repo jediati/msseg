@@ -294,8 +294,14 @@ def test_field_and_measure_fingerprints_split_the_profile():
     assert session.field_fingerprint(radius) == f0
     assert session.measure_fingerprint(radius) != m0
 
+    # The base chain feeds the statistics, the relevance range and the pixel
+    # trim -- never the MSC -- so it is a measurement.
+    base_edit = copy.deepcopy(base)
+    base_edit["base_filters"].append({"operation": "blur", "params": {"sigma": 1.0}})
+    assert session.field_fingerprint(base_edit) == f0
+    assert session.measure_fingerprint(base_edit) != m0
+
     for edit in (lambda p: p["filters"].append({"operation": "blur", "params": {"sigma": 1.0}}),
-                 lambda p: p["base_filters"].append({"operation": "blur", "params": {"sigma": 1.0}}),
                  lambda p: p["msc"].__setitem__("manifold", "descending"),
                  lambda p: p["msc"].__setitem__("accurate", True),
                  lambda p: p["input"]["color"].__setitem__("default_method", "max")):

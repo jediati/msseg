@@ -1,11 +1,11 @@
 # Design note: many task-specific models over one set of slides
 
-Status: **third draft; stages 1-4 built, and the first half of stage 5**
-(2026-09-24; first draft 2026-09-18). Stage 4 -- places, enrolment, a split
-Run and the on-demand fast path -- is described where §5 and §12 now say "as
-built". Of stage 5, the measurement split landed: the re-measure question
-(§6, §13.1) is answered yes, and the field and the statistics are keyed and
-cached apart.
+Status: **third draft; stages 1-5 built** (2026-09-24; first draft
+2026-09-18). Stage 4 -- places, enrolment, a split Run and the on-demand fast
+path -- is described where §5 and §12 now say "as built". Stage 5 landed in
+two halves: the measurement split (the re-measure question, §6 / §13.1,
+answered yes) and the layered cache keys (§6 "as built": a record's commit is
+its identity, pipes live per field, the base chain is a measurement).
 Stage 1 of §12 -- the task object with a stack, the Tasks list, session v3 --
 stage 2 -- slide-bound gestures with a scale of intent, stroke width, extent
 outlines and the trace corridor (§8) -- and stage 3 -- the derivation module
@@ -189,10 +189,11 @@ notes; 3232² coupon slice / 4096² ROI).
 
 ```
 L1  pixels          item read at level (+ halo)                 key: item, halo
-L2  rasters         base chain, topology chain -> base, filtered  key: L1 + chains         ~0.5 s
+L2  rasters         topology chain -> filtered (base chain: L4)   key: L1 + chains         ~0.5 s
 L3  pipeline        MSC / merge forest, base manifolds,           key: L2 + msc mode,      ~4 s, ~1 GB   <- THE prime
                     native cancellation hierarchy                       manifold, accuracy
-L4  measurement     stats bank -> ChannelStats per base manifold  key: L3 + stats spec     ~1 s
+L4  measurement     base chain -> base; stats bank -> ChannelStats key: L3 + base chain    ~1 s
+                    per base manifold                                   + stats spec
 L5  record          select_persistence -> labels, living ids,     key: L3 + L4 + persistence   ms
                     arcs (livingRegionArcs), FeatureTable
 L6  derived         seam graph, contact lengths, pixel adjacency, key: L5 (+ context spec) ms-100s ms
@@ -224,11 +225,19 @@ their keys agree up to it:
   study (§8.4) is therefore one prime per level per place -- the cost is real
   and it is the point of the study.
 
-**Cache keys become layered**: live pipelines by `(field_hash, item)`; records
-by `(field_hash, meas_hash, persistence, item)`; derived and inference
-artifacts by the record key plus their own spec or model hash. Sharing
-follows from identity of content. Switching tasks never *drops* a prime
-(today `commit_id` bumps and records fall); it selects a different key.
+**Cache keys are layered** (as built, 2026-09-24): live pipelines by
+`(field, item)` -- mspath keeps one slot per field with its own pins, under
+ONE live budget -- and records by `(item, prime, measurement, persistence)`
+(mspath) / `(stack generation, parameter snapshot)` (coupon). The record key
+names the PRIME, not a hash of the field: region ids are not stable from one
+prime to the next, so a re-prime must never alias an older record. Derived
+and inference artifacts needed no change at all: every cache already
+compared `entry[0] == rec["commit"]`, so the commit became the record's
+**identity** -- the interned id of its key (`msseg.labeler.record_keys`) --
+and returning to earlier parameters finds the earlier records, predictions
+included. A few records per item are kept (`MSSEG_RECORDS_PER_ITEM`, 4), and
+records that differ only in their measurement share one label raster.
+Switching tasks never drops a prime; it selects a different key.
 
 **What a change costs** (the gesture columns reflect §8):
 
@@ -238,6 +247,8 @@ follows from identity of content. Switching tasks never *drops* a prime
 | statistics edited | **kept** (re-measured) | recomputed | re-resolve | re-resolve | **refused** (names) | dropped with it |
 | chain / MSC mode edited | rebuilt | recomputed | re-resolve | re-resolve | refused | dropped |
 | level changed | new item | new item | **kept**; applied with a scale warning; extents via outline | kept via corridor (§8.2); exact coverage at own level | refused (`scope`) | dropped |
+| task switched (same field) | kept | found again if cached, else recomputed / re-measured | re-resolve | re-resolve | kept (its predictions valid again) | kept |
+| task switched (other field) | kept in its own slot while the LRU allows; its records survive eviction | found again if cached | re-resolve | re-resolve | kept | kept |
 | task renamed | -- | -- | -- | -- | -- | -- |
 
 ## 7. Targets: region-based and path-based, and what transfers
@@ -653,6 +664,37 @@ two tasks on different statistics keep BOTH rows live (today the last one
 measured wins, and a switch re-measures), `base_filters` on the measurement
 side (needs the raw slice kept; a base-chain edit still re-primes), and
 `RegionProvider.commit` becoming a record key.
+
+**What exists (stage 5, second half: layered keys, 2026-09-24).**
+`msseg/labeler/record_keys.py`: `Interner` (key -> stable int) and
+`RecordCache` (a few records per item, LRU, plus the decomposition shared by
+records that differ only in their measurement). `rec["commit"]` is the
+interned id of what the record is a function of; `protocols.py` says so and
+`RegionProvider.commit` is now an informational generation. mspath
+`SlideEngine`: field slots (`primed` / `level_range` / `persistence_abs` are
+properties over the ACTIVE slot, so no caller changed), `use_field` (never
+drops another field; the old `keep_field` is its alias), one global LRU over
+every slot, pins per field, `set_params` + `record_id` + a record cache that
+outlives a released pipe, and `start_run` jobs `(item, profile)` that prime
+into that profile's slot -- the labeler's **Run all tasks** now primes every
+task's items under its own workflow. The coupon `ComputeEngine`: `_ByCommit`
+maps (a few records per slice, two assemblies per sequence) read as the
+current record, `commit_selection(snapshot)` interns `(stack generation,
+_selection_snapshot())`, so going back to earlier parameters returns their
+commit; the coupon keeps ONE field live (a cross-field switch still drops the
+stack -- a decision, for memory). The base chain moved to the measurement
+side: the fingerprints, both engines' re-measure (the coupon re-reads the
+slice file and rebuilds `base` + `normalizers`; mspath rebuilds `Primed.base`),
+the Features tab (`_FEATURE_SECTIONS = ("stats", "base")`), and one settle
+path -- `AnnotationShell._preview_edit_settled` asks the app's
+`_measurement_moved()` and re-measures the item on screen for a base or
+statistics edit, leaving a field edit a preview. Tests: `test_record_keys.py`,
+`test_slide_engine.py` (identity, bound, fields and pins, jobs, base chain),
+`test_engine_remeasure.py` (A -> B -> A, bound, base chain), the fingerprint
+test; the mspath labeler selftest switches task A -> B -> A and finds A's
+record and prediction with no re-measure, and runs Run all tasks over a
+third field; the coupon labeler selftest checks that a profile round trip
+returns its commit.
 
 Stage 1 touched `session_doc.py`, the new `msseg/labeler/task.py`,
 `labeling.py`, `annotate.py`, `shell.py`, `panels/classpanel.py`,

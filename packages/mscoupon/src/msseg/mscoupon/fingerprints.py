@@ -2,11 +2,14 @@
 
 A prime is two computations with different inputs:
 
-* the **field** -- the chains, the colour input, the MSC and its cancellation
-  hierarchy, the base labelling. Everything ``Msc2DPipeline::build`` does
-  before it measures anything. Changing any of these means a new prime.
-* the **measurement** -- the ``statistics`` block, the extremum sample radius
-  and the declared plane count. Everything the per-region rows are made of.
+* the **field** -- the topology chain, the colour input, the MSC and its
+  cancellation hierarchy, the base labelling. Everything
+  ``Msc2DPipeline::build`` does before it measures anything. Changing any of
+  these means a new prime.
+* the **measurement** -- the base chain (``base_filters``: the raster the
+  statistics, the relevance range and the pixel trim read; the MSC never
+  does), the ``statistics`` block, the extremum sample radius and the
+  declared plane count. Everything the per-region rows are made of.
   Changing only these means ``pipe.remeasure``: the MSC, the labels and the
   arcs stay, and only the rows are rebuilt (~0.2-2 s against ~4 s).
 
@@ -59,6 +62,7 @@ def field_doc(params: Params) -> Dict[str, Any]:
     """The part of a params document the field (MSC + base labelling) reads."""
     doc = copy.deepcopy(_doc(params))
     doc.pop("statistics", None)
+    doc.pop("base_filters", None)
     msc = doc.get("msc")
     if isinstance(msc, dict):
         for k in _RESULT_FREE + _MEASURE_MSC:
@@ -87,6 +91,8 @@ def measure_doc(params: Params) -> Dict[str, Any]:
     inp = doc.get("input") if isinstance(doc.get("input"), dict) else {}
     col = inp.get("color") if isinstance(inp.get("color"), dict) else {}
     out = {"statistics": doc.get("statistics")}
+    if doc.get("base_filters"):
+        out["base_filters"] = doc.get("base_filters")
     radius = msc.get("extremum_sample_radius")
     if radius:
         out["extremum_sample_radius"] = radius

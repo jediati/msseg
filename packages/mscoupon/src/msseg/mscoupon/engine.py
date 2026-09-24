@@ -29,6 +29,11 @@ import queue
 import threading
 import time
 
+from collections import OrderedDict
+from collections.abc import MutableMapping
+
+from msseg.labeler.record_keys import Interner, records_per_item
+
 from .common import log, FeatureTable
 from .fingerprints import measure_fingerprint_of
 from .session import DEFAULT_SIMPLIFICATION
@@ -270,6 +275,104 @@ def preview_raster(engine, arr, job, log=lambda _m: None, should_stop=None):
     return out
 
 
+class _ByCommit(MutableMapping):
+    """key -> {commit: value}, a few per key, read as ONE value: the one at
+    the engine's current commit, else the newest (the view keeps showing the
+    last result while a new one computes, and every caller that needs the
+    current one already compares the commit).
+
+    A record's commit is the interned id of what it is a function of
+    (``record_keys.py``), so the older entries are not garbage: returning to
+    earlier parameters -- switching back to a task -- finds them. Assigning a
+    plain dict (the selftests, older callers) adopts its entries."""
+
+    def __init__(self, engine, field="commit", cap=None):
+        self._e = engine
+        self._f = field
+        self._cap = int(cap) if cap else records_per_item()
+        self._d = {}
+
+    @classmethod
+    def of(cls, engine, value, field="commit", cap=None):
+        if isinstance(value, cls):
+            return value
+        out = cls(engine, field, cap)
+        for k, v in (value or {}).items():
+            out[k] = v
+        return out
+
+    def _pick(self, recs):
+        v = recs.get(self._e.commit_id)
+        if v is None and recs:
+            v = next(reversed(recs.values()))
+        return v
+
+    def at(self, key, commit):
+        recs = self._d.get(key)
+        return recs.get(commit) if recs else None
+
+    def get(self, key, default=None):
+        recs = self._d.get(key)
+        if not recs:
+            return default
+        v = self._pick(recs)
+        return default if v is None else v
+
+    def __getitem__(self, key):
+        v = self.get(key)
+        if v is None:
+            raise KeyError(key)
+        return v
+
+    def __setitem__(self, key, value):
+        recs = self._d.setdefault(key, OrderedDict())
+        c = value.get(self._f) if isinstance(value, dict) else None
+        recs[c] = value
+        recs.move_to_end(c)
+        while len(recs) > self._cap:
+            recs.popitem(last=False)
+
+    def __contains__(self, key):
+        return bool(self._d.get(key))
+
+    def __delitem__(self, key):
+        if not self._d.get(key):
+            raise KeyError(key)
+        del self._d[key]
+
+    def __iter__(self):
+        return iter([k for k, v in self._d.items() if v])
+
+    def __len__(self):
+        return sum(1 for v in self._d.values() if v)
+
+    def pop(self, key, default=None):
+        recs = self._d.pop(key, None)
+        return self._pick(recs) if recs else default
+
+    def clear(self):
+        self._d.clear()
+
+    def __eq__(self, other):
+        """Equal to a mapping holding the same CURRENT values."""
+        if isinstance(other, _ByCommit):
+            other = dict(other.items())
+        if not isinstance(other, dict):
+            return NotImplemented
+        return dict(self.items()) == other
+
+    __hash__ = None
+
+    def reindex(self, fn):
+        """Move every key through `fn` (None drops it), keeping all commits."""
+        out = {}
+        for k, v in self._d.items():
+            nk = fn(k)
+            if nk is not None and v:
+                out[nk] = v
+        self._d = out
+
+
 class ComputeEngine:
     def __init__(self, params_provider):
         # params_provider(si, level, li) -> dict: the UI-state snapshot for one
@@ -282,13 +385,20 @@ class ComputeEngine:
         # primed[subseq_idx] = {"files":[...], "pipes":[pipe|None], "base":[arr],
         #                       "filtered":[arr]}  (populated by start_run)
         self.primed = []
+        # A commit is the interned id of (stack generation, the parameter
+        # snapshot a Rerun commits) -- see commit_selection.
+        self._ids = Interner(start=1)
+        self.stack_gen = 0
+        self.commit_id = 0                       # the current record identity
         # subseq_idx -> 3D assembly result (cc/global label rasters + global table).
         # Only populated at the "global" level -- see the app's _needed_level().
+        # Two commits per sequence (a whole stack of rasters each).
         self.assembly = {}
         # (subseq_idx, local_idx) -> per-slice result at some commit:
         #   {commit, labels, stats, kept, cc (optional)}
         # The per-slice tiers write here; the global tier fills it for every slice
         # as a by-product, so navigating after a full assembly costs nothing.
+        # A few commits per slice (MSSEG_RECORDS_PER_ITEM), see _ByCommit.
         self.slices = {}
         self.work_q = queue.Queue()
         # Async assembly (off the UI thread): pipes are stateful, so only ONE
@@ -297,8 +407,23 @@ class ComputeEngine:
         self.asm_running = False
         self.asm_running_si = None               # subsequence the worker is assembling
         self.asm_pending = None                  # (token, si, level, li) latest requested
-        self.commit_id = 0                       # committed parameter generation
         self.run_active = False                  # priming worker in flight
+
+    @property
+    def slices(self):
+        return self._slices
+
+    @slices.setter
+    def slices(self, value):
+        self._slices = _ByCommit.of(self, value, "commit")
+
+    @property
+    def assembly(self):
+        return self._assembly
+
+    @assembly.setter
+    def assembly(self, value):
+        self._assembly = _ByCommit.of(self, value, "_commit", cap=2)
 
     # ------------------------------------------------------------------ #
     # Priming
@@ -435,6 +560,7 @@ class ComputeEngine:
                                         "msc": msc_serial})
             use_serial = "compute_algorithm" not in msc
             measure_fp = measure_fingerprint_of(p)
+            base_chain_fp = json.dumps(base_filters, sort_keys=True)
             n_reused = sum(1 for s in subseqs if s.get("_reuse") is not None)
             total = sum(len(s["files"]) for s in subseqs
                         if s.get("_reuse") is None)
@@ -563,7 +689,8 @@ class ComputeEngine:
                 primed.append({"files": s["files"], "base": base_slices,
                                "filtered": filt_slices, "pipes": pipes,
                                "normalizers": norms, "color": color_slices,
-                               "measured": [measure_fp] * len(pipes)})
+                               "measured": [measure_fp] * len(pipes),
+                               "base_chain": [base_chain_fp] * len(pipes)})
             log(f"RUN complete: primed {total} slices")
             self.work_q.put(("done", primed))
         except Exception as exc:  # surfaced on the UI thread
@@ -603,8 +730,10 @@ class ComputeEngine:
             # A re-prime replaces every raster, so records made under the old
             # priming must never satisfy the new one -- and neither must any
             # caller-side cache keyed on the commit (the labeler's class LUTs
-            # and predictions). Bumping the generation invalidates them all.
-            self.commit_id += 1
+            # and predictions). A new stack generation, and a commit no key
+            # maps to, invalidate them all; the app then commits its snapshot.
+            self.stack_gen += 1
+            self.commit_id = self._ids.fresh()
             return ("primed",)
         if kind == "assembly":
             token, si, out = payload
@@ -672,14 +801,18 @@ class ComputeEngine:
     # ------------------------------------------------------------------ #
     # Commit / reset
     # ------------------------------------------------------------------ #
-    def commit_selection(self):
-        """Commit the current selection parameters: bump the generation and
-        drop the now-stale per-slice records (they are keyed by commit, so they
-        fall out of date automatically; pruning keeps memory from growing one
-        stack per Rerun)."""
-        self.commit_id += 1
-        self.slices = {k: v for k, v in self.slices.items()
-                       if v.get("commit") == self.commit_id}
+    def commit_selection(self, snapshot=None):
+        """Commit the current parameters. With a `snapshot` (the app's
+        selection + measurement parameters) the commit is the interned id of
+        (stack generation, snapshot): the same parameters give the same id,
+        so going back to them finds their records (bounded per slice) and
+        every caller cache keyed on them. Without one, a fresh id that matches
+        nothing -- the old "bump the generation"."""
+        if snapshot is None:
+            self.commit_id = self._ids.fresh()
+        else:
+            key = json.dumps(snapshot, sort_keys=True, default=str)
+            self.commit_id = self._ids.id_of((self.stack_gen, key))
 
     def drop_sequence(self, si):
         """Forget primed sequence `si` -- its rasters, pipes, records and 3D
@@ -692,9 +825,8 @@ class ComputeEngine:
         if not (0 <= si < len(self.primed)):
             return False
         del self.primed[si]
-        self.assembly = {(s - (s > si)): v for s, v in self.assembly.items() if s != si}
-        self.slices = {(s - (s > si), l): v for (s, l), v in self.slices.items()
-                       if s != si}
+        self.assembly.reindex(lambda s: None if s == si else s - (s > si))
+        self.slices.reindex(lambda k: None if k[0] == si else (k[0] - (k[0] > si), k[1]))
         active = getattr(self, "_gpu_active", None)
         if active is not None:
             asi, ali = active
@@ -718,8 +850,8 @@ class ComputeEngine:
                 # (start_run shares it), which the caller edits itself.
                 p[name] = seq[:li] + seq[li + 1:]
         self.assembly.pop(si, None)
-        self.slices = {(s, l - (1 if s == si and l > li else 0)): v
-                       for (s, l), v in self.slices.items() if (s, l) != (si, li)}
+        self.slices.reindex(lambda k: None if k == (si, li)
+                            else (k[0], k[1] - (1 if k[0] == si and k[1] > li else 0)))
         active = getattr(self, "_gpu_active", None)
         if active is not None:
             asi, ali = active
@@ -741,7 +873,8 @@ class ComputeEngine:
         self.primed = []
         self.assembly.clear()
         self.slices.clear()
-        self.commit_id += 1        # stale slice records now fail slice_ready
+        self.stack_gen += 1
+        self.commit_id = self._ids.fresh()   # stale slice records now fail slice_ready
         self.asm_token += 1
         self.asm_pending = None
 
@@ -894,6 +1027,7 @@ class ComputeEngine:
         if pipe is None or not hasattr(pipe, "remeasure"):
             return False
         t0 = time.perf_counter()
+        self._rebuild_base(p, li, params_json, engine, np)
         base = np.ascontiguousarray(p["base"][li], dtype=np.float32)
         filt = np.ascontiguousarray(p["filtered"][li], dtype=np.float32)
         planes = color_planes(p, li, np)
@@ -904,6 +1038,29 @@ class ComputeEngine:
         measured[li] = fp
         log(f"  slice {li}: re-measured the statistics "
             f"({1e3 * (time.perf_counter() - t0):.0f}ms){build_timings_brief(pipe)}")
+        return True
+
+    def _rebuild_base(self, p, li, params_json, engine, np):
+        """The base chain is a measurement: when it moved, the slice's base
+        raster (and its normalizer landmarks, which the pixel trim and the
+        readouts use) is rebuilt from the file -- the raw slice is not kept,
+        re-reading one is cheap next to a prime. A record without a stamp
+        is taken as current."""
+        stamps = p.get("base_chain")
+        doc = json.loads(params_json) if isinstance(params_json, str) else dict(params_json)
+        chain = doc.get("base_filters") or []
+        want = json.dumps(chain, sort_keys=True)
+        if stamps is None or li >= len(stamps) or stamps[li] == want:
+            return False
+        from .common import load_slice
+        color_in = (doc.get("input") or {}).get("color") or {}
+        arr = load_slice(p["files"][li], color_in.get("alpha", "drop"), engine, log)
+        base, norms = self._apply_base_chain(arr, chain, engine, log,
+                                             color_in.get("default_method", "luminance"))
+        p["base"][li] = base
+        if isinstance(p.get("normalizers"), list) and li < len(p["normalizers"]):
+            p["normalizers"][li] = norms
+        stamps[li] = want
         return True
 
     def _release_inactive_gpu(self, si, li):

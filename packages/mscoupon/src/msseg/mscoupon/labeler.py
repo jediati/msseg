@@ -458,14 +458,16 @@ def _selftest():
     assert not app._panes_collapsed
     assert app._pane_fractions() == [0.2, 0.5], "F9 remembers where they were"
     # Processing is ONE column of collapsible groups, and which are folded
-    # rides the session. The statistics are on the Features tab (still a
-    # folding group under the same key), and so is the ext sample radius.
-    for w in (app.filters_frame, app.base_frame, app.msc_frame, app.profile_load_btn):
+    # rides the session. The measurement -- the base channel, the statistics
+    # and the ext sample radius -- is on the Features tab (still folding
+    # groups under the same keys).
+    for w in (app.filters_frame, app.msc_frame, app.profile_load_btn):
         assert _under(w, app.processing_tab), w
-    for w in (app.filters_frame, app.base_frame, app.msc_frame):
+    for w in (app.filters_frame, app.msc_frame):
         assert _under(w, app.proc_col), w
-    assert _under(app.stats_frame, app.feat_col) and _under(app.stats_frame, app.features_tab)
-    assert not _under(app.stats_frame, app.processing_tab)
+    for w in (app.stats_frame, app.base_frame):
+        assert _under(w, app.feat_col) and _under(w, app.features_tab), w
+        assert not _under(w, app.processing_tab), w
     radius_entries = [w for w in app.stats_frame.winfo_children()
                       for w in w.winfo_children()
                       if isinstance(w, ttk.Entry)
@@ -1727,11 +1729,22 @@ def _selftest():
             from . import fingerprints as _fp
             app._primed_fingerprint = _fp.field_fingerprint_of(app._params_json(cores=1))
             primed_before = app.primed
+            prev_idx = app.active_profile_idx
             with _mock.patch.object(messagebox, "askyesno", return_value=True), \
                     _mock.patch.object(app, "_request_assembly") as _req:
                 app._load_classifier_from(clf_path, interactive=True)
             assert app.primed is primed_before, "a statistics-only switch keeps the primes"
             assert _req.called, "the slice on screen is re-assembled under the new statistics"
+            # The commit is the identity of the parameters: back and forth
+            # between the two profiles (what a task switch does) returns each
+            # one's commit, so their records and predictions are found again.
+            c_model = app._commit_id
+            with _mock.patch.object(app, "_request_assembly"):
+                app._switch_profile(prev_idx)
+                c_prev = app._commit_id
+                app._switch_profile(n_prof)
+            assert c_prev != c_model and app._commit_id == c_model, \
+                "returning to a profile returns its commit"
             assert len(app.profiles) == n_prof + 1, "accepting adds a profile"
             assert app.active_profile_idx == n_prof, "and switches to it"
             assert app.profiles[-1]["name"] == "from classifier.pkl"
@@ -2343,7 +2356,7 @@ def _selftest():
     c0 = app._commit_id
     app.engine.work_q.put(("done", []))
     app.engine.poll()
-    assert app._commit_id == c0 + 1, "re-prime must bump the commit"
+    assert app._commit_id != c0, "re-prime must move the commit"
 
     # -- Seam tools: scope box, livewire trace, resolution, overlay, session -- #
     # A fresh one-slice fixture (the four sparse-id blocks) at the current

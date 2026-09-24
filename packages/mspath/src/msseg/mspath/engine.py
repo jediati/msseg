@@ -42,6 +42,7 @@ import threading
 import time
 
 from msseg.labeler.pyramid import PyramidImageSource
+from msseg.labeler.record_keys import Interner, RecordCache
 from msseg.labeler.table import FeatureTable
 
 from msseg.mscoupon.fingerprints import field_fingerprint_of, measure_fingerprint_of
@@ -82,7 +83,8 @@ class Primed:
     """One item's live compute state."""
 
     __slots__ = ("item", "pipe", "base", "filtered", "origin", "scale", "level",
-                 "shape", "value_range", "halo", "channel_sources", "field", "measured", "chains")
+                 "shape", "value_range", "halo", "channel_sources", "field", "measured", "chains",
+                 "pipe_id", "slot")
 
     def __init__(self, item, pipe, base, filtered, origin, scale, level, shape, halo=0):
         self.item = item
@@ -105,6 +107,10 @@ class Primed:
         # a re-measure must read the rasters the MSC saw, not whatever the
         # panel says now -- an edited, un-Run chain is a preview, not a prime.
         self.chains = None
+        # Which prime this is (record ids name it: region ids are not stable
+        # from one prime to the next) and which field slot holds it.
+        self.pipe_id = 0
+        self.slot = None
 
     @property
     def live(self):
@@ -132,17 +138,27 @@ class SlideEngine:
     def __init__(self):
         self.sources = {}          # slide id -> PyramidImageSource
         self.paths = {}            # slide id -> filesystem path
-        self.primed = {}           # ItemKey -> Primed
-        self.slices = {}           # ItemKey -> record
-        self.commit_id = 1
-        # level -> the REFERENCE value range the percentage resolves against,
-        # taken from the first item primed at that level. What is pinned is the
-        # range, not the threshold: the slider must stay live, and every item
-        # at a level must read the same percentage as the same threshold.
-        self.level_range = {}
-        self.persistence_abs = {}        # level -> the threshold last resolved (readout)
+        # Field slots: field fingerprint -> {"primed": {ItemKey: Primed},
+        # "level_range": {level: ref}, "persistence_abs": {level: abs}}. The
+        # ACTIVE slot is what `primed` / `level_range` / `persistence_abs`
+        # read and write, so every caller sees one field at a time while a
+        # task on another field keeps its pipes and its pins.
+        #   level_range: level -> the REFERENCE value range the percentage
+        #   resolves against, taken from the first item primed at that level
+        #   in that field. What is pinned is the range, not the threshold: the
+        #   slider must stay live, and every item at a level must read the
+        #   same percentage as the same threshold.
+        self._slots = {}
+        self._active = None
+        # Records by identity (record_keys.py): a few per item, each under the
+        # interned id of (item, pipe, measurement, persistence).
+        self.records = RecordCache()
+        self._ids = Interner(start=2)
+        self._pipe_seq = 0
+        self._params = None              # {"meas": fp, "msc": {...}} -- see set_params
+        self.commit_id = 1               # a generation, for RegionProvider.commit only
         self.work_q = queue.Queue()
-        self._order = []                 # LRU of live keys, oldest first
+        self._order = []                 # LRU of live (slot, key), oldest first, across fields
         self._worker = None
         self._busy = False
         self.running_keys = ()           # the keys the worker is priming right now
@@ -150,6 +166,101 @@ class SlideEngine:
         # the badge. A run that primes anything says "prime".
         self.running_kind = "prime"
         self._remeasure_only = False
+
+    # ------------------------------------------------------------------ #
+    # field slots
+    # ------------------------------------------------------------------ #
+    def _slot_dict(self, slot=None):
+        s = self._slots.get(slot)
+        if s is None:
+            s = self._slots[slot] = {"primed": {}, "level_range": {}, "persistence_abs": {}}
+        return s
+
+    @property
+    def primed(self):
+        """The ACTIVE field's items -> Primed."""
+        return self._slot_dict(self._active)["primed"]
+
+    @primed.setter
+    def primed(self, value):
+        self._slot_dict(self._active)["primed"] = value
+
+    @property
+    def level_range(self):
+        return self._slot_dict(self._active)["level_range"]
+
+    @level_range.setter
+    def level_range(self, value):
+        self._slot_dict(self._active)["level_range"] = value
+
+    @property
+    def persistence_abs(self):
+        return self._slot_dict(self._active)["persistence_abs"]
+
+    @persistence_abs.setter
+    def persistence_abs(self, value):
+        self._slot_dict(self._active)["persistence_abs"] = value
+
+    @property
+    def slices(self):
+        """The records (kept under this name for the callers that ask
+        whether anything has been computed)."""
+        return self.records
+
+    @property
+    def active_field(self):
+        return self._active
+
+    def slot_of(self, profile):
+        return field_fingerprint_of(profile)
+
+    def use_field(self, profile, halo=0):
+        """Make `profile`'s field the active slot -- dropping nothing in any
+        other slot -- and, in it, release the pipes the profile cannot serve
+        (another field primed on demand under an edited chain, or an ROI
+        read with another halo). Returns how many live items it keeps. A
+        switch to a field with nothing primed simply shows nothing primed:
+        its items are primed when a Run (or a navigation to an ROI) asks."""
+        field = field_fingerprint_of(profile)
+        self._adopt(field)
+        self._active = field
+        slot = self._slot_dict(field)
+        kept = 0
+        for key in list(slot["primed"]):
+            p = slot["primed"][key]
+            ok = ((p.field is None or p.field == field)
+                  and (p.item.is_overview or p.halo == int(halo)))
+            if ok:
+                kept += int(p.live)
+                continue
+            p.release()
+            del slot["primed"][key]
+            self._order = [e for e in self._order if e != (field, key)]
+        self.commit_id += 1
+        return kept
+
+    def keep_field(self, profile, halo=0):
+        """Old name of ``use_field`` (it used to drop every other field)."""
+        return self.use_field(profile, halo)
+
+    def _adopt(self, field):
+        """Before any field is named, everything lives in the unnamed slot
+        (pins set by a caller, items installed by hand). The first field
+        named takes it over, so nothing primed or pinned so far is lost."""
+        if self._active is not None or None not in self._slots:
+            return
+        loose = self._slots.pop(None)
+        mine = self._slots.get(field)
+        if mine is None:
+            self._slots[field] = loose
+        else:
+            for k in ("primed", "level_range", "persistence_abs"):
+                for kk, vv in loose[k].items():
+                    mine[k].setdefault(kk, vv)
+        for p in self._slots[field]["primed"].values():
+            if p.slot is None:
+                p.slot = field
+        self._order = [(field if s is None else s, k) for s, k in self._order]
 
     # ------------------------------------------------------------------ #
     # slides
@@ -213,9 +324,11 @@ class SlideEngine:
                if tile.ndim == 3 else np.ascontiguousarray(tile, dtype=np.float32))
         return arr, geom, time.perf_counter() - t0
 
-    def prime_item(self, item: Item, profile, halo=0, quiet=True):
+    def prime_item(self, item: Item, profile, halo=0, quiet=True, slot=False):
         """Read the item, run both chains, prime it. Synchronous; the caller
-        decides which thread it is on."""
+        decides which thread it is on. It lands in the ACTIVE field slot
+        unless `slot` names another (``Run all tasks`` primes a task on
+        another workflow into that workflow's field)."""
         from msseg.mscoupon import mscoupon_py as ext
         from msseg.mscoupon.engine import ComputeEngine, build_timings_brief, prime
         import numpy as np
@@ -253,6 +366,13 @@ class SlideEngine:
         p.field = field_fingerprint_of(profile)
         p.measured = measure_fingerprint_of(profile)
         p.chains = {k: profile.get(k) for k in ("filters", "base_filters", "input")}
+        self._pipe_seq += 1
+        p.pipe_id = self._pipe_seq
+        if slot is False and self._active is None:
+            # The first prime names the active field.
+            self._adopt(p.field)
+            self._active = p.field
+        p.slot = self._active if slot is False else slot
         log(f"primed {item.key}: {lw}x{lh} @L{level} (halo {halo}) "
             f"read={1e3 * (t_read - t0):.0f}ms filters={1e3 * (t_filter - t_read):.0f}ms "
             f"prime={1e3 * (t_prime - t_filter):.0f}ms{build_timings_brief(pipe)} "
@@ -263,32 +383,35 @@ class SlideEngine:
     # ------------------------------------------------------------------ #
     # the measurement, separately from the field
     # ------------------------------------------------------------------ #
-    def can_remeasure(self, key):
-        p = self.primed.get(key)
+    def _get(self, key, slot=False):
+        return (self.primed if slot is False else self._slot_dict(slot)["primed"]).get(key)
+
+    def can_remeasure(self, key, slot=False):
+        p = self._get(key, slot)
         return p is not None and p.live and hasattr(p.pipe, "remeasure")
 
-    def measure_stale(self, key, profile):
+    def measure_stale(self, key, profile, slot=False):
         """True iff the item is live and its rows were measured under other
         statistics than `profile` asks for."""
-        p = self.primed.get(key)
+        p = self._get(key, slot)
         if p is None or not p.live or p.measured is None:
             return False
         return p.measured != measure_fingerprint_of(profile)
 
-    def needs_prime(self, key, profile, halo=None):
+    def needs_prime(self, key, profile, halo=None, slot=False):
         """True iff the item has no pipe that can serve `profile`: not primed,
         released, built under another field (or halo), or measured under other
         statistics on an extension that cannot re-measure."""
-        p = self.primed.get(key)
+        p = self._get(key, slot)
         if p is None or not p.live:
             return True
         if p.field is not None and p.field != field_fingerprint_of(profile):
             return True
         if halo is not None and not p.item.is_overview and p.halo != int(halo):
             return True
-        return self.measure_stale(key, profile) and not hasattr(p.pipe, "remeasure")
+        return self.measure_stale(key, profile, slot) and not hasattr(p.pipe, "remeasure")
 
-    def remeasure_item(self, key, profile, quiet=True):
+    def remeasure_item(self, key, profile, quiet=True, slot=False):
         """Rebuild the item's statistics under `profile` on its live pipe: the
         MSC, labels and arcs stay. The rasters are re-read and re-filtered
         (the pipe saw the padded raster and the colour planes, neither of
@@ -298,7 +421,7 @@ class SlideEngine:
         from msseg.mscoupon.engine import ComputeEngine, build_timings_brief
         import numpy as np
 
-        p = self.primed.get(key)
+        p = self._get(key, slot)
         if p is None or not p.live:
             raise RuntimeError(f"{key}: no live pipeline to re-measure")
         say = (lambda _m: None) if quiet else log
@@ -311,8 +434,9 @@ class SlideEngine:
         if rest:
             cur = ext.filter_chain(cur, json.dumps({"filters": rest}), method)
         filtered = np.ascontiguousarray(cur, dtype=np.float32)
+        # The base chain is a measurement: the NEW profile's, not the prime's.
         base, _norms = ComputeEngine._apply_base_chain(
-            arr, chains.get("base_filters") or [], ext, say, method)
+            arr, profile.get("base_filters") or [], ext, say, method)
         t_read = time.perf_counter()
         planes = arr if arr.ndim == 3 else None
         if planes is None:
@@ -321,59 +445,47 @@ class SlideEngine:
             p.pipe.remeasure(json.dumps(profile), base, filtered, planes)
         p.measured = measure_fingerprint_of(profile)
         p.channel_sources = {}
-        self.slices.pop(key, None)
-        self.touch(key)
+        if p.halo:
+            h, (lh, lw) = p.halo, p.shape
+            p.base = np.ascontiguousarray(base[h:h + lh, h:h + lw])
+        else:
+            p.base = base
+        self.touch(key, p.slot)
         log(f"re-measured {key}: read+filters={1e3 * (t_read - t0):.0f}ms "
             f"measure={1e3 * (time.perf_counter() - t_read):.0f}ms{build_timings_brief(p.pipe)}")
         return p
 
-    def keep_field(self, profile, halo=0):
-        """Keep the live pipes that `profile` can reuse -- same field, same
-        halo -- and drop everything else, like ``reset`` does. Records go
-        either way (a new generation). Returns how many items were kept; the
-        per-level pins stay only if something was kept."""
-        field = field_fingerprint_of(profile)
-        kept = 0
-        for key in list(self.primed):
-            p = self.primed[key]
-            keep = (p.live and p.field == field
-                    and (p.item.is_overview or p.halo == int(halo)))
-            if keep:
-                kept += 1
-                continue
-            p.release()
-            del self.primed[key]
-            if key in self._order:
-                self._order.remove(key)
-        self.slices.clear()
-        if not kept:
-            self.level_range = {}
-            self.persistence_abs = {}
-        self.commit_id += 1
-        return kept
-
     def _install(self, key, p):
-        old = self.primed.get(key)
+        slot = self._slot_dict(p.slot)["primed"]
+        old = slot.get(key)
         if old is not None:
             old.release()
-        self.primed[key] = p
-        if key in self._order:
-            self._order.remove(key)
-        self._order.append(key)
+        slot[key] = p
+        entry = (p.slot, key)
+        if entry in self._order:
+            self._order.remove(entry)
+        self._order.append(entry)
         self._evict()
 
-    def touch(self, key):
-        if key in self._order:
-            self._order.remove(key)
-            self._order.append(key)
+    def touch(self, key, slot=False):
+        entry = (self._active if slot is False else slot, key)
+        if entry in self._order:
+            self._order.remove(entry)
+            self._order.append(entry)
 
     def _evict(self):
+        """One live budget across every field: a pipe is a pipe, whichever
+        task's workflow primed it. A released item keeps its Primed (and so
+        its records); only interactive persistence needs a re-prime."""
         budget = live_budget()
-        live = [k for k in self._order if self.primed.get(k) is not None
-                and self.primed[k].live]
-        while len(live) > budget:
-            key = live.pop(0)
-            p = self.primed.get(key)
+
+        def live(entry):
+            p = self._slot_dict(entry[0])["primed"].get(entry[1])
+            return p is not None and p.live
+        self._order = [e for e in self._order if live(e)]
+        while len(self._order) > budget:
+            slot, key = self._order.pop(0)
+            p = self._slot_dict(slot)["primed"].get(key)
             if p is not None:
                 log(f"releasing pipeline for {key} (over the {budget}-item budget)")
                 p.release()
@@ -401,10 +513,11 @@ class SlideEngine:
         absolute = msc.get("persistence_absolute")
         if absolute is not None:
             return float(absolute)
+        pins = self._slot_dict(p.slot)
         level = int(p.level)
-        ref = self.level_range.get(level)
+        ref = pins["level_range"].get(level)
         if ref is None:
-            ref = self.level_range[level] = float(p.value_range)
+            ref = pins["level_range"][level] = float(p.value_range)
             log(f"level {level}: persistence % now resolves against "
                 f"{p.item.key}'s range {ref:.6g} -- every item at this level shares it")
         # Derived from the CURRENT percentage every time. The first version of
@@ -412,32 +525,77 @@ class SlideEngine:
         # and also made the persistence slider do nothing at all.
         pct = float(msc.get("persistence_percent", 10.0) or 0.0)
         hit = ref * pct / 100.0
-        self.persistence_abs[level] = hit
+        pins["persistence_abs"][level] = hit
         return hit
 
+    def _peek_persistence(self, p, msc):
+        """``resolve_persistence`` without writing a pin (a lookup must not
+        pin a level on an item nobody computed)."""
+        absolute = msc.get("persistence_absolute")
+        if absolute is not None:
+            return float(absolute)
+        ref = self._slot_dict(p.slot)["level_range"].get(int(p.level), float(p.value_range))
+        return float(ref) * float(msc.get("persistence_percent", 10.0) or 0.0) / 100.0
+
+    # ------------------------------------------------------------------ #
+    # records by identity
+    # ------------------------------------------------------------------ #
+    def set_params(self, profile):
+        """The parameters `record()` answers for: the measurement the rows
+        must be under and the persistence the labels are at. Cheap; the
+        callers that change either (a threshold, a statistics edit, a switch,
+        a Run) call it, and ``ensure_record`` does too."""
+        self._params = {"meas": measure_fingerprint_of(profile),
+                        "msc": dict((profile or {}).get("msc") or {})}
+
+    @property
+    def has_params(self):
+        return self._params is not None
+
+    @property
+    def current_measure(self):
+        return self._params["meas"] if self._params else None
+
+    def record_id(self, key, p, persistence):
+        """The interned id of (item, prime, measurement, persistence)."""
+        meas = self._params["meas"] if self._params else None
+        return self._ids.id_of((key, int(p.pipe_id), meas, float(persistence)))
+
     def record(self, key):
-        """The item's record at the current commit, or None. Never computes."""
-        rec = self.slices.get(key)
-        return None if rec is None or rec.get("commit") != self.commit_id else rec
+        """The item's record for the current parameters, or None. Never
+        computes. A released pipe still answers: its records outlive it."""
+        if self._params is None:
+            return None
+        p = self.primed.get(key)
+        if p is None:
+            return None
+        rid = self.record_id(key, p, self._peek_persistence(p, self._params["msc"]))
+        return self.records.get(key, rid)
 
     def ensure_record(self, key, profile):
         """The item's record, computing it synchronously if needed. None when
         the item is not primed (a released pipeline must be re-primed first)."""
         import numpy as np
-        rec = self.record(key)
+        self.set_params(profile)
+        p = self.primed.get(key)
+        if p is None:
+            return None
+        pers = self.resolve_persistence(p, profile)
+        rid = self.record_id(key, p, pers)
+        rec = self.records.get(key, rid)
         if rec is not None:
             return rec
-        p = self.primed.get(key)
-        if p is None or not p.live:
+        if not p.live:
             return None
         if self.measure_stale(key, profile):
             if not hasattr(p.pipe, "remeasure"):
                 return None            # the caller re-primes under the new spec
             self.remeasure_item(key, profile)
-        self.touch(key)
+        self.touch(key, p.slot)
         t0 = time.perf_counter()
-        p.pipe.select_persistence(self.resolve_persistence(p, profile))
-        labels = p.pipe.labels()
+        p.pipe.select_persistence(pers)
+        shared = self.records.shared(key, (p.pipe_id, pers))
+        labels = None if shared is not None else p.pipe.labels()
         names, values = p.pipe.feature_table()
 
         # The pipeline saw the PADDED raster, so its coordinates are relative to
@@ -445,9 +603,12 @@ class SlideEngine:
         pad_origin = (p.origin[0] - p.halo * p.scale, p.origin[1] - p.halo * p.scale)
         values = self._to_slide_coords(values, list(names), pad_origin, p.scale, np)
 
-        if p.halo:
+        if shared is not None:
+            labels = shared[0]
+        elif p.halo:
             h, (lh, lw) = p.halo, p.shape
             labels = np.ascontiguousarray(labels[h:h + lh, h:h + lw])
+        if p.halo:
             # Rows for regions that live entirely in the halo describe tissue
             # outside the item: nothing can select or annotate them, and they
             # would train a model on pixels the user never saw. Drop them.
@@ -458,18 +619,23 @@ class SlideEngine:
             ids = values[:, list(names).index("feature_id")].astype(np.int64)
             values = values[np.isin(ids, keep_ids)]
         table = FeatureTable(list(names), values)
-        try:
-            a, b, saddle = p.pipe.region_arcs()
-            arcs = ({"a": a, "b": b, "saddle": saddle, "source": "msc"}
-                    if a is not None and len(a) else None)
-        except Exception:
-            arcs = None
-        rec = {"commit": self.commit_id, "labels": labels, "stats": table, "arcs": arcs,
+        if shared is not None:
+            arcs = shared[1]
+        else:
+            try:
+                a, b, saddle = p.pipe.region_arcs()
+                arcs = ({"a": a, "b": b, "saddle": saddle, "source": "msc"}
+                        if a is not None and len(a) else None)
+            except Exception:
+                arcs = None
+            # One decomposition, whatever it is measured by: a second
+            # statistics spec reuses these rather than holding its own copy.
+            self.records.share(key, (p.pipe_id, pers), (labels, arcs))
+        rec = {"commit": rid, "labels": labels, "stats": table, "arcs": arcs,
                "kept": None, "cc": None, "origin": p.origin, "scale": p.scale,
                "level": p.level, "n_ids": int(labels.max()) + 1 if labels.size else 1}
-        self.slices[key] = rec
-        log(f"{key}: {table.n_rows} regions at persistence "
-            f"{self.resolve_persistence(p, profile):.6g} "
+        self.records.put(key, rid, rec)
+        log(f"{key}: {table.n_rows} regions at persistence {pers:.6g} "
             f"({1e3 * (time.perf_counter() - t0):.0f}ms)")
         return rec
 
@@ -514,20 +680,24 @@ class SlideEngine:
         Not while the worker runs: it may be priming that very key."""
         if self._busy:
             raise RuntimeError("cannot forget an item while a prime is running")
-        p = self.primed.pop(key, None)
-        if p is not None:
-            p.release()
-        if key in self._order:
-            self._order.remove(key)
-        self.slices.pop(key, None)
-        return p is not None
+        found = False
+        for slot, s in self._slots.items():
+            p = s["primed"].pop(key, None)
+            if p is not None:
+                p.release()
+                found = True
+        self._order = [e for e in self._order if e[1] != key]
+        self.records.drop(key)
+        return found
 
     def forget_slide(self, slide):
         """Drop every item of a slide, then the slide itself: its open
         pyramid is closed and its path forgotten. Returns the item count."""
         slide = str(slide)
-        keys = [k for k in set(self.primed) | set(self.slices)
-                if (parse_key(k) or Item("", 0)).slide == slide]
+        every = set(self.records.items())
+        for s in self._slots.values():
+            every |= set(s["primed"])
+        keys = [k for k in every if (parse_key(k) or Item("", 0)).slide == slide]
         for k in keys:
             self.forget(k)
         src = self.sources.pop(slide, None)
@@ -542,22 +712,24 @@ class SlideEngine:
     # ------------------------------------------------------------------ #
     # generations
     # ------------------------------------------------------------------ #
-    def commit_selection(self):
-        """A new parameter generation: records fall stale by commit, and the
-        stale ones are dropped so a Rerun does not stack a second copy."""
+    def commit_selection(self, profile=None):
+        """A new parameter generation. Nothing is dropped any more: a record
+        is found by the id of what it is a function of, so the parameters
+        (``set_params``, done here when `profile` is given) decide which
+        record is current, and going back to earlier ones finds theirs."""
         self.commit_id += 1
-        self.slices = {k: v for k, v in self.slices.items()
-                       if v.get("commit") == self.commit_id}
+        if profile is not None:
+            self.set_params(profile)
 
     def reset(self):
-        """Drop everything primed (the parameters that produced it are gone)."""
-        for p in self.primed.values():
-            p.release()
-        self.primed.clear()
-        self.slices.clear()
+        """Drop everything primed, in every field (the session is being
+        replaced, or the level changed so every key is different)."""
+        for s in self._slots.values():
+            for p in s["primed"].values():
+                p.release()
+        self._slots = {}
+        self.records.clear()
         self._order = []
-        self.level_range = {}
-        self.persistence_abs = {}
         self.commit_id += 1
 
     # ------------------------------------------------------------------ #
@@ -609,6 +781,11 @@ class SlideEngine:
         is re-measured whatever its field, a dead one skipped -- which is what
         navigation wants while the chains are being edited (a preview is not
         a Run).
+
+        An entry of `items` may also be an ``(item, profile)`` pair: that item
+        is primed under ITS profile, into that profile's field slot, with that
+        field's pins -- ``Run all tasks`` over tasks on other workflows. Only
+        the active field's pins are reset by `reset_pins`.
         """
         if self._busy:
             return False
@@ -616,34 +793,54 @@ class SlideEngine:
         if reset_pins:
             self.level_range = {}
             self.persistence_abs = {}
-        self.running_keys = tuple(it.key for it in items)
+        jobs = self._jobs(items, profile)
+        self.running_keys = tuple(j[0].key for j in jobs)
         self._incremental = bool(incremental)
         self._remeasure_only = bool(remeasure_only)
-        self.running_kind = ("measure" if remeasure_only or (items and all(
-            not self.needs_prime(it.key, profile, halo) for it in items)) else "prime")
+        self.running_kind = ("measure" if remeasure_only or (jobs and all(
+            not self.needs_prime(it.key, prof, halo, slot) for it, prof, slot in jobs))
+            else "prime")
         self._worker = threading.Thread(target=self._run_worker, name="mspath-prime",
-                                        args=(list(items), dict(profile), int(halo)),
+                                        args=(jobs, dict(profile), int(halo)),
                                         daemon=True)
         self._worker.start()
         return True
 
+    def _jobs(self, items, profile):
+        """(item, profile, slot) per entry; `slot` False = the active field."""
+        out = []
+        for entry in items:
+            if isinstance(entry, Item):             # (Item is a namedtuple itself)
+                out.append((entry, profile, False))
+            elif len(entry) == 3:
+                out.append(entry)                   # already a job
+            elif len(entry) == 2:
+                item, prof = entry
+                slot = field_fingerprint_of(prof)
+                out.append((item, dict(prof), False if slot == self._active else slot))
+        return out
+
     def _run_worker(self, items, profile, halo):
-        total = len(items)
+        jobs = self._jobs(items, profile)
+        total = len(jobs)
         failed = []
-        for n, item in enumerate(items, start=1):
+        for n, (item, prof, slot) in enumerate(jobs, start=1):
+            kw = {} if slot is False else {"slot": slot}
             try:
                 # A live pipe built under this field is kept: its rows are
                 # re-measured if the statistics moved, else it is left alone.
                 # Only what cannot be served is primed.
-                if self._remeasure_only or not self.needs_prime(item.key, profile, halo):
-                    if self.measure_stale(item.key, profile) and self.can_remeasure(item.key):
-                        self.remeasure_item(item.key, profile)
+                if ((self._remeasure_only and slot is False)
+                        or not self.needs_prime(item.key, prof, halo, **kw)):
+                    if (self.measure_stale(item.key, prof, **kw)
+                            and self.can_remeasure(item.key, **kw)):
+                        self.remeasure_item(item.key, prof, **kw)
                     self.work_q.put(("item_done", item.key))
                     self.work_q.put(("progress", (n, total)))
                     continue
                 # The overview is a whole level: there is nothing beyond its
                 # edges to borrow, so it takes no halo whatever the profile says.
-                self.prime_item(item, profile, halo=0 if item.is_overview else halo)
+                self.prime_item(item, prof, halo=0 if item.is_overview else halo, **kw)
                 self.work_q.put(("item_done", item.key))
             except Exception as exc:
                 # One unreadable slide must not take the rest of the run with

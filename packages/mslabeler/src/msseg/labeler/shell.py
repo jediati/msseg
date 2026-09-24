@@ -287,6 +287,13 @@ class ViewerShell:
         """Make the item on screen current under the panel's statistics
         without re-priming it (the app's; default nothing)."""
 
+    def _measurement_moved(self):
+        """True when the panel's parameters differ from what is primed in
+        the measurement ONLY (the base chain, the statistics, the sample
+        radius) -- an edit that costs a re-measure, not a Run. The app's;
+        default False."""
+        return False
+
     def _settle_controls(self):
         try:
             self.run_btn.config(state="normal")

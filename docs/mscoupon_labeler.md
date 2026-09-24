@@ -38,7 +38,7 @@ things you edit.
 | **left** | the workflow (compute-profile) picker, the **Tasks** list, the session browser (folders, files, sequences) and Run |
 | **middle** | the slice canvas, hover readout, slice navigation, image/overlay/alpha controls and the persistence entry |
 | **Processing** (default tab) | the profile tools (New/Dup/Rename/Delete, Save/Load profile) and the profile being edited, as one column of collapsible groups: colour input, filter chain, base channel, MSC parameters |
-| **Features** | the statistics every region is measured by -- the channels, reductions, seeding extremum and its sample radius, histograms -- i.e. the classifier's input columns (see "Features: an edit re-measures" below) |
+| **Features** | what every region is measured by: the base channel (the base chain, e.g. a normalize) and the statistics -- channels, reductions, seeding extremum and its sample radius, histograms -- i.e. the classifier's input columns (see "Features: an edit re-measures" below) |
 | **Annotation** | classes, tools, the Magic rows, the per-class interaction lists, Save/Load annotations, and the classifier (Train/Classify, the model strip, the confusion matrix, exports, Save/Load classifier) |
 | **Model** | the classifier kind, a read-only description of its architecture, the **Edge model** panel (the `-> edges` kinds) and the **Optimize network** search (trials, time limit, seed, feature-subset toggle, progress line) |
 | **Analysis** | **Predictions vs annotations** (the regions behind a confusion cell; double-click a row to go there) and the **Size sweep** report; a home for plots later |
@@ -135,8 +135,17 @@ whose statistics moved. What a re-measure costs is a prime minus its MSC: on a
 2048² item, 0.2 s for base-only and 0.9 s for twelve derived channels (the
 channel bank is most of that), against the MSC's own 0.5-4 s. Predictions
 still fall stale -- the rows changed -- and a model trained on other columns
-is refused by the compat gate as before. The base chain (`base_filters`) is
-still on the field side: the raw slice is not kept, so editing it needs a Run.
+is refused by the compat gate as before. The base chain (`base_filters`) is a
+measurement too -- the MSC never reads it -- so it lives on the Features tab
+and an edit re-measures: the slice file is re-read and the base raster
+rebuilt, then the rows.
+
+**What a switch costs.** A record's commit is the identity of the parameters
+it was made under, and a few records per slice are kept
+(`MSSEG_RECORDS_PER_ITEM`, default 4). Switching to a task on the same field
+and back therefore finds the first task's records -- and its predictions --
+again, with no re-measure. A task on another field still needs a Run in the
+coupon labeler: one primed stack is kept at a time.
 
 Three link-labels say what is in effect: the Run section is headed by the
 **selected workflow** as two compact chains --

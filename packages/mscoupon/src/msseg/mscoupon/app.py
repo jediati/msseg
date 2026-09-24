@@ -1923,6 +1923,10 @@ class MscouponApp(ViewerShell):
         finished assembly (the shell handles progress and errors)."""
         kind = ev[0]
         if kind == "primed":
+            # A new stack: its first commit is the panel's parameters, so a
+            # Rerun of the same parameters later finds these records.
+            self.engine.commit_selection(self._selection_snapshot())
+            self._measured_fp = fingerprints.measure_fingerprint_of(self._params_json(cores=1))
             self.run_btn.config(state="normal")
             self._set_load_enabled(True)
             self._chan_cache.clear()      # derived rasters belong to the old run
@@ -2056,13 +2060,24 @@ class MscouponApp(ViewerShell):
         self._selection_dirty = False
         if getattr(self, "rerun_btn", None) is not None:
             self.rerun_btn.config(state="disabled")
-        # Bumps the committed parameter generation and prunes the now-stale
-        # per-slice records (they are keyed by commit).
-        self.engine.commit_selection()
+        # The commit is the identity of these parameters (record_keys.py): new
+        # ones miss the cached records, parameters seen before -- a task
+        # switched back to -- find theirs, predictions included.
+        self.engine.commit_selection(self._selection_snapshot())
         cur = self._current()
         if cur is not None:
             self._request_assembly(cur[0])
         self._refresh_render()
+
+    def _selection_snapshot(self):
+        """What a slice record is a function of besides the primed stack:
+        persistence, the selection chain, the pixel trim and the measurement
+        (``_assembly_params`` without the sequence name)."""
+        if not self.subsequences:
+            return {}
+        snap = dict(self._assembly_params(0, "slice", 0))
+        snap.pop("name", None)
+        return snap
 
     # -- assembly (off the UI thread; single-flight over the stateful pipes) --- #
     #
@@ -2489,12 +2504,21 @@ class MscouponApp(ViewerShell):
         return (getattr(self, "_primed_fingerprint", None)
                 == fingerprints.field_fingerprint_of(session.profile_params_json(profile)))
 
+    def _measurement_moved(self):
+        if not self.primed or self.engine.run_active:
+            return False
+        doc = self._params_json(cores=1)
+        if fingerprints.field_fingerprint_of(doc) != getattr(self, "_primed_fingerprint", None):
+            return False
+        return fingerprints.measure_fingerprint_of(doc) != getattr(self, "_measured_fp", None)
+
     def _remeasure_current(self):
         """A new generation for the panel's statistics and selection, and the
         slice on screen re-assembled (its rows re-measured on the worker when
         the statistics moved). Other slices follow when they are needed."""
         if not self.primed:
             return
+        self._measured_fp = fingerprints.measure_fingerprint_of(self._params_json(cores=1))
         self._chan_cache.clear()
         # The primed stack follows the panel's statistics from here on, so a
         # statistics-only difference is not a stale preview.

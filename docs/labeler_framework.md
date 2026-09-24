@@ -152,8 +152,22 @@ extremum's position and value columns. The magic fill, `TrainingSetBuilder`,
 | `_stream_ready(key)` / `CLASSIFY_ON_ARRIVAL` / `_classify_current()` | True / False / -- | the fast path: model operations never prime (mspath skips uncomputed items and says how many); `C` / `R` classify the item on screen, *Classify all* the rest; mspath classifies an item when it is selected |
 | `_prime_items(scope)` (mspath) | every listed item | the labeler's **Run task** (active task's items) / **Run all tasks** (union over tasks on the active workflow) |
 | `_keep_compute_for(profile)` / `_after_profile_kept()` / `_remeasure_current()` | False / calls `_remeasure_current` / no-op | the field / measurement split: `_switch_profile` resets only when `_keep_compute_for` says the new profile's FIELD cannot reuse what is primed (coupon: the stack's field fingerprint; mspath: `SlideEngine.keep_field`), and otherwise re-measures the item on screen. `AnnotationShell._on_stat_spec_change` settles and calls `_remeasure_current` (coupon: `_rerun_selection`; mspath: a new commit + `_request_item`, which re-measures on the worker with `remeasure_only`) |
-| `_processing_parent("stats")` | the Processing column | the labeler's **Features** tab (`feat_col`; `_FEATURE_SECTIONS`) -- the statistics are what a region is measured by, and an edit there costs a re-measure, not a Run |
+| `_processing_parent("stats" / "base")` | the Processing column | the labeler's **Features** tab (`feat_col`; `_FEATURE_SECTIONS`) -- the base channel and the statistics are what a region is measured by, and an edit there costs a re-measure, not a Run |
+| `_measurement_moved()` | False | True when the panel differs from what is primed in the measurement ONLY; `AnnotationShell._preview_edit_settled` then calls `_remeasure_current` (coupon: primed field fingerprint + `_measured_fp`; mspath: the engine's active field + `current_measure`) |
 | `ItemCatalogue.binding_of(key)` / `rebase(key)` | (protocol) | coupon `(key, None)` / None; mspath `(slide, rect)` / `(slide, level, scale)` for an item key -- and `index_of` resolves a bare slide key to the slide's first row |
+
+**A record's `commit` is its identity** (`record_keys.py`): the interned id
+of what the record is a function of -- mspath `(item, prime, measurement,
+persistence)`, coupon `(stack generation, parameter snapshot)`. Every cache
+compares `entry[0] == rec["commit"]` and a `LabelLayer`'s `rev` is the same
+int, so equal commits mean equal content and returning to earlier parameters
+(a task switched back to) finds the earlier records and predictions. An
+engine never builds a record id from a parameter hash alone: region ids are
+not stable from one prime to the next. `RegionProvider.commit` is only an
+informational generation. mspath's `SlideEngine` keeps one slot per field
+(`use_field`; `primed` / pins are the active slot's), one LRU across all of
+them, and `start_run` accepts `(item, profile)` jobs that prime into that
+profile's slot.
 
 **Tasks** (`task.py`, `AnnotationShell`): a session holds several named
 detectors and one is active. Every attribute the mixins, the tools and the

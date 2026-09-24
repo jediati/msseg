@@ -164,7 +164,8 @@ def run_selftest():
 
     # -- the label layer lives in slide coordinates ---------------------- #
     layer = app.regions.label_layer(item.key)
-    assert layer is not None and layer.rev == app.engine.commit_id
+    # A layer's rev is its record's identity (record_keys.py), not a generation.
+    assert layer is not None and layer.rev == rec["commit"]
     assert layer.shape == tuple(src.level_shape(0)), (layer.shape, src.level_shape(0))
     assert layer.full() is None or scale == 1.0, "a coarse layer must not claim a full raster"
     crop = layer.crop(0, 0, 0, 32, 32)
@@ -492,7 +493,7 @@ def run_selftest():
     app._goto_slice(app.flat_slices.index((0, 1)))
     settle()
     assert app._current() == (0, 1)
-    app.engine.commit_selection()                 # its record is now stale
+    app.engine.records.drop(roi.key)              # its record is gone
     assert app.engine.record(roi.key) is None
     app._handle_compute_event(("primed",))
     assert app._current() == (0, 1), "the primed event moved the view back to the overview"
@@ -1115,8 +1116,68 @@ def run_labeler_selftest():
         rec2 = app.engine.record(kk) or app.engine.ensure_record(kk, app._profile_for_compute())
         assert "mean_blur_s2" not in rec2["stats"].names
         assert np.array_equal(rec2["labels"], labels0) and primes == []
+        # Task switches keep what a task computed. A (this task, on "stats
+        # only") holds a prediction on rec2; B, a copy of A, works the same
+        # items on the blur workflow. Back in A the record is A's again --
+        # the same id, so A's prediction is valid -- with no re-measure.
+        tA = app._task
+        fake_final = np.ones(int(rec2["n_ids"]), np.int64)            # every region: class 1
+        app._pred[kk] = (rec2["commit"], fake_final, None)
+        tB = app._task_duplicate("B")
+        assert tB is not None and app._task is tB
+        app._switch_profile(len(app.profiles) - 2)             # B on the blur workflow
+        _settle(app)
+        recB = app.engine.record(kk) or app.engine.ensure_record(kk, app._profile_for_compute())
+        assert "mean_blur_s2" in recB["stats"].names and recB["commit"] == rec1["commit"], \
+            "the blur record was found again, not re-measured into a new one"
+        measures = []
+        orig_rm = app.engine.remeasure_item
+        app.engine.remeasure_item = lambda *a, **k: measures.append(1) or orig_rm(*a, **k)
+        assert app._activate_task(tA)
+        _settle(app)
+        assert app.engine.record(kk)["commit"] == rec2["commit"] == tA.caches.pred[kk][0], \
+            "back in A, A's record and so A's prediction are current again"
+        assert measures == [] and primes == []
+        app.engine.remeasure_item = orig_rm
         app.engine.prime_item, app._handle_event = orig_prime, orig_handle
-        remeasured = "statistics re-measured without a prime, stats-only switch keeps pipes"
+        # Run all tasks primes a task on ANOTHER field under its own workflow,
+        # into its own slot; switching to it then needs no prime, and A's pipe
+        # is still there when A comes back.
+        from msseg.mscoupon.fingerprints import field_fingerprint_of as _ffp
+        coarse = _json.loads(_json.dumps(app.profiles[app._profile_index(tA.workflow)]))
+        coarse["name"] = "coarse"
+        coarse["filters"] = list(coarse.get("filters") or []) + [
+            {"operation": "blur", "params": {"sigma": 3.0}}]
+        app.profiles.append(coarse)
+        tC = app._task_duplicate("C")
+        app._switch_profile(len(app.profiles) - 1)           # C on "coarse": no prime
+        _settle(app)
+        assert app.engine.primed.get(kk) is None, "a new field starts empty -- and unprimed"
+        assert app._activate_task(tA)
+        _settle(app)
+        assert app.engine.primed.get(kk) is live0, "A's field slot kept its pipe"
+        jobs = app._prime_items("all")
+        assert any(len(j) == 2 and isinstance(j[1], dict) and j[0].key == kk          # (Item, params)
+                   and j[1]["filters"][-1]["params"]
+                   == {"sigma": 3.0} for j in jobs), jobs
+        app._run("all")
+        _settle(app)
+        assert app._activate_task(tC)
+        _settle(app)
+        pC = app.engine.primed.get(kk)
+        coarse_doc = app._profile_for_compute()
+        assert pC is not None and pC.field == _ffp(coarse_doc), "C's item was primed by Run all"
+        n_primes = []
+        app.engine.prime_item = lambda *a, **k: n_primes.append(1) or orig_prime(*a, **k)
+        recC = app.engine.record(kk) or app.engine.ensure_record(kk, coarse_doc)
+        assert recC is not None and n_primes == []
+        assert app._activate_task(tA)
+        _settle(app)
+        assert app.engine.primed.get(kk) is live0 and live0.live and n_primes == []
+        app.engine.prime_item = orig_prime
+        remeasured = ("statistics re-measured without a prime, stats-only switch keeps "
+                      "pipes, a task switch back finds the task's record and prediction, "
+                      "Run all tasks primes another field into its own slot")
     else:
         remeasured = "re-measure SKIPPED (extension predates it)"
 

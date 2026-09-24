@@ -150,13 +150,24 @@ def test_reset_forgets_the_pins():
 # --------------------------------------------------------------------------- #
 # generations and the live-pipeline budget
 # --------------------------------------------------------------------------- #
-def test_records_fall_stale_on_a_commit():
+def test_records_are_found_by_what_they_are_a_function_of():
+    """A record's id is its content key: a new generation alone drops
+    nothing, other parameters miss, and going back finds the old record."""
     eng = E.SlideEngine()
-    eng.slices["k"] = {"commit": eng.commit_id, "labels": None}
-    assert eng.record("k") is not None
+    p = primed(level=4, value_range=2.0)
+    eng.primed[p.item.key] = p
+    eng.set_params(profile(10.0))
+    rid = eng.record_id(p.item.key, p, eng._peek_persistence(p, {"persistence_percent": 10.0}))
+    eng.records.put(p.item.key, rid, {"commit": rid, "labels": None})
+    assert eng.record(p.item.key)["commit"] == rid
     eng.commit_selection()
-    assert eng.record("k") is None
-    assert "k" not in eng.slices, "a stale record must not be kept as well as missed"
+    assert eng.record(p.item.key) is not None, "a generation alone changes nothing"
+    eng.commit_selection(profile(20.0))
+    assert eng.record(p.item.key) is None, "another persistence is another record"
+    eng.commit_selection(profile(10.0))
+    assert eng.record(p.item.key)["commit"] == rid, "and going back finds it"
+    p.pipe_id += 1
+    assert eng.record(p.item.key) is None, "a re-prime never aliases an older record"
 
 
 def test_the_live_budget_releases_the_oldest_pipelines(monkeypatch):
@@ -301,21 +312,72 @@ def test_a_statistics_change_remeasures_a_live_item(synthetic, monkeypatch):
     assert np.allclose(rec_f["stats"].values, rec_b["stats"].values, equal_nan=True)
 
 
-def test_keep_field_keeps_only_what_the_profile_can_reuse(synthetic):
+def test_use_field_keeps_every_field_and_its_pins(synthetic):
     eng, item = _engine_on(synthetic)
     a = _slide_profile()
     eng.prime_item(item, a, halo=8)
-    eng.level_range = {0: 1.0}
+    eng.level_range[0] = 1.0
     stats_only = _slide_profile(("base", "color"))
-    assert eng.keep_field(stats_only, halo=8) == 1
+    assert eng.use_field(stats_only, halo=8) == 1, "same field: the same slot"
     assert eng.primed[item.key].live and eng.level_range == {0: 1.0}
-    assert eng.keep_field(a, halo=4) == 0, "a different halo is a different read"
-    assert item.key not in eng.primed and eng.level_range == {}
+    assert eng.use_field(a, halo=4) == 0, "a different halo is a different read"
+    assert item.key not in eng.primed and eng.level_range == {0: 1.0}
 
     eng.prime_item(item, a, halo=8)
+    first = eng.primed[item.key]
     other_chain = _slide_profile(filters=[{"operation": "color", "params": {"method": "luminance"}}])
-    assert eng.keep_field(other_chain, halo=8) == 0
-    assert not eng.primed
+    assert eng.use_field(other_chain, halo=8) == 0
+    assert not eng.primed and eng.level_range == {}, "another field: its own slot and pins"
+    eng.prime_item(item, other_chain, halo=8)
+    eng.ensure_record(item.key, other_chain)
+    assert eng.level_range[0] == eng.primed[item.key].value_range
+    assert eng.use_field(a, halo=8) == 1, "switching back finds the first field's pipe"
+    assert eng.primed[item.key] is first and first.live and eng.level_range == {0: 1.0}
+
+
+def test_records_by_identity_on_a_real_prime(synthetic, monkeypatch):
+    eng, item = _engine_on(synthetic)
+    a = _slide_profile()
+    b = _slide_profile(("base", {"kind": "blur", "sigmas": [2.0], "source": "color"}))
+    eng.prime_item(item, a, halo=8)
+    rec_a = eng.ensure_record(item.key, a)
+    rec_b = eng.ensure_record(item.key, b)
+    assert rec_b["commit"] != rec_a["commit"]
+    assert rec_b["labels"] is rec_a["labels"], "one decomposition, two measurements"
+    calls = []
+    monkeypatch.setattr(eng, "remeasure_item", lambda *x, **k: calls.append(1))
+    again = eng.ensure_record(item.key, a)
+    assert again is rec_a and calls == [], "back to a: its record, no re-measure"
+    eng.set_params(b)
+    assert eng.record(item.key) is rec_b
+    # a re-prime is a new decomposition: new ids
+    monkeypatch.undo()
+    eng.prime_item(item, a, halo=8)
+    assert eng.ensure_record(item.key, a)["commit"] != rec_a["commit"]
+
+
+def test_the_record_cache_is_bounded(synthetic, monkeypatch):
+    monkeypatch.setenv("MSSEG_RECORDS_PER_ITEM", "2")
+    eng, item = _engine_on(synthetic)
+    eng.prime_item(item, _slide_profile(pct=2.0), halo=8)
+    ids = [eng.ensure_record(item.key, _slide_profile(pct=pct))["commit"]
+           for pct in (2.0, 4.0, 6.0)]
+    assert len(set(ids)) == 3 and eng.records.count(item.key) == 2
+    eng.set_params(_slide_profile(pct=2.0))
+    assert eng.record(item.key) is None, "the oldest went first"
+
+
+def test_run_jobs_prime_into_their_own_field(synthetic):
+    eng, item = _engine_on(synthetic)
+    a = _slide_profile()
+    other = _slide_profile(filters=[{"operation": "color", "params": {"method": "luminance"}}])
+    eng.use_field(a, halo=8)
+    eng._run_worker([item, (item, other)], a, 8)
+    [ev for ev in eng.poll()]
+    assert eng.primed[item.key].field == E.field_fingerprint_of(a)
+    eng.use_field(other, halo=8)
+    assert eng.primed[item.key].field == E.field_fingerprint_of(other)
+    assert eng.primed[item.key].pipe_id != eng._slot_dict(E.field_fingerprint_of(a))["primed"][item.key].pipe_id
 
 
 def test_remeasure_reads_the_chains_the_pipe_was_primed_with(synthetic, monkeypatch):
@@ -355,3 +417,25 @@ def test_a_remeasure_only_run_never_primes(monkeypatch):
     calls.clear()
     eng._run_worker([dead], {}, 0)
     assert calls == [], "a released item is skipped, not primed"
+
+
+def test_a_base_chain_change_is_a_remeasure(synthetic, monkeypatch):
+    eng, item = _engine_on(synthetic)
+    a = _slide_profile()
+    eng.prime_item(item, a, halo=8)
+    rec_a = eng.ensure_record(item.key, a)
+    base0 = np.array(eng.primed[item.key].base, copy=True)
+    b = _slide_profile()
+    b["base_filters"] = [{"operation": "color", "params": {"method": "luminance"}},
+                         {"operation": "blur", "params": {"sigma": 3.0}}]
+    assert not eng.needs_prime(item.key, b, 8), "the base chain is not the field"
+    assert eng.measure_stale(item.key, b)
+    primes = []
+    orig = E.SlideEngine.prime_item
+    monkeypatch.setattr(E.SlideEngine, "prime_item",
+                        lambda self, *x, **k: primes.append(1) or orig(self, *x, **k))
+    rec_b = eng.ensure_record(item.key, b)
+    assert primes == [] and rec_b["labels"] is rec_a["labels"]
+    col = rec_a["stats"].names.index("mean_base")
+    assert not np.allclose(rec_a["stats"].values[:, col], rec_b["stats"].values[:, col])
+    assert not np.array_equal(eng.primed[item.key].base, base0)

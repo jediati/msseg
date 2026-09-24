@@ -46,7 +46,7 @@ from . import propose
 from msseg.labeler.widgets import attach_tooltip
 
 from . import places
-from .app import MAX_ROI_PX, MIN_ROI_SIDE, MsPathApp
+from .app import MAX_ROI_PX, MIN_ROI_SIDE, SLIDE_PLANES, MsPathApp
 from .items import roi as roi_item
 from .common import log
 
@@ -516,21 +516,43 @@ class LabelerApp(AnnotationShell, MsPathApp):
                                         int(place["w"]), int(place["h"])))
         return out
 
+    def _workflow_params(self, name):
+        """The params document a task on workflow `name` primes with (the
+        stored profile, composed the way ``_profile_for_compute`` composes the
+        panel's), or None when no such profile exists."""
+        idx = self._profile_index(name)
+        if idx is None:
+            return None
+        return json.loads(coupon_session.profile_params_json(self.profiles[idx], 1,
+                                                             SLIDE_PLANES))
+
     def _prime_items(self, scope="task"):
+        """"task": the active task's items. "all": the union over every task
+        -- tasks on the active workflow as plain items (the panel's
+        parameters), tasks on another workflow as ``(item, params)`` jobs the
+        engine primes under THAT workflow, into its own field slot. Only the
+        LRU's few pipes stay live, but every item keeps its record, so a
+        later switch to that task shows and classifies it without a Run."""
         if scope != "all":
             return super()._prime_items(scope)
+        self._snapshot_active_profile()
         wf = self._task.workflow
-        seen, out, skipped = set(), [], []
+        seen, out, per_wf = set(), [], {}
         for t in self.tasks:
-            if t is not self._task and t.workflow != wf:
-                skipped.append(t.name)
+            other = t is not self._task and t.workflow != wf
+            params = self._workflow_params(t.workflow) if other else None
+            if other and params is None:
+                log(f"RUN all: task '{t.name}' names no known workflow - skipped")
                 continue
             for item in self._items_of_task(t):
-                if item.key not in seen:
-                    seen.add(item.key)
-                    out.append(item)
-        if skipped:
-            log(f"RUN all: skipped task(s) on another workflow: {', '.join(skipped)}")
+                tag = (t.workflow if other else wf, item.key)
+                if tag in seen:
+                    continue
+                seen.add(tag)
+                out.append((item, params) if other else item)
+                per_wf[tag[0]] = per_wf.get(tag[0], 0) + 1
+        if len(per_wf) > 1:
+            log("RUN all: " + ", ".join(f"{n} item(s) on '{w}'" for w, n in per_wf.items()))
         return out
 
     def _enrolment_changed(self):
