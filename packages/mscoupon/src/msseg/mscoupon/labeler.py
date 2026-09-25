@@ -2602,6 +2602,35 @@ def _selftest():
         assert not app._seam_confusion_hits()
         app._refresh_stages()
         assert v.stages["model"] == "ok" and v.stages["classified"] == "ok", v.stages
+        # The Features, Model and Analysis tabs speak seams in a polyline task:
+        # the descriptor group, the classifier settings (the task's view) with
+        # the held-out report tables, and the seams behind a confusion cell.
+        assert app._seam_desc_group.winfo_manager() == "pack"
+        assert _under(app.seam_kind_combo, app.model_tab)
+        app.seam_feature_vars["geometry"].set(False)
+        assert "geometry" not in app._seam_spec().features
+        assert "geometry" not in app._task_view_from_ui()["seam_spec"]["features"]
+        app.seam_feature_vars["geometry"].set(True)
+        app._fill_seam_report({"folds": [{"n": 2, "bacc": 1.0, "auc": 1.0, "logloss": 0.1,
+                                          "per_class": {}}],
+                               "mean": {"n": 2, "bacc": 1.0, "auc": 1.0, "logloss": 0.1,
+                                        "per_class": {1: {"recall": 1.0, "precision": 1.0},
+                                                      2: {"recall": 1.0, "precision": 1.0}}},
+                               "n_folds": 1, "cv_kind": "slices", "n": 2, "n_boundary": 1})
+        assert len(app.seam_report_tree.get_children()) == 2, "the fold and the mean"
+        assert len(app.seam_class_tree.get_children()) == 2
+        assert "bal.acc" in app.seam_eval_var.get()
+        app._on_confusion_open(*right)
+        assert app._center_tab_name() == "Analysis"
+        rows_s = app._seam_error_rows
+        assert len(rows_s) == cm_s[right] and len(app.seam_errors_tree.get_children()) == len(rows_s)
+        assert app._goto_seam(rows_s[0]["si"], rows_s[0]["li"], rows_s[0]["seam"])
+        assert "seam" in app.status_var.get()
+        app.root.update()
+        assert v.canvas.find_withtag("ihover"), "the seam is drawn where it went"
+        app._on_confusion_click(*right)             # clear the selection
+        app._show_center_tab("Annotation")
+        v.view_x, v.view_y, v.scale = 0.0, 0.0, 1.0
         # Its own pickle, recorded on the task; C classifies with it.
         with tempfile.TemporaryDirectory() as td_m:
             pth = os.path.join(td_m, "seams.pkl")
@@ -2631,6 +2660,7 @@ def _selftest():
     assert app._activate_task(t_region) and app._task_kind() == "region"
     assert app.tool_var.get() == "squiggle", "back in a region task: its first tool"
     assert app.annot_frame.winfo_manager() == "pack" and not app.seam_frame.winfo_manager()
+    assert not app._seam_desc_group.winfo_manager(), "no seam descriptor in a region task"
 
     # -- The outline: a closed livewire loop fills what it encloses ---------- #
     # A 3x3 grid of blocks (ids 0..8) so a loop of seams exists: the centre

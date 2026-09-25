@@ -34,6 +34,7 @@ from .tools import DrawController, MagicFillController, _extremum_points
 from .classifier import ClassifierMixin
 from .panels.hints import HintsMixin
 from .panels.stages import StagesMixin
+from .panels.seam_tabs import SeamTabsMixin
 from .panels.model import ModelPanelMixin
 from .panels.analysis import AnalysisPanelMixin
 from .panels.view import ViewControlsMixin
@@ -84,7 +85,7 @@ def _cache_attr(field, doc):
     return property(get, put, doc=doc)
 
 
-class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMixin,
+class AnnotationShell(StagesMixin, SeamTabsMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMixin,
                       ViewControlsMixin, ClassPanelMixin, SeamPanelMixin, SeamModelMixin,
                       ClassifierMixin):
     SESSION_APP = "labeler"
@@ -243,6 +244,7 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
         self.seam_toll_var = tk.StringVar(master=root, value="feature")
         self.seam_channels_var = tk.StringVar(master=root, value="base")
         self.show_seams_var = tk.BooleanVar(master=root, value=True)
+        self._init_seam_tab_vars(root)
         self.seam_color_var = tk.StringVar(master=root, value=_SEAM_MODE_CLASS)
         self._seam_caches = {}      # (si, li) -> (commit, rev, class[S], sets, graph)
         self._seam_rasters = {}     # (si, li) -> (commit, graph, seam-index raster)
@@ -284,6 +286,8 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
         self._update_task_rows()
         root.title(self.WINDOW_TITLE)
         self._build_label_panel()
+        # After the app's own Features groups (base channel, statistics).
+        self._build_seam_features_group()
         if self.viewer is not None:
             self.viewer.tool = DrawController(self)
             # Zoom/pan invalidates screen-space annotation geometry.
@@ -369,16 +373,12 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
         self._model_region.pack(fill="both", expand=True)
         self._build_model_tab(self._model_region)
         self._model_polyline = ttk.Frame(self.model_tab)
-        ttk.Label(self._model_polyline, foreground="#666", wraplength=380, justify="left",
-                  text="The seam model is trained and evaluated from the Annotation "
-                       "tab (Train seams / Evaluate).").pack(anchor="w", padx=8, pady=8)
+        self._build_seam_model_body(self._model_polyline)
         self._analysis_region = ttk.Frame(self.analysis_tab)
         self._analysis_region.pack(fill="both", expand=True)
         self._build_analysis_tab(self._analysis_region)
         self._analysis_polyline = ttk.Frame(self.analysis_tab)
-        ttk.Label(self._analysis_polyline, foreground="#666", wraplength=380,
-                  justify="left", text="No seam analyses yet.").pack(anchor="w", padx=8,
-                                                                     pady=8)
+        self._build_seam_analysis_body(self._analysis_polyline)
         self.center.select(self.processing_tab)
         # Bound AFTER the initial select: <<NotebookTabChanged>> fires
         # synchronously on select(), and the viewer does not exist yet.
@@ -1151,6 +1151,11 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
             region_w.pack_forget()
             poly_w.pack_forget()
             (poly_w if poly else region_w).pack(fill="both", expand=True)
+        desc = getattr(self, "_seam_desc_group", None)
+        if desc is not None:
+            desc.pack_forget()
+            if poly:
+                desc.pack(fill="x", padx=4, pady=(0, 2))
         self._coerce_tool()
 
     def _on_train_hotkey(self, e=None):
@@ -1316,7 +1321,8 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
                 "neighbours": {"custom_hidden": self.custom_hidden_var.get(),
                                "freeze_base": bool(self.freeze_base_var.get()),
                                "edge_spec": self._edge_spec_from_ui().to_dict()},
-                "context": self._context_spec_from_ui().to_dict()}
+                "context": self._context_spec_from_ui().to_dict(),
+                "seam_spec": self._seam_spec().to_dict()}
 
     def _stash_task_view(self, task):
         """Record the Model tab's current settings on `task` (the one they
@@ -1333,6 +1339,7 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
         self._apply_search_view(view.get("model_search"))
         self._apply_neighbours_view(view.get("neighbours"))
         self._apply_context_view(view.get("context"))
+        self._apply_seam_spec(view.get("seam_spec"))
         if view.get("model_kind") in _MODEL_KINDS:
             self.model_kind_var.set(view["model_kind"])
 

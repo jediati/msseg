@@ -58,7 +58,7 @@ def labeler_refusal(doc: Any) -> Optional[str]:
 # The Model-tab keys that belong to a task rather than to the window (the
 # same tuple as ``task.TASK_VIEW_KEYS``; spelled here too so this module
 # stays import-free of the task module, which imports it).
-TASK_VIEW_KEYS = ("model_kind", "model_search", "neighbours", "context")
+TASK_VIEW_KEYS = ("model_kind", "model_search", "neighbours", "context", "seam_spec")
 
 
 # --------------------------------------------------------------------------- #

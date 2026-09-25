@@ -1163,6 +1163,7 @@ class ClassifierMixin:
                             ("sweep_btn", "disabled" if running else "normal"),
                             ("edge_eval_btn", "disabled" if running else "normal"),
                             ("seam_eval_btn", "disabled" if running else "normal"),
+                            ("seam_eval_btn2", "disabled" if running else "normal"),
                             ("seam_train_btn", "disabled" if running else "normal"),
                             ("cancel_search_btn", "normal" if running else "disabled")):
             btn = getattr(self, name, None)
