@@ -2704,6 +2704,28 @@ def _selftest():
         assert why_e in v.stage_tip("inputs")
     else:
         assert app._seam_base()[0] is not None
+        # The seam descriptor embeds with the region task's net -- context
+        # columns and all, built on this record under ITS spec.
+        items_e = app._seam_items("Gathering seams")
+        assert items_e and items_e[0][8] == "net", app.status_var.get()
+        # A provider net with context columns (ring reductions, then labels as
+        # context from the PROVIDER's annotations): the columns are built on
+        # this record under its spec, the gate expects them, it embeds.
+        from msseg.labeler.context import ContextSpec as _CS, LabelSpec as _LS
+        ctx_keep = t_region.model.context
+        for ctx_e in (_CS(kinds=("ring_mean",)), _CS(kinds=("ring_mean",), labels=_LS())):
+            t_region.model.context = ctx_e
+            assert prov_e.context_spec() == ctx_e
+            _p, why_c = app._input_resolved("embedding")
+            assert why_c is None, why_c
+            built = app._input_table(key_s, rec_s, prov_e, "embedding", np)
+            assert any(n.startswith("ring_mean__") for n in built.names), built.names
+            if ctx_e.labels is not None:
+                assert any(n.startswith("nbr_class__") for n in built.names), built.names
+            items_c = app._seam_items("Gathering seams")
+            assert items_c and items_c[0][8] == "net", app.status_var.get()
+        t_region.model.context = ctx_keep
+    assert "context columns" not in (why_e or ""), why_e
     assert app._on_stage_click("inputs") is None and app._center_tab_name() == "Features"
     app._show_center_tab("Annotation")
     # The slots ride the task in the session document.

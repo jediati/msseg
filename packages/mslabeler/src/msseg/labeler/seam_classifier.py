@@ -63,7 +63,13 @@ class SeamModelMixin:
         why = prov.unavailable(slot)
         if why is None:
             try:
-                have = self._expected_feature_names()
+                if slot == "labels":
+                    have = self._expected_feature_names()
+                else:
+                    # The provider net's columns this workflow can build:
+                    # the statistics plus the context columns under ITS spec.
+                    from .context import ContextSpec
+                    have = self._expected_names_for(prov.context_spec() or ContextSpec())
             except Exception:
                 have = None
             prof = "?"
@@ -117,6 +123,32 @@ class SeamModelMixin:
         region_class = resolve_sets(sets, rec["labels"], np)
         return region_class, [(it, ids) for it, ids in sets if derive.is_extent(it)]
 
+    def _input_table(self, key, rec, prov, slot, np):
+        """The provider net's input table on this record: the statistics
+        plus the context columns its net reads, built here -- a labels block
+        from the provider's annotations. Cached per (commit, provider)."""
+        table = rec["stats"]
+        ctx = prov.context_spec()
+        if ctx is None:
+            return table
+        sig = prov.signature(slot)
+        cache = self.__dict__.setdefault("_input_table_cache", {})
+        hit = cache.get((key, slot))
+        if hit is not None and hit[0] == rec.get("commit") and hit[1] == sig and hit[2] is table:
+            return hit[3]
+        rc = None
+        if ctx.labels is not None:
+            slide, rect = self._binding_of(key)
+            rc = self._training_builder.row_classes(
+                prov.gestures_for(slide, rect), rec["labels"],
+                table.column(self.FIELDS.id_field), np, self.regions.label_layer(key))
+        out = artifacts.input_table(prov.stack(), table, self.regions.arcs(key, np),
+                                    rec.get("labels"), np, conv=self.FIELDS, row_classes=rc)
+        if len(cache) >= 8:
+            cache.pop(next(iter(cache)))
+        cache[(key, slot)] = (rec.get("commit"), sig, table, out)
+        return out
+
     def _input_pdiff(self, key, rec, np):
         """p(diff) per arc of this item's record from the pdiff slot's edge
         model, cached per (commit, provider); None when there is none."""
@@ -129,8 +161,8 @@ class SeamModelMixin:
         if hit is not None and hit[0] == rec.get("commit") and hit[1] == sig:
             return hit[2]
         try:
-            pd = artifacts.pdiff_for(prov.stack(), rec["stats"], self.regions.arcs(key, np),
-                                     rec["labels"], np)
+            pd = artifacts.pdiff_for(prov.stack(), self._input_table(key, rec, prov, "pdiff", np),
+                                     self.regions.arcs(key, np), rec["labels"], np)
         except (ValueError, IndexError, TypeError) as exc:
             self._log(f"p(diff) input unusable on {key}: {exc}")
             pd = None
@@ -212,6 +244,10 @@ class SeamModelMixin:
                 if graph is None:
                     raise TrainingProblem(f"{action} stopped: no seam graph for {key}.")
                 cls = self._seam_cache_for(si, li, rec, graph, np)[2]
+                if base is not None and self._task_kind() == "polyline":
+                    # The embedding input's net reads its own context columns.
+                    table = self._input_table(key, rec, self._input_provider("embedding"),
+                                              "embedding", np)
                 names = base_names if base is not None else seam_model.region_feature_names(table, self.FIELDS)
                 if base is not None and any(table.column(n) is None for n in names):
                     names = seam_model.region_feature_names(table, self.FIELDS)

@@ -196,3 +196,51 @@ def test_derived_boundary_class():
     assert (two.cls == 2).any()
     assert np.array_equal(three.cls == 3, two.cls == 2)
     assert np.array_equal(three.cls == 1, two.cls == 1)
+
+
+def test_a_net_over_context_columns_is_an_input(tmp_path):
+    """A region net trained with context columns embeds and scores p(diff) on
+    the consumer's record: the columns are built here under ITS spec, and the
+    gate expects what this workflow can build."""
+    pytest.importorskip("sklearn")
+    from msseg.labeler import context as cx
+    from msseg.labeler import edge_model as em, model_search as ms
+    from msseg.labeler.table import FeatureTable
+    fids, X, c, arcs = _lattice()
+    table = FeatureTable(["feature_id"] + NAMES, np.column_stack([fids.astype(float), X]))
+    spec = cx.ContextSpec(kinds=("ring_mean",))
+    aug = cx.augment(table, arcs, spec, np)
+    names = [n for n in aug.names if n != "feature_id"]
+    ctx_names = cx.column_names(spec, list(table.names))
+    assert ctx_names and set(ctx_names) <= set(names)
+    Xa = np.asarray(aug.values)[:, [list(aug.names).index(n) for n in names]]
+    est = ms.fit_estimator(ms.build_estimator(ms.ModelSpec(hidden=(16, 8), backend="sklearn",
+                                                           max_iter=300), names), Xa, c)
+    edge = em.fit_edge_model(est, Xa, c, em.gather_edges([(fids, arcs, c, 0)]), None,
+                             em.EdgeSpec(), names)
+    region = Task.new("glands", workflow="p1")
+    region.model.clf, region.model.names = est, names
+    region.model.context, region.model.edge = spec, edge
+    walls = Task.new("walls", workflow="p1", kind="polyline")
+    p = af.resolve(af.ProviderRef.task(region.uid), [region, walls], consumer=walls.uid)
+    assert p.capabilities() == {"labels", "embedding", "pdiff"}
+    assert p.context_spec() == spec and p.base() == (est, names)
+    # The gate: the statistics alone do not carry the ring columns ...
+    assert "ring_mean__" in p.why_not("embedding", NAMES)
+    # ... the workflow's statistics plus what it can build under the spec do.
+    assert p.why_not("embedding", NAMES + ctx_names) is None
+    # Built on the consumer's record, the input is the net's own.
+    built = af.input_table(p.stack(), table, arcs, None, np)
+    assert list(built.names) == list(aug.names) and np.allclose(built.values, aug.values)
+    pd = af.pdiff_for(p.stack(), built, arcs, None, np)
+    assert pd.shape == (len(arcs["a"]),) and not np.isnan(pd).any()
+    with pytest.raises(ValueError):
+        af.pdiff_for(p.stack(), table, arcs, None, np)    # without the ring columns
+    # Labels as context read the PROVIDER's annotations: required, and they
+    # move the signature (the seam model goes stale when they change).
+    region.model.context = cx.ContextSpec(kinds=("ring_mean",), labels=cx.LabelSpec())
+    with pytest.raises(ValueError):
+        af.input_table(p.stack(), table, arcs, None, np)
+    sig = p.signature("embedding")
+    region.store.add("squiggle", [(0, 0), (1, 1)], 1, "s", 0, 0)
+    assert p.signature("embedding") != sig

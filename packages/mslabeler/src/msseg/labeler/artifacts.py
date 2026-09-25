@@ -28,6 +28,13 @@ reads as empty. A provider declares what it **requires** of the consuming
 workflow (feature columns + scope -- the same compatibility gate a loaded
 model passes) and the slot shows the refusal rather than guessing.
 
+A model slot runs the provider's net on the CONSUMER's record, so a net
+trained with context columns (ring / hop / slice reductions, labels as
+context) gets them built here, from this record's table, arcs and label
+raster -- the labels block from the provider's own annotations
+(``input_table``). The gate then expects exactly the columns this workflow
+can build under the provider's spec.
+
 A task provider is read WITHOUT activating it: its store is plain data, and
 its model is either the live stack (trained or loaded this session) or its
 newest saved pickle, read by ``load_model_stack`` into a stack of its own
@@ -61,7 +68,7 @@ DEFAULT_BOUNDARY_CLASS = 2
 __all__ = ["SLOTS", "SLOT_TITLES", "SLOT_HELP", "SOURCES", "DEFAULT_BOUNDARY_CLASS",
            "ProviderRef", "Requirement", "Provider", "TaskProvider", "MissingProvider",
            "normalise_inputs", "resolve", "load_model_stack", "boundary_class_of",
-           "pdiff_for", "clear_stack_cache"]
+           "input_table", "pdiff_for", "clear_stack_cache"]
 
 
 # --------------------------------------------------------------------------- #
@@ -205,6 +212,11 @@ class Provider:
     def base(self):
         return None, None
 
+    def context_spec(self):
+        """The provider model's context spec (the columns its net reads
+        beyond the statistics row), or None."""
+        return None
+
 
 class MissingProvider(Provider):
     """A reference that does not resolve; every slot says why."""
@@ -235,18 +247,21 @@ class TaskProvider(Provider):
         return load_model_stack(self.task, self.app_tag)
 
     def base(self):
-        """``(net, names)`` of the task's region net when it can embed: it
-        has hidden layers and reads plain table columns (a net over context
-        columns would need the provider's neighbourhood built here)."""
+        """``(net, names)`` of the task's region net when it can embed (it
+        has hidden layers). `names` may include context columns: the
+        consumer builds them on its own record (``input_table``)."""
         stack = self.stack()
         if stack is None or stack.clf is None:
             return None, None
         from . import seam_model
         if not seam_model.has_embedding(stack.clf):
             return None, None
-        if stack.context is not None and not stack.context.empty():
-            return None, None
         return stack.clf, list(stack.names or [])
+
+    def context_spec(self):
+        stack = self.stack()
+        ctx = getattr(stack, "context", None)
+        return None if ctx is None or ctx.empty() else ctx
 
     def capabilities(self) -> frozenset:
         caps = set()
@@ -268,8 +283,6 @@ class TaskProvider(Provider):
         if stack is None or stack.clf is None:
             return f"{self.name} has no trained model"
         if slot in ("embedding", "pdiff") and self.base()[0] is None:
-            if stack.context is not None and not stack.context.empty():
-                return f"{self.name}'s model reads context columns (not usable as an input yet)"
             return f"{self.name}'s model has no hidden layer to embed with"
         if slot == "pdiff" and stack.edge is None:
             return f"{self.name} has no edge model (Model tab, an '-> edges' kind)"
@@ -287,8 +300,11 @@ class TaskProvider(Provider):
         if slot == "labels":
             return (self.ref, slot, self.task.store.rev)
         stack = self.stack()
+        ctx = self.context_spec()
+        # Labels as context: the net's input reads the provider's annotations.
+        rev = self.task.store.rev if ctx is not None and ctx.labels is not None else None
         return (self.ref, slot, id(getattr(stack, "clf", None)),
-                id(getattr(stack, "edge", None)))
+                id(getattr(stack, "edge", None)), None if ctx is None else ctx.key(), rev)
 
     # -- labels ----------------------------------------------------------- #
     def gestures_for(self, slide, rect):
@@ -366,13 +382,34 @@ def load_model_stack(task, app_tag: Optional[str] = None):
 
 
 # --------------------------------------------------------------------------- #
-# p(diff) from a provider's edge model, on the consumer's record
+# The provider net's input, and p(diff), on the consumer's record
 # --------------------------------------------------------------------------- #
+def input_table(stack, table, arcs, labels, np, conv=None, row_classes=None):
+    """The consumer's statistics `table` plus the context columns the
+    provider's net reads (``context.augment`` under its spec; `table` itself
+    when it has none). `row_classes` (per row, 0 = unlabelled) feeds a
+    labels-as-context block -- the PROVIDER's annotations resolved on this
+    record; required when the spec has one. Raises ValueError when the
+    columns cannot be built here."""
+    from . import context
+    spec = getattr(stack, "context", None)
+    if spec is None or spec.empty():
+        return table
+    extra = None
+    if spec.labels is not None:
+        if row_classes is None:
+            raise ValueError("the provider's net reads neighbour labels, and none were given")
+        extra = {"row_classes": row_classes, "rng": None}
+    kw = {} if conv is None else {"conv": conv}
+    return context.augment(table, arcs, spec, np, labels=labels, extra=extra, **kw)
+
+
 def pdiff_for(stack, table, arcs, labels, np):
     """p(the flanks differ) per arc of the consumer's record (NaN where an
     arc's regions have no row), by the provider's base net + edge model --
     what ``_predict_slice`` computes into ``aux["pdiff"]`` for its own task.
-    None when the provider has no edge model or the item has no arcs; a
+    `table` must carry the net's context columns (``input_table``). None
+    when the provider has no edge model or the item has no arcs; a
     ValueError when the table lacks the model's columns."""
     from . import context, edge_model, magic_fill
     from .training import TrainingSetBuilder

@@ -241,11 +241,24 @@ provider's net + edge model on the consumer's record, per arc in the
 record's order -- what `_predict_slice` puts in `aux["pdiff"]` for its own
 task -- cached per `(commit, provider signature)`.
 
+**A provider net trained with context columns** (Model tab > Context: ring /
+hop / slice reductions, labels as context) is usable: its input row is the
+statistics row plus those columns, and they are a deterministic function of
+the record, so `artifacts.input_table` builds them on the CONSUMER's record
+(its table, arcs and label raster) under the PROVIDER's spec -- the labels
+block from the provider's own annotations resolved here, without dropout.
+The gate then expects `_expected_names_for(provider spec)`: the columns this
+workflow can build. The 8-d layer (and p(diff), which reads it) is a function
+of that whole row, so the columns cannot be skipped -- only built. The
+latent-ring head is not involved (it sits after the base net). With labels
+as context the provider's store rev is part of its signature, so the seam
+model goes stale when the region annotations change.
+
 Every slot shows its verdict under its picker: `3 region gestures; derived
 boundaries -> class 2 'gland wall'`, or `cannot use: needs mean_blur_s1.5,
 mean_blur_s3 (+2 more); workflow 'wide' does not measure it`, `glands has no
-edge model (Model tab, an '-> edges' kind)`, `glands's model reads context
-columns (not usable as an input yet)`. The stage strip grows an **inputs**
+edge model (Model tab, an '-> edges' kind)`, `glands's model has no hidden
+layer to embed with`. The stage strip grows an **inputs**
 box feeding the model -- green when every filled slot can be used, orange
 (with the reasons as its tip) when one cannot; a click opens Features. The
 seam model stamps the inputs it was trained with (`trained_inputs`, the
