@@ -138,16 +138,20 @@ def _note(notes, text):
 @dataclass(frozen=True)
 class Requirement:
     """What a provider needs of the consuming workflow: the statistics
-    columns its model reads, and the scope they were measured at."""
+    columns its model reads, and the scope they were measured at. An
+    unscoped requirement (``scoped=False``: gestures, which are geometry)
+    fits a workflow at any scope -- ``scope=None`` alone would demand a
+    workflow WITHOUT one, and refuse every whole-slide (``L<n>``) workflow."""
     columns: Tuple[str, ...] = ()
     scope: Optional[str] = None
+    scoped: bool = True
 
     def why_not(self, have: Optional[Sequence[str]], scope: Optional[str] = None,
                 workflow: str = "this workflow") -> Optional[str]:
         """None when a workflow producing `have` at `scope` can feed the
         provider; else the reason, naming the columns (at most four). `have`
         None means the app cannot say (no compiled extension): not refused."""
-        if (self.scope or None) != (scope or None):
+        if self.scoped and (self.scope or None) != (scope or None):
             return (f"measured at {self.scope or 'no scope'}, {workflow} at "
                     f"{scope or 'no scope'}")
         if have is None:
@@ -173,7 +177,7 @@ class Provider:
         return frozenset()
 
     def requires(self, slot: str) -> Requirement:
-        return Requirement()
+        return Requirement(scoped=False)
 
     def unavailable(self, slot: str) -> Optional[str]:
         """Why this provider cannot fill `slot` at all (before any workflow
@@ -273,10 +277,10 @@ class TaskProvider(Provider):
 
     def requires(self, slot: str) -> Requirement:
         if slot == "labels":
-            return Requirement()              # gestures are geometry
+            return Requirement(scoped=False)  # gestures are geometry
         stack = self.stack()
         if stack is None or stack.clf is None:
-            return Requirement()
+            return Requirement(scoped=False)
         return Requirement(tuple(stack.names or ()), stack.scope)
 
     def signature(self, slot: str) -> Any:

@@ -667,6 +667,20 @@ def run_labeler_selftest():
         _g, cls_s = app._seam_classes_for(0, 0, np)
         assert (cls_s == SEAM_BOUNDARY).any(), "the trace labels the seams it runs along"
         app.store.remove_many([tr.uid])
+    # Inputs under a SCOPED workflow (the level): the region task on the same
+    # workflow feeds the labels slot -- gestures have no scope -- and a model
+    # slot is never refused for scope on its own workflow.
+    assert str(app._feature_scope()).startswith("L")
+    assert app._set_input("labels", t_region.uid)
+    prov_l, why_l = app._input_resolved("labels")
+    assert prov_l is not None and why_l is None, why_l
+    assert not app.input_status["labels"].get().startswith("cannot use"),         app.input_status["labels"].get()
+    assert app._set_input("embedding", t_region.uid)
+    _p, why_e = app._input_resolved("embedding")
+    assert why_e is None or "scope" not in why_e, why_e
+    app._refresh_stages()
+    assert v.stages.get("inputs") == ("ok" if why_e is None else "stale"), (why_e, v.stages)
+    assert app._set_input("embedding", None) and app._set_input("labels", None)
     # leave nothing behind: the later sections count gestures and undo steps
     app.store.remove_many([sc.uid])
     app._rebuild_class_panels()

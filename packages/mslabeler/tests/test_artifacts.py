@@ -82,6 +82,9 @@ def test_resolve_and_capabilities_without_a_model():
     assert isinstance(p, af.TaskProvider) and p.name == "glands"
     assert p.capabilities() == {"labels"}
     assert p.why_not("labels", NAMES) is None
+    # Gestures have no scope: a whole-slide workflow (scope "L4") takes them.
+    assert p.why_not("labels", NAMES, "L4") is None
+    assert p.why_not("labels", None, "L4", "workflow 'w'") is None
     assert "no trained model" in p.why_not("embedding", NAMES)
     assert "no trained model" in p.why_not("pdiff", NAMES)
     # Gestures are geometry: the labels slot is read off the store by slide.
@@ -107,6 +110,8 @@ def test_requirement_gate():
     why = req.why_not(NAMES[:1], "L4", "workflow 'p2'")
     assert "needs mean_c1, mean_c2, mean_c3, mean_c4 (+1 more)" in why and "'p2'" in why
     assert "measured at L4" in req.why_not(NAMES, "L0")
+    assert "measured at no scope" in af.Requirement(tuple(NAMES)).why_not(NAMES, "L4")
+    assert af.Requirement(scoped=False).why_not(NAMES, "L4") is None
 
 
 def _lattice(side=6, seed=0):
