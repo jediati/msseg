@@ -244,3 +244,42 @@ def test_a_net_over_context_columns_is_an_input(tmp_path):
     sig = p.signature("embedding")
     region.store.add("squiggle", [(0, 0), (1, 1)], 1, "s", 0, 0)
     assert p.signature("embedding") != sig
+
+
+def test_the_embedding_layer_is_picked_on_the_slot():
+    """The embedding slot names a hidden layer of the provider's net: listed
+    from the net itself, kept by the document, refused when the net no
+    longer has it, and part of the signature (the seam model goes stale)."""
+    pytest.importorskip("sklearn")
+    from msseg.labeler import model_search as ms
+    fids, X, c, arcs = _lattice()
+    est = ms.fit_estimator(ms.build_estimator(ms.ModelSpec(hidden=(16, 8, 4), backend="sklearn",
+                                                           max_iter=200), NAMES), X, c)
+    region = Task.new("glands", workflow="p1")
+    region.model.clf, region.model.names, region.model.kind = est, NAMES, "custom FC"
+    walls = Task.new("walls", workflow="p1", kind="polyline")
+    ref = af.ProviderRef.task(region.uid)
+
+    def prov(layer=None):
+        entry = dict(ref.to_doc(), **({} if layer is None else {"layer": layer}))
+        return af.resolve(ref, [region, walls], consumer=walls.uid, entry=entry)
+
+    p = prov()
+    assert p.hidden_widths() == [16, 8, 4]
+    assert af.describe_architecture(p.architecture()) == \
+        "6 columns → 16 → 8 → 4 → 2 classes (custom FC)"
+    assert p.layer() == (2, None), "unset = the last"
+    assert prov(0).layer() == (0, None) and prov(0).why_not("embedding", NAMES) is None
+    assert [af.layer_label(k, [16, 8, 4]) for k in range(3)] == \
+        ["h1 · 16-d", "h2 · 8-d", "h3 · 4-d (last)"]
+    assert prov(0).signature("embedding") != prov(1).signature("embedding")
+    assert prov(0).signature("labels") == prov(1).signature("labels")
+    why = prov(5).why_not("embedding", NAMES)
+    assert "h6 was picked" in why and "3 hidden layers" in why
+    # The document keeps a layer on the embedding slot only.
+    notes = []
+    norm = af.normalise_inputs({"embedding": dict(ref.to_doc(), layer=1),
+                                "pdiff": dict(ref.to_doc(), layer=1)}, notes)
+    assert norm["embedding"]["layer"] == 1 and "layer" not in norm["pdiff"]
+    norm = af.normalise_inputs({"embedding": dict(ref.to_doc(), layer=-1)}, notes)
+    assert "layer" not in norm["embedding"] and "layer" in notes[-1]

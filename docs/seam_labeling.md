@@ -216,7 +216,7 @@ each filled by a *provider*:
 | slot | what it gives the polyline task | today's provider |
 |---|---|---|
 | region labels | derived seam labels (above), into the chosen boundary class | a region task's annotations |
-| region embedding | the seam descriptor's `pair` terms in the net's hidden layer (`embed` = net / auto) | a region task's trained net |
+| region embedding | the seam descriptor's `pair` terms in a hidden layer of the net, **picked on the slot** (`embed` = net / auto) | a region task's trained net |
 | p(diff) | the seam descriptor's `edges` term and the `edges` toll | a region task's edge model |
 
 `msseg.labeler.artifacts` is written for a **model artifact library** that
@@ -240,6 +240,20 @@ gates against the active workflow). `artifacts.pdiff_for` runs the
 provider's net + edge model on the consumer's record, per arc in the
 record's order -- what `_predict_slice` puts in `aux["pdiff"]` for its own
 task -- cached per `(commit, provider signature)`.
+
+**Picking the layer.** The embedding slot's *layer* picker lists the chosen
+net's own hidden layers -- `h1 · 64-d`, `h2 · 16-d`, `h3 · 8-d (last)` for a
+64-16-8 custom FC -- and the line under it shows the net's shape
+(`glands's net: 40 columns → 64 → 16 → 8 → 3 classes (custom FC); the pair
+terms read h2 · 16-d`; `TaskProvider.hidden_widths` / `architecture`,
+`artifacts.describe_architecture`). The slot entry stores `"layer": k`
+(0-based; absent = the last), the seam descriptor names its embedded columns
+by layer (`absdiff_h2_0 ..`), the fitted `SeamModel.spec.layer` records it,
+and the layer is part of the slot's signature, so a seam model trained on
+one layer is stale (and refused at classify time) on another. A layer the
+net no longer has after a retrain refuses the slot (`artifacts.layer_of`)
+rather than reading a different one. The p(diff) slot's line names the layer
+the provider's edge model was trained on (fixed by that model).
 
 **A provider net trained with context columns** (Model tab > Context: ring /
 hop / slice reductions, labels as context) is usable: its input row is the

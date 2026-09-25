@@ -169,8 +169,11 @@ def test_net_embedding_uses_the_base_hidden_layer():
     base.fit(X, (X[:, 0] > 3).astype(int))
     assert sm.has_embedding(base) and sm.embed_used(sm.SeamSpec(), base) == "net"
     F, fnames = sm.seam_features(g, table, names, np, base_pipeline=base)
-    assert fnames[:4] == ["absdiff_h0", "absdiff_h1", "absdiff_h2", "absdiff_h3"]
+    assert fnames[:4] == ["absdiff_h2_0", "absdiff_h2_1", "absdiff_h2_2", "absdiff_h2_3"]
     assert F.shape[1] == 8 + 2 + 2 + 5
+    F1, n1 = sm.seam_features(g, table, names, np, base_pipeline=base,
+                              spec=sm.SeamSpec(layer=0))
+    assert n1[0] == "absdiff_h1_0" and F1.shape[1] == 16 + 2 + 2 + 5, "the 8-d first layer"
     F2, _ = sm.seam_features(g, table, names, np, base_pipeline=base,
                              spec=sm.SeamSpec(embed="features"))
     assert F2.shape[1] == 6 + 2 + 2 + 5

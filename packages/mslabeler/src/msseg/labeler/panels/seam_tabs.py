@@ -46,7 +46,6 @@ class SeamTabsMixin:
         self.seam_model_kind_var = tk.StringVar(master=root, value="logistic")
         self.seam_C_var = tk.StringVar(master=root, value="1.0")
         self.seam_embed_var = tk.StringVar(master=root, value="auto")
-        self.seam_layer_var = tk.StringVar(master=root, value="-1")
         self.seam_feature_vars = {k: tk.BooleanVar(master=root, value=k in seam_model.DEFAULT_FEATURES)
                                   for k in seam_model.FEATURE_KINDS}
         self._seam_error_rows = []
@@ -59,16 +58,11 @@ class SeamTabsMixin:
             C = max(1e-4, float(self.seam_C_var.get()))
         except (ValueError, tk.TclError):
             C = 1.0
-        try:
-            layer = int(self.seam_layer_var.get())
-        except (ValueError, tk.TclError):
-            layer = -1
         kind = self.seam_model_kind_var.get()
         embed = self.seam_embed_var.get()
         return seam_model.SeamSpec(features=feats,
                                    model=kind if kind in _SEAM_KINDS else "logistic",
-                                   C=C, embed=embed if embed in _SEAM_EMBEDS else "auto",
-                                   layer=layer)
+                                   C=C, embed=embed if embed in _SEAM_EMBEDS else "auto")
 
     def _apply_seam_spec(self, d):
         if not isinstance(d, dict):
@@ -77,7 +71,6 @@ class SeamTabsMixin:
         self.seam_model_kind_var.set(spec.model if spec.model in _SEAM_KINDS else "logistic")
         self.seam_C_var.set(f"{spec.C:g}")
         self.seam_embed_var.set(spec.embed if spec.embed in _SEAM_EMBEDS else "auto")
-        self.seam_layer_var.set(str(spec.layer))
         for k, var in self.seam_feature_vars.items():
             var.set(k in spec.features)
 
@@ -121,6 +114,17 @@ class SeamTabsMixin:
             cb.pack(side="left", padx=2)
             cb.bind("<<ComboboxSelected>>", lambda _e, s=slot: self._on_input_pick(s))
             attach_tooltip(cb, artifacts.SLOT_HELP[slot])
+            if slot == "embedding":
+                ttk.Label(row, text="layer").pack(side="left", padx=(8, 2))
+                self.input_layer_var = tk.StringVar(master=self.root, value="")
+                self.input_layer_combo = ttk.Combobox(row, textvariable=self.input_layer_var,
+                                                      values=[], state="disabled", width=14)
+                self.input_layer_combo.pack(side="left")
+                self.input_layer_combo.bind("<<ComboboxSelected>>",
+                                            lambda _e: self._on_input_layer_pick())
+                attach_tooltip(self.input_layer_combo,
+                               "Which hidden layer of the chosen task's region net the "
+                               "seam descriptor's pair terms compare the two flanks in.")
             if slot == "labels":
                 ttk.Label(row, text="boundary class").pack(side="left", padx=(8, 2))
                 self.input_boundary_var = tk.StringVar(master=self.root,
@@ -161,6 +165,27 @@ class SeamTabsMixin:
         entry = self._input_entry("labels")
         if entry is not None:
             self.input_boundary_var.set(str(self._input_boundary_class()))
+        self._refresh_input_layer()
+
+    def _refresh_input_layer(self):
+        """The embedding slot's layer picker: the chosen net's hidden layers."""
+        prov, _why = self._input_resolved("embedding")
+        widths = prov.hidden_widths() if isinstance(prov, artifacts.TaskProvider) else []
+        labels = [artifacts.layer_label(k, widths) for k in range(len(widths))]
+        self._input_layer_labels = labels
+        self.input_layer_combo.config(values=labels, state="readonly" if labels else "disabled")
+        k, _w = prov.layer() if isinstance(prov, artifacts.TaskProvider) else (None, None)
+        if k is not None and labels:
+            self.input_layer_var.set(labels[k])
+        else:
+            picked = (self._input_entry("embedding") or {}).get("layer")
+            self.input_layer_var.set("" if picked is None else f"h{int(picked) + 1} (missing)")
+
+    def _on_input_layer_pick(self):
+        self._unfocus_entries()
+        labels = getattr(self, "_input_layer_labels", [])
+        if self.input_layer_var.get() in labels:
+            self._set_input_layer(labels.index(self.input_layer_var.get()))
 
     def _input_status_text(self, slot, prov):
         if slot == "labels":
@@ -168,11 +193,15 @@ class SeamTabsMixin:
             k = self._input_boundary_class()
             return (f"{n} region gesture{'s' if n != 1 else ''}; derived boundaries -> "
                     f"class {k} {self._class_name(k)!r}")
-        stack = prov.stack()
-        what = f"{stack.kind}, {len(stack.names or [])} features"
+        arch = artifacts.describe_architecture(prov.architecture())
+        widths = prov.hidden_widths()
         if slot == "embedding":
-            return f"the hidden layer of {prov.name}'s net ({what})"
-        return f"{prov.name}'s edge model over its net ({what})"
+            k, _why = prov.layer()
+            return (f"{prov.name}'s net: {arch}; the pair terms read "
+                    f"{artifacts.layer_label(k, widths)}")
+        edge = prov.stack().edge
+        on = edge.spec.layer_text(widths) if edge is not None else "?"
+        return f"{prov.name}'s net: {arch}; its edge model reads the {on} layer"
 
     def _on_input_pick(self, slot):
         self._unfocus_entries()
@@ -211,10 +240,8 @@ class SeamTabsMixin:
         cb.pack(side="left")
         attach_tooltip(cb, "What the pair terms compare: 'features' = the flank rows "
                            "z-scored; 'net' = the flanks' embedding in a region net's "
-                           "hidden layer (a region input, when there is one); 'auto' = "
-                           "net when available.")
-        ttk.Label(row, text="layer").pack(side="left", padx=(8, 2))
-        ttk.Entry(row, textvariable=self.seam_layer_var, width=4).pack(side="left")
+                           "hidden layer (the embedding input on the Features tab, "
+                           "where its layer is picked); 'auto' = net when available.")
         ttk.Label(box, foreground="#666", wraplength=380, justify="left",
                   text="logistic: a balanced multinomial regression; mlp: a (32, 16) "
                        "network. Both over the standardised seam descriptor (Features "

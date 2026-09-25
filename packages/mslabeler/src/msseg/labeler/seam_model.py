@@ -136,8 +136,11 @@ def seam_features(graph, table, names, np_, conv=DEFAULT, base_pipeline=None, ar
         how = embed_used(spec, base_pipeline)
         if how == "net":
             X = _design(table, names, np_)
-            Z = edge_model.embed(base_pipeline, X)[spec.layer]
-            prefix = [f"h{k}" for k in range(Z.shape[1])]
+            layers = edge_model.embed(base_pipeline, X)
+            Z = layers[spec.layer]
+            # Named by layer, so a model fitted on h2 is refused on h1.
+            lk = spec.layer % len(layers) + 1
+            prefix = [f"h{lk}_{k}" for k in range(Z.shape[1])]
         else:
             Z = zscore_rows(table, names, np_)
             prefix = list(names)

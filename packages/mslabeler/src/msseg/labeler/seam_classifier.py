@@ -38,11 +38,12 @@ class SeamModelMixin:
     def _input_resolved(self, slot):
         """``(provider, why)``: provider None when the slot is empty, why
         None when the provider can fill it under the active workflow."""
-        ref = artifacts.ProviderRef.from_doc(self._input_entry(slot))
+        entry = self._input_entry(slot)
+        ref = artifacts.ProviderRef.from_doc(entry)
         if ref is None:
             return None, None
         prov = artifacts.resolve(ref, self.tasks, app_tag=self.MODEL_APP_TAG,
-                                 consumer=self._task.uid)
+                                 consumer=self._task.uid, entry=entry)
         return prov, self._input_why_not(slot, prov)
 
     def _input_provider(self, slot):
@@ -190,6 +191,19 @@ class SeamModelMixin:
         self._input_changed(slot)
         return True
 
+    def _set_input_layer(self, k):
+        """Pick the hidden layer (0-based; None = the last) of the embedding
+        input's net. False without an embedding slot."""
+        entry = self._input_entry("embedding")
+        if entry is None:
+            return False
+        if k is None:
+            entry.pop("layer", None)
+        else:
+            entry["layer"] = int(k)
+        self._input_changed("embedding")
+        return True
+
     def _set_input_boundary_class(self, k):
         entry = self._input_entry("labels")
         if entry is None:
@@ -237,6 +251,11 @@ class SeamModelMixin:
             return None
         base, base_names = self._seam_base()
         spec = self._seam_spec()
+        if base is not None and self._task_kind() == "polyline":
+            # The layer is the embedding input's: picked where the input is.
+            import dataclasses
+            k, _why = self._input_provider("embedding").layer()
+            spec = dataclasses.replace(spec, layer=k)
         out = []
         try:
             for si, li, key, rec, table in slices:

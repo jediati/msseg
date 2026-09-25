@@ -68,7 +68,8 @@ DEFAULT_BOUNDARY_CLASS = 2
 __all__ = ["SLOTS", "SLOT_TITLES", "SLOT_HELP", "SOURCES", "DEFAULT_BOUNDARY_CLASS",
            "ProviderRef", "Requirement", "Provider", "TaskProvider", "MissingProvider",
            "normalise_inputs", "resolve", "load_model_stack", "boundary_class_of",
-           "input_table", "pdiff_for", "clear_stack_cache"]
+           "input_table", "pdiff_for", "clear_stack_cache", "layer_of", "layer_label",
+           "describe_architecture"]
 
 
 # --------------------------------------------------------------------------- #
@@ -113,7 +114,9 @@ def boundary_class_of(entry: Any) -> int:
 def normalise_inputs(raw: Any, notes: Optional[List[str]] = None,
                      who: str = "task") -> Optional[Dict[str, Dict[str, Any]]]:
     """A task's ``inputs`` in normal form ``{slot: {"source", "uid"|"id"[,
-    "boundary_class"]}}``, or None when there are none. Total: an unknown
+    "boundary_class"][, "layer"]}}``, or None when there are none. ``layer``
+    (embedding slot) is the 0-based hidden layer of the provider's net;
+    absent = its last. Total: an unknown
     slot or an unusable reference is a note and is dropped. Whether a task
     uid still names a task is ``resolve``'s question (the slot shows it)."""
     if raw is None:
@@ -130,8 +133,62 @@ def normalise_inputs(raw: Any, notes: Optional[List[str]] = None,
         e: Dict[str, Any] = ref.to_doc()
         if slot == "labels" and "boundary_class" in entry:
             e["boundary_class"] = boundary_class_of(entry)
+        if slot == "embedding" and entry.get("layer") is not None:
+            k = _as_layer(entry.get("layer"))
+            if k is None:
+                _note(notes, f"{who}: unusable embedding layer {entry.get('layer')!r} - "
+                             "the last is used")
+            else:
+                e["layer"] = k
         out[slot] = e
     return out or None
+
+
+def _as_layer(v) -> Optional[int]:
+    if isinstance(v, bool):
+        return None
+    try:
+        k = int(v)
+    except (TypeError, ValueError):
+        return None
+    return k if k >= 0 and k == v else None
+
+
+def layer_of(entry: Any, widths: Sequence[int]) -> Tuple[Optional[int], Optional[str]]:
+    """``(index, None)`` of the hidden layer an embedding slot reads from a
+    net with hidden `widths` -- its ``layer``, or the last when unset -- or
+    ``(None, why)`` when the net has no such layer (a retrain made it
+    shallower): the slot is refused rather than reading another layer."""
+    n = len(widths or ())
+    if not n:
+        return None, "no hidden layer to embed with"
+    k = (entry or {}).get("layer")
+    if k is None:
+        return n - 1, None
+    if 0 <= int(k) < n:
+        return int(k), None
+    return None, (f"layer h{int(k) + 1} was picked, but the net has {n} hidden "
+                  f"layer{'s' if n != 1 else ''} -- pick another")
+
+
+def layer_label(k: int, widths: Sequence[int]) -> str:
+    """``"h2 · 16-d"`` (``" (last)"`` on the last), as the pickers show it."""
+    last = " (last)" if k == len(widths) - 1 else ""
+    return f"h{k + 1} · {int(widths[k])}-d{last}"
+
+
+def describe_architecture(arch: Optional[Dict[str, Any]]) -> str:
+    """One line for ``TaskProvider.architecture()``: ``40 columns (+ context)
+    → 64 → 16 → 8 → 3 classes (custom FC)``."""
+    if not arch:
+        return "no model"
+    parts = [f"{arch.get('columns', '?')} columns"
+             + (" (+ context)" if arch.get("context") else "")]
+    parts += [str(w) for w in arch.get("hidden") or ()]
+    if arch.get("classes"):
+        parts.append(f"{arch['classes']} classes")
+    text = " → ".join(parts)
+    return f"{text} ({arch['kind']})" if arch.get("kind") else text
 
 
 def _note(notes, text):
@@ -233,11 +290,12 @@ class MissingProvider(Provider):
 class TaskProvider(Provider):
     """A region task as a provider, read without activating it."""
 
-    def __init__(self, task, app_tag: Optional[str] = None):
+    def __init__(self, task, app_tag: Optional[str] = None, entry: Optional[Dict] = None):
         self.task = task
         self.ref = ProviderRef.task(task.uid)
         self.name = task.name
         self.app_tag = app_tag
+        self.entry = dict(entry or {})       # the slot's settings (the layer)
 
     # -- the model, live or from its newest pickle ------------------------ #
     def stack(self):
@@ -263,6 +321,35 @@ class TaskProvider(Provider):
         ctx = getattr(stack, "context", None)
         return None if ctx is None or ctx.empty() else ctx
 
+    # -- what the net looks like ------------------------------------------ #
+    def hidden_widths(self) -> List[int]:
+        """The provider net's hidden layer widths (``[64, 16, 8]``), [] for
+        a model without hidden layers (a forest) or no model."""
+        net, _names = self.base()
+        if net is None:
+            return []
+        from . import edge_model
+        try:
+            return list(edge_model.hidden_widths(net))
+        except TypeError:
+            return []
+
+    def architecture(self) -> Optional[Dict[str, Any]]:
+        """``{columns, context, hidden, classes, kind}`` of the provider's
+        region model, or None without one (``describe_architecture``)."""
+        stack = self.stack()
+        if stack is None or stack.clf is None:
+            return None
+        classes = getattr(stack.clf, "classes_", None)
+        return {"columns": len(stack.names or ()), "context": self.context_spec() is not None,
+                "hidden": self.hidden_widths(),
+                "classes": None if classes is None else len(classes),
+                "kind": stack.kind}
+
+    def layer(self) -> Tuple[Optional[int], Optional[str]]:
+        """The hidden layer the embedding slot reads (``layer_of``)."""
+        return layer_of(self.entry, self.hidden_widths())
+
     def capabilities(self) -> frozenset:
         caps = set()
         if self.task.kind == "region":
@@ -284,6 +371,10 @@ class TaskProvider(Provider):
             return f"{self.name} has no trained model"
         if slot in ("embedding", "pdiff") and self.base()[0] is None:
             return f"{self.name}'s model has no hidden layer to embed with"
+        if slot == "embedding":
+            _k, why = self.layer()
+            if why:
+                return f"{self.name}'s net: {why}"
         if slot == "pdiff" and stack.edge is None:
             return f"{self.name} has no edge model (Model tab, an '-> edges' kind)"
         return None
@@ -303,8 +394,10 @@ class TaskProvider(Provider):
         ctx = self.context_spec()
         # Labels as context: the net's input reads the provider's annotations.
         rev = self.task.store.rev if ctx is not None and ctx.labels is not None else None
+        layer = self.entry.get("layer") if slot == "embedding" else None
         return (self.ref, slot, id(getattr(stack, "clf", None)),
-                id(getattr(stack, "edge", None)), None if ctx is None else ctx.key(), rev)
+                id(getattr(stack, "edge", None)), None if ctx is None else ctx.key(), rev,
+                layer)
 
     # -- labels ----------------------------------------------------------- #
     def gestures_for(self, slide, rect):
@@ -318,10 +411,10 @@ class TaskProvider(Provider):
 
 
 def resolve(ref: Optional[ProviderRef], tasks: Sequence[Any], *, app_tag: Optional[str] = None,
-            consumer: Optional[str] = None) -> Optional[Provider]:
+            consumer: Optional[str] = None, entry: Optional[Dict] = None) -> Optional[Provider]:
     """The provider behind `ref` among the session's `tasks` (None for no
     reference). `consumer` is the subscribing task's uid: a task cannot feed
-    itself."""
+    itself. `entry` is the slot's entry (its settings, e.g. the layer)."""
     if ref is None:
         return None
     if ref.source == "library":
@@ -332,7 +425,7 @@ def resolve(ref: Optional[ProviderRef], tasks: Sequence[Any], *, app_tag: Option
         return MissingProvider(ref, "a task cannot be its own input")
     for t in tasks:
         if t.uid == ref.id:
-            return TaskProvider(t, app_tag)
+            return TaskProvider(t, app_tag, entry)
     return MissingProvider(ref, "that task was deleted")
 
 

@@ -2680,6 +2680,7 @@ def _selftest():
     ent_in = app._seam_cache_for(0, 0, rec_s, g_in, np)
     assert ent_in[6] is not None
     from msseg.labeler import derive as _derive_in
+    from msseg.labeler import artifacts as _al
     alone = _derive_in.seam_labels(g_in, np, rc_in).cls
     s02 = [i for i in range(g_in.n_seams) if {int(g_in.a[i]), int(g_in.b[i])} == {0, 2}]
     assert s02 and all(alone[i] == SEAM_BOUNDARY for i in s02)
@@ -2725,6 +2726,30 @@ def _selftest():
             items_c = app._seam_items("Gathering seams")
             assert items_c and items_c[0][8] == "net", app.status_var.get()
         t_region.model.context = ctx_keep
+        # The layer is picked on the slot, from the chosen net's own layers,
+        # with the net's shape shown; the pair terms follow it, and a seam
+        # model trained on one layer is stale on another.
+        widths_e = prov_e.hidden_widths()
+        assert widths_e and list(app.input_layer_combo.cget("values")) == \
+            [_al.layer_label(k, widths_e) for k in range(len(widths_e))]
+        assert app.input_layer_var.get().endswith("(last)")
+        assert " → ".join(str(w) for w in widths_e) in app.input_status["embedding"].get(), \
+            app.input_status["embedding"].get()
+        app.input_layer_var.set(_al.layer_label(0, widths_e))
+        app._on_input_layer_pick()
+        assert t_walls.inputs["embedding"]["layer"] == 0
+        assert "h1 · " in app.input_status["embedding"].get()
+        items_1 = app._seam_items("Gathering seams")
+        pair_1 = [n for n in items_1[0][7] if n.startswith(("absdiff_", "prod_"))]
+        assert len(pair_1) == 2 * widths_e[0] and pair_1[0] == "absdiff_h1_0", pair_1[:3]
+        app._train_seam_model()
+        app._refresh_stages()
+        assert v.stages["model"] == "ok", v.stage_tip("model")
+        assert len(widths_e) > 1, widths_e
+        assert app._set_input_layer(1)
+        app._refresh_stages()
+        assert v.stages["model"] == "stale", "trained on h1, now h2"
+        assert app._set_input_layer(None) and "layer" not in t_walls.inputs["embedding"]
     assert "context columns" not in (why_e or ""), why_e
     assert app._on_stage_click("inputs") is None and app._center_tab_name() == "Features"
     app._show_center_tab("Annotation")

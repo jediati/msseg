@@ -847,7 +847,10 @@ as the **outline** tool (above) and draw no seam layer. **Inputs**
 (`msseg.labeler.artifacts`, Features > "7. Inputs"): a polyline task's slots
 -- *region labels* (another task's gestures re-resolved on this record ->
 derived seams, `seam_labels(boundary_class=)`), *region embedding* (its net
-for the `pair` terms), *p(diff)* (its edge model, `pdiff_for`) -- hold
+for the `pair` terms, its hidden LAYER picked on the slot from the net's own
+layers -- `"layer": k`, `layer_of`, columns `h<k>_*`, the net's shape shown
+via `describe_architecture`; a net with context columns has them built on
+this record by `input_table`), *p(diff)* (its edge model, `pdiff_for`) -- hold
 provider REFERENCES (`{"source": "task", "uid"}`, `{"source": "library",
 "id"}` reserved for the model-artifact library, resolving today to a
 `MissingProvider`); `TaskProvider` reads a task WITHOUT activating it (live
