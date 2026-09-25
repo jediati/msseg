@@ -33,10 +33,12 @@ Extras: `classify` (scikit-learn), `optimize` (+ optuna), `torch`, `pyramid`
 | `derive.py` | **the one label derivation**: gestures -> region classes, arc same/diff, seam boundary/interior (the §7.2 matrix of the design note: samples, then extents' unlabelled neighbours, then the explicit seam gestures); `is_extent`, `enclosed_ids` | no |
 | `extents.py` | a region set's outline as closed loops (the seam graph of the 0/1 mask) and the even-odd fill -- how a fill / blob / enclosure crosses a level | no |
 | `seam_path.py` | tolls and the livewire (one Dijkstra over the junction graph per anchor) | no |
-| `seam_model.py`, `seam_export.py` | the seam model (boundary vs interior from a seam descriptor) and the classified-seam export | no |
+| `seam_model.py`, `seam_export.py` | the seam model (a polyline task's classes from a seam descriptor, multinomial; boundaryness = 1 - P(class 1)) and the classified-seam export | no |
+| `task.py` | `Task` (uid, name, **kind** region / polyline, workflow, store, `ModelStack`, models, view, undo, caches, enrolment, **inputs**), `POLYLINE_DEFAULT_CLASSES` | no |
+| `artifacts.py` | a polyline task's **input slots**: `ProviderRef` (`task` today, `library` later), `resolve`, `TaskProvider` (another task read without activating it), `Requirement` (the gate for an input), `load_model_stack`, `pdiff_for` | no |
 | `training.py` | `TrainingSetBuilder`: annotations + tables -> `(X, y, groups, names)` and the edge model's arrays | no |
 | `context.py` | `ContextSpec` + `augment`: neighbourhood columns (ring / 2-hop / per-item reductions over the region graph, uniform / area / contact weighting, contact lengths from the label raster) appended to a table | no |
-| `bundle.py` | `ModelBundle`: the classifier pickle (v4 writer, v1-v4 reader) and `compat_message` | no |
+| `bundle.py` | `ModelBundle`: the region classifier pickle (v4 writer, v1-v4 reader), `SeamBundle`: a polyline task's seam model pickle, and `compat_message` | no |
 | `model_search.py`, `edge_model.py`, `torch_mlp.py` | the dense-net search, the pair model + voting, the GPU MLP | no |
 | `table.py` | `FeatureTable` (the columnar per-region table) | no |
 | `session_doc.py` | the session document (folders, sequences, profiles, view) and the session-file I/O | no |
@@ -47,8 +49,8 @@ Extras: `classify` (scikit-learn), `optimize` (+ optuna), `torch`, `pyramid`
 | `shell.py` | `ViewerShell`: window, session browser, profiles, navigation, pump, session flow | yes |
 | `annotate.py` | `AnnotationShell`: the labeler layer (store, tools, hotkeys, the three columns and their tabs, session additions) | yes |
 | `classifier.py` | `ClassifierMixin`: Train / Classify / Optimize / size sweep / edge evaluation | yes |
-| `seam_classifier.py` | `SeamModelMixin`: Train seams / Evaluate / Export, the seam model on the classifier pickle | yes |
-| `panels/` | `HintsMixin`, `ModelPanelMixin`, `AnalysisPanelMixin`, `ViewControlsMixin`, `ClassPanelMixin`, `SeamPanelMixin` (the Seams cluster, its caches and overlay) | yes |
+| `seam_classifier.py` | `SeamModelMixin`: Train (R) / Classify (C) / Evaluate / Export, the `SeamBundle` save / load, and the input slots (`_input_resolved`, `_input_region_labels`, `_input_pdiff`, `_set_input`, `_input_signature`) | yes |
+| `panels/` | `HintsMixin`, `ModelPanelMixin`, `AnalysisPanelMixin`, `ViewControlsMixin`, `ClassPanelMixin` (the class frames, over region OR seam gestures by task kind), `SeamPanelMixin` (the polyline Annotation rows, the ML Seam Classifier, the seam caches, overlays and confusion counts), `SeamTabsMixin` (a polyline task's Features / Model / Analysis content), `StagesMixin` (the stage strip) | yes |
 | `tools.py` | `DrawController`, `MagicFillController`, `TraceController` (trace + scope), `_extremum_points` | yes |
 | `defaults.py` | tunables and vocabularies (alphas, coloring modes, model kinds, search budgets, tool options) | -- |
 
@@ -188,8 +190,26 @@ installs into the active task. `_switch_profile` is overridden to stamp the
 active task's `workflow`; `_profile_rename` / `_profile_delete` propagate to
 every task; the bindings' `_profile_from_model` should append the profile and
 call `_bind_workflow(name)` rather than set `active_profile_idx`.
-`_task_new(name)` / `_task_duplicate(name)` / `_task_rename(name)` /
+`_task_new(name, kind)` / `_task_duplicate(name)` / `_task_rename(name)` /
 `_task_delete(confirm)` are headless-callable with their arguments given.
+
+**Task kinds** (see [seam_labeling.md](seam_labeling.md)): `Task.kind` is
+`"region"` or `"polyline"`, fixed at creation. `_apply_task_kind()` (run by
+`_activate_task` after `_set_classify_enabled`) packs the kind's variant of
+every kind-specific widget -- the Annotation tab's tool rows and ML frame,
+the Model and Analysis bodies (`_model_region` / `_model_polyline`,
+`_analysis_region` / `_analysis_polyline`), the Features tab's seam groups
+-- and forgets the other; tools (`_REGION_TOOLS` / `_POLYLINE_TOOLS`, a
+`tool_var` trace coerces) and hotkeys (`_for_kind`) are gated, and R / C
+route to the kind's model (`_on_train_hotkey` / `_on_classify_hotkey`). A
+polyline task's store vocabulary IS its seam vocabulary (class 1 = "not a
+boundary"; gestures in `store.seams`), so the class panel serves both kinds
+through a handful of kind dispatches (`_visible_interactions`,
+`_draw_interaction_geometry` -> `_draw_seam_geometry`, `_interaction_at` ->
+`_seam_gesture_at`, the confusion counts / hits, the grid's holder) rather
+than a second panel. A new widget or cache that means something only for
+one kind belongs behind `_task_kind()`, and a region-task path must stay as
+it was (the coupon selftest's panel diffing guards it).
 
 **Row removal** is one path for the sequence tree's right-click menu
 (*Go to* / *Clear annotations…* / *Remove …*), the Remove / Clear all
@@ -247,16 +267,20 @@ reach the app only through `viewer`, `regions`, `catalogue`, `store`,
   detection. The old module paths `msseg.mscoupon.model_search.FeatureSubset`
   and `msseg.mscoupon.torch_mlp.TorchMLPClassifier` resolve through the shims
   in `packages/mscoupon` -- never delete those shim modules.
-* **Session document v2 / v3** (`session_doc`): profiles are opaque to the
+* **Session document v2 / v4** (`session_doc`): profiles are opaque to the
   framework; the app's reader/default are injected. A document with
-  `tasks[]` + `active_task` is **v3** (`SESSION_DOC_VERSION_TASKS`); each
-  task entry carries `uid`, `name`, `workflow` (a profile name),
-  `annotations` (the store document), `models` (the saved-model records)
-  and `view` (the four `TASK_VIEW_KEYS`: `model_kind`, `model_search`,
-  `neighbours`, `context`, which are NOT in the window `view` any more).
+  `tasks[]` + `active_task` is **v4** (`SESSION_DOC_VERSION_TASKS`); each
+  task entry carries `uid`, `name`, **`kind`**, `workflow` (a profile name),
+  `annotations` (the store document), `models` (the saved-model records; a
+  polyline task's carry `"task_kind": "polyline"`), `view` (the five
+  `TASK_VIEW_KEYS`: `model_kind`, `model_search`, `neighbours`, `context`,
+  `seam_spec`, which are NOT in the window `view` any more) and, only when
+  set, `enrolled` and `inputs`. A labeler document that does not declare
+  task kinds -- v3 and older -- is **refused** (`labeler_refusal`: "written
+  by an older labeler -- start a new session"); there is no migration code.
   Without `tasks` the document is the v2 one it always was, byte for byte --
-  the viewers keep writing it -- and the reader turns it into ONE task named
-  after the active profile, moving the four keys out of `view`. The reader
+  the viewers keep writing it -- and the reader turns it into ONE region
+  task named after the active profile, moving the view keys out of `view`. The reader
   always returns `tasks` + `active_task`, and `annotations` / `models` as
   the active task's for older callers; a task whose workflow names no
   profile is repointed to the active one with a note
@@ -295,15 +319,26 @@ reach the app only through `viewer`, `regions`, `catalogue`, `store`,
   written, and the version raised to 3, only when there are any; a store
   without seams is byte-identical to v2 and an older reader ignores the key
   (`tests/test_compat_docs.py`, `tests/data/annotations_v3.json`).
-* **`ModelBundle.seam`**: the seam model's key is written only when one was
-  fit, so a seam-less pickle is the v4/v5 document it always was.
+* **Two pickles, one per task kind**: a region task saves a `ModelBundle`
+  (which no longer carries a seam head), a polyline task a `SeamBundle`
+  (`"task_kind": "polyline"`, its seam model, statistics and class names);
+  each loader refuses the other's file.
+* **Input references are data, not objects**: `Task.inputs` stores
+  `{"source": "task", "uid"}` / `{"source": "library", "id"}` per slot and
+  `artifacts.resolve` is called at use, so a renamed provider keeps working,
+  a deleted one reads as a `MissingProvider` with its reason, and a library
+  source slots in without a document change. A provider task is never
+  activated to be read: `TaskProvider` uses its live stack or
+  `load_model_stack` (pure; the task's own stack and `model_pending` are
+  untouched).
 
 ## Tests
 
 `packages/mslabeler/tests` (pure Python, `conftest.py` puts the three source
 trees on `sys.path`): `test_labeling`, `test_magic_fill`, `test_training`,
 `test_context`, `test_bundle`, `test_model_search`, `test_edge_model`, `test_torch_mlp`,
-`test_compat_docs`, `test_sources` (the canvas composite is compared
+`test_compat_docs`, `test_task`, `test_task_kind`, `test_artifacts`,
+`test_session_doc_tasks`, `test_seam_model`, `test_stages`, `test_sources` (the canvas composite is compared
 pixel-for-pixel with a reference implementation). `packages/mscoupon/tests`
 keeps the coupon tests plus `test_shims` (shim identity and the old pickle
 paths). The two `--selftest`s (`mscoupon-gui`, `mscoupon-labeler`) are the

@@ -68,28 +68,43 @@ compute profile, referenced by name from the session's shared pool), its
 **class vocabulary** (count, colours and names -- double-click a class title
 to name it *gland* / *not gland*), its **annotations** with their undo
 history, its **model stack** (the region classifier, the edge model, the
-latent head, the seam model) with its predictions, its saved-model records,
-and its Model-tab settings (kind, Optimize, neighbours, context). *Not gland*
-is a statement about one detector's decision boundary, which is why the
-gestures are per task rather than one ten-class vocabulary for everything.
+latent head -- or, in a polyline task, the seam model) with its predictions,
+its saved-model records, and its Model-tab settings (kind, Optimize,
+neighbours, context, the seam spec). *Not gland* is a statement about one
+detector's decision boundary, which is why the gestures are per task rather
+than one ten-class vocabulary for everything.
+
+A task has a **kind**, fixed when it is made: a **region task** classifies
+regions, a **polyline task** classifies the boundaries between them (the
+seams) into classes of its own -- *not a boundary*, *gland wall*, *cut
+artefact*. The Features, Annotation, Model and Analysis tabs, the tools, the
+hotkeys, the view options and the stage strip show the active kind's
+controls; the polyline side has the same review affordances as the region
+side (class frames with counts and click-to-see, drag-to-relabel, the K x K
+fit check with highlight, a held-out Evaluate table, an error list that goes
+to the seam). A polyline task can read a region task's annotations, net and
+edge model through **input slots** on its Features tab. All of it:
+[seam_labeling.md](seam_labeling.md).
 
 The **Tasks** list sits above the session lists in the left column: name,
-workflow, gesture count, model. Click a row to switch -- the workflow box
+kind (▦ region / ⌇ polyline), workflow, gesture count, model. Click a row to switch -- the workflow box
 follows (it shows and rebinds the ACTIVE task's workflow; two tasks on one
 workflow share its primed data, a different workflow drops it, as a profile
 switch always has) and the class stack, the Model tab and the predictions are
-the task's. **New** starts an empty task on the active workflow with the
-current class count; **Dup** copies the vocabulary, workflow and Model-tab
-settings and nothing else; **Rename…** and **Delete** (refused for the last
+the task's. **New** (*Region task* / *Polyline task*) starts an empty task
+of that kind on the active workflow; **Dup** copies the kind, vocabulary,
+workflow, Model-tab settings and inputs and nothing else; **Rename…** and **Delete** (refused for the last
 task; asks when the task has gestures or a model) do what they say. A switch
 is refused while an Optimize / sweep / evaluate search runs, because its
 result installs into the active task. A task's saved pickle loads when the
 task is first activated, and its Optimize autosaves go to
 `models/<task uid>/`.
 
-The session document is **v3**: `tasks[]` + `active_task`, each task with its
-`annotations`, `models` and `view`. A session written before tasks (v2)
-restores as one task named after its active profile, with everything it had;
+The session document is **v4**: `tasks[]` + `active_task`, each task with its
+`kind`, `annotations`, `models` and `view` (and `inputs`, `enrolled` when
+set). A labeler session written before task kinds **does not load** ("written
+by an older labeler -- start a new session"); a viewer's session (no tasks)
+restores as one region task named after its active profile;
 **New session…** keeps the tasks and empties their stores (their models too,
 when the model option is kept). Renaming or deleting a profile follows
 through to the tasks that point at it. Design and the stages that follow
@@ -237,27 +252,35 @@ today only the magic fill writes it. Resolution never reads it, so a stale
 | magic | press, drag up/down, release | a similarity flood from the pressed region -- an **extent** while the `extent` box in the Magic rows is ticked |
 | blobber | as magic | the flood in the active class **and** its bounding regions in the ring class; the core is always an **extent**, the ring a sample |
 | *SHIFT + drag* | a box, any tool | **accepts** the classifier's predictions under it as `taps` (never an extent) |
-| trace | click to anchor, move, click to extend, Enter / double-click | a livewire path along the **seams** (the boundaries between regions), labelled `boundary` -- see [seam_labeling.md](seam_labeling.md). Clicking the **first anchor again closes** the loop and commits it; a tap inside with a class armed then names the **enclosure** |
-| scope | drag a rectangle | every seam fully inside it labelled `interior` (unless a trace says boundary) |
+| outline | with a class armed: click to anchor, move, click to extend; click the **first anchor** again to close | a livewire loop along the seams; closing it paints every region it encloses as ONE **extent** of the armed class (one gesture, one undo step) |
+
+A **polyline task** has its own two tools instead (they paint the armed seam
+class, see [seam_labeling.md](seam_labeling.md)):
+
+| Tool | Gesture | Labels |
+|---|---|---|
+| trace | click to anchor, move, click to extend, Enter / double-click | the seams along a livewire path |
+| scope | drag a rectangle | every seam fully inside it (a trace inside wins) |
 
 **Samples and extents.** A squiggle, a box or a tap is a *sample*: "these
 regions are class k", nothing about their neighbours. An *extent* -- a
-lasso, a released magic fill, a blob's core, an enclosure -- says "this set
+lasso, a released magic fill, a blob's core, an outline -- says "this set
 IS the object": its outer seams are boundaries and its unlabelled neighbours
 are not it. Nothing else changes about how they paint regions; the
-difference is what the **seam and edge models learn** from them
-(`derive.py`, [seam_labeling.md](seam_labeling.md) "Derived labels"): a
-fill on a gland teaches the seam model the gland's edge with no trace drawn.
+difference is what the **edge model and the polyline tasks that read this
+task learn** from them (`derive.py`, [seam_labeling.md](seam_labeling.md)
+"Derived labels"): a fill on a gland teaches a subscribing polyline task the
+gland's edge with no trace drawn.
 An extent only speaks about *unlabelled* neighbours, so filling twice on the
 same gland, or patching a fill with a squiggle, never derives a boundary
 inside it -- an instance boundary between two touching same-class objects is
 a trace's job. Extents show ` ext` in the class panel's rows.
 
-Hotkeys: `1..4` arm a class, `0`/Escape disarm, `M` selects magic, `B` the
-blobber, `T` the trace and `S` the scope (seam tools; `E` toggles the seam
-layer, Enter commits a trace, BackSpace drops its last leg), `Tab`
-toggles the overlays, `Ctrl-Z`/`Ctrl-Y` undo/redo, `R` train + classify,
-`C` classify, `F` flips the image between the original (base, or the colour
+Hotkeys: `1..4` arm a class, `0`/Escape disarm, `M` selects magic and `B` the
+blobber (region tasks), `T` the trace and `S` the scope (polyline tasks; `E`
+toggles the seam layers, Enter commits a trace, BackSpace drops its last
+leg), `Tab` toggles the overlays, `Ctrl-Z`/`Ctrl-Y` undo/redo, `R` train +
+classify and `C` classify -- the active task's model, whichever its kind -- `F` flips the image between the original (base, or the colour
 planes of an RGB slice) and the derived channel last shown (filtered until
 one is picked). Middle/right drag always pans; a right-click opens the
 annotation menu for the region under it.

@@ -221,7 +221,8 @@ newest pickle **lazily** (the load gates against the ACTIVE workflow),
 pushes its view and repaints; refused while a search worker runs (its finish
 installs into the active task). `_switch_profile` stamps the active task's
 workflow; profile rename/delete propagate; `_profile_from_model` binds via
-`_bind_workflow`. Session document **v3**: `tasks[]` + `active_task`, no
+`_bind_workflow`. Session document **v3** (v4 since the task kinds,
+below): `tasks[]` + `active_task`, no
 top-level `annotations`/`models`; the tasks-less form is unchanged (the
 viewers write it) and reads as ONE task named after the active profile with
 the four view keys moved out of `view`; the reader returns
@@ -288,15 +289,14 @@ sets beside the row classes) -- gestures drawn `COARSE_LEVELS` coarser are
 left out. Producers: blob core `extent=True`; magic fill by the `extent`
 checkbox (Magic row 2, `magic_extent_var`, `view.magic.extent`, default
 `_DEFAULT_MAGIC_EXTENT = True`); lasso `{"extent": True}` unless **Ctrl**
-at press (`DrawController._sample`; Windows/X11 only). **Enclosure**: a
-trace closed by clicking its first anchor commits at once and parks
-(`TraceController._pending`; `derive.enclosed_ids` via `extent_mask`, exact
-on the crack lattice where a polygon fill leaks); the next press inside with
-a class armed calls `_commit_enclosure` -> `_commit_blob` with
-`{"tool": "enclosure", "extent": True, "trace": uid}` (seeds + outline, one
-undo step, row `enclosure (n) ext`); outside -> a new trace; Esc drops it. A
-return leg after one leg retraces (Dijkstra is symmetric): two intermediate
-anchors at least. `_commit_seam` now returns the Interaction. Tests:
+at press (`DrawController._sample`; Windows/X11 only). **Enclosure** --
+now the region tasks' **outline** tool (2026-09-25): with a class armed, a
+livewire loop closed on its first anchor commits ONE extent at once
+(`_commit_outline` -> `_commit_blob`, `{"tool": "outline", "extent": True,
+"n_regions", "toll", "anchors"}`; `derive.enclosed_ids` via `extent_mask`,
+exact on the crack lattice where a polygon fill leaks); no seam gesture is
+stored and the old park-then-tap flow is gone. A return leg after one leg
+retraces (Dijkstra is symmetric): two intermediate anchors at least. Tests:
 `test_derive.py`, `test_edge_hook.py`; coupon selftest sections (extent
 meta, checkbox + view, Ctrl-lasso, derived seams after a blob, the closed
 trace / outside / arm-a-class / name / Esc flow; its overlay counts grew by
@@ -725,8 +725,8 @@ through `RegionProvider.seams(key, np)` -- NOT from MSCEER arc geometry: the
 crack lattice is segmentation-independent, so a stored **trace** re-resolves
 against a new decomposition by crack coverage (`seam_labeling.resolve_seams`,
 tau 0.5; scopes first, then traces, by uid). Tools (`tools.TraceController`,
-keys T / S / E / Enter / BackSpace): a **scope** box labels every seam inside
-it interior; a **trace** is a livewire (`seam_path.Livewire`: virtual anchor
+keys T / S / E / Enter / BackSpace; a polyline task's, below): a **scope**
+box labels every seam inside it in the armed class; a **trace** is a livewire (`seam_path.Livewire`: virtual anchor
 on any seam point, ONE Dijkstra over the junction graph per anchor, hover =
 predecessor walk) whose **toll** is `geometric` / `feature` / `bhattacharyya`
 / `barrier` / `edges` (edge-model pdiff) / `model`. Seam gestures live in
@@ -736,7 +736,7 @@ when present (a seam-less store is byte-identical to v2). The **seam model**
 descriptors or the base net's embedding + saddle barrier + pdiff + geometry,
 balanced logistic, leave-items-out Evaluate on the Optimize pump) scores
 every seam's **boundaryness** (the `model` toll, the boundaryness colouring)
-and rides the classifier pickle under `ModelBundle.seam`; **Export** writes
+-- multiclass and in its own pickle since the task kinds (below); **Export** writes
 `seams_<item>.json` + `seams_summary.csv`. The overlay paints both flank
 pixels of every crack through `_region_overlay` (mspath places it).
 
@@ -814,6 +814,54 @@ and pan; hover shows the tip), a click opens the box's tab
 (`STAGE_STRIP` makes the apps' `_update_busy` leave stage states to the strip;
 the viewers are unchanged). Tests: `test_stages.py`, the canvas strip test in
 `test_sources.py`, strip blocks in both labeler selftests.
+
+**Region and polyline tasks** (2026-09-25, phases `e462b31` .. `10e906c`;
+[docs/seam_labeling.md](docs/seam_labeling.md), design note §7.3 answered):
+`Task.kind` = `region` | `polyline`, fixed at creation (New is a menu; Dup
+keeps it; a kind column ▦ / ⌇ in the Tasks list). `_apply_task_kind`
+(in `_activate_task`) packs the kind's variant of the Annotation tab (tool
+rows + ML Region Classifier, or `poly_tool_row` / `trace_row` + the ML Seam
+Classifier `seam_frame`), the Model / Analysis bodies (`_model_region` /
+`_model_polyline`, `_analysis_*`) and the Features seam groups; tools gate
+through `_REGION_TOOLS` / `_POLYLINE_TOOLS` (a `tool_var` trace coerces),
+hotkeys through `_for_kind` (M / B region; T / S / E / Enter / BackSpace
+polyline), R / C route by kind. **A polyline task's store vocabulary IS its
+seam vocabulary** (class 1 = "not a boundary", defaults
+`POLYLINE_DEFAULT_CLASSES`; gestures in `store.seams`, `add_seam` accepts
+`1..n_classes-1`, `set_class` covers seams), so the class panel serves both
+kinds: seam rows in the class frames with counts (`a · s`), click-to-see
+(`_draw_seam_geometry`), drag-relabel, menu, clear, canvas hover /
+right-click (`_seam_gesture_at`). The seam model is **multiclass**
+(`predict_proba` columns by class id, `boundaryness_of` = 1 - P(class 1),
+`_seam_pred[key] = (commit, boundaryness, proba)`), stamps `trained_rev` /
+`trained_measure` / `trained_inputs`, and has its **own pickle**
+(`bundle.SeamBundle`, `task_kind: "polyline"`; a region `ModelBundle` has no
+seam head; each loader refuses the other's file). Review parity: the K x K
+matrix in the ML Seam Classifier (by seams or crack length, cell highlight
+`_seam_confusion_hits`), the Model tab's seam spec + Evaluate report tables
+(`panels/seam_tabs.py`, spec in the task view as `seam_spec`), the Analysis
+seam error list -> `_goto_seam`, view modes class / boundaryness /
+uncertainty / P(class k) with the region overlays faded (`_seam_layers`),
+and the stage strip reading the seam model. Region tasks keep the livewire
+as the **outline** tool (above) and draw no seam layer. **Inputs**
+(`msseg.labeler.artifacts`, Features > "7. Inputs"): a polyline task's slots
+-- *region labels* (another task's gestures re-resolved on this record ->
+derived seams, `seam_labels(boundary_class=)`), *region embedding* (its net
+for the `pair` terms), *p(diff)* (its edge model, `pdiff_for`) -- hold
+provider REFERENCES (`{"source": "task", "uid"}`, `{"source": "library",
+"id"}` reserved for the model-artifact library, resolving today to a
+`MissingProvider`); `TaskProvider` reads a task WITHOUT activating it (live
+stack, or `load_model_stack` from its newest pickle, cached by path +
+mtime); `Requirement.why_not` is the per-slot gate ("needs mean_blur_s1.5;
+workflow 'x' does not measure it"); an **inputs** stage box feeds the model
+(orange when a slot cannot be filled). Session document **v4**: every task
+declares `kind` (+ `inputs` when set); an older labeler document is REFUSED
+("written by an older labeler -- start a new session",
+`session_doc.labeler_refusal`), no migration; the viewers' tasks-less doc
+still reads as one region task. Tests: `test_task_kind.py`,
+`test_artifacts.py`, `test_seam_model.py` (multiclass, `SeamBundle`),
+`test_session_doc_tasks.py`; the coupon selftest's polyline block (walls
+task) covers the tools, frames, model, matrix, tabs, pickle and inputs.
 
 **Region encoder, offline** (2026-09-15, [docs/design_region_autoencoder.md](docs/design_region_autoencoder.md)):
 a task-free latent of the statistics ROW, so the labeler's head is not the

@@ -302,7 +302,39 @@ stored**: derivation runs at training time against the consumer's own record,
 which is what lets one gesture serve two tasks, two persistences, or two
 levels.
 
-### 7.3 Region tasks and path tasks are one task kind
+### 7.3 Region tasks and path tasks ~~are one task kind~~ -- answered: one kind each, joined by inputs
+
+**Decided 2026-09-25** (built in six phases, `e462b31`..; the user-facing
+account is [seam_labeling.md](seam_labeling.md)): the single-stack proposal
+below was **not** taken. A task has a **kind**, `region` or `polyline`,
+fixed at creation, and the kind decides what every tab, tool, hotkey, view
+option and stage-strip box shows. What the proposal wanted from one stack --
+a boundary detector that embeds with a gland net, derives boundaries from
+gland extents, reads the gland edge model -- a polyline task gets by
+**subscribing** to a region task through typed input slots (`artifacts.py`:
+*region labels*, *region embedding*, *p(diff)*; §9's embedding and gestures
+subscriptions, built), each slot a provider *reference* so a future model
+artifact library fills them without a document change. Why two kinds:
+
+* the review surface differs per target -- a class frame of seam gestures,
+  a K x K matrix over seams counted by length, an error list that goes to a
+  seam -- and one stack meant every panel asking "which head am I showing?"
+  while the user is only ever training one of them;
+* seam classes are **named per task** after all (class 1 = the "not a
+  boundary" role, the rest are kinds of boundary: *gland wall*, *cut
+  artefact*), which a shared store vocabulary cannot give a region head too;
+* a polyline task's store vocabulary can then BE its seam vocabulary, so
+  the whole class-panel machinery serves both kinds unchanged;
+* a region pickle and a seam pickle are separate files (`ModelBundle` /
+  `SeamBundle`), so neither gate has to reason about the other's head.
+
+A region task keeps the livewire as an **outline** tool: a closed loop is
+an extent of the armed class in one step (the "trace the gland, tap it once"
+tool of §7.2, minus the tap); open traces and scopes exist only in polyline
+tasks. The derivation matrix of §7.2 stands; its seam column is what a
+polyline task's labels input computes against its own record.
+
+The original proposal, for the record:
 
 A task is a **stack** whose heads are chosen per target:
 
@@ -318,6 +350,8 @@ task's region head (§9). Bubble & background: a region head whose positive
 class is published as a mask. Region classes are named per task; seam classes
 are the fixed pair `boundary` / `interior`. A seam-only task may still collect
 region gestures (extents feed boundaries) under a single class *object*.
+*(Superseded: see the decision above; seam classes are per task and a
+polyline task collects no region gestures -- it reads a region task's.)*
 
 ## 8. The frame of a gesture: slide-bound, level-free
 
@@ -726,12 +760,14 @@ record key; stage 8 needs several providers' layers live at once.
    valid over.
 5. **Corridor radius for traces off-level**: one drawing-level pixel, or the
    recorded stroke width.
-6. **Does a seam-only task collect region gestures**, or only subscribe to a
-   region task's extents?
+6. ~~**Does a seam-only task collect region gestures**, or only subscribe to a
+   region task's extents?~~ Closed 2026-09-25: it subscribes (§7.3: a
+   polyline task's *region labels* input; its store holds seam gestures only).
 7. **Level per task** (a coarse pass and fine ROIs are two tasks or two
    sweep rungs) -- confirm acceptable.
 8. **Mask threshold semantics** per subscription (any-overlap vs majority).
-9. **Task uid vs name** for cross-references.
+9. ~~**Task uid vs name** for cross-references.~~ Closed: uid (an input
+   slot stores `{"source": "task", "uid"}`; a rename keeps it working).
 10. **Where gestures live on disk** with ten tasks.
 11. **Model history retention.**
 12. **Physical units on workflow parameters** (`sigma` in µm, `area` in µm²)
