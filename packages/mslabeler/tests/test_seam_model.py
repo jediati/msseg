@@ -80,18 +80,49 @@ def test_fit_predict_and_pickle_round_trip(tmp_path):
     assert "logistic" in model.brief() and "features" in model.brief()
     with pytest.raises(ValueError):
         sm.predict_boundaryness(model, F[:, :3])
-    # The pickle: the seam key only when set; a round trip predicts the same.
-    b = ModelBundle(model=None, names=["x"], kind="dense FC", seam=model.to_dict())
-    doc = b.to_doc()
-    assert "seam" in doc and "seam" not in ModelBundle(model=None, names=["x"], kind="k").to_doc()
-    path = tmp_path / "m.pkl"
+    P = sm.predict_proba(model, F)
+    assert P.shape == (g.n_seams, 3) and np.allclose(P[:, 1:].sum(axis=1), 1.0)
+    assert np.allclose(sm.boundaryness_of(P), p)
+    assert (sm.predicted_class(P)[y > 0] == y[y > 0]).mean() > 0.9
+    # The seam model is its own pickle (a polyline task's), not a key of the
+    # region bundle; each loader refuses the other's file.
+    from msseg.labeler.bundle import SeamBundle
+    assert "seam" not in ModelBundle(model=None, names=["x"], kind="k").to_doc()
+    b = SeamBundle(seam=model.to_dict(), statistics={"channels": ["base"]},
+                   classes={1: "not a boundary", 2: "gland wall"})
+    path = tmp_path / "s.pkl"
     b.save(str(path))
-    back = ModelBundle.load(str(path))
+    back = SeamBundle.load(str(path))
+    assert back.classes == {1: "not a boundary", 2: "gland wall"}
     m2 = sm.SeamModel.from_dict(back.seam)
     assert m2.feature_names == fnames and m2.names_hash == model.names_hash
+    assert m2.classes == [1, 2] and m2.n_classes == 3
     assert np.allclose(sm.predict_boundaryness(m2, F), p)
-    assert back.record_entry(str(path))["seam"] is True
-    assert "seam" not in ModelBundle(model=None, names=["x"], kind="k").record_entry(str(path))
+    entry = back.record_entry(str(path))
+    assert entry["task_kind"] == "polyline" and entry["kind"] == "seam logistic"
+    with pytest.raises(ValueError):
+        ModelBundle.load(str(path))
+    region = tmp_path / "r.pkl"
+    ModelBundle(model=None, names=["x"], kind="k").save(str(region))
+    with pytest.raises(ValueError):
+        SeamBundle.load(str(region))
+
+
+def test_three_seam_classes():
+    """A polyline task's own vocabulary: two kinds of boundary plus class 1."""
+    rng = np.random.default_rng(4)
+    _lab, table, g, y = lattice(rng)
+    F, fnames = sm.seam_features(g, table, sm.region_feature_names(table), np)
+    # Split the boundary seams into two classes by a feature they differ in.
+    y3 = y.copy()
+    b = np.flatnonzero(y == SEAM_BOUNDARY)
+    y3[b[F[b, 0] > np.median(F[b, 0])]] = 3
+    model = sm.fit_seam_model(F, y3, sm.SeamSpec(), fnames, n_classes=4)
+    assert model.classes == [1, 2, 3] and model.n_classes == 4
+    assert model.n_boundary == int((y3 >= 2).sum())
+    P = sm.predict_proba(model, F)
+    assert P.shape == (g.n_seams, 4) and np.allclose(P[:, 0], 0.0)
+    assert "3 classes" in model.brief()
 
 
 def test_gather_and_evaluate_leave_items_out():
@@ -111,6 +142,8 @@ def test_gather_and_evaluate_leave_items_out():
                             progress_cb=lambda f, n: progress.append((f, n)))
     assert rep["cv_kind"] == "slices" and rep["n_folds"] == 3 and len(progress) == 3
     assert rep["mean"]["auc"] > 0.9 and rep["mean"]["bacc"] > 0.8
+    assert rep["classes"] == [1, 2] and set(rep["mean"]["per_class"]) == {1, 2}
+    assert rep["mean"]["per_class"][2]["recall"] > 0.8
     assert rep["n"] == int((data["y"] > 0).sum())
     text = sm.summary(rep)
     assert "AUC" in text and "3-fold slices CV" in text

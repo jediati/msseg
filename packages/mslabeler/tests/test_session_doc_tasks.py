@@ -67,10 +67,12 @@ def test_v3_round_trip_two_tasks():
     a.store.set_name(1, "gland")
     a.store.add("squiggle", [(0, 0), (1, 1)], 1, "d/a.tif", 0, 0)
     a.models.append({"path": "ga.pkl", "kind": "dense (tuned)", "fingerprint": ["x"],
-                     "scope": "L0", "context": {"kinds": ["ring_mean"]}, "seam": True})
+                     "scope": "L0", "context": {"kinds": ["ring_mean"]}})
     a.view = {"model_kind": "dense (tuned)", "context": {"kinds": ["ring_mean"]}}
-    b = Task.new("stroma", workflow="p2", n_classes=2)
+    b = Task.new("stroma", workflow="p2", n_classes=3, kind="polyline")
     b.store.add_seam("scope", [(0, 0), (5, 5)], 1, "d/a.tif", 0, 0)
+    b.models.append({"path": "sb.pkl", "kind": "seam logistic", "fingerprint": ["y"],
+                     "task_kind": "polyline", "seam": True})
     doc = build_session_doc(**_base(), tasks=[a.to_doc(), b.to_doc()], active_task=b.uid,
                             annotations={"should": "not appear"}, models=[{"path": "no"}])
     assert doc["session_version"] == SESSION_DOC_VERSION_TASKS == 4
@@ -87,9 +89,11 @@ def test_v3_round_trip_two_tasks():
     assert ta["annotations"] == a.store.to_json()
     assert ta["models"] == [{"path": "ga.pkl", "fingerprint": ["x"], "kind": "dense (tuned)",
                              "statistics": {}, "spec": None, "edge": False, "scope": "L0",
-                             "context": {"kinds": ["ring_mean"]}, "seam": True}]
+                             "context": {"kinds": ["ring_mean"]}}]
+    assert tb["kind"] == "polyline" and tb["models"][0]["task_kind"] == "polyline"
+    assert "seam" not in tb["models"][0], "the old seam-rides-along flag is not read"
     assert ta["view"] == a.view and tb["view"] == {}
-    assert back["annotations"] == tb["annotations"] and back["models"] == []
+    assert back["annotations"] == tb["annotations"] and back["models"] == tb["models"]
     # A v3 window view is returned as written: the task keys are only moved
     # out of it on the tasks-less (v2) path, where they had nowhere else to be.
     assert back["view"] == _base()["view"]

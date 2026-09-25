@@ -1171,7 +1171,7 @@ def _selftest():
         # ...plus the seam overlay: two classes drawn on adjacent regions
         # derive boundary / interior seam labels (derive.py) with no seam
         # gesture at all, and the seams layer shows them.
-        assert len(ovs) == 4, "regions + prediction layer + drawn labels + derived seams"
+        assert len(ovs) == 3, "regions + prediction layer + drawn labels (no seams in a region task)"
         assert int(ovs[1]["lut"][:, 3].max()) < 255, "prediction layer is translucent"
 
         # Probabilities ride the same cache; the hard label IS their argmax.
@@ -1201,7 +1201,7 @@ def _selftest():
             ovs_m = app._seg_overlays(0, 0, rec3, None, np, _mc)
             # The scalar layer REPLACES the id layer, so the stack is the same
             # height; it is the bottom one, and only living regions are opaque.
-            assert len(ovs_m) == 4, mode
+            assert len(ovs_m) == 3, mode
             lut_m = ovs_m[0]["lut"]
             assert lut_m.shape == (10, 4)
             assert int(lut_m[[0, 2, 5, 9], 3].min()) > 0, mode
@@ -1436,11 +1436,11 @@ def _selftest():
         assert (f"{before['current'].get(moved, 0)} on this slice / "
                 f"{before['all'].get(moved, 0)} total") in app.status_var.get()
         ovs_h = app._seg_overlays(0, 0, rec3, None, np, _mc)
-        assert len(ovs_h) == 5, "highlight rides on top (of regions, prediction, labels, seams)"
+        assert len(ovs_h) == 4, "highlight rides on top (of regions, prediction, labels)"
         assert set(np.nonzero(ovs_h[-1]["lut"][:, 3])[0].tolist()) == hits
         app._on_confusion_click(*moved)                       # click again clears
         assert app._cm_cell is None
-        assert len(app._seg_overlays(0, 0, rec3, None, np, _mc)) == 4
+        assert len(app._seg_overlays(0, 0, rec3, None, np, _mc)) == 3
 
         # Navigating changes only the current-slice table; the all-slice table
         # remains the aggregate over both records.
@@ -2583,6 +2583,35 @@ def _selftest():
         app._train_seam_model()
         assert app._seam_model is not None, app.status_var.get()
         assert key_s in app._seam_pred and len(app._seam_pred[key_s][1]) == 4
+        assert app._seam_pred[key_s][2].shape == (4, 3), "p(class k) per seam"
+        # The K x K fit check lives in the ML Seam Classifier and counts seams
+        # (or crack length); a cell highlights its seams; the strip is green.
+        cm_s = app._confusion_counts("all")
+        assert sum(cm_s.values()) == 4, cm_s
+        assert _under(app._cm_cells["all"][(SEAM_BOUNDARY, SEAM_BOUNDARY)],
+                      app.seam_confusion_holder)
+        app.seam_count_by_var.set("length")
+        assert sum(app._confusion_counts("all").values()) > 4, "counted by crack length"
+        app.seam_count_by_var.set("seams")
+        right = max(cm_s, key=cm_s.get)
+        app._on_confusion_click(*right)
+        assert app._seam_confusion_hits(), "the cell's seams on this item"
+        hl_s = app._seg_overlays(0, 0, rec_s, None, np, _mc_s)[-1]
+        assert int(hl_s["lut"][:, 0].max()) == 255 and int(hl_s["lut"][:, 3].max()) == 255
+        app._on_confusion_click(*right)
+        assert not app._seam_confusion_hits()
+        app._refresh_stages()
+        assert v.stages["model"] == "ok" and v.stages["classified"] == "ok", v.stages
+        # Its own pickle, recorded on the task; C classifies with it.
+        with tempfile.TemporaryDirectory() as td_m:
+            pth = os.path.join(td_m, "seams.pkl")
+            app._save_seam_model_to(pth)
+            assert app.models[-1]["task_kind"] == "polyline"
+            app._seam_model = None
+            app._load_seam_model_from(pth)
+            assert app._seam_model is not None and not app._seam_pred
+        app._on_classify_hotkey()
+        assert key_s in app._seam_pred, "C classifies the polyline task's seams"
         app.seam_toll_var.set("model")
         assert ctrl.on_press(_FakeEvent(10, 3)) and tc.active
         app._on_escape()

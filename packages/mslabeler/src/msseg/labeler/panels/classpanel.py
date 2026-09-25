@@ -441,18 +441,23 @@ class ClassPanelMixin:
         _refresh_confusion, which runs right after this on the same signal. A
         commit changes only the counts, so rebuilding here just made the ML
         panel flash black along with the annotation panel."""
-        holder = getattr(self, "confusion_holder", None)
+        holder = self._cm_holder()
         if holder is None:
             return
-        sig = self._class_panel_signature()
+        sig = (self._task_kind(),) + self._class_panel_signature()
         if sig == getattr(self, "_cm_grid_sig", None) and getattr(self, "_cm_cells", None):
             return
         self._cm_grid_sig = sig
-        for w in list(holder.winfo_children()):
-            w.destroy()
+        # One grid lives at a time, in the active kind's holder.
+        for h in (getattr(self, "confusion_holder", None),
+                  getattr(self, "seam_confusion_holder", None)):
+            if h is not None:
+                for w in list(h.winfo_children()):
+                    w.destroy()
         self._cm_cells = {}
         n = self.store.n_classes
-        for scope, title in (("all", "All slices"), ("current", "Current slice")):
+        noun = self.ITEM_NOUN
+        for scope, title in (("all", f"All {noun}s"), ("current", f"Current {noun}")):
             frame = ttk.LabelFrame(holder, text=title)
             frame.pack(fill="x", padx=2, pady=1)
             cells = {}
@@ -481,6 +486,12 @@ class ClassPanelMixin:
         if self._cm_cell not in self._cm_cells.get("all", {}):
             self._cm_cell = None         # the class count shrank under it
 
+    def _cm_holder(self):
+        """The active kind's confusion holder (ML Region / Seam Classifier)."""
+        if self._task_kind() == "polyline":
+            return getattr(self, "seam_confusion_holder", None)
+        return getattr(self, "confusion_holder", None)
+
     def _confusion_counts(self, scope="all"):
         """{(true, pred): n} globally or on the current slice.
 
@@ -488,7 +499,10 @@ class ClassPanelMixin:
         more moves only the true axis -- "old prediction, new value".
 
         Truth comes from _labels_cache_for, the rasterization the class LUT
-        already paid for, so this adds no pass over the interactions."""
+        already paid for, so this adds no pass over the interactions. A
+        polyline task counts seams (or crack length) instead."""
+        if self._task_kind() == "polyline":
+            return self._seam_confusion_counts(scope)
         import numpy as np
         counts = {}
         current = self._current_key() if scope == "current" else None
@@ -560,8 +574,9 @@ class ClassPanelMixin:
                             "Analysis tab (double-click the cell to open it)")
 
     def _confusion_hits(self):
-        """Region ids on the current slice matching the selected cell."""
-        if self._cm_cell is None:
+        """Region ids on the current slice matching the selected cell (a
+        polyline task highlights seams instead: _seam_confusion_hits)."""
+        if self._cm_cell is None or self._task_kind() == "polyline":
             return set()
         cur = self._current()
         if cur is None:

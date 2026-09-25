@@ -99,6 +99,8 @@ class StagesMixin:
 
     # -- the framework's boxes -------------------------------------------- #
     def _stage_model(self):
+        if self._task_kind() == "polyline":
+            return self._stage_seam_model()
         if self._clf is None:
             return ("none", "No model yet: annotate, then Train (Annotation tab) "
                             "or load one.")
@@ -143,7 +145,35 @@ class StagesMixin:
         self._stage_compat_cache = (sig, msg)
         return msg
 
+    def _stage_seam_model(self):
+        model = self._seam_model
+        if model is None:
+            return ("none", "No seam model yet: label seams in two classes, then "
+                            "Train (R).")
+        stack = self._task.model
+        mk = self._measure_key()
+        if stack.trained_measure is not None and mk is not None and mk != stack.trained_measure:
+            return ("stale", "The base channel or statistics changed since this seam "
+                             "model was trained -- Train again (R).")
+        if stack.trained_rev is not None and stack.trained_rev != self.store.rev:
+            return ("stale", "Seam labels or classes changed since this model was "
+                             "trained -- Train again (R).")
+        if stack.trained_rev is None:
+            return ("ok", f"Loaded seam model ({model.brief()}).")
+        return ("ok", f"Trained this session: {model.brief()}.")
+
     def _stage_classified(self, key):
+        if self._task_kind() == "polyline":
+            if self._seam_model is None:
+                return ("none", "Nothing to classify seams with yet.")
+            entry = self._seam_pred.get(key)
+            if entry is None:
+                return ("none", "Seams not classified -- press C.")
+            rec = self.regions.record(key)
+            if rec is None or entry[0] != rec.get("commit"):
+                return ("stale", "Classified on an earlier version of these seams -- "
+                                 "press C.")
+            return ("ok", "Seams classified with the current model.")
         if self._clf is None:
             return ("none", "Nothing to classify with yet.")
         pr = self._pred.get(key)

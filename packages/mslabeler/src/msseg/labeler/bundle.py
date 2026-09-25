@@ -9,8 +9,10 @@ A saved classifier is one pickled dict::
                         #      the stack settings (custom hidden sizes, edge spec,
                         #      and -- only when the names carry neighbourhood
                         #      columns -- "context": the ContextSpec dict)
-     "scope",           # v5:  the app's feature scope, when it has one
-     "seam"}            # the seam model (seam_model.SeamModel.to_dict), when one was fit
+     "scope"}           # v5:  the app's feature scope, when it has one
+
+A polyline task's seam model is its own pickle (``SeamBundle``): a region
+pickle no longer carries one, and each loader refuses the other's file.
 
 Reading is feature-detecting rather than version-gated, so every earlier
 layout (v1: no kind/statistics; v2: no spec; v3: no edge/stack; v4: no scope)
@@ -57,7 +59,6 @@ class ModelBundle:
     edge: Optional[Dict[str, Any]] = None
     stack: Dict[str, Any] = field(default_factory=dict)
     scope: Optional[str] = None
-    seam: Optional[Dict[str, Any]] = None
     app_tag: str = DEFAULT_APP_TAG
 
     def to_doc(self) -> Dict[str, Any]:
@@ -70,9 +71,6 @@ class ModelBundle:
         # keeps producing the document it always has.
         if self.scope is not None:
             doc["scope"] = str(self.scope)
-        # Likewise the seam model: only when one rides along.
-        if self.seam is not None:
-            doc["seam"] = dict(self.seam)
         return doc
 
     @classmethod
@@ -82,7 +80,6 @@ class ModelBundle:
             raise ValueError("not a labeler classifier file")
         spec = doc.get("spec")
         edge = doc.get("edge")
-        seam = doc.get("seam")
         return cls(model=doc["model"], names=list(doc["names"]),
                    kind=str(doc.get("kind") or "random forest"),
                    statistics=dict(doc.get("statistics") or {}),
@@ -90,7 +87,6 @@ class ModelBundle:
                    edge=edge if isinstance(edge, dict) else None,
                    stack=dict(doc.get("stack") or {}),
                    scope=(str(doc["scope"]) if doc.get("scope") is not None else None),
-                   seam=seam if isinstance(seam, dict) else None,
                    app_tag=app_tag)
 
     def save(self, path: str) -> None:
@@ -106,15 +102,71 @@ class ModelBundle:
     def record_entry(self, path: str) -> Dict[str, Any]:
         """The session's model record for this bundle saved at `path`."""
         return model_record_entry(path, self.names, self.kind, self.statistics,
-                                  self.spec, self.edge is not None, self.scope,
-                                  has_seam=self.seam is not None)
+                                  self.spec, self.edge is not None, self.scope)
+
+
+SEAM_BUNDLE_VERSION = 1
+
+
+@dataclass
+class SeamBundle:
+    """A polyline task's seam model on disk: ``{"app", "version",
+    "task_kind": "polyline", "seam": SeamModel.to_dict(), "statistics",
+    "classes": {k: name}[, "scope"]}``. The class names are the task's at
+    save time (display only: ids are the wire format)."""
+    seam: Dict[str, Any]
+    statistics: Dict[str, Any] = field(default_factory=dict)
+    classes: Dict[int, str] = field(default_factory=dict)
+    scope: Optional[str] = None
+    app_tag: str = DEFAULT_APP_TAG
+
+    def to_doc(self) -> Dict[str, Any]:
+        doc = {"app": self.app_tag, "version": SEAM_BUNDLE_VERSION, "task_kind": "polyline",
+               "seam": dict(self.seam), "statistics": dict(self.statistics),
+               "classes": {str(int(k)): str(v) for k, v in self.classes.items()}}
+        if self.scope is not None:
+            doc["scope"] = str(self.scope)
+        return doc
+
+    @classmethod
+    def from_doc(cls, doc: Any, app_tag: str = DEFAULT_APP_TAG) -> "SeamBundle":
+        if (not isinstance(doc, dict) or doc.get("app") != app_tag
+                or doc.get("task_kind") != "polyline" or not isinstance(doc.get("seam"), dict)):
+            raise ValueError("not a polyline-task (seam) model file")
+        classes = {}
+        for k, v in (doc.get("classes") or {}).items():
+            try:
+                classes[int(k)] = str(v)
+            except (TypeError, ValueError):
+                continue
+        return cls(seam=dict(doc["seam"]), statistics=dict(doc.get("statistics") or {}),
+                   classes=classes,
+                   scope=(str(doc["scope"]) if doc.get("scope") is not None else None),
+                   app_tag=app_tag)
+
+    def save(self, path: str) -> None:
+        with open(path, "wb") as f:
+            pickle.dump(self.to_doc(), f)
+
+    @classmethod
+    def load(cls, path: str, app_tag: str = DEFAULT_APP_TAG) -> "SeamBundle":
+        with open(path, "rb") as f:
+            doc = pickle.load(f)
+        return cls.from_doc(doc, app_tag)
+
+    def record_entry(self, path: str) -> Dict[str, Any]:
+        spec = self.seam.get("spec") or {}
+        entry = model_record_entry(path, self.seam.get("feature_names") or [],
+                                   f"seam {spec.get('model', 'logistic')}", self.statistics,
+                                   None, False, self.scope)
+        entry["task_kind"] = "polyline"
+        return entry
 
 
 def model_record_entry(path: str, names: Sequence[str], kind: str, statistics: Any,
                        spec: Optional[Dict[str, Any]], has_edge: bool,
                        scope: Optional[str] = None,
-                       context: Optional[Dict[str, Any]] = None,
-                       has_seam: bool = False) -> Dict[str, Any]:
+                       context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """A session ``models[]`` entry: where the pickle is, the feature
     fingerprint it needs, and enough provenance to describe it unloaded.
     `context` is the ContextSpec dict of the neighbourhood columns the
@@ -129,8 +181,6 @@ def model_record_entry(path: str, names: Sequence[str], kind: str, statistics: A
         entry["scope"] = str(scope)
     if context:
         entry["context"] = dict(context)
-    if has_seam:
-        entry["seam"] = True             # a seam model rides the pickle
     return entry
 
 

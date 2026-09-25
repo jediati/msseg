@@ -1483,6 +1483,18 @@ class ClassifierMixin:
 
     # -- classifier persistence (pickle: the sklearn-native format) ------ #
     def _save_classifier(self):
+        if self._task_kind() == "polyline":
+            if self._seam_model is None:
+                self.status_var.set("Train first.")
+                return
+            path = filedialog.asksaveasfilename(title="Save seam classifier",
+                                                defaultextension=".pkl",
+                                                initialfile="seam_classifier.pkl",
+                                                filetypes=[("Pickle", "*.pkl")])
+            if path:
+                self._save_seam_model_to(path)
+                self.status_var.set(f"Wrote {path}")
+            return
         if self._clf is None:
             self.status_var.set("Train first.")
             return
@@ -1517,13 +1529,9 @@ class ClassifierMixin:
         latent = getattr(self, "_context_model", None)
         if latent is not None:
             stack["latent"] = latent.to_dict()
-        # The seam model rides along when one was fit (its own key, written
-        # only then, so a seam-less pickle is unchanged).
-        sm = getattr(self, "_seam_model", None)
-        seam = None if sm is None else sm.to_dict()
         model_bundle.ModelBundle(model=self._clf, names=list(self._clf_names), kind=self._clf_kind,
                                  statistics=stats, spec=spec, edge=edge, stack=stack,
-                                 seam=seam, app_tag=self.MODEL_APP_TAG).save(path)
+                                 app_tag=self.MODEL_APP_TAG).save(path)
         self._record_model(path, stats)
 
     def _record_model(self, path, statistics):
@@ -1533,8 +1541,7 @@ class ClassifierMixin:
             path, self._clf_names, self._clf_kind, statistics,
             None if self._clf_spec is None else self._clf_spec.to_dict(),
             self._edge_model is not None, getattr(self, "_clf_scope", None),
-            context=None if ctx is None or ctx.empty() else ctx.to_dict(),
-            has_seam=getattr(self, "_seam_model", None) is not None)
+            context=None if ctx is None or ctx.empty() else ctx.to_dict())
         self.models = [m for m in self.models if m.get("path") != entry["path"]]
         self.models.append(entry)
 
@@ -1542,6 +1549,15 @@ class ClassifierMixin:
         path = filedialog.askopenfilename(title="Load classifier",
                                           filetypes=[("Pickle", "*.pkl")])
         if not path:
+            return
+        if self._task_kind() == "polyline":
+            try:
+                model = self._load_seam_model_from(path)
+            except Exception as exc:
+                messagebox.showerror(self.APP_TITLE, str(exc))
+                self.status_var.set(f"Could not load seam classifier: {exc}")
+                return
+            self.status_var.set(f"Loaded {model.brief()} from {path}")
             return
         try:
             self._load_classifier_from(path, interactive=True)
@@ -1602,20 +1618,6 @@ class ClassifierMixin:
                     self._log("edge model in the pickle was fit over other features - dropped")
             except Exception as exc:
                 self._log(f"edge model in the pickle not restored: {exc}")
-        # The seam model, only when its pair block did not embed with a base
-        # net other than this one (a 'features' embedding is base-independent).
-        self._seam_model = None
-        self._seam_pred.clear()
-        if doc.seam is not None:
-            try:
-                sm = seam_model.SeamModel.from_dict(doc.seam)
-                if (sm.embed_used == "net" and sm.net_hash
-                        and sm.net_hash != edge_model.net_hash(self._clf)):
-                    self._log("seam model in the pickle was fit on another base net - dropped")
-                else:
-                    self._seam_model = sm
-            except Exception as exc:
-                self._log(f"seam model in the pickle not restored: {exc}")
         stack = doc.stack
         # The latent-ring head on top, only when it was fit over these
         # features and on this very base net.

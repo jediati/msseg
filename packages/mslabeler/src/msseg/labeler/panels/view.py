@@ -215,6 +215,14 @@ class ViewControlsMixin:
         if not self.show_overlay_var.get():
             return []                # master switch (Tab): base image only
         overlays = super()._seg_overlays(si, li, rec, data, np, min_colors)
+        if self._task_kind() == "polyline":
+            # A polyline task: the regions are context (faded), the seams are
+            # the point -- predictions, labels and a confusion cell on top.
+            for o in overlays:
+                if "lut" in o:
+                    o["lut"] = o["lut"].copy()
+                    o["lut"][:, 3] = np.minimum(o["lut"][:, 3], _REGION_ALPHA)
+            return overlays + self._seam_layers(si, li, rec, np)
         scalar = None
         if rec is not None and self.show_regions_var.get():
             entry = self._pred.get(self.catalogue.key_of(si, li))
@@ -251,12 +259,6 @@ class ViewControlsMixin:
                 lut = self._class_lut_for(si, li, rec, np)
                 if lut is not None:
                     overlays.append(self._region_overlay(rec["labels"], lut, np))
-            # The seams (boundaries between regions) by class, or by the
-            # seam model's boundaryness: a 2-px line over both flanks.
-            if self.show_seams_var.get():
-                sov = self._seam_overlay(si, li, rec, np)
-                if sov is not None:
-                    overlays.append(sov)
             # A selected confusion cell outranks everything: it is a question
             # about WHERE those regions are, so it goes on top, opaque.
             hits = self._confusion_hits()

@@ -12,6 +12,7 @@ import threading
 import time
 from tkinter import filedialog
 
+from . import bundle as model_bundle
 from . import edge_model, model_search, seam_export, seam_model
 from .training import TrainingProblem
 from .defaults import *  # noqa: F401,F403
@@ -107,21 +108,27 @@ class SeamModelMixin:
         fnames, embed = items[0][7], items[0][8]
         spec = self._seam_spec()
         t0 = time.perf_counter()
-        self._compute_badge("Fitting seams")
+        self._compute_badge("Fitting seams", stage="model")
         try:
             model = seam_model.fit_seam_model(data["F"], data["y"], spec, fnames, embed=embed,
-                                              net_hash=self._seam_net_hash(embed))
+                                              net_hash=self._seam_net_hash(embed),
+                                              n_classes=self.store.n_classes)
         except ValueError as exc:
             self.status_var.set(f"Seam model not fit: {exc}")
             return
         finally:
             self._clear_compute_badge()
         self._seam_model = model
+        # What it was trained on, for the stage strip (as the region model).
+        self._task.model.trained_rev = self.store.rev
+        self._task.model.trained_measure = self._measure_key()
         self._seam_pred.clear()
         self._log(f"seam model: {model.describe()}; {len(fnames)} inputs, "
                   f"{1e3 * model.fit_s:.0f} ms")
         self._classify_seams(items)
         self._refresh_seam_panel()
+        self._refresh_confusion()
+        self._update_task_rows()
         self._refresh_render()
         self.status_var.set(f"Trained the seam model on {model.n_seams} labelled seams "
                             f"({model.n_boundary} boundary) in "
@@ -147,7 +154,10 @@ class SeamModelMixin:
                 self.status_var.set("The seam model was fit on another region net - "
                                     "Train seams again.")
                 return
-            self._seam_pred[key] = (rec.get("commit"), seam_model.predict_boundaryness(model, F))
+            proba = seam_model.predict_proba(model, F)
+            self._seam_pred[key] = (rec.get("commit"), seam_model.boundaryness_of(proba), proba)
+        self._refresh_confusion()
+        self._refresh_stages()
         self._refresh_render()
 
     # ------------------------------------------------------------------ #
@@ -165,7 +175,7 @@ class SeamModelMixin:
         mask, yb = seam_model.labeled_binary(data["y"])
         _trials, _timeout, seed, _feat, _backend = self._search_settings()
         try:
-            model_search.make_cv(yb[mask], data["group"][mask], seed=seed)
+            model_search.make_cv(data["y"][mask], data["group"][mask], seed=seed)
         except ValueError as exc:
             self.status_var.set(f"Cannot evaluate seams: {exc}.")
             return
@@ -208,6 +218,43 @@ class SeamModelMixin:
         self.status_var.set("Evaluated seams - " + text)
 
     # ------------------------------------------------------------------ #
+    # The seam model on disk (bundle.SeamBundle)
+    # ------------------------------------------------------------------ #
+    def _save_seam_model_to(self, path):
+        model = self._seam_model
+        if model is None:
+            raise ValueError("no seam model - Train (R) first")
+        self._snapshot_active_profile()
+        stats = dict(self.profiles[self.active_profile_idx].get("statistics") or {})
+        b = model_bundle.SeamBundle(seam=model.to_dict(), statistics=stats,
+                                    classes={k: self._class_name(k)
+                                             for k in range(1, self.store.n_classes)},
+                                    scope=self._feature_scope(), app_tag=self.MODEL_APP_TAG)
+        b.save(path)
+        entry = b.record_entry(path)
+        self.models = [m for m in self.models if m.get("path") != entry["path"]]
+        self.models.append(entry)
+        self._update_task_rows()
+        return entry
+
+    def _load_seam_model_from(self, path):
+        """Install a saved seam model. Its descriptor is checked when it
+        classifies (the features can only be built with a record in hand)."""
+        b = model_bundle.SeamBundle.load(path, self.MODEL_APP_TAG)
+        model = seam_model.SeamModel.from_dict(b.seam)
+        self._seam_model = model
+        self._seam_pred.clear()
+        self._task.model.trained_rev = None      # a loaded model makes no claim
+        self._task.model.trained_measure = None
+        entry = b.record_entry(path)
+        self.models = [m for m in self.models if m.get("path") != entry["path"]]
+        self.models.append(entry)
+        self._refresh_seam_panel()
+        self._refresh_confusion()
+        self._update_task_rows()
+        return model
+
+    # ------------------------------------------------------------------ #
     # Export
     # ------------------------------------------------------------------ #
     def _export_seams(self):
@@ -239,9 +286,12 @@ class SeamModelMixin:
                     continue
                 cls = self._seam_cache_for(si, li, rec, graph, np)[2]
                 entry = self._seam_pred.get(key)
-                p = entry[1] if entry is not None and entry[0] == rec.get("commit") else None
+                live = entry is not None and entry[0] == rec.get("commit")
+                p = entry[1] if live else None
+                pred = seam_model.predicted_class(entry[2]) if live and len(entry) > 2 else None
+                names = {k: self._class_name(k) for k in range(1, self.store.n_classes)}
                 path = os.path.join(folder, f"seams_{seam_export.item_stem(key)}.json")
-                doc = seam_export.write_seams_json(path, key, graph, cls, p, np)
+                doc = seam_export.write_seams_json(path, key, graph, cls, p, np, names, pred)
                 rows.extend(seam_export.summary_rows(key, doc))
                 n_items += 1
                 n_seams += graph.n_seams

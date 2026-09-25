@@ -14,10 +14,11 @@ A **seam descriptor** is the per-seam feature vector the model reads:
              (length / chord) and whether the seam is a loop.
 
 The model is a balanced logistic regression (or a small MLP) behind a
-``StandardScaler``, fit on every seam a scope or a trace has labelled
-(``seams.SEAM_INTERIOR`` = 0, ``SEAM_BOUNDARY`` = 1); it scores every seam of
-every item with a **boundaryness** in [0, 1] that the trace tool's ``model``
-toll and the overlay's boundaryness colouring read. ``evaluate_seams`` is the
+``StandardScaler``, fit on every seam a scope or a trace has labelled, one
+class per class of the polyline task's vocabulary (class 1 is the "not a
+boundary" role, the rest are kinds of boundary). It gives every seam of every
+item its class probabilities and a **boundaryness** in [0, 1] -- 1 - p(class
+1) -- that the trace tool's ``model`` toll and the boundaryness colouring read. ``evaluate_seams`` is the
 leave-items-out report (``model_search.make_cv`` over the catalogue's groups).
 
 Headless (sklearn under the labeler's ``[classify]`` extra); pytest-covered.
@@ -32,7 +33,7 @@ import numpy as np
 
 from . import edge_model, seam_path
 from .fields import DEFAULT
-from .seams import SEAM_BOUNDARY
+from .seams import SEAM_BOUNDARY, SEAM_INTERIOR
 
 FEATURE_KINDS = ("pair", "barrier", "edges", "geometry")
 DEFAULT_FEATURES = FEATURE_KINDS
@@ -228,13 +229,18 @@ class SeamModel:
     n_boundary: int = 0
     fit_s: float = 0.0
     report: Optional[Dict[str, Any]] = None
+    # The task's seam classes the model was fit on (class 1 = "not a
+    # boundary"), and the vocabulary size its probability columns span.
+    classes: List[int] = field(default_factory=lambda: [1, 2])
+    n_classes: int = 3
 
     def to_dict(self) -> Dict[str, Any]:
         return {"model": self.model, "spec": self.spec.to_dict(), "n_in": int(self.n_in),
                 "feature_names": list(self.feature_names), "names_hash": self.names_hash,
                 "net_hash": self.net_hash, "embed_used": self.embed_used,
                 "n_seams": int(self.n_seams), "n_boundary": int(self.n_boundary),
-                "fit_s": float(self.fit_s), "report": self.report}
+                "fit_s": float(self.fit_s), "report": self.report,
+                "classes": [int(c) for c in self.classes], "n_classes": int(self.n_classes)}
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "SeamModel":
@@ -243,14 +249,16 @@ class SeamModel:
                    names_hash=str(d.get("names_hash", "")), net_hash=str(d.get("net_hash", "")),
                    embed_used=str(d.get("embed_used") or "features"),
                    n_seams=int(d.get("n_seams", 0)), n_boundary=int(d.get("n_boundary", 0)),
-                   fit_s=float(d.get("fit_s", 0.0)), report=d.get("report"))
+                   fit_s=float(d.get("fit_s", 0.0)), report=d.get("report"),
+                   classes=[int(c) for c in (d.get("classes") or [1, 2])],
+                   n_classes=int(d.get("n_classes") or 3))
 
     def brief(self) -> str:
-        text = (f"{self.spec.model} on {self.n_seams:,} seams "
+        text = (f"{self.spec.model} · {len(self.classes)} classes on {self.n_seams:,} seams "
                 f"({self.n_boundary / max(1, self.n_seams):.0%} boundary, {self.embed_used})")
         m = (self.report or {}).get("mean")
         if m:
-            text += f" · held-out AUC {m['auc']:.2f}, bal.acc {m['bacc']:.0%}"
+            text += f" · held-out bal.acc {m['bacc']:.0%}, boundary AUC {m['auc']:.2f}"
         return text
 
     def describe(self) -> str:
@@ -280,14 +288,22 @@ def _fit(est, F, y, spec: SeamSpec):
     return est.fit(F, y)
 
 
-def _proba_boundary(est, F) -> np.ndarray:
+def _proba_columns(est, F, n_classes) -> np.ndarray:
+    """``(S, n_classes)`` class probabilities, column k = class k (columns of
+    classes the estimator never saw stay 0)."""
     p = np.asarray(est.predict_proba(F), np.float64)
-    classes = [int(c) for c in est.classes_]
-    if 1 in classes:
-        out = p[:, classes.index(1)]
-    else:
-        out = np.zeros(len(F))
-    return np.clip(out, 1e-4, 1 - 1e-4).astype(np.float32)
+    out = np.zeros((len(F), int(n_classes)), np.float64)
+    for j, c in enumerate(est.classes_):
+        if 0 <= int(c) < out.shape[1]:
+            out[:, int(c)] = p[:, j]
+    return out
+
+
+def boundaryness_of(proba) -> np.ndarray:
+    """p(any boundary) = 1 - p(class 1, "not a boundary")."""
+    proba = np.asarray(proba, np.float64)
+    p1 = proba[:, SEAM_INTERIOR] if proba.shape[1] > SEAM_INTERIOR else np.zeros(len(proba))
+    return np.clip(1.0 - p1, 1e-4, 1 - 1e-4).astype(np.float32)
 
 
 def labeled_binary(y) -> Tuple[np.ndarray, np.ndarray]:
@@ -300,16 +316,20 @@ def labeled_binary(y) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def fit_seam_model(F, y, spec: Optional[SeamSpec], feature_names: Sequence[str],
-                   embed: str = "features", net_hash: str = "") -> SeamModel:
-    """Fit on the labelled seams (``y > 0``). Raises ValueError when one class
-    is missing -- draw a scope (interior) and a trace (boundary) first."""
+                   embed: str = "features", net_hash: str = "",
+                   n_classes: Optional[int] = None) -> SeamModel:
+    """Fit on the labelled seams (``y > 0``), one class per task seam class.
+    Raises ValueError with fewer than two classes labelled -- e.g. scope some
+    seams into class 1 (not a boundary) and trace some into class 2."""
     spec = spec or SeamSpec()
     F = np.asarray(F, np.float32)
-    mask, yb = labeled_binary(y)
-    Fl, yl = F[mask], yb[mask]
-    if len(yl) == 0 or yl.min() == yl.max():
-        raise ValueError("need both boundary and interior seams - draw a scope "
-                         "(interior by default) and a trace (boundary)")
+    y = np.asarray(y, np.int64)
+    mask = y > 0
+    Fl, yl = F[mask], y[mask]
+    classes = sorted(int(c) for c in np.unique(yl))
+    if len(classes) < 2:
+        raise ValueError("need seams of at least two classes - e.g. a scope in class 1 "
+                         "(not a boundary) and a trace in class 2")
     t0 = time.perf_counter()
     est = _make_estimator(spec)
     _fit(est, Fl, yl, spec)
@@ -317,18 +337,42 @@ def fit_seam_model(F, y, spec: Optional[SeamSpec], feature_names: Sequence[str],
                      feature_names=list(feature_names),
                      names_hash=edge_model.names_hash(list(feature_names)),
                      net_hash=str(net_hash), embed_used=str(embed),
-                     n_seams=int(len(yl)), n_boundary=int(yl.sum()),
-                     fit_s=time.perf_counter() - t0)
+                     n_seams=int(len(yl)), n_boundary=int((yl >= SEAM_BOUNDARY).sum()),
+                     fit_s=time.perf_counter() - t0, classes=classes,
+                     n_classes=int(n_classes) if n_classes else max(classes) + 1)
 
 
-def predict_boundaryness(model: SeamModel, F) -> np.ndarray:
-    """float32 ``[S]`` p(boundary) per seam."""
+def _check_inputs(model: SeamModel, F):
     F = np.asarray(F, np.float32)
     if F.shape[1] != model.n_in:
         raise ValueError(f"seam model expects {model.n_in} inputs, got {F.shape[1]}")
+    return F
+
+
+def predict_proba(model: SeamModel, F) -> np.ndarray:
+    """``(S, model.n_classes)`` p(class k) per seam, column k = class k."""
+    F = _check_inputs(model, F)
+    if len(F) == 0:
+        return np.zeros((0, model.n_classes), np.float64)
+    return _proba_columns(model.model, F, model.n_classes)
+
+
+def predict_boundaryness(model: SeamModel, F) -> np.ndarray:
+    """float32 ``[S]`` p(any boundary) per seam."""
+    F = _check_inputs(model, F)
     if len(F) == 0:
         return np.zeros(0, np.float32)
-    return _proba_boundary(model.model, F)
+    return boundaryness_of(predict_proba(model, F))
+
+
+def predicted_class(proba) -> np.ndarray:
+    """int ``[S]``: the most probable class per seam (0 where nothing is)."""
+    proba = np.asarray(proba, np.float64)
+    if proba.size == 0:
+        return np.zeros(len(proba), np.int64)
+    out = np.argmax(proba, axis=1).astype(np.int64)
+    out[proba.max(axis=1) <= 0] = 0
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -337,16 +381,19 @@ def predict_boundaryness(model: SeamModel, F) -> np.ndarray:
 def evaluate_seams(F, y, groups, spec: Optional[SeamSpec] = None, seed: int = 0,
                    progress_cb=None, stop_event=None, n_splits: int = 5) -> Dict[str, Any]:
     """Leave-items-out CV of the seam model: per fold a fresh estimator on
-    the training items' labelled seams, scored on the held-out ones
-    (``edge_model._score``: balanced accuracy, AUC, log-loss, boundary
-    recall / precision), averaged."""
+    the training items' labelled seams, scored on the held-out ones --
+    balanced accuracy over the classes, per-class recall / precision, the
+    boundary AUC (1 - p(class 1) against "any boundary class"), log-loss --
+    averaged over the folds."""
     from . import model_search
     spec = spec or SeamSpec()
     t0 = time.perf_counter()
     F = np.asarray(F, np.float32)
-    mask, yb = labeled_binary(y)
-    Fl, yl = F[mask], yb[mask]
+    y = np.asarray(y, np.int64)
+    mask = y > 0
+    Fl, yl = F[mask], y[mask]
     gl = np.asarray(groups, object)[mask] if groups is not None else None
+    classes = sorted(int(c) for c in np.unique(yl))
     cv, kind = model_search.make_cv(yl, gl, n_splits=n_splits, seed=seed)
     splits = list(cv.split(Fl, yl, gl if kind == "slices" else None))
     folds = []
@@ -357,25 +404,54 @@ def evaluate_seams(F, y, groups, spec: Optional[SeamSpec] = None, seed: int = 0,
             break
         est = _make_estimator(spec)
         _fit(est, Fl[tr], yl[tr], spec)
-        folds.append(edge_model._score(yl[te], _proba_boundary(est, Fl[te])))
+        folds.append(_score_fold(yl[te], _proba_columns(est, Fl[te], max(classes) + 1),
+                                 classes))
         if progress_cb is not None:
             progress_cb(f, len(splits))
     mean = {}
     if folds:
-        for k in folds[0]:
-            vals = np.asarray([fd[k] for fd in folds], np.float64)
-            mean[k] = float(np.nanmean(vals)) if k != "n" else int(vals.sum())
-    return {"n": int(len(yl)), "n_boundary": int(yl.sum()), "folds": folds, "mean": mean,
-            "cv_kind": kind, "n_folds": len(splits), "elapsed_s": time.perf_counter() - t0,
+        for k in ("bacc", "auc", "logloss"):
+            mean[k] = float(np.nanmean([fd[k] for fd in folds]))
+        mean["n"] = int(sum(fd["n"] for fd in folds))
+        mean["per_class"] = {
+            c: {m: float(np.nanmean([fd["per_class"][c][m] for fd in folds]))
+                for m in ("recall", "precision")}
+            for c in classes}
+    return {"n": int(len(yl)), "n_boundary": int((yl >= SEAM_BOUNDARY).sum()),
+            "classes": classes, "folds": folds, "mean": mean, "cv_kind": kind,
+            "n_folds": len(splits), "elapsed_s": time.perf_counter() - t0,
             "stopped": stopped, "spec": spec.to_dict()}
+
+
+def _score_fold(y, proba, classes) -> Dict[str, Any]:
+    """One held-out fold's scores (NaN where a fold cannot tell)."""
+    from sklearn.metrics import (balanced_accuracy_score, log_loss,
+                                 precision_recall_fscore_support, roc_auc_score)
+    y = np.asarray(y, np.int64)
+    yhat = predicted_class(proba)
+    bacc = float(balanced_accuracy_score(y, yhat)) if len(y) else float("nan")
+    yb = y >= SEAM_BOUNDARY
+    auc = (float(roc_auc_score(yb, boundaryness_of(proba)))
+           if yb.any() and (~yb).any() else float("nan"))
+    p = np.clip(proba[:, classes], 1e-9, 1.0)
+    p = p / p.sum(axis=1, keepdims=True)
+    try:
+        ll = float(log_loss(y, p, labels=classes))
+    except ValueError:
+        ll = float("nan")
+    prec, rec, _f, _s = precision_recall_fscore_support(y, yhat, labels=classes,
+                                                        zero_division=0)
+    per = {c: {"recall": float(rec[i]), "precision": float(prec[i])}
+           for i, c in enumerate(classes)}
+    return {"n": int(len(y)), "bacc": bacc, "auc": auc, "logloss": ll, "per_class": per}
 
 
 def summary(report: Dict[str, Any]) -> str:
     m = report.get("mean") or {}
     if not m:
         return "no fold could be scored"
-    text = (f"held-out log-loss {m['logloss']:.3f}, bal.acc {m['bacc']:.1%}, AUC {m['auc']:.3f}, "
-            f"boundary recall {m['diff_recall']:.0%} / precision {m['diff_precision']:.0%} · "
+    text = (f"held-out bal.acc {m['bacc']:.1%}, boundary AUC {m['auc']:.3f}, "
+            f"log-loss {m['logloss']:.3f} · "
             f"{report.get('n_folds', 0)}-fold {report.get('cv_kind', '')} CV on "
             f"{report.get('n', 0)} seams ({report.get('n_boundary', 0)} boundary)")
     if report.get("stopped"):

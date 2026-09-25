@@ -411,7 +411,9 @@ def _models_from_json(raw: Any) -> List[Dict[str, Any]]:
                            **({"scope": str(md["scope"])} if md.get("scope") is not None else {}),
                            **({"context": _as_dict(md["context"])}
                               if isinstance(md.get("context"), dict) and md["context"] else {}),
-                           **({"seam": True} if md.get("seam") else {})})
+                           # A polyline task's seam model (bundle.SeamBundle).
+                           **({"task_kind": "polyline"}
+                              if md.get("task_kind") == "polyline" else {})})
     return models
 
 

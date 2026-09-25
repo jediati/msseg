@@ -1749,7 +1749,10 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
         for entry in reversed(task.models):
             if os.path.isfile(entry.get("path", "")):
                 try:
-                    self._load_classifier_from(entry["path"])
+                    if task.kind == "polyline":
+                        self._load_seam_model_from(entry["path"])
+                    else:
+                        self._load_classifier_from(entry["path"])
                 except Exception as exc:
                     task.load_note = f"task {task.name!r}: model not reloaded: {exc}"
                     self._log(task.load_note)
@@ -1810,8 +1813,10 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
 
     def _task_row_values(self, task):
         n = task.gesture_count
-        if task.model.clf is not None or task.model.seam is not None:
-            model = task.model.kind if task.model.clf is not None else "seam model"
+        if task.kind == "polyline" and task.model.seam is not None:
+            model = f"seam {task.model.seam.spec.model}"
+        elif task.model.clf is not None:
+            model = task.model.kind
         elif task.model_pending and task.models:
             model = f"{task.models[-1].get('kind', '?')} (saved)"
         else:

@@ -13,6 +13,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from .. import seam_labeling, seam_path
+from .. import seam_model
 from ..seams import (SEAM_COLORS, nearest_seam_point, seam_class_lut, seam_pixel_raster,
                      seam_scalar_lut)
 from ..widgets import attach_tooltip
@@ -96,6 +97,11 @@ class SeamPanelMixin:
         self.seam_eval_btn.pack(side="left", padx=2)
         attach_tooltip(self.seam_eval_btn, "Leave-items-out cross-validation of the seam "
                                            "model (held-out log-loss, balanced accuracy).")
+        self.seam_classify_btn = ttk.Button(row, text="Classify all", width=11,
+                                            command=self._classify_seams, state="disabled")
+        self.seam_classify_btn.pack(side="left", padx=2)
+        attach_tooltip(self.seam_classify_btn, "Score every seam of every computed item "
+                                               "with the seam model (C).")
         self.seam_export_btn = ttk.Button(row, text="Export…", width=8,
                                           command=self._export_seams)
         self.seam_export_btn.pack(side="left", padx=2)
@@ -106,7 +112,30 @@ class SeamPanelMixin:
         self.seam_readout_var = tk.StringVar(master=self.root, value="")
         lab = ttk.Label(f, textvariable=self.seam_readout_var, justify="left",
                         wraplength=280)
-        lab.pack(side="top", fill="x", padx=6, pady=(2, 4))
+        lab.pack(side="top", fill="x", padx=6, pady=(2, 2))
+
+        # The K x K fit check, the region classifier's grid over seams.
+        row = ttk.Frame(f); row.pack(side="top", fill="x", padx=4)
+        ttk.Label(row, text="count by").pack(side="left")
+        self.seam_count_by_var = tk.StringVar(master=self.root, value="seams")
+        for value in ("seams", "length"):
+            ttk.Radiobutton(row, text=value, value=value, variable=self.seam_count_by_var,
+                            command=self._refresh_confusion).pack(side="left", padx=2)
+        self.seam_confusion_holder = ttk.LabelFrame(f, text="true \\ predicted")
+        self.seam_confusion_holder.pack(side="top", fill="x", padx=4, pady=(2, 4))
+        attach_tooltip(self.seam_confusion_holder,
+                       "The seam model's predictions against your seam labels (rows = "
+                       "labelled class, columns = predicted), counted by seam or by "
+                       "crack length. A fit check on the training labels -- Evaluate "
+                       "reports held-out numbers. Click a cell to highlight its seams on "
+                       "this item.")
+        row = ttk.Frame(f); row.pack(side="top", fill="x", padx=4, pady=(2, 4))
+        ttk.Button(row, text="Save classifier…",
+                   command=self._save_classifier).pack(side="left", fill="x", expand=True,
+                                                       padx=(0, 2))
+        ttk.Button(row, text="Load classifier…",
+                   command=self._load_classifier).pack(side="left", fill="x", expand=True,
+                                                       padx=(2, 0))
 
     def _on_seam_mode_change(self, _e=None):
         self._unfocus_entries()
@@ -180,28 +209,119 @@ class SeamPanelMixin:
     # ------------------------------------------------------------------ #
     # Overlay
     # ------------------------------------------------------------------ #
-    def _seam_overlay(self, si, li, rec, np):
-        """The seam layer for the class stack: seam classes in their colours,
-        or boundaryness on the ramp when a seam model has scored this commit."""
-        if rec is None or rec.get("labels") is None:
-            return None
+    def _seam_modes(self):
+        """What the prediction layer can show: the predicted class, the
+        boundaryness, the uncertainty, or one class's probability."""
+        return (list(_SEAM_MODES) + ["uncertainty"]
+                + [f"P(class {k})" for k in range(1, self.store.n_classes)])
+
+    def _seam_layers(self, si, li, rec, np):
+        """A polyline task's overlay stack: the predictions (Show
+        Classification, coloured by the seam colour mode), the labelled
+        seams (Show GT), and a selected confusion cell's seams on top --
+        each a 2-px line over both flanks of every crack."""
+        if rec is None or rec.get("labels") is None or not self.show_seams_var.get():
+            return []
         graph = self._seam_graph_for(si, li, np)
         if graph is None or graph.n_seams == 0:
-            return None
-        lut = None
-        if self.seam_color_var.get() == _SEAM_MODE_BOUNDARYNESS:
-            entry = self._seam_pred.get(self.catalogue.key_of(si, li))
-            if entry is not None and entry[0] == rec.get("commit") and len(entry[1]) == graph.n_seams:
-                lut = seam_scalar_lut(entry[1], np, _SCALAR_ALPHA)
-        if lut is None:
+            return []
+        luts = []
+        if self.show_pred_var.get():
+            lut = self._seam_pred_lut(si, li, rec, graph, np)
+            if lut is not None:
+                luts.append(lut)
+        if self.show_gt_var.get():
             cls = self._seam_cache_for(si, li, rec, graph, np)[2]
-            if not cls.any():
-                return None            # nothing labelled: no layer to composite
-            lut = seam_class_lut(cls, np, colors=self._class_colors_rgba(np))
-        # The raster (both flank pixels of every crack) is built only now, once
-        # there is something to show, and cached per commit.
+            if cls.any():
+                luts.append(seam_class_lut(cls, np, colors=self._class_colors_rgba(np)))
+        hits = self._seam_confusion_hits()
+        if hits:
+            hl = np.zeros((graph.n_seams, 4), np.uint8)
+            hl[[s for s in hits if s < graph.n_seams]] = (255, 255, 255, 255)
+            luts.append(hl)
+        if not luts:
+            return []
+        # The raster is built only once there is something to show, and
+        # cached per commit.
         raster = self._seam_raster_for(si, li, rec, graph, np)
-        return self._region_overlay(raster, lut, np)
+        return [self._region_overlay(raster, lut, np) for lut in luts]
+
+    def _seam_pred_lut(self, si, li, rec, graph, np):
+        entry = self._seam_pred.get(self.catalogue.key_of(si, li))
+        if (entry is None or entry[0] != rec.get("commit") or len(entry) < 3
+                or len(entry[2]) != graph.n_seams):
+            return None
+        proba = np.asarray(entry[2], np.float64)
+        mode = self.seam_color_var.get()
+        if mode == _SEAM_MODE_BOUNDARYNESS:
+            return seam_scalar_lut(entry[1], np, _SCALAR_ALPHA)
+        if mode == "uncertainty":
+            top = np.sort(proba, axis=1)
+            u = 1.0 - (top[:, -1] - (top[:, -2] if top.shape[1] > 1 else 0.0))
+            return seam_scalar_lut(u, np, _SCALAR_ALPHA)
+        if mode.startswith("P(class "):
+            try:
+                k = int(mode[len("P(class "):-1])
+            except ValueError:
+                k = -1
+            if 0 < k < proba.shape[1]:
+                return seam_scalar_lut(proba[:, k], np, _SCALAR_ALPHA)
+        pred = seam_model.predicted_class(proba)
+        return seam_class_lut(pred, np, colors=self._class_colors_rgba(np), alpha=_PRED_ALPHA)
+
+    # ------------------------------------------------------------------ #
+    # The confusion matrix over seams
+    # ------------------------------------------------------------------ #
+    def _seam_truth_pred(self, key, np):
+        """(truth int[S], predicted int[S], weight float[S]) of a classified
+        item at its current record, or None."""
+        entry = self._seam_pred.get(key)
+        pos = self.catalogue.index_of(key) if entry is not None else None
+        if entry is None or pos is None or len(entry) < 3:
+            return None
+        rec = self.regions.record(key)
+        if rec is None or rec.get("labels") is None or entry[0] != rec.get("commit"):
+            return None
+        graph = self.regions.seams(key, np)
+        if graph is None or len(entry[2]) != graph.n_seams:
+            return None
+        truth = np.asarray(self._seam_cache_for(pos[0], pos[1], rec, graph, np)[2], np.int64)
+        pred = seam_model.predicted_class(entry[2])
+        count_by = getattr(self, "seam_count_by_var", None)
+        by_length = count_by is not None and count_by.get() == "length"
+        weight = graph.lengths(np).astype(np.float64) if by_length else np.ones(graph.n_seams)
+        return truth, pred, weight
+
+    def _seam_confusion_counts(self, scope="all"):
+        import numpy as np
+        counts = {}
+        keys = ([self._current_key()] if scope == "current" else list(self._seam_pred))
+        for key in keys:
+            if key is None:
+                continue
+            got = self._seam_truth_pred(key, np)
+            if got is None:
+                continue
+            truth, pred, weight = got
+            m = (truth >= 1) & (pred >= 1)
+            for t, p, w in zip(truth[m], pred[m], weight[m]):
+                counts[(int(t), int(p))] = counts.get((int(t), int(p)), 0) + float(w)
+        return {k: int(round(v)) for k, v in counts.items()}
+
+    def _seam_confusion_hits(self):
+        """Seam ids on the current item in the selected confusion cell."""
+        if self._cm_cell is None or self._task_kind() != "polyline":
+            return set()
+        key = self._current_key()
+        if key is None:
+            return set()
+        import numpy as np
+        got = self._seam_truth_pred(key, np)
+        if got is None:
+            return set()
+        truth, pred, _w = got
+        i, j = self._cm_cell
+        return set(int(s) for s in np.nonzero((truth == i) & (pred == j))[0])
 
     # ------------------------------------------------------------------ #
     # Tolls for the trace tool
@@ -327,6 +447,14 @@ class SeamPanelMixin:
         if var is None:
             return
         var.set(self._seam_counts_text())
+        try:
+            self.seam_classify_btn.config(
+                state="normal" if self._seam_model is not None else "disabled")
+            self.seam_mode_combo.config(values=self._seam_modes())
+            if self.seam_color_var.get() not in self._seam_modes():
+                self.seam_color_var.set(_SEAM_MODE_CLASS)
+        except (AttributeError, tk.TclError):
+            pass
 
     def _seam_class_totals(self):
         """All-item seams per class: resolved on every item that has a record
@@ -393,7 +521,7 @@ class SeamPanelMixin:
             self.seam_channels_var.set(d["channels"])
         if isinstance(d.get("show"), bool):
             self.show_seams_var.set(d["show"])
-        if d.get("coloring") in _SEAM_MODES:
+        if d.get("coloring") in self._seam_modes():
             self.seam_color_var.set(d["coloring"])
 
     # ------------------------------------------------------------------ #
