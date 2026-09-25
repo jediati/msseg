@@ -23,7 +23,38 @@ SESSION_DOC_VERSION = 2
 # A document that carries ``tasks[]`` (several named detectors, each with its
 # own annotations, models and Model-tab settings -- msseg.labeler.task)
 # declares 3. Without tasks the document is the v2 one it always was.
-SESSION_DOC_VERSION_TASKS = 3
+SESSION_DOC_VERSION_TASKS = 4
+# A task is region-based or polyline-based (docs/seam_labeling.md), fixed at
+# creation: the Features / Annotation / Model / Analysis tabs, the tools and
+# the view options follow it. Written on every task since v4.
+TASK_KINDS = ("region", "polyline")
+DEFAULT_TASK_KIND = "region"
+
+
+def normalise_kind(raw: Any, notes: Optional[List[str]] = None, who: str = "task"):
+    """A task kind, or None when `raw` is not one (noted when it was set)."""
+    if raw in TASK_KINDS:
+        return raw
+    if raw is not None:
+        _note(notes, f"{who}: unknown kind {raw!r}")
+    return None
+
+
+def labeler_refusal(doc: Any) -> Optional[str]:
+    """Why a labeler must NOT load `doc`, or None. A document listing tasks
+    must say every task's kind (session v4); an older one is refused whole
+    rather than guessed at -- there is no migration. A tasks-less document
+    (what the viewers write) is one region task and loads."""
+    root = doc if isinstance(doc, dict) else {}
+    tasks = [t for t in (root.get("tasks") or []) if isinstance(t, dict)] \
+        if isinstance(root.get("tasks"), list) else []
+    if not tasks:
+        return None
+    if any(t.get("kind") not in TASK_KINDS for t in tasks):
+        return ("This session was written by an older labeler (its tasks do not "
+                "say whether they are region or polyline tasks) and cannot be "
+                "loaded -- start a new session.")
+    return None
 # The Model-tab keys that belong to a task rather than to the window (the
 # same tuple as ``task.TASK_VIEW_KEYS``; spelled here too so this module
 # stays import-free of the task module, which imports it).
@@ -313,10 +344,12 @@ def session_doc_from_json(doc: Any, notes: Optional[List[str]] = None, *,
                              f"session - using {active!r}")
                 workflow = active
             tview = _as_dict(td.get("view"))
+            kind = normalise_kind(td.get("kind"), notes, f"task {name!r}")
             # Enrolment only when written: absent means "every place".
             enrolled = (normalise_enrolled(td["enrolled"], notes, f"task {name!r}")
                         if "enrolled" in td else None)
             tasks.append({"uid": uid, "name": name, "workflow": workflow,
+                          **({"kind": kind} if kind is not None else {}),
                           "annotations": _first_dict(td.get("annotations"), td.get("labels")),
                           "models": _models_from_json(td.get("models")),
                           "view": {k: tview[k] for k in TASK_VIEW_KEYS if k in tview},
@@ -328,6 +361,7 @@ def session_doc_from_json(doc: Any, notes: Optional[List[str]] = None, *,
             active_task = uids[0]
     else:
         tasks.append({"uid": new_task_uid(), "name": active, "workflow": active,
+                      "kind": DEFAULT_TASK_KIND,
                       # "labels" is what sessions written before the rename
                       # call this, and it is the ONLY thing that key ever
                       # meant here (the raw gesture geometry); elsewhere in

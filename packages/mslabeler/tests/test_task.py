@@ -53,7 +53,8 @@ def test_new_task_and_doc_round_trip():
               "panes": [0.2, 0.5],            # not a task key: must not ride
               "context": {"kinds": []}}
     doc = t.to_doc()
-    assert list(doc) == ["uid", "name", "workflow", "annotations", "models", "view"]
+    assert list(doc) == ["uid", "name", "kind", "workflow", "annotations", "models", "view"]
+    assert doc["kind"] == "region", "a task says its kind (session v4)"
     assert doc["view"] == {"model_kind": "random forest", "model_search": {"trials": 3},
                            "context": {"kinds": []}}
     assert set(doc["view"]) <= set(TASK_VIEW_KEYS)

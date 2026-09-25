@@ -43,11 +43,13 @@ class ClassPanelMixin:
         # for the class stack -- the one thing here that wants more room.
         ml = ttk.LabelFrame(panel, text="ML Region Classifier")
         ml.pack(side="bottom", fill="x", padx=4, pady=(2, 4))
+        self.region_ml_frame = ml
         # The seam tools (boundaries between regions) sit between the class
         # stack and the classifier; packed bottom so the stack keeps the rest.
         self._build_seam_panel(panel)
         ann = ttk.LabelFrame(panel, text="Annotation")
         ann.pack(side="top", fill="both", expand=True, padx=4, pady=(4, 2))
+        self.annot_frame = ann
 
         # -- Annotation ---------------------------------------------------- #
         row = ttk.Frame(ann); row.pack(side="top", fill="x", padx=4, pady=(4, 2))
@@ -73,6 +75,11 @@ class ClassPanelMixin:
                 attach_tooltip(rb, "Blobber (key B): a magic fill in the active "
                                    "class plus its immediately adjacent regions in "
                                    "the ring class (see 'ring' in the Magic row).")
+            elif value == "outline":
+                attach_tooltip(rb, "Outline: click along region boundaries like a "
+                                   "livewire; click the first anchor again to close "
+                                   "the loop, and every region inside is filled in "
+                                   "the armed class as one extent.")
 
         # Magic-fill options: how regions are compared while the fill grows.
         row = ttk.Frame(ann); row.pack(side="top", fill="x", padx=4, pady=2)

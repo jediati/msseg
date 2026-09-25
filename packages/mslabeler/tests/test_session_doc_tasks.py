@@ -73,14 +73,14 @@ def test_v3_round_trip_two_tasks():
     b.store.add_seam("scope", [(0, 0), (5, 5)], 1, "d/a.tif", 0, 0)
     doc = build_session_doc(**_base(), tasks=[a.to_doc(), b.to_doc()], active_task=b.uid,
                             annotations={"should": "not appear"}, models=[{"path": "no"}])
-    assert doc["session_version"] == SESSION_DOC_VERSION_TASKS == 3
+    assert doc["session_version"] == SESSION_DOC_VERSION_TASKS == 4
     assert is_session_doc(doc)
     assert "annotations" not in doc and "models" not in doc, "one source of truth"
     assert doc["active_task"] == b.uid
     notes = []
     back = session_doc_from_json(json.loads(json.dumps(doc)), notes)
     assert notes == []
-    assert back["session_version"] == 3 and back["active_task"] == b.uid
+    assert back["session_version"] == 4 and back["active_task"] == b.uid
     ta, tb = back["tasks"]
     assert (ta["uid"], ta["name"], ta["workflow"]) == (a.uid, "gland", "p1")
     assert (tb["uid"], tb["name"], tb["workflow"]) == (b.uid, "stroma", "p2")

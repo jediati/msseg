@@ -45,7 +45,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from .context import ContextSpec
 from .labeling import LabelStore
-from .session_doc import TASK_VIEW_KEYS, dedupe_profile_name, new_task_uid, normalise_enrolled
+from .session_doc import (DEFAULT_TASK_KIND, TASK_KINDS, TASK_VIEW_KEYS, dedupe_profile_name,
+                          new_task_uid, normalise_enrolled)
 
 # The Model-tab state that is a property of the task's NEXT model, not of the
 # window: the picked kind, the search settings, the neighbour (edge) settings
@@ -127,6 +128,8 @@ class Task:
     uid: str
     name: str
     workflow: Optional[str] = None        # a profile name; None until bound
+    # "region" | "polyline": what the task labels, fixed at creation.
+    kind: str = DEFAULT_TASK_KIND
     store: LabelStore = field(default_factory=LabelStore)
     model: ModelStack = field(default_factory=ModelStack)
     models: List[Dict[str, Any]] = field(default_factory=list)
@@ -149,9 +152,12 @@ class Task:
     # -- construction ------------------------------------------------------ #
     @classmethod
     def new(cls, name: str, workflow: Optional[str] = None, n_classes: int = 3,
-            uid: Optional[str] = None, taken: Sequence[str] = ()) -> "Task":
+            uid: Optional[str] = None, taken: Sequence[str] = (),
+            kind: str = DEFAULT_TASK_KIND) -> "Task":
+        if kind not in TASK_KINDS:
+            raise ValueError(f"unknown task kind {kind!r}")
         return cls(uid=uid or new_uid(taken), name=str(name), workflow=workflow,
-                   store=LabelStore(n_classes=n_classes))
+                   kind=kind, store=LabelStore(n_classes=n_classes))
 
     def duplicate(self, name: str, uid: Optional[str] = None,
                   taken: Sequence[str] = ()) -> "Task":
@@ -162,7 +168,7 @@ class Task:
         store.colors = dict(self.store.colors)
         store.names = dict(self.store.names)
         return Task(uid=uid or new_uid(taken), name=str(name), workflow=self.workflow,
-                    store=store, view=_deep_copy_json(self.view),
+                    kind=self.kind, store=store, view=_deep_copy_json(self.view),
                     enrolled=_deep_copy_json(self.enrolled))
 
     # -- counts for display ------------------------------------------------ #
@@ -172,7 +178,7 @@ class Task:
 
     # -- the session document form ---------------------------------------- #
     def to_doc(self) -> Dict[str, Any]:
-        doc: Dict[str, Any] = {"uid": self.uid, "name": self.name}
+        doc: Dict[str, Any] = {"uid": self.uid, "name": self.name, "kind": self.kind}
         if self.workflow is not None:
             doc["workflow"] = str(self.workflow)
         doc["annotations"] = self.store.to_json()
@@ -195,6 +201,7 @@ class Task:
         uid = str(d.get("uid") or new_uid())
         workflow = d.get("workflow")
         workflow = str(workflow) if workflow is not None else None
+        kind = d.get("kind") if d.get("kind") in TASK_KINDS else DEFAULT_TASK_KIND
         store = LabelStore()
         ann = d.get("annotations")
         if isinstance(ann, dict):
@@ -209,8 +216,8 @@ class Task:
         pending = any(os.path.isfile(str(m.get("path") or "")) for m in models)
         enrolled = (normalise_enrolled(d["enrolled"], notes, f"task {name!r}")
                     if "enrolled" in d else None)
-        return cls(uid=uid, name=name, workflow=workflow, store=store, models=models,
-                   view=view, model_pending=pending, enrolled=enrolled)
+        return cls(uid=uid, name=name, workflow=workflow, kind=kind, store=store,
+                   models=models, view=view, model_pending=pending, enrolled=enrolled)
 
 
 def _deep_copy_json(value: Any) -> Any:

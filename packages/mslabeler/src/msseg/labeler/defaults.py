@@ -184,7 +184,7 @@ _PREVIEW_PUMP_MS = 60
 _NON_FEATURE_FIELDS = set(magic_fill.POSITIONAL_FIELDS)   # one list, shared with cosine
 
 _TOOL_LABELS = (("squiggle", "squiggle"), ("box", "box"), ("polygon", "lasso"),
-                ("magic", "magic"), ("blobber", "blobber"))
+                ("magic", "magic"), ("blobber", "blobber"), ("outline", "outline"))
 # What the tool selector offers (a superset of the STORED tools: "magic" and
 # "blobber" are ways of producing "taps" interactions, not gesture types).
 # Blobber ring-class choices: the class after the active one, or a fixed id.
@@ -219,6 +219,10 @@ def _bounded_float(text, default, lo, hi):
 _SEAM_TOOL_LABELS = (("trace", "trace"), ("scope", "scope"))
 _UI_TOOLS = (tuple(v for v, _txt in _TOOL_LABELS)
              + tuple(v for v, _txt in _SEAM_TOOL_LABELS))
+# What each task kind may draw with; the first is the fallback when a tool of
+# the other kind is asked for (a hotkey, a restored session view).
+_REGION_TOOLS = tuple(v for v, _txt in _TOOL_LABELS)
+_POLYLINE_TOOLS = tuple(v for v, _txt in _SEAM_TOOL_LABELS)
 # Seam overlay colourings: by resolved class, or by the seam model's p(boundary).
 _SEAM_MODE_CLASS = "class"
 _SEAM_MODE_BOUNDARYNESS = "boundaryness"
@@ -230,4 +234,4 @@ _SEAM_MODES = (_SEAM_MODE_CLASS, _SEAM_MODE_BOUNDARYNESS)
 from .widgets import TYPING_CLASSES as _TYPING_CLASSES  # noqa: E402
 
 
-__all__ = ['_REGION_ALPHA', '_PRED_ALPHA', '_SCALAR_ALPHA', '_MODE_ID', '_MODE_UNCERTAINTY', '_MODE_FLIPPED', '_MODE_PDIFF', '_TUNED_KIND', '_CUSTOM_KIND', '_TUNED_EDGE_KIND', '_CUSTOM_EDGE_KIND', '_EDGE_KINDS', '_MODEL_KINDS', '_DEFAULT_CUSTOM_HIDDEN', '_EDGE_LAM_RANGE', '_EDGE_ROUNDS_RANGE', '_EDGE_C_RANGE', '_is_edge_kind', '_base_kind', '_edge_kind_of', '_DENSE_TOP_N', '_FOREST_TREES', '_OOB_MIN_SAMPLES', '_MLP_HIDDEN', '_MLP_MAX_ITER', '_SEARCH_TRIALS', '_SEARCH_TIMEOUT_MIN', '_SEARCH_TIMEOUT_S', '_SEARCH_TRIALS_RANGE', '_SEARCH_TIMEOUT_RANGE', '_SEARCH_PUMP_MS', '_SWEEP_TRIALS', '_SWEEP_TRIALS_RANGE', '_hms', '_model_description', '_PREVIEW_SETTLE_MS', '_PREVIEW_POLL_MS', '_PREVIEW_PUMP_MS', '_CENTER_TABS', '_LABELER_PANES', '_PANE_MIN_PX', '_PANE_SASH_TRIES', '_HINT_COLOR', '_HINT_POLL_MS', '_NON_FEATURE_FIELDS', '_TOOL_LABELS', '_RING_CHOICES', '_DEFAULT_HOP_GAIN', '_HOP_GAIN_RANGE', '_DEFAULT_DRAG_PX', '_DRAG_PX_RANGE', '_DEFAULT_MAGIC_EXTENT', '_bounded_float', '_UI_TOOLS', '_TYPING_CLASSES', '_SEAM_TOOL_LABELS', '_SEAM_MODE_CLASS', '_SEAM_MODE_BOUNDARYNESS', '_SEAM_MODES']
+__all__ = ['_REGION_ALPHA', '_PRED_ALPHA', '_SCALAR_ALPHA', '_MODE_ID', '_MODE_UNCERTAINTY', '_MODE_FLIPPED', '_MODE_PDIFF', '_TUNED_KIND', '_CUSTOM_KIND', '_TUNED_EDGE_KIND', '_CUSTOM_EDGE_KIND', '_EDGE_KINDS', '_MODEL_KINDS', '_DEFAULT_CUSTOM_HIDDEN', '_EDGE_LAM_RANGE', '_EDGE_ROUNDS_RANGE', '_EDGE_C_RANGE', '_is_edge_kind', '_base_kind', '_edge_kind_of', '_DENSE_TOP_N', '_FOREST_TREES', '_OOB_MIN_SAMPLES', '_MLP_HIDDEN', '_MLP_MAX_ITER', '_SEARCH_TRIALS', '_SEARCH_TIMEOUT_MIN', '_SEARCH_TIMEOUT_S', '_SEARCH_TRIALS_RANGE', '_SEARCH_TIMEOUT_RANGE', '_SEARCH_PUMP_MS', '_SWEEP_TRIALS', '_SWEEP_TRIALS_RANGE', '_hms', '_model_description', '_PREVIEW_SETTLE_MS', '_PREVIEW_POLL_MS', '_PREVIEW_PUMP_MS', '_CENTER_TABS', '_LABELER_PANES', '_PANE_MIN_PX', '_PANE_SASH_TRIES', '_HINT_COLOR', '_HINT_POLL_MS', '_NON_FEATURE_FIELDS', '_TOOL_LABELS', '_RING_CHOICES', '_DEFAULT_HOP_GAIN', '_HOP_GAIN_RANGE', '_DEFAULT_DRAG_PX', '_DRAG_PX_RANGE', '_DEFAULT_MAGIC_EXTENT', '_bounded_float', '_UI_TOOLS', '_REGION_TOOLS', '_POLYLINE_TOOLS', '_TYPING_CLASSES', '_SEAM_TOOL_LABELS', '_SEAM_MODE_CLASS', '_SEAM_MODE_BOUNDARYNESS', '_SEAM_MODES']

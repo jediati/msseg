@@ -294,6 +294,11 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
             # The stage strip's boxes open the tab that edits them.
             self.viewer.on_stage_click = self._on_stage_click
         self._bind_hotkeys()
+        # A task kind offers its own tools; any other request (a hotkey, a
+        # restored view, a test) falls back to the kind's first tool.
+        self._coercing_tool = False
+        self.tool_var.trace_add("write", self._coerce_tool)
+        self._apply_task_kind()
         self._hint_tick()          # first paint + the poll
 
     # ------------------------------------------------------------------ #
@@ -358,8 +363,22 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
         self.feat_scroll.pack(side="top", fill="both", expand=True)
         self.feat_col = self.feat_scroll.inner
 
-        self._build_model_tab(self.model_tab)
-        self._build_analysis_tab(self.analysis_tab)
+        # The Model and Analysis tabs hold one body per task kind; the active
+        # task's kind decides which is packed (_apply_task_kind).
+        self._model_region = ttk.Frame(self.model_tab)
+        self._model_region.pack(fill="both", expand=True)
+        self._build_model_tab(self._model_region)
+        self._model_polyline = ttk.Frame(self.model_tab)
+        ttk.Label(self._model_polyline, foreground="#666", wraplength=380, justify="left",
+                  text="The seam model is trained and evaluated from the Annotation "
+                       "tab (Train seams / Evaluate).").pack(anchor="w", padx=8, pady=8)
+        self._analysis_region = ttk.Frame(self.analysis_tab)
+        self._analysis_region.pack(fill="both", expand=True)
+        self._build_analysis_tab(self._analysis_region)
+        self._analysis_polyline = ttk.Frame(self.analysis_tab)
+        ttk.Label(self._analysis_polyline, foreground="#666", wraplength=380,
+                  justify="left", text="No seam analyses yet.").pack(anchor="w", padx=8,
+                                                                     pady=8)
         self.center.select(self.processing_tab)
         # Bound AFTER the initial select: <<NotebookTabChanged>> fires
         # synchronously on select(), and the viewer does not exist yet.
@@ -760,19 +779,18 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
         t = (added[-1].meta or {}).get("threshold")
         self.status_var.set(f"{tool}: {what}" + (f" at t={t:.3g}" if t is not None else ""))
 
-    def _commit_enclosure(self, pending, cls):
-        """"Trace the gland, tap it once": the regions inside a closed trace
-        become ONE extent of class `cls`, stored the way a fill is (taps at
-        the seeding extrema + the outline, derive.py reads the extent), with
-        the trace's uid as provenance. The trace itself stays a boundary."""
-        si, li = pending["si"], pending["li"]
+    def _commit_outline(self, si, li, ids, cls, extra=None):
+        """A region task's closed outline: the regions it encloses become ONE
+        extent of class `cls`, stored the way a fill is (taps at the seeding
+        extrema + the outline, derive.py reads the extent) -- one gesture,
+        one undo step, no seam gesture."""
         rec = self.regions.record(self.catalogue.key_of(si, li))
         if rec is None or rec.get("labels") is None:
-            self.status_var.set("enclosure not stored: the regions are gone")
+            self.status_var.set("outline not stored: the regions are gone")
             return
-        ids = [int(i) for i in pending["ids"]]
-        meta = {"tool": "enclosure", "extent": True, "trace": int(pending["uid"]),
-                "n_regions": len(ids)}
+        ids = [int(i) for i in ids]
+        meta = {"tool": "outline", "extent": True, "n_regions": len(ids)}
+        meta.update(extra or {})
         self._commit_blob(si, li, rec["labels"], [(ids, int(cls), meta)])
 
     def _accept_predictions(self, pts):
@@ -1033,37 +1051,116 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
         for k in range(0, MAX_CLASSES):
             self.root.bind(str(k), self._on_class_key)
         self.root.bind("<Escape>", self._on_escape)
-        self.root.bind("m", self._on_magic_key)
-        self.root.bind("M", self._on_magic_key)
-        self.root.bind("b", self._on_blob_key)
-        self.root.bind("B", self._on_blob_key)
+        region, polyline = self._for_kind("region"), self._for_kind("polyline")
+        self.root.bind("m", region(self._on_magic_key))
+        self.root.bind("M", region(self._on_magic_key))
+        self.root.bind("b", region(self._on_blob_key))
+        self.root.bind("B", region(self._on_blob_key))
         self.root.bind("<Control-z>", self._on_undo_key)
         self.root.bind("<Control-y>", self._on_undo_key)
         self.root.bind("<Tab>", self._on_tab_toggle)
         # 'R': one keystroke = train + immediate reclassify. 'C': classify.
-        self.root.bind("r", self._train_and_classify)
-        self.root.bind("R", self._train_and_classify)
-        self.root.bind("c", self._on_classify_key)
-        self.root.bind("C", self._on_classify_key)
+        # R / C train / classify the ACTIVE task's model, whichever kind.
+        self.root.bind("r", self._on_train_hotkey)
+        self.root.bind("R", self._on_train_hotkey)
+        self.root.bind("c", self._on_classify_hotkey)
+        self.root.bind("C", self._on_classify_hotkey)
         # 'O': optimize the dense network (search + install + classify).
-        self.root.bind("o", self._on_optimize_key)
-        self.root.bind("O", self._on_optimize_key)
+        self.root.bind("o", region(self._on_optimize_key))
+        self.root.bind("O", region(self._on_optimize_key))
         # 'N': neighbours on/off -- flip between an edge kind and its base.
-        self.root.bind("n", self._on_edge_key)
-        self.root.bind("N", self._on_edge_key)
-        # Seam tools: T trace, S scope, E seam layer on/off, Enter commits the
-        # trace in flight, BackSpace drops its last leg.
-        self.root.bind("t", self._on_trace_key)
-        self.root.bind("T", self._on_trace_key)
-        self.root.bind("s", self._on_scope_key)
-        self.root.bind("S", self._on_scope_key)
-        self.root.bind("e", self._on_seams_toggle_key)
-        self.root.bind("E", self._on_seams_toggle_key)
+        self.root.bind("n", region(self._on_edge_key))
+        self.root.bind("N", region(self._on_edge_key))
+        # Polyline tools: T trace, S scope, E seam layer on/off; Enter commits
+        # the livewire in flight (a trace, or a region task's outline) and
+        # BackSpace drops its last leg.
+        self.root.bind("t", polyline(self._on_trace_key))
+        self.root.bind("T", polyline(self._on_trace_key))
+        self.root.bind("s", polyline(self._on_scope_key))
+        self.root.bind("S", polyline(self._on_scope_key))
+        self.root.bind("e", polyline(self._on_seams_toggle_key))
+        self.root.bind("E", polyline(self._on_seams_toggle_key))
         self.root.bind("<Return>", self._on_trace_commit_key)
         self.root.bind("<BackSpace>", self._on_trace_back_key)
         # F9: the canvas takes the whole center, and back. A function key
         # needs no _typing() guard -- and every letter is already taken.
         self.root.bind("<F9>", self._toggle_center_tabs)
+
+    # ------------------------------------------------------------------ #
+    # Task kinds: what the tabs, tools and keys offer
+    # ------------------------------------------------------------------ #
+    _KIND_GLYPH = {"region": "\u25a6", "polyline": "\u2307"}
+
+    def _task_kind(self):
+        return getattr(getattr(self, "_task", None), "kind", "region")
+
+    def _allowed_tools(self):
+        return _POLYLINE_TOOLS if self._task_kind() == "polyline" else _REGION_TOOLS
+
+    def _coerce_tool(self, *_a):
+        """tool_var's guard: a tool the active kind does not offer falls back
+        to the kind's first (squiggle / trace)."""
+        if self._coercing_tool:
+            return
+        allowed = self._allowed_tools()
+        if self.tool_var.get() not in allowed:
+            self._coercing_tool = True
+            try:
+                self.tool_var.set(allowed[0])
+            finally:
+                self._coercing_tool = False
+
+    def _for_kind(self, kind):
+        """Wrap a hotkey handler so it acts only in a task of `kind`."""
+        def wrap(handler):
+            def run(e=None):
+                if self._task_kind() != kind:
+                    return None
+                return handler(e)
+            return run
+        return wrap
+
+    def _apply_task_kind(self):
+        """Show the active task kind's controls: the Annotation tab's region
+        frames (tools + classes, ML Region Classifier) or the seam frame, the
+        Model and Analysis bodies, and a tool the kind offers. A trace or
+        outline in flight is abandoned first."""
+        if not hasattr(self, "annot_frame"):
+            return
+        poly = self._task_kind() == "polyline"
+        tool = self.viewer.tool if self.viewer is not None else None
+        trace = getattr(tool, "trace", None)
+        if trace is not None and trace.active:
+            trace.cancel("abandoned: the task changed")
+        for w in (self.annot_frame, self.region_ml_frame, self.seam_frame):
+            w.pack_forget()
+        if poly:
+            self.seam_frame.pack(side="top", fill="both", expand=True, padx=4, pady=4)
+        else:
+            self.region_ml_frame.pack(side="bottom", fill="x", padx=4, pady=(2, 4))
+            self.annot_frame.pack(side="top", fill="both", expand=True, padx=4, pady=(4, 2))
+        for region_w, poly_w in ((self._model_region, self._model_polyline),
+                                 (self._analysis_region, self._analysis_polyline)):
+            region_w.pack_forget()
+            poly_w.pack_forget()
+            (poly_w if poly else region_w).pack(fill="both", expand=True)
+        self._coerce_tool()
+
+    def _on_train_hotkey(self, e=None):
+        if self._task_kind() == "polyline":
+            if self._typing():
+                return None
+            self._train_seam_model()
+            return None
+        return self._train_and_classify(e)
+
+    def _on_classify_hotkey(self, e=None):
+        if self._task_kind() == "polyline":
+            if self._typing():
+                return None
+            self._classify_seams()
+            return None
+        return self._on_classify_key(e)
 
     def _on_edge_key(self, _e=None):
         """N: toggle neighbour voting by flipping between the current edge kind
@@ -1395,6 +1492,14 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
 
     def _apply_session_doc(self, doc, source="session", notes=None):
         notes = notes if notes is not None else []
+        # A labeler document whose tasks do not say their kind is refused
+        # whole, before anything of it is applied: nothing to migrate.
+        why = session_doc.labeler_refusal(doc)
+        if why is not None:
+            notes.append(why)
+            self._log(f"{source}: {why}")
+            self._notify(why)
+            return notes
         # (An app's override may return None rather than the list it was
         # given; the notes it appended are in ours either way.)
         returned = super()._apply_session_doc(doc, source, notes)
@@ -1559,6 +1664,7 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
         if self.active_class_var.get() >= task.store.n_classes:
             self.active_class_var.set(0)
         self._set_classify_enabled()
+        self._apply_task_kind()
         self._rebuild_class_panels()
         self._refresh_model_panels()
         self._update_task_rows()
@@ -1651,10 +1757,12 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
         c = ttk.LabelFrame(self._left_section_parent("tasks"), text="Tasks")
         c.pack(fill="x", padx=6, pady=4, before=self.session_frame)
         self.task_frame = c
-        tree = ttk.Treeview(c, columns=("workflow", "annot", "model"),
+        tree = ttk.Treeview(c, columns=("kind", "workflow", "annot", "model"),
                             show="tree headings", height=3, selectmode="browse")
         tree.heading("#0", text="task")
         tree.column("#0", width=110, minwidth=60, stretch=True)
+        tree.heading("kind", text="")
+        tree.column("kind", width=24, minwidth=20, stretch=False, anchor="center")
         tree.heading("workflow", text="workflow")
         tree.column("workflow", width=90, minwidth=40, stretch=True)
         tree.heading("annot", text="annot")
@@ -1672,7 +1780,17 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
         row = ttk.Frame(c)
         row.pack(fill="x", padx=4, pady=(0, 4))
         self.task_btn_row = row
-        ttk.Button(row, text="New", width=5, command=self._task_new).pack(side="left")
+        new = ttk.Menubutton(row, text="New", width=5)
+        menu = tk.Menu(new, tearoff=False)
+        menu.add_command(label="Region task (classify regions)",
+                         command=lambda: self._task_new(kind="region"))
+        menu.add_command(label="Polyline task (classify boundaries)",
+                         command=lambda: self._task_new(kind="polyline"))
+        new.config(menu=menu)
+        new.pack(side="left")
+        attach_tooltip(new, "A region task labels regions (squiggle, lasso, magic, "
+                            "outline ...); a polyline task labels the boundaries "
+                            "between them (trace, scope). The kind is fixed.")
         b = ttk.Button(row, text="Dup", width=5, command=self._task_duplicate)
         b.pack(side="left", padx=2)
         attach_tooltip(b, "A new task with this one's classes, colours, names, "
@@ -1691,7 +1809,8 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
             model = f"{task.models[-1].get('kind', '?')} (saved)"
         else:
             model = ""
-        return (task.workflow or "-", str(n) if n else "", model)
+        return (self._KIND_GLYPH.get(task.kind, "?"), task.workflow or "-",
+                str(n) if n else "", model)
 
     def _paint_task_rows(self, tree):
         """Repaint in place (the sequence tree's pattern): rows are keyed by
@@ -1738,16 +1857,17 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
     def _task_by_name(self, name):
         return next((t for t in self.tasks if t.name == name), None)
 
-    def _task_new(self, name=None):
-        """A task on the active workflow with the current class count and
-        default colours, activated. `name` given -> no dialog (headless)."""
+    def _task_new(self, name=None, kind="region"):
+        """A task of `kind` ("region" | "polyline", fixed from here on) on
+        the active workflow with the current class count and default
+        colours, activated. `name` given -> no dialog (headless)."""
         taken = [t.name for t in self.tasks]
-        name = dedupe_task_name(str(name or "task"), taken)
+        name = dedupe_task_name(str(name or ("walls" if kind == "polyline" else "task")), taken)
         workflow = None
         if 0 <= self.active_profile_idx < len(self.profiles):
             workflow = self.profiles[self.active_profile_idx]["name"]
         task = Task.new(name, workflow=workflow, n_classes=self.store.n_classes,
-                        taken=[t.uid for t in self.tasks])
+                        taken=[t.uid for t in self.tasks], kind=kind)
         if self.ENROLMENT:
             task.enrolled = {}             # a new task works nothing yet
         self.tasks.append(task)

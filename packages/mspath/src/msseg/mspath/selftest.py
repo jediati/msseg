@@ -618,8 +618,13 @@ def run_labeler_selftest():
     assert 0 <= int(rx) < lw and 0 <= int(ry) < lh, (rx, ry)
 
     # -- seam tools on a placed item: gestures in slide coordinates ---------- #
+    # (a polyline task's, enrolled in the same overview)
     import types as _types
     from msseg.labeler.seams import SEAM_BOUNDARY, SEAM_INTERIOR
+    t_region = app._task
+    t_walls = app._task_new("walls", kind="polyline")
+    assert app._task is t_walls and app.tool_var.get() == "trace"
+    assert app._enrol_row(0, 0) and app._current() == (0, 0)
     g_s = app.regions.seams(item.key, np)
     assert g_s is not None and g_s.n_seams > 0, "the overview has seams"
     assert g_s.placement.scale == rec["scale"]
@@ -667,7 +672,9 @@ def run_labeler_selftest():
     app._rebuild_class_panels()
     app._undo_stack[:] = undo_before
     app._redo_stack.clear()
-    app.tool_var.set("squiggle"); app.seam_toll_var.set("feature")
+    app.seam_toll_var.set("feature")
+    assert app._task_delete(confirm=True) and app._task is t_region
+    assert app.tool_var.get() == "squiggle" and app._current() == (0, 0)
     v.view_x, v.view_y, v.scale = view_before
 
     # -- a gesture in SLIDE coordinates paints the regions under it ------- #
@@ -958,7 +965,7 @@ def run_labeler_selftest():
     assert t1.workflow == prof["name"] and t2.workflow != prof["name"], \
         "a profile from a model becomes the active task's workflow only"
     doc_t = app._session_doc()
-    assert doc_t["session_version"] == 3 and len(doc_t["tasks"]) == 2
+    assert doc_t["session_version"] == 4 and len(doc_t["tasks"]) == 2
     assert doc_t["active_task"] == t1.uid and doc_t["tasks"][0]["workflow"] == prof["name"]
     app2 = LabelerApp(tk.Toplevel(root), autosave=False)
     app2._apply_session_doc(doc_t, "tasks")

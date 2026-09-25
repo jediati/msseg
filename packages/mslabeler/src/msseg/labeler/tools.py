@@ -83,11 +83,12 @@ class DrawController:
         self._accept = bool(e.state & self._SHIFT)
         self._sample = bool(e.state & self._CTRL)
         tool = self.app.tool_var.get()
-        if (self.trace.active or self.trace.pending) and (self._accept or tool not in SEAM_TOOLS):
+        if self.trace.active and (self._accept or tool not in LIVEWIRE_TOOLS):
             self.trace.cancel("trace abandoned (tool changed)")
-        if not self._accept and tool in SEAM_TOOLS:
-            # Before the armed-class test: seam gestures carry their own class.
-            return self.trace.on_press(e, scope=(tool == "scope"))
+        if not self._accept and tool in LIVEWIRE_TOOLS:
+            # Before the armed-class test: a seam gesture carries its own class,
+            # an outline asks for the armed one itself.
+            return self.trace.on_press(e, scope=(tool == "scope"), outline=(tool == "outline"))
         if not self._accept and tool in ("magic", "blobber"):
             return self.magic.on_press(e, ring=(tool == "blobber"))
         if not self._accept and self.app.active_class_var.get() <= 0:
@@ -157,7 +158,7 @@ class DrawController:
     def cancel(self):
         """Escape: abandon whatever is in flight (any tool) without committing.
         Returns True when there was something to abandon."""
-        if self.trace.active or self.trace.pending:
+        if self.trace.active:
             return self.trace.cancel()
         if self.magic.active:
             return self.magic.cancel()
@@ -581,8 +582,13 @@ class MagicFillController:
             v.set_hud(*s["hud"])       # give the canvas HUD back to the engine
 
 
+# The tools the livewire serves: a polyline task's trace and scope, and a
+# region task's outline (a closed livewire loop that fills what it encloses).
+LIVEWIRE_TOOLS = SEAM_TOOLS + ("outline",)
+
+
 class TraceController:
-    """The seam tools (docs/seam_labeling.md).
+    """The seam tools (docs/seam_labeling.md), and the region tasks' outline.
 
     **Trace** (tool "trace", key T): a press snaps to the nearest crack of
     any seam and anchors a ``seam_path.Livewire`` there -- one Dijkstra over
@@ -598,16 +604,16 @@ class TraceController:
     fully inside it on the transient layer; the release commits a "scope"
     gesture in the picked class (interior by default).
 
+    **Outline** (tool "outline", region tasks): the same livewire in the
+    ARMED region class; it commits only as a closed loop (click the first
+    anchor again), and the regions it encloses are stored at once as ONE
+    extent of that class -- one gesture, one undo step, no seam gesture.
+
     Points are stored in IMAGE coordinates like every gesture; the snapping
     and the search run on the item's raster through ``_region_placement``.
     """
 
-    SNAP_RADIUS = 8
-    # A CLOSED trace just committed (its first anchor clicked again), waiting
-    # to be named: the next press inside it with a class armed stores the
-    # enclosure as an extent (derive.py); a press outside starts a new
-    # trace; Escape leaves it a boundary only.
-    _pending = None            # raster px around the pointer searched for a crack
+    SNAP_RADIUS = 8            # raster px around the pointer searched for a crack
     DOUBLE_CLICK_S = 0.35      # a second click on the same point commits
 
     def __init__(self, app):
@@ -641,13 +647,13 @@ class TraceController:
         return cur, key, rec, graph, np
 
     # -- dispatch ------------------------------------------------------ #
-    def on_press(self, e, scope=False):
+    def on_press(self, e, scope=False, outline=False):
         self.app._unfocus_entries()
         if scope:
             if self._s is not None:
                 self.cancel("trace abandoned")
             return self._scope_press(e)
-        return self._trace_press(e)
+        return self._trace_press(e, outline=outline)
 
     def on_move(self, e):
         if self._box is not None:
@@ -669,48 +675,12 @@ class TraceController:
         if self._s is not None:
             s, self._s = self._s, None
             self._finish(s["hud"])
-            self.app.status_var.set(why or "trace cancelled")
-            return True
-        if self._pending is not None:
-            p, self._pending = self._pending, None
-            self._clear_pending(p)
-            self.app.status_var.set(why or "enclosure dropped - the trace stays a boundary")
+            self.app.status_var.set(why or ("outline cancelled" if s.get("mode") == "outline"
+                                            else "trace cancelled"))
             return True
         return False
 
-    # -- the pending enclosure ------------------------------------------ #
-    @property
-    def pending(self):
-        return self._pending is not None
-
-    def _trace_alive(self, uid):
-        it = self.app.store.get(uid)
-        return it is not None and it.tool == "trace"
-
-    def _clear_pending(self, p):
-        v = self.app.viewer
-        if v is not None:
-            v.canvas.delete("pending")
-            if v.hud[0] == "info":
-                v.set_hud(*p["hud"])
-
-    def _draw_pending(self):
-        """The closed loop, dashed, until it is named or dropped."""
-        p = self._pending
-        v = self.app.viewer
-        if p is None or v is None:
-            return
-        c = v.canvas
-        c.delete("pending")
-        flat = []
-        for x, y in p["loop"]:
-            flat.extend(((x - v.view_x) / v.scale, (y - v.view_y) / v.scale))
-        if len(flat) >= 4:
-            c.create_line(*flat, fill="#ffffff", width=2, dash=(4, 4),
-                          tags=("draw", "pending"))
-
     def redraw(self):
-        self._draw_pending()
         if self._s is not None:
             self._draw_trace()
         elif self._box is not None:
@@ -798,35 +768,17 @@ class TraceController:
         rx, ry = place.to_raster(x, y)
         return nearest_seam_point(graph, labels, rx, ry, np, radius=self.SNAP_RADIUS)
 
-    def _trace_press(self, e):
+    def _trace_press(self, e, outline=False):
         app = self.app
         ctx = self._context()
+        what = "Outline" if outline else "Trace"
         if ctx is None:
-            app._notify("Trace needs computed regions - Run first.")
+            app._notify(f"{what} needs computed regions - Run first.")
             return False
         cur, key, rec, graph, np = ctx
-        p = self._pending
-        if p is not None:
-            # A closed trace waits to be named: inside it with a class armed
-            # -> the enclosure; outside (or stale) -> an ordinary press.
-            self._pending = None
-            alive = (p["commit"] == rec.get("commit") and (p["si"], p["li"]) == cur
-                     and self._trace_alive(p["uid"]))
-            if alive:
-                x, y = self._image_pt(e)
-                rx, ry = p["place"].to_raster(x, y)
-                ix, iy = int(np.floor(rx)) - p["xa"], int(np.floor(ry)) - p["ya"]
-                m = p["mask"]
-                if 0 <= iy < m.shape[0] and 0 <= ix < m.shape[1] and bool(m[iy, ix]):
-                    cls = int(app.active_class_var.get())
-                    if cls <= 0:
-                        self._pending = p
-                        app._notify("Arm a class (1-4) to name the enclosure")
-                        return True
-                    self._clear_pending(p)
-                    app._commit_enclosure(p, cls)
-                    return True
-            self._clear_pending(p)
+        if outline and self._s is None and int(app.active_class_var.get()) <= 0:
+            app._notify("Arm a class to outline in (its number key)")
+            return False
         s = self._s
         if s is not None and (s["commit"] != rec.get("commit") or (s["si"], s["li"]) != cur):
             self.cancel("trace cancelled: regions changed under it")
@@ -850,7 +802,9 @@ class TraceController:
             v = app.viewer
             self._s = {"si": cur[0], "li": cur[1], "commit": rec.get("commit"),
                        "graph": graph, "labels": rec["labels"], "np": np, "place": place,
-                       "lw": lw, "cls": int(app.seam_class_var.get()),
+                       "lw": lw, "mode": "outline" if outline else "trace",
+                       "cls": int(app.active_class_var.get() if outline
+                                  else app.seam_class_var.get()),
                        "toll": app.seam_toll_var.get(), "restricted": restrict is not None,
                        "hover": None, "hud": v.hud}
             app._begin_preview()          # no region hover outlines while tracing
@@ -896,13 +850,17 @@ class TraceController:
         if s is None:
             return
         lw = s["lw"]
-        text = (f"trace {s['toll']}{' (scoped)' if s['restricted'] else ''}  "
+        outline = s.get("mode") == "outline"
+        text = (f"{'outline' if outline else 'trace'} {s['toll']}"
+                f"{' (scoped)' if s['restricted'] else ''}  "
                 f"anchors {len(lw.anchors)}  cost {lw.total_cost:.3g}  "
                 f"seams {len(lw.seams_on_path)}")
         if hover is not None:
             c = lw.cost_to(*hover)
             text += f"  +{c:.3g}" if c is not None else "  (unreachable)"
-        text += "  |  click: anchor - Enter: commit - BackSpace: undo leg - Esc: abandon"
+        text += ("  |  click: anchor - the first anchor again closes and fills - "
+                 "BackSpace: undo leg - Esc: abandon" if outline else
+                 "  |  click: anchor - Enter: commit - BackSpace: undo leg - Esc: abandon")
         self.app.viewer.set_hud("info", text)
 
     def _screen(self, s, pts):
@@ -923,7 +881,8 @@ class TraceController:
         c.delete("trace")
         if s is None:
             return
-        color = self.app._seam_color_hex(s["cls"])
+        color = (self.app._class_color_hex(s["cls"]) if s.get("mode") == "outline"
+                 else self.app._seam_color_hex(s["cls"]))
         lw = s["lw"]
         tags = ("draw", "trace")
         pts = lw.points()
@@ -941,13 +900,30 @@ class TraceController:
             c.create_oval(sx - 4, sy - 4, sx + 4, sy + 4, outline=color, width=2, tags=tags)
 
     def commit(self):
-        """Enter / double-click: store the legs as one trace gesture."""
+        """Enter / double-click: store the legs as one trace gesture -- or,
+        for an outline, fill what the closed loop encloses."""
         s = self._s
         if s is None:
             return False
+        from . import derive
         lw = s["lw"]
         pts = lw.commit_points()
         raw = lw.points()                 # every corner, for the enclosure test
+        if s.get("mode") == "outline":
+            if len(pts) < 2 or not derive.is_closed(pts):
+                self.app._notify("An outline closes on its first anchor - click it "
+                                 "(Esc abandons)")
+                return True               # still in flight
+            self._s = None
+            self._finish(s["hud"])
+            enc = derive.enclosed_ids(raw, s["labels"], s["np"])
+            if enc is None:
+                self.app.status_var.set("the outline encloses no region (retraced?) - "
+                                        "nothing stored")
+                return True
+            self.app._commit_outline(s["si"], s["li"], enc[0], s["cls"],
+                                     {"toll": s["toll"], "anchors": int(len(lw.anchors))})
+            return True
         self._s = None
         self._finish(s["hud"])
         if len(pts) < 2:
@@ -956,28 +932,7 @@ class TraceController:
         meta = {"tool": "trace", "toll": s["toll"], "anchors": int(len(lw.anchors)),
                 "seams": int(len(lw.seams_on_path)), "cost": round(lw.total_cost, 4),
                 "scoped": bool(s["restricted"])}
-        it = self.app._commit_seam("trace", s["graph"].to_image(pts), s["cls"], meta=meta)
-        from . import derive
-        if it is not None and derive.is_closed(pts):
-            # "Trace the gland, tap it once": a closed trace is an extent of
-            # unknown class until a tap inside names it (derive.py).
-            enc = derive.enclosed_ids(raw, s["labels"], s["np"])
-            if enc is None:
-                self.app.status_var.set("closed trace encloses no region (retraced?) - "
-                                        "committed as a boundary")
-            else:
-                ids, mask, ya, xa = enc
-                self._pending = {"uid": int(it.uid), "si": s["si"], "li": s["li"],
-                                 "commit": s["commit"], "ids": ids, "mask": mask,
-                                 "ya": int(ya), "xa": int(xa), "place": s["place"],
-                                 "loop": s["graph"].to_image(pts), "hud": s["hud"]}
-                v = self.app.viewer
-                if v is not None:
-                    v.set_hud("info", f"closed trace ({len(ids)} region(s)) - tap inside "
-                                      "with a class armed to name it - Esc: boundary only")
-                self.app.status_var.set(f"#{it.uid} closed trace: {len(ids)} region(s) "
-                                        "inside - tap inside to name them")
-                self._draw_pending()
+        self.app._commit_seam("trace", s["graph"].to_image(pts), s["cls"], meta=meta)
         return True
 
     def drop_last(self):

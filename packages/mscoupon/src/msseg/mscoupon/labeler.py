@@ -830,7 +830,7 @@ def _selftest():
     assert sdoc["view"]["panes"] == [0.2, 0.5], sdoc["view"]["panes"]
     # The Model-tab settings and the gestures are the TASK's (session v3):
     # one task here, and nothing duplicated at the top level.
-    assert sdoc["session_version"] == 3 and len(sdoc["tasks"]) == 1
+    assert sdoc["session_version"] == 4 and len(sdoc["tasks"]) == 1
     assert sdoc["active_task"] == sdoc["tasks"][0]["uid"] == app._task.uid
     assert "model_kind" not in sdoc["view"], "the picked kind is the task's, not the window's"
     assert sdoc["tasks"][0]["view"]["model_kind"] == _CUSTOM_EDGE_KIND, \
@@ -843,6 +843,14 @@ def _selftest():
     assert len(sdoc["tasks"][0]["annotations"]["interactions"]) == 2
     assert sdoc["tasks"][0]["workflow"] == app.profiles[app.active_profile_idx]["name"]
     assert sdoc["sequences"][0]["folder"] == "data"
+    # A labeler document whose tasks do not say their kind is refused whole.
+    old = json.loads(json.dumps(sdoc))
+    for _t in old["tasks"]:
+        _t.pop("kind")
+    n_before = len(app.store.interactions)
+    notes_old = app._apply_session_doc(old, "older")
+    assert notes_old and "older labeler" in notes_old[-1], notes_old
+    assert len(app.store.interactions) == n_before, "nothing of a refused document applies"
     app.store = LabelStore()             # clobber
     app._apply_session_doc(sdoc, "test")
     assert app._center_tab_name() == "Model", "the center tab restores by name"
@@ -927,7 +935,7 @@ def _selftest():
     assert app._task_rename("stroma detector")
     # The session document: both tasks, the active one marked, both restored.
     sdoc_t = app._session_doc()
-    assert sdoc_t["session_version"] == 3 and sdoc_t["active_task"] == t2.uid
+    assert sdoc_t["session_version"] == 4 and sdoc_t["active_task"] == t2.uid
     assert [t["name"] for t in sdoc_t["tasks"]] == [t1.name, "stroma detector"]
     assert sdoc_t["tasks"][0]["annotations"]["classes"][0]["name"] == "gland"
     assert sdoc_t["tasks"][0]["view"]["model_kind"] == _CUSTOM_EDGE_KIND
@@ -2437,6 +2445,19 @@ def _selftest():
         app._slices.setdefault(tuple(_sl), dict(rec_s))
     app._pred = {}
     app._clear_seam_caches()
+    # Seams are a POLYLINE task's: its own kind, on the same workflow; the
+    # tabs, tools and keys follow the kind.
+    t_region = app._task
+    t_walls = app._task_new("walls", kind="polyline")
+    assert app._task is t_walls and app._task_kind() == "polyline"
+    assert app.tool_var.get() == "trace", "a polyline task offers trace / scope"
+    assert app.seam_frame.winfo_manager() == "pack" and not app.annot_frame.winfo_manager()
+    assert not app.region_ml_frame.winfo_manager()
+    assert app._model_polyline.winfo_manager() and not app._model_region.winfo_manager()
+    app.tool_var.set("magic")
+    assert app.tool_var.get() == "trace", "a region tool is refused in a polyline task"
+    assert app._for_kind("region")(lambda e: "ran")() is None
+    assert app.task_tree.set(t_walls.uid, "kind") == app._KIND_GLYPH["polyline"]
     key_s = app.catalogue.key_of(0, 0)
     v = app.viewer
     v.view_x, v.view_y, v.scale = 0.0, 0.0, 1.0
@@ -2518,7 +2539,9 @@ def _selftest():
     assert app._on_trace_commit_key(_KeyEv()) is None, "Enter with no trace in flight passes"
     # The session document carries the seams (v3) and the view state the toll.
     doc_s = app._session_doc()
-    ann_s = doc_s["tasks"][0]["annotations"]
+    walls_doc = next(t for t in doc_s["tasks"] if t["uid"] == t_walls.uid)
+    assert walls_doc["kind"] == "polyline"
+    ann_s = walls_doc["annotations"]
     assert ann_s["version"] == 3 and len(ann_s["seams"]) == 2
     assert doc_s["view"]["seams"]["toll"] == "feature" and doc_s["view"]["tool"] == "trace"
     app.seam_toll_var.set("barrier"); app.show_seams_var.set(False)
@@ -2551,9 +2574,11 @@ def _selftest():
         assert "logistic" in app.seam_readout_var.get(), app.seam_readout_var.get()
     # Row helpers see seam gestures too.
     assert len(app._row_interactions(0, 0)) >= 2
-    app.tool_var.set("squiggle")
+    assert app._activate_task(t_region) and app._task_kind() == "region"
+    assert app.tool_var.get() == "squiggle", "back in a region task: its first tool"
+    assert app.annot_frame.winfo_manager() == "pack" and not app.seam_frame.winfo_manager()
 
-    # -- "Trace the gland, tap it once": a closed trace names its enclosure -- #
+    # -- The outline: a closed livewire loop fills what it encloses ---------- #
     # A 3x3 grid of blocks (ids 0..8) so a loop of seams exists: the centre
     # block 4 is ringed by the seams 1|4, 4|5, 4|7 and 3|4, with junctions
     # at the four corners. (The earlier scope + trace go first: a scope
@@ -2578,7 +2603,8 @@ def _selftest():
     g_e = app.regions.seams(key_s, np)
     assert g_e is not None and g_e.n_seams == 12, g_e.n_seams
     n_i0, n_s0 = len(app.store.interactions), len(app.store.seams)
-    app.tool_var.set("trace"); app.seam_class_var.set(SEAM_BOUNDARY)
+    app.tool_var.set("outline")
+    assert app.tool_var.get() == "outline"
     app.seam_toll_var.set("geometric")
 
     def _loop():
@@ -2587,47 +2613,42 @@ def _selftest():
         assert ctrl.on_press(_FakeEvent(16, 21)) and len(tc._s["lw"].legs) == 2   # 4|7
         assert ctrl.on_press(_FakeEvent(11, 16)) and len(tc._s["lw"].legs) == 3   # 3|4
         assert ctrl.on_press(_FakeEvent(16, 11))            # the first anchor again: closed
-    _loop()
-    assert not tc.active and tc.pending, "a closed trace commits and waits to be named"
-    assert v._hud_mode == "info" and "closed" in v._hud_text, v._hud_text
-    assert len(app.store.seams) == n_s0 + 1 and _derive.is_closed(app.store.seams[-1].points)
-    assert app.store.seams[-1].meta["anchors"] == 5
-    # A press outside drops it and is an ordinary trace press.
+    # No class armed: the outline does not start.
     app.active_class_var.set(0)
-    assert ctrl.on_press(_FakeEvent(6, 6)) and tc.active and not tc.pending
-    app._on_escape()
-    assert not tc.active and v._hud_mode is None
-    # Inside without a class armed: still pending, told to arm one.
-    _loop()
-    assert tc.pending
-    assert ctrl.on_press(_FakeEvent(16, 16)) and tc.pending
+    assert not ctrl.on_press(_FakeEvent(16, 11)) and not tc.active
     assert "Arm a class" in app.status_var.get(), app.status_var.get()
-    # Inside with class 1: the enclosure, stored like a fill.
+    # With class 1: the closed loop fills its one enclosed region at once.
     app.active_class_var.set(1)
-    assert ctrl.on_press(_FakeEvent(16, 16)) and not tc.pending
+    _loop()
+    assert not tc.active and v._hud_mode is None
+    assert len(app.store.seams) == n_s0, "an outline stores no seam gesture"
     assert len(app.store.interactions) == n_i0 + 1
     enc = app.store.interactions[-1]
     assert enc.tool == "taps" and enc.class_id == 1 and len(enc.points) == 1
-    assert enc.meta["tool"] == "enclosure" and enc.meta["extent"] is True
-    assert enc.meta["trace"] == app.store.seams[-1].uid and enc.meta["n_regions"] == 1
+    assert enc.meta["tool"] == "outline" and enc.meta["extent"] is True
+    assert enc.meta["n_regions"] == 1 and enc.meta["anchors"] == 5
     assert enc.meta.get("outline"), "the loop rides along as the outline"
     assert labeling.resolve_slice([enc], lab_e, np)[4] == 1
-    assert "enclosure (1) ext" in app._interaction_row_text(enc)
+    assert "outline (1) ext" in app._interaction_row_text(enc)
+    app._undo()
+    assert len(app.store.interactions) == n_i0, "one gesture, one undo step"
+    app._redo()
+    enc = app.store.interactions[-1]
     _g2, cls_e = app._seam_classes_for(0, 0, np)
-    idx_e = {(int(a), int(b)): i for i, (a, b) in enumerate(zip(_g2.a, _g2.b))}
-    for pair in ((1, 4), (4, 5), (4, 7), (3, 4)):
-        assert cls_e[idx_e[pair]] == SEAM_BOUNDARY, pair
-    # The rest follow whatever region gestures earlier sections left on the
-    # slice, as the derivation module says.
+    # No seam gesture was stored, so every seam -- the ring included -- is
+    # what the derivation makes of the extent and whatever region gestures
+    # earlier sections left on the slice.
     _rc, sl_e, _bo, _di = _derive.labels_for_item(
         app._gestures_for_key(key_s), app._seam_gestures_for_key(key_s), lab_e, _g2, None, np)
     assert cls_e.tolist() == sl_e.cls.tolist()
-    # Escape with a closed trace pending leaves it a boundary, class still armed.
-    _loop()
-    assert tc.pending
+    # An open outline does not commit: Enter says so and keeps it in flight;
+    # Escape abandons it with the class still armed.
+    assert ctrl.on_press(_FakeEvent(16, 11)) and ctrl.on_press(_FakeEvent(21, 16))
+    assert app._on_trace_commit_key(_KeyEv()) == "break" and tc.active
+    assert "closes on its first anchor" in app.status_var.get(), app.status_var.get()
     app._on_escape()
-    assert not tc.pending and app.active_class_var.get() == 1
-    assert len(app.store.seams) == n_s0 + 3 and len(app.store.interactions) == n_i0 + 1
+    assert not tc.active and app.active_class_var.get() == 1
+    assert len(app.store.seams) == n_s0 and len(app.store.interactions) == n_i0 + 1
     # Back to the four-block fixture, without the gestures of this block.
     app.store.remove_many([s.uid for s in app.store.seams] + [enc.uid])
     app._slices[(0, 0)] = rec_s
@@ -2647,7 +2668,7 @@ def _selftest():
     assert app.store.interactions
     clf_keep = app._clf
     # ...and the tasks stay, emptied: a second one with its own vocabulary.
-    task_names = [app._task.name, "bubbles"]
+    task_names = [t.name for t in app.tasks] + ["bubbles"]
     tb = app._task_new("bubbles")
     assert tb is app._task and app._clf is None
     app._rename_class(1, "bubble")
@@ -2662,7 +2683,7 @@ def _selftest():
     assert app.store.seams == [], "a new session drops the seam gestures too"
     assert [t.name for t in app.tasks] == task_names and app._task is app.tasks[0]
     assert all(t.gesture_count == 0 and t.undo == [] for t in app.tasks), "every store emptied"
-    assert app.tasks[1].store.name(1) == "bubble", "vocabularies stay"
+    assert app.tasks[-1].store.name(1) == "bubble", "vocabularies stay"
     assert [p["name"] for p in app.profiles] == prof_names
     assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND
     assert app.custom_hidden_var.get() == "4"
@@ -2699,7 +2720,8 @@ def _selftest():
           "tasks: per-task stores / vocabularies / Model tabs, session v3 + v2-as-one-task, "
           "workflow binding through profile rename / delete, New session keeps tasks, "
           "extents: fill / blob core / lasso (Ctrl = sample) + the checkbox in the view, "
-          "derived seam labels with no seam gesture, the closed trace -> enclosure flow")
+          "derived seam labels with no seam gesture, the outline -> enclosure in one step, "
+          "region / polyline task kinds (tabs, tools, keys; older documents refused)")
     return 0
 
 
