@@ -2451,13 +2451,17 @@ def _selftest():
     t_walls = app._task_new("walls", kind="polyline")
     assert app._task is t_walls and app._task_kind() == "polyline"
     assert app.tool_var.get() == "trace", "a polyline task offers trace / scope"
-    assert app.seam_frame.winfo_manager() == "pack" and not app.annot_frame.winfo_manager()
+    assert app.seam_frame.winfo_manager() == "pack" and app.annot_frame.winfo_manager() == "pack"
     assert not app.region_ml_frame.winfo_manager()
     assert app._model_polyline.winfo_manager() and not app._model_region.winfo_manager()
     app.tool_var.set("magic")
     assert app.tool_var.get() == "trace", "a region tool is refused in a polyline task"
     assert app._for_kind("region")(lambda e: "ran")() is None
     assert app.task_tree.set(t_walls.uid, "kind") == app._KIND_GLYPH["polyline"]
+    # Its vocabulary is its seam vocabulary: 1 = not a boundary, 2 = boundary.
+    assert app.store.n_classes == 3 and app.store.name(SEAM_INTERIOR) == "not a boundary"
+    assert app.store.name(SEAM_BOUNDARY) == "boundary"
+    assert app.poly_tool_row.winfo_manager() and not app.magic_row.winfo_manager()
     key_s = app.catalogue.key_of(0, 0)
     v = app.viewer
     v.view_x, v.view_y, v.scale = 0.0, 0.0, 1.0
@@ -2474,7 +2478,7 @@ def _selftest():
 
     # Scope: a box over everything -> every seam interior, previewed on the
     # transient layer with the HUD saying how many.
-    app.tool_var.set("scope"); app.seam_class_var.set(SEAM_INTERIOR)
+    app.tool_var.set("scope"); app.active_class_var.set(SEAM_INTERIOR)
     assert ctrl.on_press(_FakeEvent(1, 1)) and tc.active
     assert ctrl.on_move(_FakeEvent(19, 19))
     assert v._transient is not None and v._hud_mode == "info", (v._hud_mode, v._hud_text)
@@ -2494,7 +2498,7 @@ def _selftest():
     # Trace: a press near the 0|2 seam (x = 10) anchors; hovering shows the
     # path; a click at the centre junction and one at the right edge add
     # legs; Enter commits ONE trace in the boundary class.
-    app.tool_var.set("trace"); app.seam_class_var.set(SEAM_BOUNDARY)
+    app.tool_var.set("trace"); app.active_class_var.set(SEAM_BOUNDARY)
     assert app.seam_toll_var.get() == "feature"
     assert ctrl.on_press(_FakeEvent(10, 3)) and tc.active
     assert v._hud_mode == "info" and "trace feature" in v._hud_text, v._hud_text
@@ -2516,13 +2520,34 @@ def _selftest():
     idx_s = {(int(a), int(b)): i for i, (a, b) in enumerate(zip(_g.a, _g.b))}
     assert cls_s[idx_s[(0, 2)]] == SEAM_BOUNDARY and cls_s[idx_s[(2, 9)]] == SEAM_BOUNDARY
     assert cls_s[idx_s[(0, 5)]] == SEAM_INTERIOR and cls_s[idx_s[(5, 9)]] == SEAM_INTERIOR
-    assert "2 boundary, 2 interior" in app.seam_readout_var.get(), app.seam_readout_var.get()
-    assert len(app._seam_rows) == 2, "the panel lists this slice's seam gestures"
+    assert "2 not a boundary, 2 boundary, 0 unknown" in app.seam_readout_var.get(), \
+        app.seam_readout_var.get()
     # Undo / redo take the whole trace.
     app._undo()
     assert len(app.store.seams) == n_seams0 + 1
     app._redo()
     assert len(app.store.seams) == n_seams0 + 2
+    # The gestures are listed in their class frames, and a row does what a
+    # region row does: click = go there and draw it in its class colour, the
+    # canvas right-click finds it, drag / menu relabel it, the titles count.
+    scope_s, tr_s = app.store.seams[-2], app.store.seams[-1]
+    assert set(app._row_widgets) == {scope_s.uid, tr_s.uid}
+    assert app._row_widgets[tr_s.uid]["class"] == SEAM_BOUNDARY
+    assert "trace (2 seams, feature)" in app._row_widgets[tr_s.uid]["text"], \
+        app._row_widgets[tr_s.uid]["text"]
+    assert "1a" in app._class_title_labels[SEAM_BOUNDARY].cget("text")
+    assert "2s" in app._class_title_labels[SEAM_BOUNDARY].cget("text"), \
+        app._class_title_labels[SEAM_BOUNDARY].cget("text")
+    app._on_row_click(tr_s.uid)
+    hov = v.canvas.find_withtag("ihover")
+    assert hov and v.canvas.itemcget(hov[0], "fill") == app._class_color_hex(SEAM_BOUNDARY)
+    assert app._interaction_at(10, 6) == tr_s.uid, "the canvas finds the trace by its seam"
+    app._move_interaction(tr_s.uid, SEAM_INTERIOR)
+    assert app.store.get(tr_s.uid).class_id == SEAM_INTERIOR
+    assert app._row_widgets[tr_s.uid]["class"] == SEAM_INTERIOR, "the row moved frames"
+    app._undo()
+    assert app.store.get(tr_s.uid).class_id == SEAM_BOUNDARY
+    v.view_x, v.view_y, v.scale = 0.0, 0.0, 1.0      # the click re-centred the view
     # A trace anchored inside a scope is confined to it (the scope covers
     # everything here, so the search is merely flagged as scoped).
     assert ctrl.on_press(_FakeEvent(10, 3)) and tc._s["restricted"]

@@ -156,8 +156,16 @@ class Task:
             kind: str = DEFAULT_TASK_KIND) -> "Task":
         if kind not in TASK_KINDS:
             raise ValueError(f"unknown task kind {kind!r}")
+        store = LabelStore(n_classes=n_classes)
+        if kind == "polyline":
+            # A polyline task's vocabulary IS its seam vocabulary: class 1 is
+            # the "not a boundary" role, the rest are kinds of boundary.
+            for k, (label, colour) in POLYLINE_DEFAULT_CLASSES.items():
+                if k < store.n_classes:
+                    store.names[k] = label
+                    store.colors[k] = colour
         return cls(uid=uid or new_uid(taken), name=str(name), workflow=workflow,
-                   kind=kind, store=LabelStore(n_classes=n_classes))
+                   kind=kind, store=store)
 
     def duplicate(self, name: str, uid: Optional[str] = None,
                   taken: Sequence[str] = ()) -> "Task":
@@ -218,6 +226,12 @@ class Task:
                     if "enrolled" in d else None)
         return cls(uid=uid, name=name, workflow=workflow, kind=kind, store=store,
                    models=models, view=view, model_pending=pending, enrolled=enrolled)
+
+
+# A new polyline task's classes: 1 = not a boundary (the role the scope box and
+# derived interiors fill), 2 = a boundary; renameable and recolourable, and
+# more boundary kinds are one Classes click away.
+POLYLINE_DEFAULT_CLASSES = {1: ("not a boundary", "#46beff"), 2: ("boundary", "#ff3cc8")}
 
 
 def _deep_copy_json(value: Any) -> Any:

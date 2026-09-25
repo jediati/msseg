@@ -31,7 +31,7 @@ import time
 
 from . import seam_labeling, seam_path
 from .labeling import SEAM_TOOLS
-from .seams import SEAM_CLASSES, SEAM_COLORS, nearest_seam_point
+from .seams import nearest_seam_point
 
 
 class DrawController:
@@ -696,16 +696,27 @@ class TraceController:
                 v.set_hud(*hud)         # give the canvas HUD back to the engine
 
     # -- scope ---------------------------------------------------------- #
+    def _armed(self):
+        """The armed class for a seam gesture, or None (told to arm one)."""
+        cls = int(self.app.active_class_var.get())
+        if cls <= 0:
+            self.app._notify("Arm a class to label seams with (its number key)")
+            return None
+        return cls
+
     def _scope_press(self, e):
         ctx = self._context()
         if ctx is None:
             self.app._notify("Scope needs computed regions - Run first.")
             return False
+        cls = self._armed()
+        if cls is None:
+            return False
         cur, key, rec, graph, np = ctx
         v = self.app.viewer
         self._box = {"si": cur[0], "li": cur[1], "commit": rec.get("commit"), "rec": rec,
                      "graph": graph, "pts": [self._image_pt(e)], "mask": None,
-                     "cls": int(self.app.seam_class_var.get()), "hud": v.hud}
+                     "cls": cls, "hud": v.hud}
         self.app._begin_preview()
         return True
 
@@ -731,10 +742,10 @@ class TraceController:
         b["mask"] = mask
         raster = self.app._seam_raster_for(b["si"], b["li"], b["rec"], b["graph"], np)
         lut = np.zeros((b["graph"].n_seams, 4), np.uint8)
-        r, g, bb, _a = SEAM_COLORS[b["cls"]] if 0 <= b["cls"] < len(SEAM_COLORS) else SEAM_COLORS[-1]
+        r, g, bb, _a = (int(c) for c in self.app._class_colors_rgba(np)[b["cls"]])
         lut[mask] = (min(255, r + 60), min(255, g + 60), min(255, bb + 60), 255)
         self.app.viewer.set_transient(self.app._region_overlay(raster, lut, np))
-        name = SEAM_CLASSES[b["cls"]] if 0 <= b["cls"] < len(SEAM_CLASSES) else str(b["cls"])
+        name = self.app._class_name(b["cls"])
         self.app.viewer.set_hud("info", f"scope: {int(mask.sum())} seams -> {name}")
 
     def _scope_release(self, e):
@@ -776,8 +787,9 @@ class TraceController:
             app._notify(f"{what} needs computed regions - Run first.")
             return False
         cur, key, rec, graph, np = ctx
-        if outline and self._s is None and int(app.active_class_var.get()) <= 0:
-            app._notify("Arm a class to outline in (its number key)")
+        if self._s is None and int(app.active_class_var.get()) <= 0:
+            app._notify("Arm a class to outline in (its number key)" if outline
+                        else "Arm a class to label seams with (its number key)")
             return False
         s = self._s
         if s is not None and (s["commit"] != rec.get("commit") or (s["si"], s["li"]) != cur):
@@ -803,8 +815,7 @@ class TraceController:
             self._s = {"si": cur[0], "li": cur[1], "commit": rec.get("commit"),
                        "graph": graph, "labels": rec["labels"], "np": np, "place": place,
                        "lw": lw, "mode": "outline" if outline else "trace",
-                       "cls": int(app.active_class_var.get() if outline
-                                  else app.seam_class_var.get()),
+                       "cls": int(app.active_class_var.get()),
                        "toll": app.seam_toll_var.get(), "restricted": restrict is not None,
                        "hover": None, "hud": v.hud}
             app._begin_preview()          # no region hover outlines while tracing

@@ -1,9 +1,11 @@
-"""The Seams cluster of the annotation pane: the trace / scope tools, the
-toll, the overlay (class colours or boundaryness), the current item's seam
-gestures, and the seam model buttons. Also the per-item caches the overlay
-and the tools share -- the seam graph comes from the provider
-(``regions.seams``), the pixel raster is rebuilt per commit, the resolved
-classes per (commit, store.rev). See docs/seam_labeling.md.
+"""A polyline task's annotation controls: the trace / scope tool row and the
+toll row (in the Annotation frame, where a region task has its tools and the
+Magic rows), and the ML Seam Classifier frame (the overlay, Train / Evaluate
+/ Export, the readout). The gestures themselves are listed in the class
+frames like any task's. Also the per-item caches the overlay and the tools
+share -- the seam graph comes from the provider (``regions.seams``), the
+pixel raster is rebuilt per commit, the resolved classes per (commit,
+store.rev). See docs/seam_labeling.md.
 """
 from __future__ import annotations
 
@@ -11,24 +13,22 @@ import tkinter as tk
 from tkinter import ttk
 
 from .. import seam_labeling, seam_path
-from ..seams import (SEAM_CLASSES, SEAM_BOUNDARY, SEAM_INTERIOR, seam_class_lut,
-                     seam_pixel_raster, seam_scalar_lut)
+from ..seams import (SEAM_COLORS, nearest_seam_point, seam_class_lut, seam_pixel_raster,
+                     seam_scalar_lut)
 from ..widgets import attach_tooltip
 from ..defaults import *  # noqa: F401,F403
-
-_SEAM_CLASS_KEYS = ((SEAM_BOUNDARY, "boundary"), (SEAM_INTERIOR, "interior"))
 
 
 class SeamPanelMixin:
     # ------------------------------------------------------------------ #
     # UI
     # ------------------------------------------------------------------ #
-    def _build_seam_panel(self, parent):
-        f = ttk.LabelFrame(parent, text="Seams (boundaries between regions)")
-        f.pack(side="bottom", fill="x", padx=4, pady=(2, 2))
-        self.seam_frame = f
-
-        row = ttk.Frame(f); row.pack(side="top", fill="x", padx=4, pady=(4, 2))
+    def _build_polyline_rows(self, ann):
+        """The polyline task's rows of the Annotation frame (packed in place of
+        the region tools and the Magic rows by _apply_task_kind): the tools,
+        and the livewire's toll."""
+        row = ttk.Frame(ann)
+        self.poly_tool_row = row
         ttk.Label(row, text="Tool:").pack(side="left")
         for value, txt in _SEAM_TOOL_LABELS:
             rb = ttk.Radiobutton(row, text=txt, variable=self.tool_var, value=value)
@@ -36,20 +36,19 @@ class SeamPanelMixin:
             if value == "trace":
                 attach_tooltip(rb, "Trace (key T): click near a seam to anchor, move to "
                                    "see the cheapest path along the seams, click to add "
-                                   "an anchor, Enter or double-click to commit as "
-                                   "boundary, BackSpace drops the last leg, Escape "
+                                   "an anchor, Enter or double-click to commit in the "
+                                   "armed class, BackSpace drops the last leg, Escape "
                                    "abandons.")
             else:
                 attach_tooltip(rb, "Scope (key S): drag a box; every seam fully inside "
-                                   "it is labelled interior unless a trace says "
-                                   "boundary. A trace anchored inside a scope stays "
+                                   "it takes the armed class unless a trace says "
+                                   "otherwise. A trace anchored inside a scope stays "
                                    "inside it.")
-        ttk.Label(row, text="  as:").pack(side="left")
-        for value, txt in _SEAM_CLASS_KEYS:
-            ttk.Radiobutton(row, text=txt, variable=self.seam_class_var,
-                            value=value).pack(side="left", padx=2)
+        ttk.Label(row, text="  (arm a class: its number key or swatch)",
+                  foreground="#666").pack(side="left")
 
-        row = ttk.Frame(f); row.pack(side="top", fill="x", padx=4, pady=2)
+        row = ttk.Frame(ann)
+        self.trace_row = row
         ttk.Label(row, text="Toll:").pack(side="left")
         cb = ttk.Combobox(row, textvariable=self.seam_toll_var,
                           values=list(seam_path.TOLLS), state="readonly", width=13)
@@ -68,6 +67,12 @@ class SeamPanelMixin:
         attach_tooltip(ent, "Channels for the feature / bhattacharyya tolls "
                             "(comma-separated; 'base' by default).")
 
+    def _build_seam_panel(self, parent):
+        """The ML Seam Classifier frame (a polyline task's, in place of the ML
+        Region Classifier): the overlay, the seam model, the readout."""
+        f = ttk.LabelFrame(parent, text="ML Seam Classifier")
+        self.seam_frame = f
+
         row = ttk.Frame(f); row.pack(side="top", fill="x", padx=4, pady=2)
         chk = ttk.Checkbutton(row, text="show seams (E)", variable=self.show_seams_var,
                               command=self._refresh_render)
@@ -80,13 +85,12 @@ class SeamPanelMixin:
         self.seam_mode_combo.bind("<<ComboboxSelected>>", self._on_seam_mode_change)
 
         row = ttk.Frame(f); row.pack(side="top", fill="x", padx=4, pady=2)
-        self.seam_train_btn = ttk.Button(row, text="Train seams", width=11,
+        self.seam_train_btn = ttk.Button(row, text="Train (R)", width=11,
                                          command=self._train_seam_model)
         self.seam_train_btn.pack(side="left")
-        attach_tooltip(self.seam_train_btn, "Fit the seam model (boundary vs interior) on "
-                                            "every labelled seam, then score every seam of "
-                                            "every item: the 'model' toll and the "
-                                            "boundaryness colouring.")
+        attach_tooltip(self.seam_train_btn, "Fit the seam model on every labelled seam, "
+                                            "then score every seam of every item: the "
+                                            "'model' toll and the boundaryness colouring.")
         self.seam_eval_btn = ttk.Button(row, text="Evaluate", width=9,
                                         command=self._evaluate_seams)
         self.seam_eval_btn.pack(side="left", padx=2)
@@ -102,11 +106,7 @@ class SeamPanelMixin:
         self.seam_readout_var = tk.StringVar(master=self.root, value="")
         lab = ttk.Label(f, textvariable=self.seam_readout_var, justify="left",
                         wraplength=280)
-        lab.pack(side="top", fill="x", padx=6, pady=(2, 2))
-
-        self.seam_list = ttk.Frame(f)
-        self.seam_list.pack(side="top", fill="x", padx=4, pady=(0, 4))
-        self._seam_rows = {}
+        lab.pack(side="top", fill="x", padx=6, pady=(2, 4))
 
     def _on_seam_mode_change(self, _e=None):
         self._unfocus_entries()
@@ -197,7 +197,7 @@ class SeamPanelMixin:
             cls = self._seam_cache_for(si, li, rec, graph, np)[2]
             if not cls.any():
                 return None            # nothing labelled: no layer to composite
-            lut = seam_class_lut(cls, np)
+            lut = seam_class_lut(cls, np, colors=self._class_colors_rgba(np))
         # The raster (both flank pixels of every crack) is built only now, once
         # there is something to show, and cached per commit.
         raster = self._seam_raster_for(si, li, rec, graph, np)
@@ -250,7 +250,10 @@ class SeamPanelMixin:
     # Geometry on the canvas
     # ------------------------------------------------------------------ #
     def _seam_color_hex(self, class_id):
-        from ..seams import SEAM_COLORS
+        """A seam class's colour: the task's own class colour (a polyline
+        task's vocabulary is its seam vocabulary)."""
+        if getattr(self, "_task_kind", lambda: "region")() == "polyline":
+            return self._class_color_hex(int(class_id))
         k = int(class_id)
         r, g, b, _a = SEAM_COLORS[k] if 0 <= k < len(SEAM_COLORS) else SEAM_COLORS[-1]
         return f"#{r:02x}{g:02x}{b:02x}"
@@ -301,10 +304,12 @@ class SeamPanelMixin:
             graph, cls = None, None
         if graph is None:
             return head + " · no regions yet"
-        nb = int((cls == SEAM_BOUNDARY).sum())
-        ni = int((cls == SEAM_INTERIOR).sum())
-        nu = int(graph.n_seams) - nb - ni
-        text = f"{head} · {graph.n_seams} seams: {nb} boundary, {ni} interior, {nu} unknown"
+        import numpy as np
+        counts = np.bincount(np.asarray(cls, np.intp), minlength=self.store.n_classes)
+        parts = [f"{int(counts[k])} {self._class_name(k)}"
+                 for k in range(1, self.store.n_classes)]
+        text = (f"{head} · {graph.n_seams} seams: " + ", ".join(parts)
+                + f", {int(counts[0])} unknown")
         # Labels the region gestures derived (derive.py), no seam gesture needed.
         entry = self._seam_caches.get((cur[0], cur[1]))
         derived = entry[5] if entry is not None and len(entry) > 5 else None
@@ -314,55 +319,61 @@ class SeamPanelMixin:
         text += " · model: " + (model.brief() if model is not None else "none")
         return text
 
+    def _class_name(self, k):
+        return self.store.name(k) if self.store.has_name(k) else f"class {k}"
+
     def _refresh_seam_panel(self):
         var = getattr(self, "seam_readout_var", None)
         if var is None:
             return
         var.set(self._seam_counts_text())
-        self._sync_seam_rows()
 
-    def _seam_row_text(self, it):
-        name = SEAM_CLASSES[it.class_id] if 0 <= it.class_id < len(SEAM_CLASSES) else str(it.class_id)
-        n = ""
-        meta = it.meta or {}
-        if it.tool == "trace" and meta.get("seams") is not None:
-            n = f"  ({meta['seams']} seams, {meta.get('toll', '?')})"
-        where = "" if it.bound else f"  [{it.slice_key} (unbound)]"
-        return f"#{it.uid} {it.tool} → {name}{n}{where}"
+    def _seam_class_totals(self):
+        """All-item seams per class: resolved on every item that has a record
+        and a seam gesture (the polyline task's counterpart of the region
+        counts in the class titles)."""
+        import numpy as np
+        out = {}
+        for key in self.catalogue.keys():
+            pos = self.catalogue.index_of(key)
+            if pos is None or not self._seam_gestures_for_key(key):
+                continue
+            rec = self.regions.record(key)
+            if rec is None or rec.get("labels") is None:
+                continue
+            graph = self.regions.seams(key, np)
+            if graph is None:
+                continue
+            cls = self._seam_cache_for(pos[0], pos[1], rec, graph, np)[2]
+            counts = np.bincount(np.asarray(cls, np.intp), minlength=self.store.n_classes)
+            for k in range(1, self.store.n_classes):
+                if counts[k]:
+                    out[k] = out.get(k, 0) + int(counts[k])
+        return out
 
-    def _sync_seam_rows(self):
-        lst = getattr(self, "seam_list", None)
-        if lst is None:
-            return
-        want = {it.uid: it for it in self._visible_seam_gestures()}
-        for uid in [u for u in self._seam_rows if u not in want]:
-            self._seam_rows.pop(uid)["frame"].destroy()
-        for uid, it in want.items():
-            row = self._seam_rows.get(uid)
-            if row is None:
-                fr = ttk.Frame(lst)
-                fr.pack(side="top", fill="x")
-                lab = ttk.Label(fr, text=self._seam_row_text(it), anchor="w")
-                lab.pack(side="left", fill="x", expand=True)
-                btn = ttk.Button(fr, text="✕", width=2,
-                                 command=lambda u=uid: self._delete_interaction(u))
-                btn.pack(side="right")
-                for w in (fr, lab):
-                    w.bind("<Enter>", lambda _e, u=uid: self._show_seam_geometry(u))
-                    w.bind("<Leave>", lambda _e: self._hide_interaction_geometry())
-                    w.bind("<Button-1>", lambda _e, u=uid: self._on_row_click(u))
-                row = {"frame": fr, "label": lab}
-                self._seam_rows[uid] = row
-            else:
-                row["label"].config(text=self._seam_row_text(it))
-
-    def _show_seam_geometry(self, uid):
-        if self.viewer is None:
-            return
-        self.viewer.canvas.delete("ihover")
-        self._hover_key = None
-        self._hover_uid = uid
-        self._draw_seam_geometry(self.store.get(uid))
+    def _seam_gesture_at(self, ix, iy):
+        """The uid of the seam gesture that labels the seam nearest an image
+        point (the last-drawn one, the resolution order), or None."""
+        cur = self._current()
+        if cur is None or ix is None or iy is None:
+            return None
+        import numpy as np
+        rec = self.regions.record(self.catalogue.key_of(*cur))
+        if rec is None or rec.get("labels") is None:
+            return None
+        graph = self._seam_graph_for(cur[0], cur[1], np)
+        if graph is None or graph.n_seams == 0:
+            return None
+        rx, ry = self._region_placement().to_raster(ix, iy)
+        hit = nearest_seam_point(graph, rec["labels"], rx, ry, np, radius=6)
+        if hit is None:
+            return None
+        sets = self._seam_cache_for(cur[0], cur[1], rec, graph, np)[3]
+        best = None
+        for it, mask in sets:                 # application order: the last wins
+            if mask[hit[0]]:
+                best = it.uid
+        return best
 
     # ------------------------------------------------------------------ #
     # Session view state
@@ -371,8 +382,7 @@ class SeamPanelMixin:
         return {"toll": self.seam_toll_var.get(),
                 "channels": self.seam_channels_var.get(),
                 "show": bool(self.show_seams_var.get()),
-                "coloring": self.seam_color_var.get(),
-                "class": int(self.seam_class_var.get())}
+                "coloring": self.seam_color_var.get()}
 
     def _apply_seams_view(self, d):
         if not isinstance(d, dict):
@@ -385,8 +395,6 @@ class SeamPanelMixin:
             self.show_seams_var.set(d["show"])
         if d.get("coloring") in _SEAM_MODES:
             self.seam_color_var.set(d["coloring"])
-        if d.get("class") in (SEAM_BOUNDARY, SEAM_INTERIOR):
-            self.seam_class_var.set(int(d["class"]))
 
     # ------------------------------------------------------------------ #
     # Hotkeys

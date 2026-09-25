@@ -680,14 +680,14 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
         self.status_var.set(f"#{it.uid} {tool} -> class {cls} ({slice_key})")
 
     def _commit_seam(self, tool, points, class_id, meta=None):
-        """Store a seam gesture (a trace or a scope) on the current item."""
-        from .seams import SEAM_CLASSES
+        """Store a seam gesture (a trace or a scope) on the current item, in
+        one of the polyline task's classes."""
         cur = self._current()
         if cur is None:
             return
         si, li = cur
         slice_key = self._slice_key(si, li)
-        if slice_key is None or int(class_id) < 1:
+        if slice_key is None or not (1 <= int(class_id) < self.store.n_classes):
             return
         self._push_history()
         hsi, hli = self._hints_for(slice_key, si, li)
@@ -695,7 +695,7 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
                                  meta=self._with_draw_meta(meta, si, li))
         self._rebuild_class_panels()
         self._refresh_render()
-        name = SEAM_CLASSES[it.class_id] if it.class_id < len(SEAM_CLASSES) else str(it.class_id)
+        name = self._class_name(it.class_id)
         n = (meta or {}).get("seams")
         self.status_var.set(f"#{it.uid} {tool} -> {name}"
                             + (f" ({n} seams)" if n is not None else "") + f" ({slice_key})")
@@ -1134,11 +1134,18 @@ class AnnotationShell(StagesMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMix
             trace.cancel("abandoned: the task changed")
         for w in (self.annot_frame, self.region_ml_frame, self.seam_frame):
             w.pack_forget()
-        if poly:
-            self.seam_frame.pack(side="top", fill="both", expand=True, padx=4, pady=4)
-        else:
-            self.region_ml_frame.pack(side="bottom", fill="x", padx=4, pady=(2, 4))
-            self.annot_frame.pack(side="top", fill="both", expand=True, padx=4, pady=(4, 2))
+        # The Annotation frame is shared (classes, class frames, Save / Load);
+        # its tool rows are the kind's.
+        region_rows = (self.region_tool_row, self.magic_row, self.magic_row2)
+        poly_rows = (self.poly_tool_row, self.trace_row)
+        for w in region_rows + poly_rows:
+            w.pack_forget()
+        for w in (poly_rows if poly else region_rows):
+            w.pack(side="top", fill="x", padx=4, pady=2, before=self.classes_holder)
+        (self.seam_frame if poly else self.region_ml_frame).pack(
+            side="bottom", fill="x", padx=4, pady=(2, 4))
+        self.annot_frame.pack(side="top", fill="both", expand=True, padx=4, pady=(4, 2))
+        self._hover_seam_uid = None
         for region_w, poly_w in ((self._model_region, self._model_polyline),
                                  (self._analysis_region, self._analysis_polyline)):
             region_w.pack_forget()

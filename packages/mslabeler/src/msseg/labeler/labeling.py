@@ -173,13 +173,14 @@ class LabelStore:
         return it
 
     def add_seam(self, tool, points, class_id, slice_key, si=None, li=None, meta=None):
-        """A seam gesture (``SEAM_TOOLS``). Seam classes are their own space
-        (``seams.SEAM_CLASSES``: 1 interior, 2 boundary), independent of the
-        region class count; uids are shared with the region gestures."""
+        """A seam gesture (``SEAM_TOOLS``) -- a polyline task's. Its class is
+        one of the store's own (in a polyline task the vocabulary IS the seam
+        vocabulary; class 1 is the "not a boundary" role); uids are shared
+        with the region gestures."""
         if tool not in SEAM_TOOLS:
             raise ValueError(f"unknown seam tool {tool!r}")
-        if int(class_id) < 1:
-            raise ValueError(f"seam class {class_id} must be >= 1")
+        if not (1 <= int(class_id) < self.n_classes):
+            raise ValueError(f"seam class {class_id} out of range 1..{self.n_classes - 1}")
         it = Interaction(self._next_uid, slice_key, si, li, tool, points, class_id,
                          meta=meta)
         self._next_uid += 1
@@ -210,7 +211,7 @@ class LabelStore:
     def set_class(self, uid, class_id):
         if not (1 <= int(class_id) < self.n_classes):
             raise ValueError(f"class {class_id} out of range 1..{self.n_classes - 1}")
-        for it in self.interactions:
+        for it in self.interactions + self.seams:
             if it.uid == uid and it.class_id != int(class_id):
                 it.class_id = int(class_id)
                 self.rev += 1
@@ -224,7 +225,7 @@ class LabelStore:
         if not (2 <= n <= MAX_CLASSES):
             raise ValueError(f"n_classes must be 2..{MAX_CLASSES}, got {n}")
         changed = []
-        for it in self.interactions:
+        for it in self.interactions + self.seams:
             if it.class_id >= n:
                 it.class_id = n - 1
                 changed.append(it.uid)
@@ -238,8 +239,8 @@ class LabelStore:
         return [it for it in self.interactions if it.slice_key == slice_key]
 
     def for_class(self, class_id):
-        """Every interaction of one class, across all slices."""
-        return [it for it in self.interactions if it.class_id == int(class_id)]
+        """Every gesture of one class (region or seam), across all slices."""
+        return [it for it in self.interactions + self.seams if it.class_id == int(class_id)]
 
     def for_slice_seams(self, slice_key):
         """The slice's seam gestures in creation order."""

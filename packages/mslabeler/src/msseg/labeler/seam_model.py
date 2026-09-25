@@ -291,11 +291,12 @@ def _proba_boundary(est, F) -> np.ndarray:
 
 
 def labeled_binary(y) -> Tuple[np.ndarray, np.ndarray]:
-    """``(mask, yb)``: the labelled seams and their boundary (1) / interior
-    (0) target."""
+    """``(mask, yb)``: the labelled seams and their boundary (1) / not (0)
+    target -- class 1 is the "not a boundary" role, every higher class a
+    kind of boundary."""
     y = np.asarray(y, np.int64)
     mask = y > 0
-    return mask, (y == SEAM_BOUNDARY).astype(int)
+    return mask, (y >= SEAM_BOUNDARY).astype(int)
 
 
 def fit_seam_model(F, y, spec: Optional[SeamSpec], feature_names: Sequence[str],

@@ -62,6 +62,7 @@ class ClassPanelMixin:
         ttk.Label(row, text="(class 0 = no label)").pack(side="left", padx=4)
 
         row = ttk.Frame(ann); row.pack(side="top", fill="x", padx=4, pady=2)
+        self.region_tool_row = row
         ttk.Label(row, text="Tool:").pack(side="left")
         for value, txt in _TOOL_LABELS:
             rb = ttk.Radiobutton(row, text=txt, variable=self.tool_var,
@@ -149,6 +150,10 @@ class ClassPanelMixin:
                            "it' (the seam and edge models learn from it). Off: a sample "
                            "of regions, for a partial release. A blob's core is always "
                            "an extent, a lasso too unless Ctrl-dragged.")
+
+        # A polyline task's rows, packed instead of the region tools and the
+        # Magic rows (_apply_task_kind).
+        self._build_polyline_rows(ann)
 
         # Packed before the class holder (side="bottom") so it lands directly
         # under the class panels, leaving the holder the cavity between.
@@ -581,6 +586,8 @@ class ClassPanelMixin:
         """The interactions listed in the class panels: the CURRENT slice's
         only (they swap with every slice change); everything when no slice is
         on screen (nothing primed yet, or a freshly loaded session)."""
+        if self._task_kind() == "polyline":
+            return self._visible_seam_gestures()
         cur = self._current()
         if cur is None:
             return list(self.store.interactions)
@@ -614,15 +621,21 @@ class ClassPanelMixin:
         return annot, regions
 
     def _update_class_titles(self):
-        annot, regions = self._class_totals()
+        if self._task_kind() == "polyline":
+            annot = {}
+            for it in self.store.seams:
+                annot[it.class_id] = annot.get(it.class_id, 0) + 1
+            labelled, unit = self._seam_class_totals(), "s"
+        else:
+            (annot, labelled), unit = self._class_totals(), "r"
         for k, lbl in getattr(self, "_class_title_labels", {}).items():
             try:
                 # Terse: the full "Class k — annot: n — regions: m" overflowed
-                # the 300 px pane. a = annotations (all slices), r = regions.
-                # A named class shows its name after the id.
+                # the 300 px pane. a = annotations (all slices), r = regions
+                # (s = seams in a polyline task). A named class shows its name.
                 head = f"{k} {self.store.name(k)}" if self.store.has_name(k) else f"{k}"
                 lbl.configure(text=f"{head} · {annot.get(k, 0)}a · "
-                                   f"{regions.get(k, 0)}r")
+                                   f"{labelled.get(k, 0)}{unit}")
             except tk.TclError:
                 pass
 
@@ -690,6 +703,13 @@ class ClassPanelMixin:
         else:
             where = ""
         name = it.tool
+        meta = it.meta or {}
+        if it.tool in ("trace", "scope"):        # a polyline task's gesture
+            n = meta.get("seams")
+            detail = [] if n is None else [f"{n} seams"]
+            if it.tool == "trace" and meta.get("toll"):
+                detail.append(str(meta["toll"]))
+            return f"#{it.uid} {it.tool}" + (f" ({', '.join(detail)})" if detail else "") + where
         if it.meta and it.meta.get("tool"):
             name = str(it.meta["tool"])          # e.g. a magic fill's taps
             if it.meta.get("part"):
@@ -813,6 +833,9 @@ class ClassPanelMixin:
         one whose gesture touched that pixel's region -- the same resolution
         order the class layer paints in, so the menu acts on the gesture the
         user can actually see there. Falls back to a row-hovered gesture."""
+        if self._task_kind() == "polyline":
+            uid = self._seam_gesture_at(ix, iy)
+            return uid if uid is not None else self._hover_uid
         cur = self._current()
         if cur is None or ix is None:
             return self._hover_uid
@@ -857,6 +880,9 @@ class ClassPanelMixin:
         annotation view is not tied to where the pointer happens to be."""
         v = self.viewer
         if it is None or v is None or not it.points or not it.bound:
+            return
+        if it.tool in ("trace", "scope"):        # a polyline task's gesture
+            self._draw_seam_geometry(it, tags=tags)
             return
         cur = self._current()
         if cur is None or not self._gesture_on_item(it, *cur):
@@ -914,8 +940,6 @@ class ClassPanelMixin:
             return
         for it in self._visible_interactions():
             self._draw_interaction_geometry(it, tags=("draw", "ipersist"))
-        for it in self._visible_seam_gestures():
-            self._draw_seam_geometry(it, tags=("draw", "ipersist"))
         # Every one of these is a Tk canvas item that the next window redraw
         # has to walk -- a magic fill commits one tap per region, so the count
         # is worth seeing beside the frame time (see labeler/perf.py).
@@ -995,6 +1019,18 @@ class ClassPanelMixin:
                             f"class probabilities: {probabilities}")
         if self._hover_suppressed:
             return                        # a gesture is previewing: no outlines
+        if self._task_kind() == "polyline":
+            # The seam gesture that labels the seam under the pointer.
+            uid = self._seam_gesture_at(ix, iy)
+            if uid == getattr(self, "_hover_seam_uid", None):
+                return
+            self._hover_seam_uid = uid
+            self._hover_key = None
+            self._hover_uid = None
+            v.canvas.delete("ihover")
+            if uid is not None:
+                self._draw_interaction_geometry(self.store.get(uid))
+            return
         key = None if region is None else (cur[0], cur[1], region)
         if key == self._hover_key:
             return

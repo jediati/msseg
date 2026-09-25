@@ -640,7 +640,7 @@ def run_labeler_selftest():
     def _ev(x, y):
         return _types.SimpleNamespace(x=int(x), y=int(y), x_root=int(x), y_root=int(y), state=0)
 
-    app.tool_var.set("scope"); app.seam_class_var.set(SEAM_INTERIOR)
+    app.tool_var.set("scope"); app.active_class_var.set(SEAM_INTERIOR)
     assert ctrl.on_press(_ev(0, 0)) and ctrl.on_move(_ev(lw, lh)) and ctrl.on_release(_ev(lw, lh))
     sc = app.store.seams[-1]
     assert sc.tool == "scope"
@@ -653,7 +653,7 @@ def run_labeler_selftest():
         s_long = int(open_s[np.argmax(g_s.lengths(np)[open_s])])
         pts_s = g_s.seam_points(s_long)
         (ax, ay), (bx, by) = pts_s[0].tolist(), pts_s[-1].tolist()
-        app.tool_var.set("trace"); app.seam_class_var.set(SEAM_BOUNDARY)
+        app.tool_var.set("trace"); app.active_class_var.set(SEAM_BOUNDARY)
         app.seam_toll_var.set("geometric")
         assert ctrl.on_press(_ev(ax, ay)) and ctrl.trace.active
         ctrl.trace.on_hover(*g_s.placement.to_image(bx, by))
