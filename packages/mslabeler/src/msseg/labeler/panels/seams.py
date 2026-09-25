@@ -161,11 +161,13 @@ class SeamPanelMixin:
         return raster
 
     def _seam_cache_for(self, si, li, rec, graph, np):
-        """(commit, store.rev, seam class uint8[S], [(gesture, mask)]) for one
-        item, memoized on (commit, rev) like the region class LUTs."""
+        """(commit, store.rev, seam class uint8[S], [(gesture, mask)], graph,
+        derived bool[S][, labels-input signature]) for one item, memoized on
+        (commit, rev) like the region class LUTs -- and, in a polyline task,
+        on its labels input (another task's gestures, which move its rev)."""
         hit = self._seam_caches.get((si, li))
         if (hit is not None and hit[0] == rec.get("commit") and hit[1] == self.store.rev
-                and hit[4] is graph):
+                and hit[4] is graph and self._task_kind() != "polyline"):
             return hit
         key = self.catalogue.key_of(si, li)
         # Every gesture speaks to the seams (derive.py): region samples label
@@ -176,6 +178,22 @@ class SeamPanelMixin:
         # read as boundaries.
         from .. import derive
         from ..labeling import resolve_sets
+        in_sig = None
+        if self._task_kind() == "polyline":
+            # A polyline task has no region gestures of its own: what it
+            # derives comes from its labels input (another task's).
+            in_sig = self._input_labels_sig()
+            if hit is not None and len(hit) > 6 and hit[6] == in_sig and hit[0] == rec.get("commit") \
+                    and hit[1] == self.store.rev and hit[4] is graph:
+                return hit
+            region_class, extents = self._input_region_labels(si, li, key, rec, np)
+            res = derive.seam_labels(graph, np, region_class, extents,
+                                     self._seam_gestures_for_key(key),
+                                     boundary_class=self._input_boundary_class())
+            entry = (rec.get("commit"), self.store.rev, res.cls, res.sets, graph, res.derived,
+                     in_sig)
+            self._seam_caches[(si, li)] = entry
+            return entry
         gestures = self._gestures_for_key(key)
         coarse = {it.uid for it in self._coarse_gestures(si, li)}
         keep = [it for it in gestures if it.uid not in coarse]
@@ -339,9 +357,7 @@ class SeamPanelMixin:
         pdiff = None
         boundaryness = None
         if toll == "edges":
-            pr = self._pred.get(key)
-            aux = self._pred_aux(pr) if pr is not None and pr[0] == rec.get("commit") else None
-            pdiff = None if aux is None else aux.get("pdiff")
+            pdiff = self._seam_pdiff(key, rec, np)
         elif toll == "model":
             entry = self._seam_pred.get(key)
             if entry is not None and entry[0] == rec.get("commit"):

@@ -2657,10 +2657,69 @@ def _selftest():
         assert "logistic" in app.seam_readout_var.get(), app.seam_readout_var.get()
     # Row helpers see seam gestures too.
     assert len(app._row_interactions(0, 0)) >= 2
+    # -- Inputs: another task's region work, read through slots ------------ #
+    # The region task's annotations derive this task's seams (flanks in
+    # different classes -> a boundary), without activating it and without
+    # storing anything here; the stage strip grows an inputs box.
+    it_a = t_region.store.add("squiggle", [(5, 5), (6, 6)], 1, key_s, 0, 0)
+    it_b = t_region.store.add("squiggle", [(14, 5), (15, 6)], 2, key_s, 0, 0)
+    assert app._input_signature() == ()
+    app._refresh_stages()
+    assert "inputs" not in v.stages
+    assert app._seam_inputs_group.winfo_manager() == "pack"
+    assert app.input_vars["labels"].get() == "(none)"
+    assert t_region.name in app.input_combos["labels"].cget("values")
+    assert t_walls.name not in app.input_combos["labels"].cget("values"), "never itself"
+    assert app._set_input("labels", t_region.uid)
+    assert t_walls.inputs == {"labels": {"source": "task", "uid": t_region.uid}}
+    assert app.input_vars["labels"].get() == t_region.name
+    assert f"{len(t_region.store.interactions)} region gestures" in app.input_status["labels"].get()
+    rc_in, ext_in = app._input_region_labels(0, 0, key_s, rec_s, np)
+    assert rc_in[0] == 1 and rc_in[2] == 2 and ext_in == []
+    g_in = app.regions.seams(key_s, np)
+    ent_in = app._seam_cache_for(0, 0, rec_s, g_in, np)
+    assert ent_in[6] is not None
+    from msseg.labeler import derive as _derive_in
+    alone = _derive_in.seam_labels(g_in, np, rc_in).cls
+    s02 = [i for i in range(g_in.n_seams) if {int(g_in.a[i]), int(g_in.b[i])} == {0, 2}]
+    assert s02 and all(alone[i] == SEAM_BOUNDARY for i in s02)
+    assert np.array_equal(ent_in[2], _derive_in.seam_labels(
+        g_in, np, rc_in, (), app._seam_gestures_for_key(key_s)).cls), \
+        "derived under the explicit seam gestures"
+    app._refresh_stages()
+    assert v.stages["inputs"] == "ok", v.stages
+    if app._seam_model is not None and t_walls.model.trained_inputs is not None:
+        assert v.stages["model"] == "stale", "trained without that input"
+    # The provider's edits move the derived seams (its rev is in the key).
+    t_region.store.remove(it_b.uid)
+    assert app._seam_cache_for(0, 0, rec_s, g_in, np) is not ent_in
+    it_b = t_region.store.add("squiggle", [(14, 5), (15, 6)], 2, key_s, 0, 0)
+    # A slot the provider cannot fill says why, in the panel and the strip.
+    assert app._set_input("embedding", t_region.uid)
+    prov_e, why_e = app._input_resolved("embedding")
+    app._refresh_stages()
+    assert v.stages["inputs"] == ("ok" if why_e is None else "stale"), (why_e, v.stages)
+    if why_e:
+        assert why_e in app.input_status["embedding"].get()
+        assert why_e in v.stage_tip("inputs")
+    else:
+        assert app._seam_base()[0] is not None
+    assert app._on_stage_click("inputs") is None and app._center_tab_name() == "Features"
+    app._show_center_tab("Annotation")
+    # The slots ride the task in the session document.
+    doc_in = next(t for t in app._session_doc()["tasks"] if t["uid"] == t_walls.uid)
+    assert set(doc_in["inputs"]) == {"labels", "embedding"}
+    assert app._set_input("embedding", None) and app._set_input("labels", None)
+    assert t_walls.inputs is None and app._input_signature() == ()
+    app._refresh_stages()
+    assert "inputs" not in v.stages
+    t_region.store.remove_many([it_a.uid, it_b.uid])
     assert app._activate_task(t_region) and app._task_kind() == "region"
     assert app.tool_var.get() == "squiggle", "back in a region task: its first tool"
     assert app.annot_frame.winfo_manager() == "pack" and not app.seam_frame.winfo_manager()
     assert not app._seam_desc_group.winfo_manager(), "no seam descriptor in a region task"
+    assert not app._seam_inputs_group.winfo_manager(), "nor inputs"
+    assert not app._set_input("labels", t_walls.uid), "a region task has no slots"
 
     # -- The outline: a closed livewire loop fills what it encloses ---------- #
     # A 3x3 grid of blocks (ids 0..8) so a loop of seams exists: the centre
@@ -2805,7 +2864,8 @@ def _selftest():
           "workflow binding through profile rename / delete, New session keeps tasks, "
           "extents: fill / blob core / lasso (Ctrl = sample) + the checkbox in the view, "
           "derived seam labels with no seam gesture, the outline -> enclosure in one step, "
-          "region / polyline task kinds (tabs, tools, keys; older documents refused)")
+          "region / polyline task kinds (tabs, tools, keys; older documents refused), "
+          "polyline inputs (a region task's labels derive seams; slots, gate, strip box)")
     return 0
 
 

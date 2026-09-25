@@ -288,6 +288,7 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, HintsMixin, ModelPanelMixin, A
         self._build_label_panel()
         # After the app's own Features groups (base channel, statistics).
         self._build_seam_features_group()
+        self._build_seam_inputs_group()
         if self.viewer is not None:
             self.viewer.tool = DrawController(self)
             # Zoom/pan invalidates screen-space annotation geometry.
@@ -608,17 +609,27 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, HintsMixin, ModelPanelMixin, A
         than it works at -- a stroke meant at gland scale applied to a
         decomposition where the lumen is its own regions. Empty for an app
         without levels (no `_draw_meta`)."""
+        return self._coarse_of(self._gestures_for(si, li) + self._seam_gestures_for(si, li),
+                               si, li)
+
+    def _coarse_of(self, gestures, si, li):
+        """Those of `gestures` drawn ``COARSE_LEVELS`` coarser than item (si, li)."""
         draw = self._draw_meta(si, li)
         if not draw or draw.get("level") is None:
             return []
         here = int(draw["level"])
         out = []
-        for it in self._gestures_for(si, li) + self._seam_gestures_for(si, li):
+        for it in gestures:
             lvl = (it.meta or {}).get("level")
             if isinstance(lvl, (int, float)) and not isinstance(lvl, bool) \
                     and int(lvl) - here >= self.COARSE_LEVELS:
                 out.append(it)
         return out
+
+    def _coarse_filter(self, gestures, si, li):
+        """`gestures` minus the ones drawn much coarser than item (si, li)."""
+        coarse = {it.uid for it in self._coarse_of(gestures, si, li)}
+        return [it for it in gestures if it.uid not in coarse]
 
     def _annotation_mark(self, si, li, count):
         mark = super()._annotation_mark(si, li, count)
@@ -1151,11 +1162,14 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, HintsMixin, ModelPanelMixin, A
             region_w.pack_forget()
             poly_w.pack_forget()
             (poly_w if poly else region_w).pack(fill="both", expand=True)
-        desc = getattr(self, "_seam_desc_group", None)
-        if desc is not None:
-            desc.pack_forget()
-            if poly:
-                desc.pack(fill="x", padx=4, pady=(0, 2))
+        for name in ("_seam_desc_group", "_seam_inputs_group"):
+            group = getattr(self, name, None)
+            if group is not None:
+                group.pack_forget()
+                if poly:
+                    group.pack(fill="x", padx=4, pady=(0, 2))
+        if poly:
+            self._refresh_inputs_panel()
         self._coerce_tool()
 
     def _on_train_hotkey(self, e=None):
@@ -1862,6 +1876,8 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, HintsMixin, ModelPanelMixin, A
         if tree is None:
             return
         self._paint_task_rows(tree)
+        # A task came, went or was renamed: the input pickers list them.
+        self._refresh_inputs_panel()
 
     def _on_task_select(self, _event=None):
         if self._task_rows_syncing:

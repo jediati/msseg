@@ -348,12 +348,15 @@ def session_doc_from_json(doc: Any, notes: Optional[List[str]] = None, *,
             # Enrolment only when written: absent means "every place".
             enrolled = (normalise_enrolled(td["enrolled"], notes, f"task {name!r}")
                         if "enrolled" in td else None)
+            from .artifacts import normalise_inputs
+            inputs = normalise_inputs(td.get("inputs"), notes, f"task {name!r}")
             tasks.append({"uid": uid, "name": name, "workflow": workflow,
                           **({"kind": kind} if kind is not None else {}),
                           "annotations": _first_dict(td.get("annotations"), td.get("labels")),
                           "models": _models_from_json(td.get("models")),
                           "view": {k: tview[k] for k in TASK_VIEW_KEYS if k in tview},
-                          **({"enrolled": enrolled} if enrolled is not None else {})})
+                          **({"enrolled": enrolled} if enrolled is not None else {}),
+                          **({"inputs": inputs} if inputs else {})})
             uids.append(uid)
             tnames.append(name)
         active_task = str(root.get("active_task") or "")

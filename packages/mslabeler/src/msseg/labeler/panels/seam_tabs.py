@@ -3,7 +3,10 @@ tabs' counterparts over seams.
 
 * **Features**: the seam descriptor group (which blocks the seam model reads:
   pair terms over the flank rows or an embedding, the saddle barrier, the
-  edge model's p(diff), geometry). The statistics above it are the flank rows.
+  edge model's p(diff), geometry) and the **Inputs** group (``artifacts``:
+  which region task feeds the derived labels, the embedding and p(diff),
+  each slot saying why it cannot be used). The statistics above them are
+  the flank rows.
 * **Model**: the seam classifier's kind and settings, and Evaluate with its
   held-out report -- a table per fold plus the mean, and per-class recall /
   precision.
@@ -17,10 +20,12 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
-from .. import seam_model
+from .. import artifacts, seam_model
+from ..labeling import MAX_CLASSES
 from ..widgets import attach_tooltip
 from ..defaults import *  # noqa: F401,F403
 
+_NO_INPUT = "(none)"
 _SEAM_KINDS = ("logistic", "mlp")
 _SEAM_EMBEDS = ("auto", "features", "net")
 _FEATURE_TIPS = {
@@ -91,6 +96,101 @@ class SeamTabsMixin:
             cb = ttk.Checkbutton(row, text=k, variable=self.seam_feature_vars[k])
             cb.pack(side="left", padx=(0, 8))
             attach_tooltip(cb, _FEATURE_TIPS.get(k, k))
+
+    # ------------------------------------------------------------------ #
+    # Features tab: the inputs (``artifacts``)
+    # ------------------------------------------------------------------ #
+    def _build_seam_inputs_group(self):
+        body = self._group(self.feat_col, "7. Inputs", key="seam_inputs")
+        self._seam_inputs_group = body.master if body.master is not self.feat_col else body
+        ttk.Label(body, foreground="#666", wraplength=380, justify="left",
+                  text="Region work this task reads: another task's annotations and "
+                       "model. A slot that cannot be used says why.").pack(
+            anchor="w", padx=4, pady=(2, 2))
+        self.input_vars, self.input_status, self.input_combos = {}, {}, {}
+        self._input_choices = {}
+        for slot in artifacts.SLOTS:
+            row = ttk.Frame(body)
+            row.pack(fill="x", padx=4, pady=(2, 0))
+            lab = ttk.Label(row, text=artifacts.SLOT_TITLES[slot], width=16)
+            lab.pack(side="left")
+            attach_tooltip(lab, artifacts.SLOT_HELP[slot])
+            var = tk.StringVar(master=self.root, value=_NO_INPUT)
+            cb = ttk.Combobox(row, textvariable=var, values=[_NO_INPUT], state="readonly",
+                              width=18)
+            cb.pack(side="left", padx=2)
+            cb.bind("<<ComboboxSelected>>", lambda _e, s=slot: self._on_input_pick(s))
+            attach_tooltip(cb, artifacts.SLOT_HELP[slot])
+            if slot == "labels":
+                ttk.Label(row, text="boundary class").pack(side="left", padx=(8, 2))
+                self.input_boundary_var = tk.StringVar(master=self.root,
+                                                       value=str(artifacts.DEFAULT_BOUNDARY_CLASS))
+                sp = ttk.Spinbox(row, from_=2, to=MAX_CLASSES - 1, width=4,
+                                 textvariable=self.input_boundary_var,
+                                 command=self._on_input_boundary)
+                sp.pack(side="left")
+                sp.bind("<Return>", lambda _e: self._on_input_boundary())
+                sp.bind("<FocusOut>", lambda _e: self._on_input_boundary())
+                attach_tooltip(sp, "The class a derived boundary gets (seams between "
+                                   "flanks annotated in different classes).")
+            status = tk.StringVar(master=self.root, value="")
+            ttk.Label(body, textvariable=status, foreground="#666", wraplength=380,
+                      justify="left").pack(anchor="w", padx=(22, 4))
+            self.input_vars[slot], self.input_status[slot] = var, status
+            self.input_combos[slot] = cb
+
+    def _refresh_inputs_panel(self):
+        """The slots' pickers and verdicts for the active task."""
+        if not getattr(self, "input_vars", None) or self._task_kind() != "polyline":
+            return
+        me = self._task
+        names = [t.name for t in self.tasks if t is not me and t.kind == "region"]
+        self._input_choices = {t.name: t.uid for t in self.tasks
+                               if t is not me and t.kind == "region"}
+        for slot in artifacts.SLOTS:
+            self.input_combos[slot].config(values=[_NO_INPUT] + names)
+            prov, why = self._input_resolved(slot)
+            if prov is None:
+                self.input_vars[slot].set(_NO_INPUT)
+                self.input_status[slot].set("")
+                continue
+            self.input_vars[slot].set(prov.name if isinstance(prov, artifacts.TaskProvider)
+                                      else f"({why})")
+            self.input_status[slot].set(f"cannot use: {why}" if why
+                                        else self._input_status_text(slot, prov))
+        entry = self._input_entry("labels")
+        if entry is not None:
+            self.input_boundary_var.set(str(self._input_boundary_class()))
+
+    def _input_status_text(self, slot, prov):
+        if slot == "labels":
+            n = len(prov.task.store.interactions)
+            k = self._input_boundary_class()
+            return (f"{n} region gesture{'s' if n != 1 else ''}; derived boundaries -> "
+                    f"class {k} {self._class_name(k)!r}")
+        stack = prov.stack()
+        what = f"{stack.kind}, {len(stack.names or [])} features"
+        if slot == "embedding":
+            return f"the hidden layer of {prov.name}'s net ({what})"
+        return f"{prov.name}'s edge model over its net ({what})"
+
+    def _on_input_pick(self, slot):
+        self._unfocus_entries()
+        name = self.input_vars[slot].get()
+        uid = self._input_choices.get(name)
+        if name == _NO_INPUT or uid is None:
+            self._set_input(slot, None)
+        else:
+            self._set_input(slot, uid)
+
+    def _on_input_boundary(self):
+        try:
+            k = int(self.input_boundary_var.get())
+        except (ValueError, tk.TclError):
+            return
+        entry = self._input_entry("labels")
+        if entry is not None and artifacts.boundary_class_of(entry) != k:
+            self._set_input_boundary_class(k)
 
     # ------------------------------------------------------------------ #
     # Model tab: the seam classifier and its held-out report

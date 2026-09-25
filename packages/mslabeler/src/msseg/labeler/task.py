@@ -43,6 +43,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
+from .artifacts import normalise_inputs
 from .context import ContextSpec
 from .labeling import LabelStore
 from .session_doc import (DEFAULT_TASK_KIND, TASK_KINDS, TASK_VIEW_KEYS, dedupe_profile_name,
@@ -89,6 +90,9 @@ class ModelStack:
     # turns the model box stale when either moves.
     trained_rev: Any = None
     trained_measure: Any = None
+    # A polyline task's seam model: the input slots' signatures it was
+    # trained with (``SeamModelMixin._input_signature``).
+    trained_inputs: Any = None
 
     @property
     def empty(self) -> bool:
@@ -148,6 +152,9 @@ class Task:
     # level -- a task written before enrolment, and every coupon task; {} =
     # nothing. An app with enrolment (mspath) never leaves it None.
     enrolled: Optional[Dict[str, Dict[str, Optional[int]]]] = None
+    # A polyline task's input slots (``artifacts``): ``{slot: {"source":
+    # "task", "uid": ...[, "boundary_class": k]}}``, None when there are none.
+    inputs: Optional[Dict[str, Dict[str, Any]]] = None
 
     # -- construction ------------------------------------------------------ #
     @classmethod
@@ -177,7 +184,8 @@ class Task:
         store.names = dict(self.store.names)
         return Task(uid=uid or new_uid(taken), name=str(name), workflow=self.workflow,
                     kind=self.kind, store=store, view=_deep_copy_json(self.view),
-                    enrolled=_deep_copy_json(self.enrolled))
+                    enrolled=_deep_copy_json(self.enrolled),
+                    inputs=_deep_copy_json(self.inputs))
 
     # -- counts for display ------------------------------------------------ #
     @property
@@ -196,6 +204,8 @@ class Task:
         # coupon task) writes the document it always has; {} is written.
         if self.enrolled is not None:
             doc["enrolled"] = _deep_copy_json(self.enrolled)
+        if self.inputs:
+            doc["inputs"] = _deep_copy_json(self.inputs)
         return doc
 
     @classmethod
@@ -224,8 +234,11 @@ class Task:
         pending = any(os.path.isfile(str(m.get("path") or "")) for m in models)
         enrolled = (normalise_enrolled(d["enrolled"], notes, f"task {name!r}")
                     if "enrolled" in d else None)
+        inputs = (normalise_inputs(d.get("inputs"), notes, f"task {name!r}")
+                  if kind == "polyline" else None)
         return cls(uid=uid, name=name, workflow=workflow, kind=kind, store=store,
-                   models=models, view=view, model_pending=pending, enrolled=enrolled)
+                   models=models, view=view, model_pending=pending, enrolled=enrolled,
+                   inputs=inputs)
 
 
 # A new polyline task's classes: 1 = not a boundary (the role the scope box and

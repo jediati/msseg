@@ -102,12 +102,14 @@ def _membership(ids, K, np):
 
 
 def seam_labels(graph, np, region_class=None, extents=(), seam_gestures=(),
-                tau=SEAM_COVER_TAU):
+                tau=SEAM_COVER_TAU, boundary_class=SEAM_BOUNDARY):
     """``SeamLabels(cls uint8[S], sets, derived bool[S])`` for an item's seam
     graph: `cls` is the seam class per seam (0 unknown / 1 interior / 2
     boundary); `sets` the explicit seam gestures' masks (for the hover
     lookup and the readout, as ``seam_labeling.seam_sets`` gives them);
-    `derived` marks the seams whose label came from region gestures alone."""
+    `derived` marks the seams whose label came from region gestures alone.
+    `boundary_class` is the class a DERIVED boundary gets (a polyline task
+    with several boundary kinds picks which one its region input means)."""
     S = graph.n_seams
     cls = np.full(S, SEAM_UNKNOWN, np.uint8)
     derived = np.zeros(S, bool)
@@ -131,6 +133,8 @@ def seam_labels(graph, np, region_class=None, extents=(), seam_gestures=(),
             if EXTENT_EDGE_VS_SAME_CLASS is not None:
                 cls[edge & (other > 0) & (ca == cb)] = EXTENT_EDGE_VS_SAME_CLASS
         derived = cls > 0
+        if boundary_class != SEAM_BOUNDARY:
+            cls[cls == SEAM_BOUNDARY] = boundary_class
     sets = _explicit_seam_sets(list(seam_gestures), graph, np, tau) if seam_gestures else []
     explicit = np.zeros(S, bool)
     for it, mask in sets:

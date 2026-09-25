@@ -12,6 +12,7 @@ import threading
 import time
 from tkinter import filedialog
 
+from . import artifacts
 from . import bundle as model_bundle
 from . import edge_model, model_search, seam_export, seam_model
 from .training import TrainingProblem
@@ -25,11 +26,168 @@ class SeamModelMixin:
     def _seam_spec(self):
         return seam_model.SeamSpec()
 
+    # ------------------------------------------------------------------ #
+    # Inputs (``artifacts``): the region work a polyline task reads
+    # ------------------------------------------------------------------ #
+    def _input_entry(self, slot):
+        """The active polyline task's slot entry, or None."""
+        if self._task_kind() != "polyline":
+            return None
+        return (self._task.inputs or {}).get(slot)
+
+    def _input_resolved(self, slot):
+        """``(provider, why)``: provider None when the slot is empty, why
+        None when the provider can fill it under the active workflow."""
+        ref = artifacts.ProviderRef.from_doc(self._input_entry(slot))
+        if ref is None:
+            return None, None
+        prov = artifacts.resolve(ref, self.tasks, app_tag=self.MODEL_APP_TAG,
+                                 consumer=self._task.uid)
+        return prov, self._input_why_not(slot, prov)
+
+    def _input_provider(self, slot):
+        """The slot's provider when it is usable here, else None."""
+        prov, why = self._input_resolved(slot)
+        return prov if prov is not None and why is None else None
+
+    def _input_why_not(self, slot, prov):
+        """The slot's refusal, cached by what it depends on (the provider's
+        model, the measurement, the scope and the workflow): the schema call
+        is not free on the stage strip's poll."""
+        sig = (prov.signature(slot), self._measure_key(), self._feature_scope(),
+               self.active_profile_idx)
+        cache = self.__dict__.setdefault("_input_why_cache", {})
+        hit = cache.get(slot)
+        if hit is not None and hit[0] == sig:
+            return hit[1]
+        why = prov.unavailable(slot)
+        if why is None:
+            try:
+                have = self._expected_feature_names()
+            except Exception:
+                have = None
+            prof = "?"
+            if 0 <= self.active_profile_idx < len(self.profiles):
+                prof = self.profiles[self.active_profile_idx]["name"]
+            why = prov.requires(slot).why_not(have, self._feature_scope(), f"workflow {prof!r}")
+        cache[slot] = (sig, why)
+        return why
+
+    def _input_boundary_class(self):
+        """The class a derived boundary gets: the labels slot's setting,
+        brought into the task's vocabulary (class 1 is "not a boundary")."""
+        k = artifacts.boundary_class_of(self._input_entry("labels"))
+        return max(2, min(k, self.store.n_classes - 1))
+
+    def _input_labels_sig(self):
+        prov = self._input_provider("labels")
+        return None if prov is None else (prov.signature("labels"), self._input_boundary_class())
+
+    def _input_signature(self):
+        """What the polyline task's inputs are, as one value: each filled
+        slot's provider signature (None when unusable) -- the seam model is
+        stale when this moves under it. () in a region task."""
+        if self._task_kind() != "polyline":
+            return ()
+        out = []
+        for slot in artifacts.SLOTS:
+            if self._input_entry(slot) is None:
+                continue
+            prov = self._input_provider(slot)
+            out.append((slot, None if prov is None else prov.signature(slot)))
+        if self._input_entry("labels") is not None:
+            out.append(("boundary_class", self._input_boundary_class()))
+        return tuple(out)
+
+    def _input_region_labels(self, si, li, key, rec, np):
+        """``(region_class, extents)`` over this item's regions from the
+        labels slot's provider: its region gestures on the item's slide,
+        resolved against THIS task's decomposition (gestures are geometry).
+        ``(None, [])`` when the slot is empty or unusable."""
+        prov = self._input_provider("labels")
+        if prov is None or key is None:
+            return None, []
+        from . import derive
+        from .labeling import resolve_sets, touched_sets
+        slide, rect = self._binding_of(key)
+        gestures = self._coarse_filter(prov.gestures_for(slide, rect), si, li)
+        if not gestures:
+            return None, []
+        sets = touched_sets(gestures, rec["labels"], np, self.regions.label_layer(key))
+        region_class = resolve_sets(sets, rec["labels"], np)
+        return region_class, [(it, ids) for it, ids in sets if derive.is_extent(it)]
+
+    def _input_pdiff(self, key, rec, np):
+        """p(diff) per arc of this item's record from the pdiff slot's edge
+        model, cached per (commit, provider); None when there is none."""
+        prov = self._input_provider("pdiff")
+        if prov is None or rec is None or rec.get("stats") is None:
+            return None
+        sig = prov.signature("pdiff")
+        cache = self.__dict__.setdefault("_input_pdiff_cache", {})
+        hit = cache.get(key)
+        if hit is not None and hit[0] == rec.get("commit") and hit[1] == sig:
+            return hit[2]
+        try:
+            pd = artifacts.pdiff_for(prov.stack(), rec["stats"], self.regions.arcs(key, np),
+                                     rec["labels"], np)
+        except (ValueError, IndexError, TypeError) as exc:
+            self._log(f"p(diff) input unusable on {key}: {exc}")
+            pd = None
+        cache[key] = (rec.get("commit"), sig, pd)
+        return pd
+
+    def _set_input(self, slot, uid, boundary_class=None):
+        """Fill (a task uid) or empty (None) one of the active polyline
+        task's slots; headless-callable. False in a region task."""
+        task = self._task
+        if task.kind != "polyline" or slot not in artifacts.SLOTS:
+            return False
+        inputs = dict(task.inputs or {})
+        old = inputs.get(slot) or {}
+        if uid is None:
+            inputs.pop(slot, None)
+        else:
+            entry = artifacts.ProviderRef.task(uid).to_doc()
+            if slot == "labels":
+                bc = boundary_class if boundary_class is not None else old.get("boundary_class")
+                if bc is not None:
+                    entry["boundary_class"] = artifacts.boundary_class_of({"boundary_class": bc})
+            inputs[slot] = entry
+        task.inputs = inputs or None
+        self._input_changed(slot)
+        return True
+
+    def _set_input_boundary_class(self, k):
+        entry = self._input_entry("labels")
+        if entry is None:
+            return False
+        entry["boundary_class"] = artifacts.boundary_class_of({"boundary_class": k})
+        self._input_changed("labels")
+        return True
+
+    def _input_changed(self, slot):
+        self.__dict__.pop("_input_why_cache", None)
+        self._clear_seam_caches()
+        if slot != "labels":
+            # The seam descriptor's values moved under the predictions.
+            self._seam_pred.clear()
+        refresh = getattr(self, "_refresh_inputs_panel", None)
+        if refresh is not None:
+            refresh()
+        self._refresh_seam_panel()
+        self._refresh_confusion()
+        self._refresh_stages()
+        self._refresh_render()
+
     def _seam_base(self):
         """``(pipeline, names)`` of the region net the pair block may embed
-        with: the current classifier when it has hidden layers and its
-        inputs are plain table columns (no context columns); else
-        ``(None, None)``."""
+        with: in a polyline task, the embedding slot's provider; else the
+        current classifier when it has hidden layers and its inputs are
+        plain table columns (no context columns); else ``(None, None)``."""
+        if self._task_kind() == "polyline":
+            prov = self._input_provider("embedding")
+            return prov.base() if prov is not None else (None, None)
         clf = getattr(self, "_clf", None)
         if clf is None or not seam_model.has_embedding(clf):
             return None, None
@@ -61,9 +219,7 @@ class SeamModelMixin:
                 else:
                     use_base = base
                 arcs = self.regions.arcs(key, np)
-                pr = self._pred.get(key)
-                aux = self._pred_aux(pr) if pr is not None and pr[0] == rec.get("commit") else None
-                pdiff = None if aux is None else aux.get("pdiff")
+                pdiff = self._seam_pdiff(key, rec, np)
                 F, fnames = seam_model.seam_features(graph, table, names, np, conv=self.FIELDS,
                                                      base_pipeline=use_base, arcs=arcs,
                                                      pdiff=pdiff, spec=spec)
@@ -81,8 +237,17 @@ class SeamModelMixin:
             return None
         return out
 
+    def _seam_pdiff(self, key, rec, np):
+        """p(diff) per arc for the seam descriptor and the edges toll: the
+        pdiff input in a polyline task, the task's own edge model else."""
+        if self._task_kind() == "polyline":
+            return self._input_pdiff(key, rec, np)
+        pr = self._pred.get(key)
+        aux = self._pred_aux(pr) if pr is not None and pr[0] == rec.get("commit") else None
+        return None if aux is None else aux.get("pdiff")
+
     def _seam_net_hash(self, embed):
-        clf = getattr(self, "_clf", None)
+        clf = self._seam_base()[0]
         if embed != "net" or clf is None:
             return ""
         try:
@@ -122,6 +287,7 @@ class SeamModelMixin:
         # What it was trained on, for the stage strip (as the region model).
         self._task.model.trained_rev = self.store.rev
         self._task.model.trained_measure = self._measure_key()
+        self._task.model.trained_inputs = self._input_signature()
         self._seam_pred.clear()
         self._log(f"seam model: {model.describe()}; {len(fnames)} inputs, "
                   f"{1e3 * model.fit_s:.0f} ms")

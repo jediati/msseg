@@ -3,7 +3,11 @@
 ::
 
     [msc]--[stats]--+--[classified]
-           [model]--+
+  [inputs]--[model]--+
+
+The ``inputs`` box exists only in a polyline task that declares inputs
+(``artifacts``): orange when a slot's provider is missing or cannot feed this
+workflow, and a click opens the Features tab where the slots are.
 
 Each box is COMPUTED from what the engines already hold -- the field and
 measurement fingerprints, the record's identity, the prediction's commit, the
@@ -29,14 +33,20 @@ from typing import Dict, List, Optional, Tuple
 
 from .. import bundle as model_bundle
 
-ORDER = ("msc", "stats", "model", "classified")
-LABELS = {"msc": "msc", "stats": "stats", "model": "model", "classified": "classified"}
-TABS = {"msc": "Processing", "stats": "Features", "model": "Model", "classified": "Annotation"}
+ORDER = ("msc", "stats", "inputs", "model", "classified")
+LABELS = {"msc": "msc", "stats": "stats", "inputs": "inputs", "model": "model",
+          "classified": "classified"}
+TABS = {"msc": "Processing", "stats": "Features", "inputs": "Features", "model": "Model",
+        "classified": "Annotation"}
+# The inputs box is not upstream of the model in the propagation sense: the
+# model judges its own staleness against the inputs it was trained with.
 UPSTREAM = {"stats": ("msc",), "classified": ("stats", "model")}
-# (row, col, feeds): the model joins the chain below it.
+# (row, col, feeds): the model joins the chain below it; inputs feed the model.
 LAYOUT = {"msc": (0, 0, ("stats",)), "stats": (0, 1, ("classified",)),
+          "inputs": (1, 0, ("model",)),
           "model": (1, 1, ("classified",)), "classified": (0, 2, ())}
 _BLOCKING = ("stale", "busy", "error")
+_OPTIONAL = ("inputs",)
 
 State = Tuple[str, str, str]          # (state, tip, text)
 
@@ -50,14 +60,15 @@ def _norm(v) -> State:
 
 def propagate(states: Dict[str, tuple]) -> Dict[str, State]:
     """Downstream of a stale / busy / failed box, a box that reads ``ok`` is
-    stale: what it shows will be recomputed. Pure, in dependency order."""
-    out = {k: _norm(states.get(k)) for k in ORDER}
-    for key in ORDER:
+    stale: what it shows will be recomputed. Pure, in dependency order. An
+    optional box (``inputs``) is kept only when `states` names it."""
+    out = {k: _norm(states.get(k)) for k in ORDER if k in states or k not in _OPTIONAL}
+    for key in out:
         state, tip, text = out[key]
         if state not in ("ok", "cached"):
             continue
         for up in UPSTREAM.get(key, ()):
-            if out[up][0] in _BLOCKING:
+            if up in out and out[up][0] in _BLOCKING:
                 why = "is being recomputed" if out[up][0] == "busy" else "changed"
                 out[key] = ("stale", f"{tip} -- but {up} {why}, so this is out of date"
                             if tip else f"{up} {why}, so this is out of date", text)
@@ -69,6 +80,8 @@ def boxes(states: Dict[str, State]) -> List[dict]:
     """The canvas strip's box list (``SliceCanvas.set_stages``)."""
     out = []
     for key in ORDER:
+        if key not in states:
+            continue
         state, tip, text = states[key]
         row, col, feeds = LAYOUT[key]
         out.append({"key": key, "label": LABELS[key], "state": state, "tip": tip,
@@ -158,9 +171,34 @@ class StagesMixin:
         if stack.trained_rev is not None and stack.trained_rev != self.store.rev:
             return ("stale", "Seam labels or classes changed since this model was "
                              "trained -- Train again (R).")
+        if (stack.trained_inputs is not None
+                and stack.trained_inputs != self._input_signature()):
+            return ("stale", "The inputs changed since this seam model was trained "
+                             "(another task's annotations or model, or a slot) -- "
+                             "Train again (R).")
         if stack.trained_rev is None:
             return ("ok", f"Loaded seam model ({model.brief()}).")
         return ("ok", f"Trained this session: {model.brief()}.")
+
+    def _stage_inputs(self):
+        """The polyline task's input slots, or None when it declares none."""
+        from .. import artifacts
+        filled = [s for s in artifacts.SLOTS if self._input_entry(s) is not None]
+        if not filled:
+            return None
+        good, bad = [], []
+        for slot in filled:
+            prov, why = self._input_resolved(slot)
+            title = artifacts.SLOT_TITLES[slot]
+            if why:
+                bad.append(f"{title}: {why}")
+            else:
+                good.append(f"{title} from {prov.name}")
+        text = f"{len(good)}/{len(filled)}" if len(filled) > 1 else ""
+        if bad:
+            return ("stale", "; ".join(bad) + (" (" + "; ".join(good) + ")" if good else "")
+                    + " -- fix on the Features tab (Inputs).", text)
+        return ("ok", "Inputs: " + "; ".join(good) + ".", text)
 
     def _stage_classified(self, key):
         if self._task_kind() == "polyline":
@@ -202,6 +240,10 @@ class StagesMixin:
             return None
         states = {"msc": self._stage_field(key), "stats": self._stage_measure(key),
                   "model": self._stage_model(), "classified": self._stage_classified(key)}
+        if self._task_kind() == "polyline":
+            inputs = self._stage_inputs()
+            if inputs is not None:
+                states["inputs"] = inputs
         busy = getattr(self, "_stage_busy", None)
         if busy is not None and busy[0] in states:
             states[busy[0]] = ("busy", busy[1], busy[2] if len(busy) > 2 else "")
