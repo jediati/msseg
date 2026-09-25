@@ -172,6 +172,9 @@ msseg::Msc2DParams parse_msc(const nlohmann::json& cfg) {
     if (m.contains("persistence_percent")) msc.persistence_percent = m["persistence_percent"].get<float>();
     msc.compute_algorithm = m.value("compute_algorithm", msc.compute_algorithm);
     msc.simplification = m.value("simplification", msc.simplification);
+    if (m.contains("max_region_area") && !m["max_region_area"].is_null())
+      msc.max_region_area = m["max_region_area"].get<long long>();
+    msc.max_region_parallel = m.value("max_region_parallel", msc.max_region_parallel);
     msc.accurate_ascending = m.value("accurate_ascending", msc.accurate_ascending);
     msc.accurate_descending = m.value("accurate_descending", msc.accurate_descending);
     msc.manifold = m.value("manifold", msc.manifold);

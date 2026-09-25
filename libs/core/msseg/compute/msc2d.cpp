@@ -56,6 +56,16 @@ struct HasSimplification<Options,
                          std::void_t<decltype(std::declval<Options&>().simplification)>>
     : std::true_type {};
 
+// ComputeOptions::rules (custom simplification rules: the max-area veto and its
+// allowParallel flag); detected so an older pin still builds (and warns).
+template <typename Options, typename = void>
+struct HasSimplificationRules : std::false_type {};
+
+template <typename Options>
+struct HasSimplificationRules<Options,
+                              std::void_t<decltype(std::declval<Options&>().rules.maxRegionCells)>>
+    : std::true_type {};
+
 // Region-scale facade (baseToLiving/paintLabels), from MSCEER's cuda-gradient
 // branch: lets a re-select work per base REGION (~100k entries) instead of per
 // PIXEL (~10M hash probes), and paint through the persistent GPU label context
@@ -208,6 +218,24 @@ void compute_with_algorithm(MscType& msc, const float* pixels, int rows, int col
                      "msc2d: msc.simplification='merge_forest' requested but the "
                      "linked msc_2d_lib predates ComputeOptions::simplification; "
                      "using the MSC hierarchy.\n");
+      }
+    }
+    const bool max_area_on = cfg.max_region_area.has_value() && *cfg.max_region_area > 0;
+    if constexpr (HasSimplificationRules<typename MscType::ComputeOptions>::value) {
+      if (max_area_on) {
+        // Restrict the manifold being labelled: ascending manifolds of minima
+        // (pixels) or descending manifolds of maxima (dual pixels).
+        const bool descending = cfg.manifold == "descending";
+        options.rules.restrictMinima = !descending;
+        options.rules.restrictMaxima = descending;
+        options.rules.maxRegionCells = *cfg.max_region_area;
+        options.rules.allowParallel = cfg.max_region_parallel;
+      }
+    } else {
+      if (max_area_on) {
+        std::fprintf(stderr,
+                     "msc2d: msc.max_region_area requested but the linked "
+                     "msc_2d_lib predates ComputeOptions::rules; ignoring it.\n");
       }
     }
     if (cfg.compute_algorithm == "partitioned") {

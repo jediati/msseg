@@ -115,6 +115,76 @@ def format_hist_ranges(ranges):
     return "; ".join(f"{k}: {v[0]:g}, {v[1]:g}" for k, v in ranges.items() if len(v) == 2)
 
 
+def hist_channel_choices(params_json):
+    """The channels a histogram may name: the spec's own, resolved with the
+    histogram block left out -- it names channels OF the spec, so it cannot
+    decide them, and one stale name makes the whole resolution throw."""
+    try:
+        doc = json.loads(params_json)
+        stats = dict(doc.get("statistics") or {})
+        stats.pop("histogram", None)
+        doc["statistics"] = stats
+        return [c["name"] for c in config_io.stat_channels(json.dumps(doc))]
+    except Exception:
+        return []
+
+
+def sync_hist_channels(var, combo, choices):
+    """Offer `choices` in the histogram's channel dropdown and keep the
+    selection to names the spec has: a name the spec no longer measures (the
+    `base` default after base is unticked) is dropped, and an empty selection
+    falls back to the first channel. A multi-channel selection loaded from a
+    config is kept as long as every name still resolves."""
+    if combo is not None:
+        try:
+            combo.config(values=choices)
+        except tk.TclError:
+            pass
+    if not choices:
+        return
+    names = [n.strip() for n in var.get().replace(";", ",").split(",") if n.strip()]
+    kept = [n for n in names if n in choices] or [choices[0]]
+    if kept != names:
+        var.set(", ".join(kept))
+
+
+def build_hist_row(parent, on_var, bins_var, channels_var, on_change):
+    """The histogram's first row (toggle, bins, channel dropdown), shared by
+    the coupon and mspath statistics panels. Returns the channel combobox."""
+    row = ttk.Frame(parent); row.pack(fill="x", padx=4, pady=(4, 1))
+    ttk.Checkbutton(row, text="histogram", variable=on_var, width=10,
+                    command=on_change).pack(side="left")
+    ttk.Label(row, text="bins:").pack(side="left")
+    e = ttk.Entry(row, textvariable=bins_var, width=4); e.pack(side="left", padx=2)
+    e.bind("<Return>", lambda ev: on_change())
+    e.bind("<FocusOut>", lambda ev: on_change())
+    ttk.Label(row, text="channel:").pack(side="left")
+    combo = ttk.Combobox(row, textvariable=channels_var, state="readonly", width=18)
+    combo.pack(side="left", padx=2)
+    combo.bind("<<ComboboxSelected>>", lambda ev: on_change())
+    return combo
+
+
+def build_max_area_row(parent, area_var, parallel_var):
+    """The max-area simplification rule's two controls (`msc.max_region_area`,
+    `msc.max_region_parallel`), shared by the coupon and mspath MSC panels."""
+    row = ttk.Frame(parent); row.pack(fill="x", padx=4, pady=2)
+    ttk.Label(row, text="Max region area (px):").pack(side="left")
+    ttk.Entry(row, textvariable=area_var, width=9).pack(side="left", padx=4)
+    ttk.Checkbutton(row, text="parallel (best effort)",
+                    variable=parallel_var).pack(side="left", padx=4)
+    ttk.Label(parent, text="blank = no cap. Vetoes any simplification merge that would "
+                           "grow a region past the cap, at every persistence\n"
+                           "(a single base basin larger than it is not split). "
+                           "Unticked: serial build, reproduces the serial result exactly.",
+              foreground="#666").pack(anchor="w", padx=4)
+
+
+def max_area_from_var(var):
+    """The max-area entry's text as `msc.max_region_area` (int > 0, or None)."""
+    return session.max_region_area({"max_region_area": str(var.get()).strip()})
+
+
 def single_channel_params(params_json, name):
     """`params_json` with its statistics block cut down to the ONE derived
     channel `name` (its kind at its sigma, keeping the card's other keys such
@@ -213,6 +283,9 @@ class MscouponApp(ViewerShell):
         # unconditionally. It was the one missed when the default flipped, so a
         # GUI-saved session pinned "msc" over every other default.
         self.simplification_var = tk.StringVar(value=session.DEFAULT_SIMPLIFICATION)
+        # msc.max_region_area (blank = no cap) / msc.max_region_parallel.
+        self.max_area_var = tk.StringVar(value="")
+        self.max_area_parallel_var = tk.BooleanVar(value=True)
         self.ext_radius_var = tk.StringVar(value="0")
         self.min_area_var = tk.StringVar(value="")
         self.connectivity_var = tk.IntVar(value=6)
@@ -443,16 +516,9 @@ class MscouponApp(ViewerShell):
         ttk.Label(row, text="(0 = the critical pixel)").pack(side="left")
         # Histograms: a fixed range per channel (or "*" for all), so the bins
         # add across slices and mean the same thing on every slice.
-        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=(4, 1))
-        ttk.Checkbutton(row, text="histogram", variable=self.hist_on_var, width=10,
-                        command=self._on_stat_spec_change).pack(side="left")
-        ttk.Label(row, text="bins:").pack(side="left")
-        for var, width in ((self.hist_bins_var, 4), (self.hist_channels_var, 14)):
-            e = ttk.Entry(row, textvariable=var, width=width); e.pack(side="left", padx=2)
-            e.bind("<Return>", lambda ev: self._on_stat_spec_change())
-            e.bind("<FocusOut>", lambda ev: self._on_stat_spec_change())
-            if var is self.hist_bins_var:
-                ttk.Label(row, text="channels:").pack(side="left")
+        self.hist_channel_combo = build_hist_row(c, self.hist_on_var, self.hist_bins_var,
+                                                 self.hist_channels_var,
+                                                 self._on_stat_spec_change)
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=1)
         ttk.Label(row, text="ranges (name: lo, hi; ...):").pack(side="left")
         e = ttk.Entry(row, textvariable=self.hist_ranges_var, width=22); e.pack(side="left", padx=2)
@@ -463,7 +529,17 @@ class MscouponApp(ViewerShell):
         self.stat_summary_var = tk.StringVar(value="")
         ttk.Label(c, textvariable=self.stat_summary_var, foreground="#555",
                   wraplength=330, justify="left").pack(anchor="w", padx=4, pady=(0, 3))
+        self._sync_hist_channels()
         self._refresh_stat_summary()
+
+    def _sync_hist_channels(self):
+        """Keep the histogram's channel dropdown to the channels the spec has."""
+        try:
+            choices = hist_channel_choices(self._params_json())
+        except Exception:      # mid-build: a panel the params read is not up yet
+            return
+        sync_hist_channels(self.hist_channels_var, getattr(self, "hist_channel_combo", None),
+                           choices)
 
     def _apply_stat_state(self, state, setvar):
         """Restore the `statistics` block into the panel's controls.
@@ -655,6 +731,7 @@ class MscouponApp(ViewerShell):
         query cards and the channel pickers must be rebuilt, and anything primed
         under the old spec is stale."""
         self._chan_cache.clear()
+        self._sync_hist_channels()
         self._refresh_stat_summary()
         self._refresh_channel_picker()
         self._rebuild_query_cards()
@@ -732,6 +809,7 @@ class MscouponApp(ViewerShell):
                           "corner minima, which the MSC keeps alive at every "
                           "persistence. MSC arcs are still built on demand.",
                   foreground="#666").pack(anchor="w", padx=4)
+        build_max_area_row(c, self.max_area_var, self.max_area_parallel_var)
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="Per-slice min area:").pack(side="left")
         ttk.Entry(row, textvariable=self.min_area_var, width=8).pack(side="left", padx=4)
@@ -1708,7 +1786,9 @@ class MscouponApp(ViewerShell):
                     "accurate": bool(self.accurate_var.get()),
                     "extremum_sample_radius": radius,
                     "use_gpu_gradient": bool(self.gpu_var.get()),
-                    "simplification": self.simplification_var.get()},
+                    "simplification": self.simplification_var.get(),
+                    "max_region_area": max_area_from_var(self.max_area_var),
+                    "max_region_parallel": bool(self.max_area_parallel_var.get())},
             "statistics": config_io.statistics_to_json(
                 self._stat_channel_cards(), self._stat_reductions(),
                 self.stat_extremum_var.get(), radius, relevance,
@@ -1738,6 +1818,9 @@ class MscouponApp(ViewerShell):
         setvar(self.gpu_var, bool(msc.get("use_gpu_gradient")))
         setvar(self.simplification_var,
                str(msc.get("simplification") or session.DEFAULT_SIMPLIFICATION))
+        cap = session.max_region_area(msc)
+        setvar(self.max_area_var, "" if cap is None else str(cap))
+        setvar(self.max_area_parallel_var, msc.get("max_region_parallel") is not False)
         setvar(self.ext_radius_var, str(int(msc.get("extremum_sample_radius") or 0)))
         sel = profile.get("selection") or {}
         min_area = sel.get("min_area")
@@ -1774,6 +1857,7 @@ class MscouponApp(ViewerShell):
         self._rebuild_filter_cards("base")
         self._rebuild_query_cards()
         self._rebuild_pixel_cards()
+        self._sync_hist_channels()
         self._refresh_channel_picker()
         self._refresh_stat_summary()
 
@@ -2923,6 +3007,21 @@ def _selftest():
         names = app._stat_channel_names()
         assert "color_c2" in names and "dizenzo_largest_s0.7" in names and "blur_c1_s0.7" in names, names
         assert "hist00_color_c0" in config_io.query_fields(app._params_json())
+        # The channel dropdown offers the spec's channels, and a name the spec
+        # stops measuring leaves the selection instead of breaking the spec.
+        assert "color_c2" in app.hist_channel_combo.cget("values"), app.hist_channel_combo.cget("values")
+        app.stat_base_var.set(False)
+        app._on_stat_spec_change()
+        assert app.hist_channels_var.get() == "color_c0", app.hist_channels_var.get()
+        assert "base" not in app.hist_channel_combo.cget("values")
+        assert "hist00_color_c0" in config_io.query_fields(app._params_json())
+        app.hist_channels_var.set("base")        # a stale name alone -> the first channel
+        app._on_stat_spec_change()
+        assert app.hist_channels_var.get() == app.hist_channel_combo.cget("values")[0]
+        app.stat_base_var.set(True)
+        app.hist_channels_var.set("base, color_c0")
+        app._on_stat_spec_change()
+        assert app.hist_channels_var.get() == "base, color_c0", app.hist_channels_var.get()
         app._measure_hist_ranges()
         assert app.hist_ranges_var.get().startswith("*: 0, ") or app.hist_ranges_var.get().startswith("*: "),             app.hist_ranges_var.get()
         d = app._preview_channel(planes, rgb, "dizenzo_largest_s0.7")

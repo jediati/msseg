@@ -198,6 +198,18 @@ struct Msc2DParams {
   // Requires an msc_2d_lib new enough to expose ComputeOptions::simplification;
   // older pins warn and use the MSC. Env kill-switch: MSSEG_SIMPLIFICATION=msc.
   std::string simplification = "merge_forest";  // "msc" | "merge_forest"
+  // Max-area simplification rule (MSCEER ComputeOptions::rules): veto any
+  // cancellation / merge whose combined region would exceed this many pixels,
+  // so no living region of the chosen `manifold` grows past it at any
+  // persistence (a single base basin larger than the cap is not split). Applies
+  // to both simplification modes. Unset / <= 0 => off.
+  std::optional<long long> max_region_area;
+  // Keep the builder's parallelism under the rule (best effort). The merge
+  // forest stays banded and still matches the serial result exactly; the
+  // partitioned MSC holds the cap but WHICH merges win can differ from a serial
+  // build. false forces a serial MSC / serial-order forest for exact serial
+  // reproduction. Ignored while max_region_area is off.
+  bool max_region_parallel = true;
   bool accurate_ascending = true;
   bool accurate_descending = true;
   std::string manifold = "ascending";  // "ascending" | "descending"

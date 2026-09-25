@@ -72,6 +72,23 @@ DEFAULT_SIMPLIFICATION = "merge_forest"
 SIMPLIFICATIONS = ("merge_forest", "msc")
 
 
+def max_region_area(msc: Any) -> Optional[int]:
+    """`msc.max_region_area` as a positive pixel count, or None (no cap).
+
+    The max-area simplification rule (MSCEER ComputeOptions::rules): no merge
+    may build a region of the profile's manifold larger than this. 0, a
+    negative, a blank or junk all read as off -- the C++ side treats <= 0 the
+    same way, so there is one "off" whatever a profile file says."""
+    raw = _as_dict(msc).get("max_region_area")
+    if raw is None or raw == "":
+        return None
+    try:
+        n = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
 def default_profile(name: str = "default", relevance: bool = True) -> Dict[str, Any]:
     return {
         "name": str(name),
@@ -81,7 +98,8 @@ def default_profile(name: str = "default", relevance: bool = True) -> Dict[str, 
         "msc": {"manifold": "ascending", "persistence_percent": 10.0,
                 "accurate": False, "extremum_sample_radius": 0,
                 "use_gpu_gradient": False,
-                "simplification": DEFAULT_SIMPLIFICATION},
+                "simplification": DEFAULT_SIMPLIFICATION,
+                "max_region_area": None, "max_region_parallel": True},
         "statistics": config_io.statistics_to_json(
             [{"kind": "base"}], list(config_io.STAT_REDUCTIONS), True, 0,
             relevance),
@@ -130,6 +148,8 @@ def profile_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[str, 
         "extremum_sample_radius": max(0, _as_int(msc.get("extremum_sample_radius"), 0)),
         "use_gpu_gradient": bool(msc.get("use_gpu_gradient")),
         "simplification": simplification,
+        "max_region_area": max_region_area(msc),
+        "max_region_parallel": msc.get("max_region_parallel") is not False,
     }
 
     stats = config_io.statistics_from_json(root.get("statistics"), notes)
@@ -184,6 +204,12 @@ def profile_params_json(profile: Dict[str, Any], cores: int = 1,
         msc["use_gpu_gradient"] = True
     if m.get("simplification"):
         msc["simplification"] = str(m["simplification"])
+    # Emitted only when the cap is on, so a profile without it primes with
+    # the params (and fingerprints) it always had.
+    cap = max_region_area(m)
+    if cap is not None:
+        msc["max_region_area"] = cap
+        msc["max_region_parallel"] = m.get("max_region_parallel") is not False
     if cores > 1:
         msc["compute_algorithm"] = "partitioned"
         msc["requested_parallelism"] = int(cores)
@@ -403,7 +429,8 @@ def chain_text(stages: Sequence[Dict[str, Any]], start: str = "base",
 
 
 def msc_code(msc: Dict[str, Any]) -> str:
-    """`msc(asc, 10%)`, with a trailing `mf` for the merge-forest simplifier."""
+    """`msc(asc, 10%)`, with a trailing `mf` for the merge-forest simplifier
+    and `≤5000px` for a max-area cap (`≤5000px*` when it is forced serial)."""
     manifold = "dsc" if str(msc.get("manifold", "ascending")).startswith("desc") else "asc"
     try:
         pct = f"{float(msc.get('persistence_percent', 10.0)):g}%"
@@ -412,6 +439,9 @@ def msc_code(msc: Dict[str, Any]) -> str:
     args = [manifold, pct]
     if str(msc.get("simplification") or DEFAULT_SIMPLIFICATION) == "merge_forest":
         args.append("mf")
+    cap = max_region_area(msc)
+    if cap is not None:
+        args.append(f"≤{cap}px" + ("" if msc.get("max_region_parallel") is not False else "*"))
     return f"msc({', '.join(args)})"
 
 

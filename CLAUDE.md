@@ -782,6 +782,19 @@ the coupon re-reads the slice file -- and the Features tab); a settled edit
 goes through `AnnotationShell._preview_edit_settled` -> the app's
 `_measurement_moved()` -> `_remeasure_current`, a field edit stays a preview.
 
+**Max-area simplification rule** (2026-09-24, MSCEER pin `898fd95`,
+`ComputeOptions::rules`): `msc.max_region_area` (pixels; null / <= 0 = off)
+vetoes every cancellation / forest merge that would grow a region of the
+profile's `manifold` past the cap, at every persistence (a base basin larger
+than the cap is not split); `msc.max_region_parallel` (default true) keeps the
+builder parallel -- best effort: the banded forest still equals serial, the
+partitioned MSC holds the cap but may pick other merges; false forces a serial
+build. Both modes, CLI + pybind + both GUIs' MSC panel (`build_max_area_row`
+in the coupon `app.py`, reused by mspath); emitted into the params only when
+on, so capless profiles prime (and fingerprint) as before; both keys are
+FIELD keys. Summary: `msc(asc, 10%, mf, ≤5000px)` (`*` = serial). Tests:
+`test_msc2d_max_region_area` (C++), `test_max_region_area.py`.
+
 **Stage strip** (2026-09-24, labelers only, `msseg.labeler.panels.stages`):
 the top-left of the canvas shows `[msc]--[stats]--+--[classified]` with
 `[model]` joining below, for the current task x item, COMPUTED on every

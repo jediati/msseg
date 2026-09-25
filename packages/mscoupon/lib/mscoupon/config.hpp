@@ -87,6 +87,11 @@ struct MscConfig {
   // "msc" (the cancellation hierarchy) | "merge_forest" (the extremum network).
   // See msseg::Msc2DParams::simplification.
   std::string simplification = "merge_forest";
+  // Max-area rule: no simplification merge may build a region of the chosen
+  // manifold larger than this many pixels. Unset (or null) => off. See
+  // msseg::Msc2DParams::max_region_area / max_region_parallel.
+  std::optional<long long> max_region_area;
+  bool max_region_parallel = true;
   bool accurate_ascending = true;
   bool accurate_descending = true;
   std::string manifold = "ascending";

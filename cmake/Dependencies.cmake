@@ -61,7 +61,7 @@ FetchContent_Declare(diffg
 )
 FetchContent_Declare(msceer
   GIT_REPOSITORY https://github.com/sci-visus/MSCEER.git
-  GIT_TAG 5f843e3ce64081200556de096ee9c3332af02bc1   # cuda-gradient: DigitizeSegmentInternal fix merged + Stages A0-A6 (tiled successor resolver, useGpuAccurate)
+  GIT_TAG 898fd958042b33528aa4fb3cb1958d85f2e39476   # master: custom simplification rules (max-area veto, allowParallel) on top of the cuda-gradient stages
 )
 FetchContent_Declare(tinytiff
   GIT_REPOSITORY https://github.com/jkriege2/TinyTIFF.git

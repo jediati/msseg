@@ -41,7 +41,9 @@ except Exception:                                   # headless import
 from msseg.labeler.shell import ViewerShell
 from msseg.mscoupon import session as coupon_session
 from msseg.mscoupon import config_io
-from msseg.mscoupon.app import format_hist_ranges, parse_hist_ranges
+from msseg.mscoupon.app import (build_hist_row, build_max_area_row, format_hist_ranges,
+                                hist_channel_choices, max_area_from_var, parse_hist_ranges,
+                                sync_hist_channels)
 from msseg.mscoupon.common import _format_sigmas, _parse_sigmas
 from msseg.mscoupon.config_io import (FILTER_OPERATIONS, FILTER_SCHEMA, COLOR_METHODS,
                                       filter_param_schema, filters_to_json)
@@ -200,6 +202,8 @@ class MsPathApp(ViewerShell):
         self.simplification_var = tk.StringVar(value=coupon_session.DEFAULT_SIMPLIFICATION)
         self.accurate_var = tk.BooleanVar(value=False)
         self.gpu_var = tk.BooleanVar(value=False)        # msc.use_gpu_gradient
+        self.max_area_var = tk.StringVar(value="")       # msc.max_region_area (blank = off)
+        self.max_area_parallel_var = tk.BooleanVar(value=True)  # msc.max_region_parallel
         self.level_var = tk.IntVar(value=DEFAULT_OVERVIEW_LEVEL)
         self.halo_var = tk.IntVar(value=DEFAULT_HALO)
         self.regions_var = tk.BooleanVar(value=True)
@@ -865,6 +869,7 @@ class MsPathApp(ViewerShell):
                         value="merge_forest").pack(side="left", padx=4)
         ttk.Radiobutton(row, text="MSC hierarchy", variable=self.simplification_var,
                         value="msc").pack(side="left", padx=4)
+        build_max_area_row(msc, self.max_area_var, self.max_area_parallel_var)
         ttk.Checkbutton(msc, text="accurate gradient (slower, ~12x the memory; "
                                   "run-to-run nondeterministic)",
                         variable=self.accurate_var).pack(anchor="w", padx=6)
@@ -930,16 +935,9 @@ class MsPathApp(ViewerShell):
         ttk.Checkbutton(c, text="seeding extremum (ext_* per channel)",
                         variable=self.stat_extremum_var,
                         command=self._on_stat_spec_change).pack(anchor="w", padx=4)
-        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=(4, 1))
-        ttk.Checkbutton(row, text="histogram", variable=self.hist_on_var, width=10,
-                        command=self._on_stat_spec_change).pack(side="left")
-        ttk.Label(row, text="bins:").pack(side="left")
-        for var, width in ((self.hist_bins_var, 4), (self.hist_channels_var, 14)):
-            e = ttk.Entry(row, textvariable=var, width=width); e.pack(side="left", padx=2)
-            e.bind("<Return>", lambda ev: self._on_stat_spec_change())
-            e.bind("<FocusOut>", lambda ev: self._on_stat_spec_change())
-            if var is self.hist_bins_var:
-                ttk.Label(row, text="channels:").pack(side="left")
+        self.hist_channel_combo = build_hist_row(c, self.hist_on_var, self.hist_bins_var,
+                                                 self.hist_channels_var,
+                                                 self._on_stat_spec_change)
         row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=1)
         ttk.Label(row, text="ranges (name: lo, hi; ...):").pack(side="left")
         e = ttk.Entry(row, textvariable=self.hist_ranges_var, width=22); e.pack(side="left", padx=2)
@@ -1081,12 +1079,22 @@ class MsPathApp(ViewerShell):
         except Exception:
             return ["base"]
 
+    def _sync_hist_channels(self):
+        """Keep the histogram's channel dropdown to the channels the spec has."""
+        try:
+            choices = hist_channel_choices(json.dumps(self._profile_for_compute()))
+        except Exception:      # mid-build: a panel the profile reads is not up yet
+            return
+        sync_hist_channels(self.hist_channels_var, getattr(self, "hist_channel_combo", None),
+                           choices)
+
     def _refresh_stat_summary(self):
         """The resolved channel and field counts: what decides how wide every
         per-region row is, and therefore what the classifier sees."""
         var = getattr(self, "stat_summary_var", None)
         if var is None:
             return
+        self._sync_hist_channels()
         try:
             params = json.dumps(self._profile_for_compute())
             n_ch = len(config_io.stat_channels(params))
@@ -1678,7 +1686,9 @@ class MsPathApp(ViewerShell):
                     "persistence_percent": float(self.persist_var.get()),
                     "accurate": bool(self.accurate_var.get()),
                     "use_gpu_gradient": bool(self.gpu_var.get()),
-                    "simplification": self.simplification_var.get()},
+                    "simplification": self.simplification_var.get(),
+                    "max_region_area": max_area_from_var(self.max_area_var),
+                    "max_region_parallel": bool(self.max_area_parallel_var.get())},
             "statistics": config_io.statistics_to_json(
                 self._stat_channel_cards(), self._stat_reductions(),
                 bool(self.stat_extremum_var.get()), 0, False,
@@ -1696,6 +1706,9 @@ class MsPathApp(ViewerShell):
         setvar(self.gpu_var, bool(msc.get("use_gpu_gradient")))
         setvar(self.simplification_var,
                str(msc.get("simplification") or coupon_session.DEFAULT_SIMPLIFICATION))
+        cap = coupon_session.max_region_area(msc)
+        setvar(self.max_area_var, "" if cap is None else str(cap))
+        setvar(self.max_area_parallel_var, msc.get("max_region_parallel") is not False)
         sl = profile.get("slide") or {}
         setvar(self.level_var, int(sl.get("overview_level", DEFAULT_OVERVIEW_LEVEL)))
         setvar(self.halo_var, int(sl.get("halo", DEFAULT_HALO)))

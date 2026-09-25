@@ -2523,6 +2523,65 @@ void test_msc2d_remeasure() {
   expect(threw, "remeasure on other dimensions throws");
 }
 
+void test_msc2d_max_region_area() {
+  // msc.max_region_area vetoes every merge that would build a region larger
+  // than the cap. With the cap at the largest BASE basin, nothing may grow past
+  // it at any persistence (so the full-range simplification, which collapses
+  // the uncapped wells into one region, keeps several), in both simplification
+  // modes, serial and partitioned, parallel best-effort or not. A cap above the
+  // image area changes nothing.
+  const int w = 48, h = 40;
+  const diffg::Image<float> field = make_wells(w, h);
+  const auto areas = [](const std::vector<int>& labels) {
+    std::unordered_map<int, long long> a;
+    for (int l : labels) if (l >= 0) ++a[l];
+    return a;
+  };
+  const auto max_area = [&](const std::vector<int>& labels) {
+    long long m = 0;
+    for (const auto& kv : areas(labels)) m = std::max(m, kv.second);
+    return m;
+  };
+
+  for (const char* simplification : {"merge_forest", "msc"}) {
+    for (const char* algorithm : {"serial", "partitioned"}) {
+      msseg::Msc2DParams cfg;
+      cfg.manifold = "ascending";
+      cfg.simplification = simplification;
+      cfg.compute_algorithm = algorithm;
+      cfg.requested_parallelism = std::string(algorithm) == "partitioned" ? 4 : 0;
+      cfg.accurate_ascending = cfg.accurate_descending = false;  // deterministic gradient
+      cfg.persistence_absolute.reset();
+      cfg.persistence_percent = 100.0f;
+
+      msseg::Msc2DPipeline plain;
+      plain.build(field, field, cfg);
+      const std::vector<int> full = plain.labels();
+      plain.select_persistence(0.0f);
+      const long long base_max = max_area(plain.labels());
+      expect(areas(plain.labels()).size() > areas(full).size(),
+             "max-area: the fixture simplifies at full persistence");
+
+      for (bool parallel : {true, false}) {
+        msseg::Msc2DParams capped = cfg;
+        capped.max_region_area = base_max;
+        capped.max_region_parallel = parallel;
+        msseg::Msc2DPipeline pipe;
+        pipe.build(field, field, capped);
+        expect(max_area(pipe.labels()) <= base_max, "max-area: no living region exceeds the cap");
+        expect(areas(pipe.labels()).size() > areas(full).size(),
+               "max-area: the cap keeps regions the plain build merges");
+
+        msseg::Msc2DParams loose = capped;
+        loose.max_region_area = static_cast<long long>(w) * h + 1;
+        msseg::Msc2DPipeline same;
+        same.build(field, field, loose);
+        expect(same_partition(same.labels(), full), "max-area: a cap above the image is a no-op");
+      }
+    }
+  }
+}
+
 void test_histogram_stats() {
   msseg::StatsSpec spec;
   spec.std = false;
@@ -2680,6 +2739,7 @@ int main() try {
   RUN(test_color_stat_channels);
   RUN(test_histogram_stats);
   RUN(test_msc2d_remeasure);
+  RUN(test_msc2d_max_region_area);
   std::cout << "mscoupon tests passed\n";
   return 0;
 } catch (const std::exception& e) {

@@ -363,6 +363,10 @@ void parse_msc(const nlohmann::json& root, MscConfig& msc) {
   }
   set_if_present(m, "compute_algorithm", msc.compute_algorithm);
   set_if_present(m, "simplification", msc.simplification);
+  if (m.contains("max_region_area") && !m.at("max_region_area").is_null()) {
+    msc.max_region_area = m.at("max_region_area").get<long long>();
+  }
+  set_if_present(m, "max_region_parallel", msc.max_region_parallel);
   set_if_present(m, "accurate_ascending", msc.accurate_ascending);
   set_if_present(m, "accurate_descending", msc.accurate_descending);
   set_if_present(m, "manifold", msc.manifold);
@@ -612,6 +616,9 @@ void validate_config(const AppConfig& cfg) {
   }
   if (cfg.msc.extremum_sample_radius < 0) {
     throw std::runtime_error("msc.extremum_sample_radius must be >= 0 (0 = the single critical pixel).");
+  }
+  if (cfg.msc.max_region_area.has_value() && *cfg.msc.max_region_area < 0) {
+    throw std::runtime_error("msc.max_region_area must be >= 0 pixels (0 or null = no cap).");
   }
   if (cfg.matching.enabled) {
     if (cfg.matching.map_template.empty()) throw std::runtime_error("matching.map_template must not be empty when matching is enabled.");

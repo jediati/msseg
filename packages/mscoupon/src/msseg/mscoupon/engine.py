@@ -580,6 +580,8 @@ class ComputeEngine:
                 f"persistence_percent={msc.get('persistence_percent')} "
                 f"accurate={msc.get('accurate_ascending')} "
                 f"simplification={msc.get('simplification', DEFAULT_SIMPLIFICATION)} "
+                f"max_region_area={msc.get('max_region_area', 'off')}"
+                f"{'' if 'max_region_area' not in msc else (' (parallel)' if msc.get('max_region_parallel', True) else ' (serial)')} "
                 f"gpu_gradient={bool(msc.get('use_gpu_gradient'))} "
                 f"algorithm={msc.get('compute_algorithm', 'serial')} "
                 f"requested_parallelism={msc.get('requested_parallelism', 0)}")
