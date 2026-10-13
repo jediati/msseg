@@ -549,6 +549,106 @@ if __name__ == "__main__":
     sys.exit(run_selftest())
 
 
+def _foundation_block(app, item, rec, tmp, np):
+    """Foundation columns end to end with a fake patch-local backbone (no
+    download): Train fits the projection and builds the region pools from
+    the item's pixels + halo, the names carry the basis hash, Classify
+    rebuilds them, the pickle restores the basis, a refit is a new feature
+    set the gate refuses, the view keeps the hash but not the basis; a
+    polyline task's seam descriptor gains the crossing block and the flank
+    pools. Leaves the foundation switched off."""
+    try:
+        import torch
+    except ImportError:
+        print("[mspath] (torch unavailable - foundation block skipped)")
+        return
+    from msseg.labeler.foundation.cache import TokenCache
+    from msseg.labeler.foundation.spec import is_foundation_column
+
+    class _FakeBB:
+        patch, mean, std = 14, (0.5, 0.5, 0.5), (0.25, 0.25, 0.25)
+
+        def __init__(self):
+            g = torch.Generator().manual_seed(0)
+            self.conv = torch.nn.Conv2d(3, 12, 14, stride=14)
+            with torch.no_grad():
+                self.conv.weight.copy_(torch.randn(self.conv.weight.shape, generator=g) * 0.05)
+
+        def __call__(self, x):
+            return [self.conv.to(x.device)(x.float())]
+
+    fake = _FakeBB()
+    loads = []
+    app._fm_backbone_for = lambda fs: (loads.append(fs.model), fake)[1]
+    app._fm_cache = TokenCache(None)               # no disk writes from a selftest
+    app._fm_fitted = None
+    assert app.regions.pixels_halo(item.key, rec) == app.engine.primed[item.key].halo
+    arr, halo = app.regions.item_pixels(item.key, rec, np)
+    assert arr.shape[-2:] == tuple(s + 2 * halo for s in rec["labels"].shape), (arr.shape, halo)
+
+    app.fm_enabled_var.set(True)
+    app.fm_dims_var.set("6")
+    for p, var in app.fm_pool_vars.items():
+        var.set(p in ("mean", "interior"))
+    app._on_foundation_change()
+    assert app._foundation_spec_from_ui().basis is None, "nothing is fitted yet"
+    app.model_kind_var.set("dense FC")
+    app._train_classifier()
+    assert app._clf is not None, f"foundation Train failed: {app.status_var.get()!r}"
+    ctx = app._clf_context
+    fs = ctx.foundation
+    assert fs is not None and fs.basis is not None and fs.dims == 6, ctx
+    fm_names = [n for n in app._clf_names if is_foundation_column(n)]
+    assert len(fm_names) == 2 * 6 + 2, fm_names
+    assert all(n.startswith(f"fm{fs.hash8}__") for n in fm_names)
+    assert loads, "the backbone was never asked for"
+    assert app._foundation_spec_from_ui().hash8 == fs.hash8, "the fitted basis is the group's"
+    assert app._check_model_compat(app._clf_names, "selftest") is None
+    bad = [n.replace(fs.hash8, "deadbeef") for n in app._clf_names]
+    assert app._check_model_compat(bad, "selftest"), "another basis must be refused"
+    app._classify()
+    pred = app._pred.get(item.key)
+    assert pred is not None and pred[0] == rec["commit"], "foundation model did not classify"
+    # the view keeps the spec and its hash, never the basis (it rides the pickle)
+    view_ctx = app._task_view_from_ui()["context"]
+    assert view_ctx["foundation"]["hash8"] == fs.hash8 and "basis" not in view_ctx["foundation"]
+    path = os.path.join(tmp, "fm_model.pkl")
+    app._save_classifier_to(path)
+    app._refit_foundation()
+    assert app._foundation_spec_from_ui().basis is None
+    app._load_classifier_from(path)
+    assert app._clf_context.foundation.hash8 == fs.hash8, "the pickle restores the basis"
+    assert app._foundation_spec_from_ui().hash8 == fs.hash8, "and the group follows it"
+    n_miss = app._fm_cache.misses
+    app._pred.clear()
+    app._classify()
+    assert app._fm_cache.misses == n_miss, "a classify re-extracted a cached grid"
+
+    # a polyline task: the seam descriptor gains the cells it runs through
+    t_region = app._task
+    t_walls = app._task_new("fm walls", kind="polyline")
+    assert app._task is t_walls and app._enrol_row(0, 0)
+    app.fm_enabled_var.set(True)
+    app.fm_dims_var.set("6")
+    app._on_foundation_change()
+    items = app._seam_items("selftest seams")
+    assert items, app.status_var.get()
+    fnames = items[0][7]
+    sfs = app._seam_spec().foundation
+    assert sfs is not None and sfs.basis is not None
+    cross = [n for n in fnames if n.startswith(f"fm{sfs.hash8}__seam_")]
+    assert len(cross) == 6 + 1, cross
+    graph = items[0][4]
+    assert items[0][6].shape == (graph.n_seams, len(fnames))
+    if items[0][8] == "features":
+        assert any(n.startswith("absdiff_fm") for n in fnames), "flank pools in the pair terms"
+    assert app._task_delete(confirm=True) and app._task is t_region
+
+    app.fm_enabled_var.set(False)
+    app._on_foundation_change()
+    assert app._context_spec_from_ui().foundation is None
+
+
 def run_labeler_selftest():
     """``mspath-labeler --selftest``: the annotation layer over a placed item.
 
@@ -764,6 +864,9 @@ def run_labeler_selftest():
     ids_by_area = np.argsort(-np.asarray(stats.column("area")))[:3]
     app.active_class_var.set(1)
     app._commit_interaction("taps", [(float(ex[i]), float(ey[i])) for i in ids_by_area])
+    # -- foundation-model columns (panels/foundation.py), on a fake backbone - #
+    _foundation_block(app, item, rec, tmp, np)
+
     # An "-> edges" kind first: its pair model groups edges by the catalogue's
     # group, which here is the slide NAME. int("WSI/a.tiff") took the first
     # real Train down.
@@ -1258,6 +1361,7 @@ def run_labeler_selftest():
 
     root.destroy()
     print("labeler selftest OK: placement, slide-coordinate gestures, class layer, "
+          "foundation columns (pixels + halo, fitted basis, gate, pickle, seams), "
           "box over the item, training rows, level-scoped compat gate, "
           "classify + propose ROIs, refusal notice on the HUD, "
           "predictions survive an incremental prime, undo, tree rows: "

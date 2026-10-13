@@ -1,8 +1,10 @@
 # Foundation-model region features
 
 Status (2026-10-13): **phase 0 built** (`msseg.labeler.foundation` + the
-experiment `packages/mspath/experiments/fm_ablation.py`), first run below. Nothing in the labeler reads it yet; phase 1 waits on the go/no-go
-result.
+experiment `packages/mspath/experiments/fm_ablation.py`), first run below;
+**phase 1 landed** (the labeler, opt-in, both task kinds). The go/no-go
+is answered by use (2026-10-13): in the user's own testing the foundation
+columns perform as well as or better than the hand-made feature combinations.
 
 ## Why
 
@@ -173,19 +175,71 @@ pulls a CPU-only torch from PyPI over the cu128 build. Install
 torch/torchvision from `--index-url https://download.pytorch.org/whl/cu128`
 together (torch 2.11.0 <-> torchvision 0.26.0).
 
-## Phase 1: labeler wiring (if go)
+## Phase 1: the labeler (landed 2026-10-13)
 
-- `ModelStack.foundation` (pickle `stack["foundation"]` with the basis; model
-  record and task view key `foundation`, each written only when set).
-- Columns appended in `classifier._context_table` before `context.augment`.
-- `_expected_names_for` / `_feature_schema_with_context` extended for the
-  gate and Optimize.
-- An optional `RegionProvider.item_pixels(key, rec, np)`: mspath via
-  `SlideEngine.read_item` at the record's level + halo.
-- A `FoundationWorker` (the `PreviewWorker` pattern) fills the cache off the
-  Tk thread before Train / Classify.
-- A "Foundation features" group on the Model tab, and an `fm` stage box
-  feeding `[model]`.
-- The coupon follows once its provider grows `item_pixels`. The core / CLI /
-  3D matcher are not planned: a `ChannelStats` cell is a fixed 24 B for every
-  slot, and the CLI cannot run torch.
+Built before the go/no-go rerun on >= 3 slides, at the user's request. It
+is opt-in: with the group off, every document, pickle and row is what it
+was before.
+
+**One group, two homes.** The Features tab's "8. Foundation features"
+(`panels/foundation.py`, `FoundationMixin`) describes the active task's NEXT
+model: model, layers, scale, dims, region pools, and *Refit projection*.
+- A **region** task carries the spec inside its `ContextSpec`
+  (`ContextSpec.foundation`). So the pickle (`stack["context"]`, written
+  `to_dict(full=True)` with the basis), the model record and the session
+  view (`to_dict()`: the spec + `hash8`, never the basis), the compat gate
+  (`_expected_names_for` -> `context.all_column_names`) and Optimize's
+  feature mask (`context.schema_entries`, one group per pool) all see it
+  with no new keys.
+- A **polyline** task carries it inside its `SeamSpec`
+  (`SeamSpec.foundation`). That covers the task view's `seam_spec` and the
+  `SeamBundle` (`SeamModel.to_dict` writes the spec in full).
+- Only the active kind's spec is pushed onto the shared group
+  (`_apply_context_spec` / `_apply_seam_spec`).
+
+**Rows.**
+- `classifier._context_table` appends the region pools BEFORE
+  `context.augment`. The context kinds never reduce over `fm` columns
+  (`source_columns`): 4 x 130 ring columns, for no measured gain.
+- `seam_classifier._seam_items`, the one choke point for seam
+  train / classify / evaluate, appends the region pools to the table (the
+  pair terms read them when they read the table, not an embedding input's
+  net), then the crossing block (`fm<h>__seam_<kk>`, `seam_cells`).
+
+**The projection is fitted at Train.**
+- `_training_set` -> `_resolve_context_spec`, and `_seam_items`, fit over
+  every ready item's grid when the spec has no basis.
+- The fitted spec becomes the group's (`_fm_fitted`). The model keeps it,
+  and loading a model restores it, so Classify rebuilds the same names.
+- Optimize and the size sweep now read the Model-tab spec AFTER
+  `_training_set` for that reason.
+- *Refit projection* forgets the basis: a new feature set, which the gate
+  refuses old models on.
+
+**Pixels.**
+- An OPTIONAL provider pair, `item_pixels(key, rec, np) -> (array, halo)`
+  and `pixels_halo(key, rec)` (`protocols.py`).
+- mspath's `SlideRegionProvider` reads `SlideEngine.read_item` with the
+  record's halo, so the model sees what the MSC saw.
+- The coupon has no `item_pixels` yet and refuses with a message.
+- Grids come from `TokenCache` at `<app data>/fm_cache`; projected grids are
+  memoised per item.
+
+**Fixed on the way.** `_save_classifier_to` never wrote the model's scope.
+Every mspath (level-scoped) region pickle came back "trained at no scope"
+and Classify refused it. It now passes `scope=_clf_scope` (scope-less
+pickles are unchanged).
+
+**Not built yet:**
+- A worker thread: extraction runs on the Tk thread under the compute badge,
+  like record streaming. The first Train loads the backbone (about 7 s),
+  then about 0.6 s per uncached 2048² item.
+- An `fm` stage-strip box.
+- The coupon's `item_pixels`.
+- The core / CLI / 3D matcher are not planned: a `ChannelStats` cell is a
+  fixed 24 B for every slot, and the CLI cannot run torch.
+
+Tests: `test_foundation_spec.py` (spec plumbing) and the mspath labeler
+selftest's foundation block (fake backbone: pixels + halo, fitted basis,
+names, gate, classify, view, pickle round trip, cache reuse, polyline seam
+block).

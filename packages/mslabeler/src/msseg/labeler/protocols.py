@@ -157,6 +157,12 @@ class RegionProvider(Protocol):
         None without a record."""
         ...
 
+    # OPTIONAL (foundation-model features; the framework probes with getattr):
+    #   item_pixels(key, rec, np) -> (array (C,H,W) | (H,W), halo): the item's
+    #       raw pixels padded by `halo`, so rec["labels"][0, 0] is pixel
+    #       (halo, halo) of the array;
+    #   pixels_halo(key, rec) -> int: that halo, without reading (cache keys).
+
 
 @runtime_checkable
 class ImageSource(Protocol):

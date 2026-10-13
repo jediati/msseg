@@ -181,6 +181,23 @@ class SlideRegionProvider:
             log(f"{key}: record failed: {type(exc).__name__}: {exc}")
             return None
 
+    def pixels_halo(self, key, rec=None):
+        """The halo the item's record was primed with: its labels are cropped
+        by it, so pixels read with it sit at that offset."""
+        p = self.engine.primed.get(key)
+        return int(p.halo) if p is not None else int(self.app._halo())
+
+    def item_pixels(self, key, rec, np):
+        """``(array, halo)``: the item's pixels at its own level, padded by
+        the record's halo -- exactly what a prime reads (``read_item``), so a
+        foundation model sees what the MSC saw, with context past the edge."""
+        item = parse_key(key)
+        if item is None:
+            raise ValueError(f"{key} is not an item key")
+        halo = self.pixels_halo(key, rec)
+        arr, _geom, _secs = self.engine.read_item(item, halo)
+        return arr, halo
+
     def request(self, key):
         self.app._request_item(key)
 

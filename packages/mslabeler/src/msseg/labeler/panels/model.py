@@ -178,7 +178,8 @@ class ModelPanelMixin:
                 dropout=_bounded_float(self.context_label_dropout_var.get(), 0.3, 0.0, 0.95),
                 seed=int(self._search_settings()[2]))
         return context.ContextSpec(kinds=kinds, weights=weights or ("uniform",), source=source,
-                                   latent=latent, labels=labels)
+                                   latent=latent, labels=labels,
+                                   foundation=self._foundation_spec_from_ui())
 
     def _apply_context_spec(self, spec):
         """Push a ContextSpec onto the Model tab controls."""
@@ -197,6 +198,10 @@ class ModelPanelMixin:
         self.context_labels_var.set(spec.labels is not None)
         if spec.labels is not None:
             self.context_label_dropout_var.set(f"{spec.labels.dropout:g}")
+        # The foundation group is shared by both task kinds: a region task's
+        # spec rides its context, a polyline task's its seam spec.
+        if self._task_kind() != "polyline":
+            self._apply_foundation_spec(spec.foundation)
         self._refresh_model_readout()
 
     def _on_context_settings_change(self, *_a):

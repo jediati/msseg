@@ -62,7 +62,8 @@ class SeamTabsMixin:
         embed = self.seam_embed_var.get()
         return seam_model.SeamSpec(features=feats,
                                    model=kind if kind in _SEAM_KINDS else "logistic",
-                                   C=C, embed=embed if embed in _SEAM_EMBEDS else "auto")
+                                   C=C, embed=embed if embed in _SEAM_EMBEDS else "auto",
+                                   foundation=self._foundation_spec_from_ui())
 
     def _apply_seam_spec(self, d):
         if not isinstance(d, dict):
@@ -73,6 +74,8 @@ class SeamTabsMixin:
         self.seam_embed_var.set(spec.embed if spec.embed in _SEAM_EMBEDS else "auto")
         for k, var in self.seam_feature_vars.items():
             var.set(k in spec.features)
+        if self._task_kind() == "polyline":
+            self._apply_foundation_spec(spec.foundation)
 
     # ------------------------------------------------------------------ #
     # Features tab: the seam descriptor

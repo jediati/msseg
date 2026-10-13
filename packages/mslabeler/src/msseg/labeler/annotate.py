@@ -35,6 +35,7 @@ from .classifier import ClassifierMixin
 from .panels.hints import HintsMixin
 from .panels.stages import StagesMixin
 from .panels.seam_tabs import SeamTabsMixin
+from .panels.foundation import FoundationMixin
 from .panels.model import ModelPanelMixin
 from .panels.analysis import AnalysisPanelMixin
 from .panels.view import ViewControlsMixin
@@ -85,9 +86,9 @@ def _cache_attr(field, doc):
     return property(get, put, doc=doc)
 
 
-class AnnotationShell(StagesMixin, SeamTabsMixin, HintsMixin, ModelPanelMixin, AnalysisPanelMixin,
-                      ViewControlsMixin, ClassPanelMixin, SeamPanelMixin, SeamModelMixin,
-                      ClassifierMixin):
+class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, ModelPanelMixin,
+                      AnalysisPanelMixin, ViewControlsMixin, ClassPanelMixin, SeamPanelMixin,
+                      SeamModelMixin, ClassifierMixin):
     SESSION_APP = "labeler"
     APP_TITLE = "labeler"
     WINDOW_TITLE = "labeler"
@@ -245,6 +246,7 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, HintsMixin, ModelPanelMixin, A
         self.seam_channels_var = tk.StringVar(master=root, value="base")
         self.show_seams_var = tk.BooleanVar(master=root, value=True)
         self._init_seam_tab_vars(root)
+        self._init_foundation_vars(root)
         self.seam_color_var = tk.StringVar(master=root, value=_SEAM_MODE_CLASS)
         self._seam_caches = {}      # (si, li) -> (commit, rev, class[S], sets, graph)
         self._seam_rasters = {}     # (si, li) -> (commit, graph, seam-index raster)
@@ -289,6 +291,7 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, HintsMixin, ModelPanelMixin, A
         # After the app's own Features groups (base channel, statistics).
         self._build_seam_features_group()
         self._build_seam_inputs_group()
+        self._build_foundation_group()
         if self.viewer is not None:
             self.viewer.tool = DrawController(self)
             # Zoom/pan invalidates screen-space annotation geometry.

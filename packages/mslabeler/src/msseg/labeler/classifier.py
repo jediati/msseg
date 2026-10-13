@@ -114,6 +114,7 @@ class ClassifierMixin:
         table = rec.get("stats")
         if spec is None or spec.empty():
             return table
+        base = table
         cache = getattr(self, "_ctx_cache", None)
         if cache is None:
             cache = self._ctx_cache = {}
@@ -121,8 +122,17 @@ class ClassifierMixin:
         ck = (key, rec.get("commit"), spec.key(),
               (bool(training), self.store.rev) if with_labels else None)
         hit = cache.get(ck)
-        if hit is not None and hit[0] is table:
+        if hit is not None and hit[0] is base:
             return hit[1]
+        # Foundation columns first (they need pixels: FoundationMixin); the
+        # context kinds then reduce over the statistics only.
+        if spec.foundation is not None:
+            table = self._foundation_table(key, rec, table, spec.foundation, np)
+            if spec.without_foundation().empty():
+                if len(cache) >= 2:
+                    cache.pop(next(iter(cache)))
+                cache[ck] = (base, table)
+                return table
         arcs = self.regions.arcs(key, np)
         labels = rec.get("labels")
         extra = None
@@ -141,8 +151,23 @@ class ClassifierMixin:
                               extra=extra)
         if len(cache) >= 2:
             cache.pop(next(iter(cache)))
-        cache[ck] = (table, aug)
+        cache[ck] = (base, aug)
         return aug
+
+    def _foundation_table(self, key, rec, table, fs, np):
+        """Headless: no pixels, so no foundation columns (FoundationMixin)."""
+        raise ValueError("foundation features are not available here")
+
+    def _fm_resolved(self, fs):
+        return fs
+
+    def _resolve_context_spec(self, spec):
+        """`spec` ready to build rows: its foundation projection fitted now
+        when it has none (ValueError when that cannot be done)."""
+        if spec is None or spec.foundation is None or spec.foundation.basis is not None:
+            return spec
+        import dataclasses
+        return dataclasses.replace(spec, foundation=self._fm_resolved(spec.foundation))
 
     def _labels_changed(self):
         """The store changed. With labels in the loaded model's context the
@@ -305,6 +330,11 @@ class ClassifierMixin:
         import numpy as np
         if spec is None:
             spec = self._context_spec_from_ui()
+        try:
+            spec = self._resolve_context_spec(spec)
+        except ValueError as exc:
+            self.status_var.set(f"Foundation features: {exc}")
+            return None
         slices = self._stream_stat_slices("Preparing training", spec, training=True)
         if slices is None:
             return None
@@ -714,12 +744,13 @@ class ClassifierMixin:
         if self._search is not None:
             self.status_var.set("A search is already running - Cancel it first.")
             return
-        # The training set reads the Model tab's context itself; the spec is
-        # captured beside it so the winner is installed under the same one.
-        ctx = self._context_spec_from_ui()
+        # The training set reads the Model tab's context itself (fitting a
+        # foundation projection into it if needed); the spec is captured
+        # right after so the winner is installed under the same one.
         got = self._training_set()
         if got is None:
             return
+        ctx = self._context_spec_from_ui()
         X, y, groups, names = got
         n_trials, timeout_s, seed, feat, backend = self._search_settings()
         try:
@@ -903,12 +934,13 @@ class ClassifierMixin:
         except ValueError as exc:
             self.status_var.set(str(exc))
             return
-        # The training set reads the Model tab's context itself; the spec is
-        # captured beside it so the winner is installed under the same one.
-        ctx = self._context_spec_from_ui()
+        # The training set reads the Model tab's context itself (fitting a
+        # foundation projection into it if needed); the spec is captured
+        # right after so the winner is installed under the same one.
         got = self._training_set()
         if got is None:
             return
+        ctx = self._context_spec_from_ui()
         X, y, groups, names = got
         _n_trials, timeout_s, seed, feat, backend = self._search_settings()
         try:
@@ -1291,7 +1323,7 @@ class ClassifierMixin:
             spec = getattr(self, "_clf_context", None)
         expected = list(expected)
         if spec is not None and not spec.empty():
-            expected += context.column_names(spec, expected, self.FIELDS)
+            expected += context.all_column_names(spec, expected, self.FIELDS)
         return expected
 
     def _feature_schema_with_context(self, spec, names):
@@ -1526,12 +1558,13 @@ class ClassifierMixin:
         # are any so a context-free pickle stays the document it always was.
         ctx = getattr(self, "_clf_context", None)
         if ctx is not None and not ctx.empty():
-            stack["context"] = ctx.to_dict()
+            stack["context"] = ctx.to_dict(full=True)      # with the foundation basis
         latent = getattr(self, "_context_model", None)
         if latent is not None:
             stack["latent"] = latent.to_dict()
         model_bundle.ModelBundle(model=self._clf, names=list(self._clf_names), kind=self._clf_kind,
                                  statistics=stats, spec=spec, edge=edge, stack=stack,
+                                 scope=getattr(self, "_clf_scope", None),
                                  app_tag=self.MODEL_APP_TAG).save(path)
         self._record_model(path, stats)
 

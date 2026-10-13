@@ -46,6 +46,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import magic_fill
 from .fields import DEFAULT, FieldConventions
+from .foundation import spec as fm_spec
 from .labeling import MAX_CLASSES
 from .table import FeatureTable
 
@@ -167,14 +168,25 @@ class ContextSpec:
     source: str = "all"
     latent: Optional[LatentSpec] = None
     labels: Optional[LabelSpec] = None
+    # Foundation-model columns (msseg.labeler.foundation): appended to the row
+    # BEFORE the context kinds, which never reduce over them (see
+    # `source_columns`). The classifier builds them -- they need pixels.
+    foundation: Optional[fm_spec.FoundationSpec] = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, full: bool = False) -> Dict[str, Any]:
+        """`full` keeps the foundation projection's basis (the pickle needs
+        it; the session view and model record carry only its ``hash8``)."""
         d = {"kinds": list(self.kinds), "weights": list(self.weights),
              "source": str(self.source)}
         if self.latent is not None:
             d["latent"] = self.latent.to_dict()
         if self.labels is not None:
             d["labels"] = self.labels.to_dict()
+        if self.foundation is not None:
+            fd = self.foundation.to_dict(include_basis=full)
+            if self.foundation.basis is not None:
+                fd["hash8"] = self.foundation.hash8
+            d["foundation"] = fd
         return d
 
     @classmethod
@@ -191,18 +203,27 @@ class ContextSpec:
         latent = LatentSpec.from_dict(latent) if isinstance(latent, dict) else None
         labels = d.get("labels")
         labels = LabelSpec.from_dict(labels) if isinstance(labels, dict) else None
+        found = d.get("foundation")
+        found = fm_spec.FoundationSpec.from_dict(found) if isinstance(found, dict) else None
         return cls(kinds=tuple(kinds), weights=tuple(weights) or ("uniform",),
-                   source=source, latent=latent, labels=labels)
+                   source=source, latent=latent, labels=labels, foundation=found)
 
     def empty(self) -> bool:
-        return not self.kinds and self.latent is None and self.labels is None
+        return (not self.kinds and self.latent is None and self.labels is None
+                and self.foundation is None)
+
+    def without_foundation(self) -> "ContextSpec":
+        return dataclasses.replace(self, foundation=None)
 
     def needs_graph(self) -> bool:
         return any(k in GRAPH_KINDS for k in self.kinds) or self.labels is not None
 
     def key(self) -> str:
         """A short stable digest of the spec, for caches keyed on it."""
-        text = json.dumps(self.to_dict(), sort_keys=True)
+        d = self.to_dict()
+        if self.foundation is not None:                 # the basis, by digest
+            d["foundation"]["hash8"] = self.foundation.hash8
+        text = json.dumps(d, sort_keys=True)
         return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
 
     def brief(self) -> str:
@@ -226,6 +247,9 @@ class ContextSpec:
             text += " +" + self.latent.brief()
         if self.labels is not None:
             text += " +" + self.labels.brief()
+        if self.foundation is not None:
+            text = (self.foundation.brief() if text == "ctx:"
+                    else text + " +" + self.foundation.brief())
         return text
 
     def describe(self, base_names: Optional[Sequence[str]] = None,
@@ -233,8 +257,9 @@ class ContextSpec:
         if self.empty():
             return "no context features"
         text = self.brief()
-        if base_names is not None and (self.kinds or self.labels is not None):
-            n = len(column_names(self, base_names, conv))
+        if base_names is not None and (self.kinds or self.labels is not None
+                                       or self.foundation is not None):
+            n = len(all_column_names(self, base_names, conv))
             text += f"; {n} column(s)"
         return text
 
@@ -284,7 +309,8 @@ def source_columns(spec: ContextSpec, names: Sequence[str],
     id columns and minus any context column already present (so augmenting
     twice cannot nest), then narrowed by the spec's source."""
     base = [n for n in names
-            if n not in conv.positional and n != conv.id_field and not is_context_column(n)]
+            if n not in conv.positional and n != conv.id_field and not is_context_column(n)
+            and not fm_spec.is_foundation_column(n)]
     if spec.source == "ext":
         return [n for n in base if n.startswith("ext_")]
     if spec.source == "mean":
@@ -314,12 +340,32 @@ def column_names(spec: ContextSpec, base_names: Sequence[str],
     return out
 
 
+def foundation_column_names(spec: ContextSpec) -> List[str]:
+    """The foundation columns the spec's row carries ([] when it has none,
+    or its projection is not fitted yet -- then the names are unknown)."""
+    fs = None if spec is None else spec.foundation
+    if fs is None or fs.basis is None:
+        return []
+    return fm_spec.column_names(fs)
+
+
+def all_column_names(spec: ContextSpec, base_names: Sequence[str],
+                     conv: FieldConventions = DEFAULT) -> List[str]:
+    """Everything the spec adds to a row: the foundation columns, then the
+    context kinds' (what the compatibility gate expects on top of the
+    profile's own schema)."""
+    return foundation_column_names(spec) + column_names(spec, base_names, conv)
+
+
 def schema_entries(spec: ContextSpec, base_names: Sequence[str],
                    conv: FieldConventions = DEFAULT) -> List[Dict[str, str]]:
     """``{name, channel, reduction}`` per context column, the shape of
     ``config_io.feature_schema()``: the channel is the kind (and weighting),
-    so ``model_search.feature_groups`` masks a whole rung at once."""
+    so ``model_search.feature_groups`` masks a whole rung at once. The
+    foundation columns come first, one group per pool."""
     out = []
+    if spec is not None and spec.foundation is not None and spec.foundation.basis is not None:
+        out += fm_spec.schema_entries(spec.foundation)
     for n in column_names(spec, base_names, conv):
         kind, w, src = split_column(n)
         out.append({"name": n, "channel": kind if w == "uniform" else f"{kind}[{w}]",

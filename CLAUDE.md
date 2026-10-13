@@ -887,10 +887,18 @@ the prefix is no context kind, so ring context over fm columns comes free.
 on disk (fp16 attention is not bit-exact -- the cache is the source of truth).
 The go/no-go experiment is `packages/mspath/experiments/fm_ablation.py`
 (variants x region-size buckets, s/item, peak VRAM; `--fake` = no-download
-smoke test). NOT wired into the labeler; phase 1 (spec on `ModelStack`,
-columns in `_context_table`, `item_pixels`, a worker, Model-tab group, `fm`
-stage box) waits on its result. Tests: `test_foundation_pool.py`,
-`test_foundation_extract.py`.
+smoke test). **Phase 1 (the labeler, opt-in)**: the Features tab's
+"8. Foundation features" (`panels/foundation.py`) feeds a region task's
+`ContextSpec.foundation` (so pickle / record / view / gate / Optimize mask
+need no new keys; views keep `hash8`, never the basis) and a polyline
+task's `SeamSpec.foundation` (`_seam_items` appends flank pools + the
+crossing block). The basis is fitted at Train, kept by the model, restored on
+load; context kinds never reduce over fm columns. Pixels via the OPTIONAL
+provider pair `item_pixels` / `pixels_halo` (mspath only so far); extraction
+runs on the Tk thread (no worker, no `fm` stage box yet). Also fixed: region
+pickles never wrote their scope, so a reloaded mspath model was refused.
+Tests: `test_foundation_pool.py`, `test_foundation_extract.py`,
+`test_foundation_spec.py`, the mspath labeler selftest's foundation block.
 
 **Region encoder, offline** (2026-09-15, [docs/design_region_autoencoder.md](docs/design_region_autoencoder.md)):
 a task-free latent of the statistics ROW, so the labeler's head is not the

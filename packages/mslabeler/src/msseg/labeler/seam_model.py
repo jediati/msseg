@@ -12,6 +12,11 @@ A **seam descriptor** is the per-seam feature vector the model reads:
   edges      the '-> edges' model's p(diff) for the pair, plus a present flag.
   geometry   crack length, its log, the bbox aspect, the tortuosity
              (length / chord) and whether the seam is a loop.
+  foundation (``SeamSpec.foundation``, optional) the mean foundation-model
+             token over the cells the seam runs through + its length in
+             cells (``foundation.pool.pool_seams``), appended by the labeler,
+             which has the pixels; the flanks' foundation columns also enter
+             ``pair`` when it reads the table.
 
 The model is a balanced logistic regression (or a small MLP) behind a
 ``StandardScaler``, fit on every seam a scope or a trace has labelled, one
@@ -33,6 +38,7 @@ import numpy as np
 
 from . import edge_model, seam_path
 from .fields import DEFAULT
+from .foundation import spec as fm_spec
 from .seams import SEAM_BOUNDARY, SEAM_INTERIOR
 
 FEATURE_KINDS = ("pair", "barrier", "edges", "geometry")
@@ -51,22 +57,37 @@ class SeamSpec:
     embed: str = "auto"
     layer: int = -1
     seed: int = 0
+    foundation: Optional[fm_spec.FoundationSpec] = None
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {"features": list(self.features), "model": self.model, "C": float(self.C),
-                "embed": self.embed, "layer": int(self.layer), "seed": int(self.seed)}
+    def to_dict(self, full: bool = False) -> Dict[str, Any]:
+        """`full` keeps the foundation basis (the pickle); the task view
+        carries its ``hash8`` only. No foundation -> the old document."""
+        d = {"features": list(self.features), "model": self.model, "C": float(self.C),
+             "embed": self.embed, "layer": int(self.layer), "seed": int(self.seed)}
+        if self.foundation is not None:
+            fd = self.foundation.to_dict(include_basis=full)
+            if self.foundation.basis is not None:
+                fd["hash8"] = self.foundation.hash8
+            d["foundation"] = fd
+        return d
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> "SeamSpec":
         d = d or {}
         feats = tuple(f for f in (d.get("features") or DEFAULT_FEATURES) if f in FEATURE_KINDS)
+        found = d.get("foundation")
         return cls(features=feats or DEFAULT_FEATURES,
                    model=str(d.get("model") or "logistic"),
                    C=float(d.get("C", 1.0)), embed=str(d.get("embed") or "auto"),
-                   layer=int(d.get("layer", -1)), seed=int(d.get("seed", 0)))
+                   layer=int(d.get("layer", -1)), seed=int(d.get("seed", 0)),
+                   foundation=(fm_spec.FoundationSpec.from_dict(found)
+                               if isinstance(found, dict) else None))
 
     def describe(self) -> str:
-        return f"{self.model} on {'+'.join(self.features)} (embed {self.embed})"
+        text = f"{self.model} on {'+'.join(self.features)} (embed {self.embed})"
+        if self.foundation is not None:
+            text += " + " + self.foundation.brief()
+        return text
 
 
 # --------------------------------------------------------------------------- #
@@ -238,7 +259,7 @@ class SeamModel:
     n_classes: int = 3
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"model": self.model, "spec": self.spec.to_dict(), "n_in": int(self.n_in),
+        return {"model": self.model, "spec": self.spec.to_dict(full=True), "n_in": int(self.n_in),
                 "feature_names": list(self.feature_names), "names_hash": self.names_hash,
                 "net_hash": self.net_hash, "embed_used": self.embed_used,
                 "n_seams": int(self.n_seams), "n_boundary": int(self.n_boundary),

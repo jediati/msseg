@@ -251,6 +251,14 @@ class SeamModelMixin:
             return None
         base, base_names = self._seam_base()
         spec = self._seam_spec()
+        if spec.foundation is not None and spec.foundation.basis is None:
+            import dataclasses
+            try:
+                spec = dataclasses.replace(spec, foundation=self._fm_resolved(spec.foundation))
+            except ValueError as exc:
+                self.status_var.set(f"{action}: foundation features: {exc}")
+                return None
+        fs = spec.foundation
         if base is not None and self._task_kind() == "polyline":
             # The layer is the embedding input's: picked where the input is.
             import dataclasses
@@ -267,6 +275,10 @@ class SeamModelMixin:
                     # The embedding input's net reads its own context columns.
                     table = self._input_table(key, rec, self._input_provider("embedding"),
                                               "embedding", np)
+                if fs is not None:
+                    # The flanks' foundation columns: the pair terms read them
+                    # when they read the table (not an embedding input's net).
+                    table = self._foundation_table(key, rec, table, fs, np)
                 names = base_names if base is not None else seam_model.region_feature_names(table, self.FIELDS)
                 if base is not None and any(table.column(n) is None for n in names):
                     names = seam_model.region_feature_names(table, self.FIELDS)
@@ -278,6 +290,10 @@ class SeamModelMixin:
                 F, fnames = seam_model.seam_features(graph, table, names, np, conv=self.FIELDS,
                                                      base_pipeline=use_base, arcs=arcs,
                                                      pdiff=pdiff, spec=spec)
+                if fs is not None:
+                    block, bnames = self._foundation_seam_block(key, rec, graph, fs, np)
+                    F = np.concatenate([F, block], axis=1)
+                    fnames = list(fnames) + bnames
                 out.append((key, si, li, rec, graph, cls, F, fnames,
                             seam_model.embed_used(spec, use_base)))
         except TrainingProblem as problem:
@@ -464,6 +480,9 @@ class SeamModelMixin:
         b = model_bundle.SeamBundle.load(path, self.MODEL_APP_TAG)
         model = seam_model.SeamModel.from_dict(b.seam)
         self._seam_model = model
+        if model.spec.foundation is not None:
+            # Its basis is what its columns were named by: Classify rebuilds them.
+            self._apply_foundation_spec(model.spec.foundation)
         self._seam_pred.clear()
         self._task.model.trained_rev = None      # a loaded model makes no claim
         self._task.model.trained_measure = None
