@@ -24,6 +24,8 @@ dependencies = [
 classify = ["msseg-labeler[classify]"]
 optimize = ["msseg-labeler[optimize]"]
 torch = ["msseg-labeler[torch]"]
+embed = ["msseg-labeler[embed]"]
+foundation = ["msseg-labeler[foundation]"]
 
 [project.scripts]
 mspath-gui = "msseg.mspath.app:main"

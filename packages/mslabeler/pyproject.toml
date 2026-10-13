@@ -20,6 +20,8 @@ optimize = ["scikit-learn>=1.7", "optuna>=4"]
 torch = ["torch>=2.7"]
 # `embedding_train`: the walk-objective region encoder (the PCA baseline needs only numpy).
 embed = ["torch>=2.7"]
+# Foundation-model region features (`foundation`): a timm ViT (DINOv2/v3) on the GPU.
+foundation = ["torch>=2.7", "timm>=1.0.20"]
 # Pyramidal (tiled) base-image rendering in the canvas. ANY ONE of these is
 # enough -- `pyramid.py` tries the backends in order and takes the first that
 # opens the file. OpenSlide is the default because it brings its own decoders,

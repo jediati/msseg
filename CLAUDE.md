@@ -30,6 +30,8 @@ packages/             one independently pip-installable distribution each:
   msseg-viz/          "msseg-viz": pure-Python shared viewers (palette, merge-tree icicle) — universal wheel
   mslabeler/          "msseg-labeler": pure-Python labeler framework (viewer/annotation shells, canvas,
                       annotation store, region-graph tools, classifier training) — universal wheel
+  mspath/             "msseg-mspath": whole-slide (OpenSlide) viewer + labeler + `mspath-embed`, over the
+                      labeler framework and the mscoupon extension
   msseg-meta/         "msseg": umbrella that depends on all of the above
 CMakeLists.txt        dev "build & test everything" root (add_subdirectory libs/core + each package)
 ```
@@ -865,6 +867,30 @@ still reads as one region task. Tests: `test_task_kind.py`,
 `test_artifacts.py`, `test_seam_model.py` (multiclass, `SeamBundle`),
 `test_session_doc_tasks.py`; the coupon selftest's polyline block (walls
 task) covers the tools, frames, model, matrix, tabs, pickle and inputs.
+
+**Foundation-model region features, phase 0** (2026-10-13,
+[docs/design_foundation_features.md](docs/design_foundation_features.md)):
+`msseg.labeler.foundation` turns a timm ViT (DINOv2/v3, `[foundation]` extra)
+into per-region columns. `extract.extract_grid` tiles an item + halo
+(`tile` 448, `overlap_tokens` 2, owned ranges mid-overlap, CLS/registers
+dropped) into ONE `(Gh, Gw, D)` token grid at the PATCH's resolution (14/16 px
+/ `scale`); `project` freezes a whitened PCA `Basis` onto the
+`FoundationSpec`; `pool.pool_regions` reduces each region's cells through a
+sparse region x cell count (`mean` / `purity` / `interior` / `boundary` +
+`tokens`, `purity_frac`), so any region size is one fixed-length row, with
+the halo as the pixel offset; a polyline task's seams pool the cells they
+run through (`pool_seams`: each crack weights its two flank pixels' cells,
+`seam_cells` = length in cells). Columns `fm<hash8>__<pool>_<kk>`: `hash8` =
+extract key + basis digest, so the name-set compat gate refuses a mismatch;
+the prefix is no context kind, so ring context over fm columns comes free.
+`TokenCache` keeps grids by `(item, level, halo, extract_key)` in memory and
+on disk (fp16 attention is not bit-exact -- the cache is the source of truth).
+The go/no-go experiment is `packages/mspath/experiments/fm_ablation.py`
+(variants x region-size buckets, s/item, peak VRAM; `--fake` = no-download
+smoke test). NOT wired into the labeler; phase 1 (spec on `ModelStack`,
+columns in `_context_table`, `item_pixels`, a worker, Model-tab group, `fm`
+stage box) waits on its result. Tests: `test_foundation_pool.py`,
+`test_foundation_extract.py`.
 
 **Region encoder, offline** (2026-09-15, [docs/design_region_autoencoder.md](docs/design_region_autoencoder.md)):
 a task-free latent of the statistics ROW, so the labeler's head is not the
