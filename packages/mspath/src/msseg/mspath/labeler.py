@@ -65,6 +65,36 @@ class LabelerApp(AnnotationShell, MsPathApp):
     FIELDS = fields.DEFAULT
 
     # ------------------------------------------------------------------ #
+    # Persistence: the workflow's last stage, not a view control
+    # ------------------------------------------------------------------ #
+    def _build_live_panel(self, parent):
+        """Nothing under the picture: the persistence decides which regions
+        exist, so it is the last Processing group of the task's workflow."""
+
+    def _build_processing_sections(self):
+        super()._build_processing_sections()
+        import tkinter as tk
+        from tkinter import ttk
+        c = self._group(self._processing_parent("persistence"), "4b. Persistence",
+                        key="persistence")
+        self.persist_frame = c
+        # A numeric entry committed on Enter / focus-out, as in the viewer: a
+        # select is cheap, but re-resolving on every keystroke bumps the
+        # commit and drops every cache keyed on it.
+        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
+        ttk.Label(row, text="Persistence %:").pack(side="left")
+        self.persist_entry = ttk.Entry(row, textvariable=self.persist_live_var, width=8)
+        self.persist_entry.pack(side="left", padx=4)
+        self.persist_entry.bind("<Return>", self._on_persistence_change)
+        self.persist_entry.bind("<FocusOut>", self._on_persistence_change)
+        attach_tooltip(self.persist_entry,
+                       "The simplification the regions are read at (percent of the "
+                       "field's range; pinned per level by the first item primed). "
+                       "Part of the task's workflow.")
+        self.persist_label = tk.StringVar(value="")
+        ttk.Label(row, textvariable=self.persist_label).pack(side="left", padx=4)
+
+    # ------------------------------------------------------------------ #
     # Where the ids are
     # ------------------------------------------------------------------ #
     def _region_placement(self):
@@ -482,7 +512,7 @@ class LabelerApp(AnnotationShell, MsPathApp):
             for t in self.tasks:
                 places.drop_slide(t.enrolled, sid)
 
-    # -- Run: the active task's items, or every task's on this workflow ---- #
+    # -- Run: the active task's items, or every task's ------------------- #
     def _build_run_section(self):
         from tkinter import ttk
         super()._build_run_section()
@@ -493,11 +523,11 @@ class LabelerApp(AnnotationShell, MsPathApp):
                                       command=lambda: self._run("all"))
         self.run_all_btn.pack(fill="x", padx=6, pady=(0, 4))
         attach_tooltip(self.run_all_btn,
-                       "Every item any task on this workflow works, primed once: "
-                       "switching between those tasks then needs no Run, and each "
-                       "level's persistence threshold no longer depends on which "
-                       "task ran first. (Tasks on another workflow wait for their "
-                       "own Run.)")
+                       "Every item any task works, each under its own task's "
+                       "workflow; tasks whose workflows build the same field "
+                       "share one prime. Switching between tasks then needs no "
+                       "Run, and each level's persistence threshold no longer "
+                       "depends on which task ran first.")
 
     def _items_of_task(self, task):
         """The items `task` works, without making it the active one."""
@@ -564,43 +594,43 @@ class LabelerApp(AnnotationShell, MsPathApp):
                              "Run task to recompute.")
         return ("none", "Not computed at this persistence yet.")
 
-    def _workflow_params(self, name):
-        """The params document a task on workflow `name` primes with (the
-        stored profile, composed the way ``_profile_for_compute`` composes the
-        panel's), or None when no such profile exists."""
-        idx = self._profile_index(name)
-        if idx is None:
-            return None
-        return json.loads(coupon_session.profile_params_json(self.profiles[idx], 1,
-                                                             SLIDE_PLANES))
+    def _workflow_params(self, task):
+        """The params document `task` primes with: its own workflow, composed
+        the way ``_profile_for_compute`` composes the panel's (the active
+        task's IS the panel's)."""
+        if task is self._task:
+            return self._profile_for_compute()
+        return json.loads(coupon_session.profile_params_json(task.workflow, 1, SLIDE_PLANES))
 
     def _prime_items(self, scope="task"):
         """"task": the active task's items. "all": the union over every task
-        -- tasks on the active workflow as plain items (the panel's
-        parameters), tasks on another workflow as ``(item, params)`` jobs the
-        engine primes under THAT workflow, into its own field slot. Only the
-        LRU's few pipes stay live, but every item keeps its record, so a
-        later switch to that task shows and classifies it without a Run."""
+        -- every task owns its workflow, so they are grouped by FIELD: a task
+        whose workflow builds the active field contributes plain items (the
+        panel's parameters; its own statistics re-measure when it is
+        activated), any other ``(item, params)`` jobs the engine primes under
+        THAT workflow, into its own field slot. An item two tasks share on one
+        field primes once. Only the LRU's few pipes stay live, but every item
+        keeps its record, so a later switch to that task shows and classifies
+        it without a Run."""
         if scope != "all":
             return super()._prime_items(scope)
         self._snapshot_active_profile()
-        wf = self._task.workflow
-        seen, out, per_wf = set(), [], {}
+        here = field_fingerprint_of(self._profile_for_compute())
+        seen, out, per_field = set(), [], {}
         for t in self.tasks:
-            other = t is not self._task and t.workflow != wf
-            params = self._workflow_params(t.workflow) if other else None
-            if other and params is None:
-                log(f"RUN all: task '{t.name}' names no known workflow - skipped")
-                continue
+            params = self._workflow_params(t)
+            fp = field_fingerprint_of(params)
+            other = fp != here
             for item in self._items_of_task(t):
-                tag = (t.workflow if other else wf, item.key)
+                tag = (fp, item.key)
                 if tag in seen:
                     continue
                 seen.add(tag)
                 out.append((item, params) if other else item)
-                per_wf[tag[0]] = per_wf.get(tag[0], 0) + 1
-        if len(per_wf) > 1:
-            log("RUN all: " + ", ".join(f"{n} item(s) on '{w}'" for w, n in per_wf.items()))
+                label = "this task's field" if not other else f"task '{t.name}'"
+                per_field.setdefault(fp, [label, 0])[1] += 1
+        if len(per_field) > 1:
+            log("RUN all: " + ", ".join(f"{n} item(s) on {w}" for w, n in per_field.values()))
         return out
 
     def _enrolment_changed(self):
@@ -686,16 +716,18 @@ class LabelerApp(AnnotationShell, MsPathApp):
                 "topology field's filter chain, and the statistics the classifier "
                 "sees. A model is valid at one level only.")
 
+    def _workflow_field_key(self, workflow):
+        return field_fingerprint_of(coupon_session.profile_params_json(workflow, 1, SLIDE_PLANES))
+
     def _profile_from_model(self, path, statistics):
-        """Offer a profile rebuilt from a loaded model's statistics block."""
-        prof = self._default_profile(os.path.splitext(os.path.basename(path))[0])
+        """The active task's workflow, rebuilt from a loaded model's
+        statistics block (the defaults otherwise), applied as a workflow
+        replacement is: the compute state follows the field."""
+        prof = self._default_profile(self._task.name)
         if statistics:
             prof["statistics"] = dict(statistics)
-        self.profiles.append(prof)
-        # Through the switch, so the active task's workflow follows the
-        # profile (and the compute state is reset, as any switch does).
-        self._bind_workflow(prof["name"])
-        return prof
+        self._replace_workflow(prof, f"model {os.path.basename(path)}")
+        return self._task.workflow
 
     # ------------------------------------------------------------------ #
     # Where to look next

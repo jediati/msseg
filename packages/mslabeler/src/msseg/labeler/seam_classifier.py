@@ -57,7 +57,7 @@ class SeamModelMixin:
         model, the measurement, the scope and the workflow): the schema call
         is not free on the stage strip's poll."""
         sig = (prov.signature(slot), self._measure_key(), self._feature_scope(),
-               self.active_profile_idx)
+               self._task.uid)
         cache = self.__dict__.setdefault("_input_why_cache", {})
         hit = cache.get(slot)
         if hit is not None and hit[0] == sig:
@@ -74,10 +74,8 @@ class SeamModelMixin:
                     have = self._expected_names_for(prov.context_spec() or ContextSpec())
             except Exception:
                 have = None
-            prof = "?"
-            if 0 <= self.active_profile_idx < len(self.profiles):
-                prof = self.profiles[self.active_profile_idx]["name"]
-            why = prov.requires(slot).why_not(have, self._feature_scope(), f"workflow {prof!r}")
+            why = prov.requires(slot).why_not(have, self._feature_scope(),
+                                              f"task {self._task.name!r}")
         cache[slot] = (sig, why)
         return why
 

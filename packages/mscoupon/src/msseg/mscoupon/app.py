@@ -2567,7 +2567,9 @@ class MscouponApp(ViewerShell):
             output_folder=output_folder,
             filters=profile.get("filters") or [],
             base_filters=profile.get("base_filters") or [],
-            persistence_percent=float(msc.get("persistence_percent") or 10.0),
+            # A labeler workflow reads its regions at the live value.
+            persistence_percent=float(msc.get("persistence_live")
+                                      or msc.get("persistence_percent") or 10.0),
             manifold=str(msc.get("manifold") or "ascending"),
             accurate=bool(msc.get("accurate")),
             extremum_sample_radius=int(msc.get("extremum_sample_radius") or 0),

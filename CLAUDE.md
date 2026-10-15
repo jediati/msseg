@@ -204,8 +204,8 @@ pickles) were held identical through the extraction.
 [docs/design_multi_model_tasks.md](docs/design_multi_model_tasks.md)): a
 session holds several named detectors ("gland detector", "bubble &
 background") over one corpus, exactly one active. A `Task` owns a
-**workflow** (a profile NAME in the session's shared pool -- profiles stay
-session-level so two tasks on one workflow share its primes), the class
+**workflow** (since stage 5b, below, the task's OWN profile document; it was
+a profile NAME in a session-level pool), the class
 vocabulary (count, colours, and now **names**, `LabelStore.names` /
 `set_name`, written into `classes[].name` only when set), the `LabelStore`
 with its undo history, the `ModelStack` (region clf + names/kind/spec/scope/
@@ -221,18 +221,15 @@ assignment. `_activate_task` stashes the outgoing Model-tab view, clears the
 to the task's workflow via `_switch_profile` (no-op when shared), loads its
 newest pickle **lazily** (the load gates against the ACTIVE workflow),
 pushes its view and repaints; refused while a search worker runs (its finish
-installs into the active task). `_switch_profile` stamps the active task's
-workflow; profile rename/delete propagate; `_profile_from_model` binds via
-`_bind_workflow`. Session document **v3** (v4 since the task kinds,
-below): `tasks[]` + `active_task`, no
+installs into the active task). Session document **v3** (v4 since the task
+kinds, v5 since task-owned workflows, below): `tasks[]` + `active_task`, no
 top-level `annotations`/`models`; the tasks-less form is unchanged (the
 viewers write it) and reads as ONE task named after the active profile with
 the four view keys moved out of `view`; the reader returns
 `annotations`/`models` as the active task's for older callers and now keeps
 the model record's `context` key (a pre-existing drop). New session keeps the
 tasks with emptied stores. UI: a Tasks `Treeview` (name / workflow / annot /
-model) above the session lists with New / Dup / Rename… / Delete; the
-profile box is titled "0. Workflow" (`PROFILE_SECTION_TITLE`); double-click
+model) above the session lists with New / Dup / Rename… / Delete; double-click
 a class title to name it. Accepted for stage 1: a cross-workflow switch drops
 primes; row removal dooms only the active task's gestures (others rebind
 greyed on activation); `MAX_CLASSES` still bounds every vocabulary.
@@ -783,6 +780,45 @@ live. **The base chain is a measurement** (fingerprints, both re-measures --
 the coupon re-reads the slice file -- and the Features tab); a settled edit
 goes through `AnnotationShell._preview_edit_settled` -> the app's
 `_measurement_moved()` -> `_remeasure_current`, a field edit stays a preview.
+
+**Task-owned workflows** (2026-10-15, stage 5b of the design note): every
+task OWNS its workflow -- `Task.workflow` is the whole profile dict (chains,
+MSC, live persistence, base chain, statistics), named after the task, never a
+link; a session is "every kind of task on this set of slides", so a shared
+pool was the wrong granularity. Sharing is by CONTENT: primes key on the
+field fingerprint and records on the measurement, so two tasks whose
+workflows agree still share both. Mechanism: the shell's profile machinery
+is unchanged -- `AnnotationShell` keeps `profiles[i] IS tasks[i].workflow`
+(`_link_pool` after any task-list change; `_snapshot_active_profile` copies
+the replaced entry back, `_pool_to_tasks`), so a task switch is
+`_switch_profile(tasks.index(task))` with the usual snapshot / keep-the-
+primes / re-apply, and a switch between EQUAL workflows is a no-op. No
+profile picker (`_build_profile_section` builds Copy from task… / Load
+workflow… / Save workflow… on top of Processing; all go through
+`_replace_workflow`); New task asks for the source (`_new_task_workflow`:
+a task's copy, a template `.profile.json`, the defaults; headless
+`_task_new(name)` copies the active task's, `workflow=` passes one);
+`_profile_from_model` replaces the active task's statistics; the Tasks
+list's workflow column is the field line (`_workflow_brief`). The live
+persistence is the workflow's last Processing group (**4b. Persistence**,
+both labelers; coupon: `msc.persistence_live`, kept by
+`session.profile_from_json` only when present, no longer in `view`; not in
+the params, so no fingerprint moves); the context COLUMNS are the last
+Features group (**9. Context**, region tasks; `_build_context_features_group`),
+the latent ring head stays on Model; `ContextSpec` / `view.context` /
+pickles unchanged. Session document **v5**: each task carries `workflow`
+inline, no top-level `profiles`; a v4 document migrates (each task gets a
+copy of the profile it named, noted); the reader's `profiles` IS the tasks'
+workflows; a viewer doc's spare profiles are noted, not carried. mspath
+**Run all tasks** groups by field fingerprint (`_workflow_params(task)`).
+Input slots: messages name the task; a provider on another field fills the
+slot with a note (`_field_differs_from`, `_workflow_field_key`). Accepted:
+the coupon keeps one field live, so switching between tasks on different
+fields re-primes. Also: the reader copies a task's workflow before the app's
+reader normalises it (the mspath reader worked in place). Future: a field
+reference (`{"source": "task", "uid"}`) to keep two tasks' fields in lock
+step. Tests: `test_session_doc_tasks.py` (v5 round trip, v4 migration),
+`test_task.py`, both labeler selftests' task blocks.
 
 **Max-area simplification rule** (2026-09-24, MSCEER pin `898fd95`,
 `ComputeOptions::rules`): `msc.max_region_area` (pixels; null / <= 0 = off)

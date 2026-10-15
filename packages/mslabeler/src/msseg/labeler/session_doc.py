@@ -21,9 +21,12 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 SESSION_DOC_VERSION = 2
 # A document that carries ``tasks[]`` (several named detectors, each with its
-# own annotations, models and Model-tab settings -- msseg.labeler.task)
-# declares 3. Without tasks the document is the v2 one it always was.
-SESSION_DOC_VERSION_TASKS = 4
+# own annotations, models, Model-tab settings and -- since v5 -- its own
+# WORKFLOW, the whole profile document inline; msseg.labeler.task) declares
+# 5. Without tasks the document is the v2 one it always was. A v4 document
+# named a profile in a session-level pool instead; it reads as v5 with that
+# profile copied into every task that named it.
+SESSION_DOC_VERSION_TASKS = 5
 # A task is region-based or polyline-based (docs/seam_labeling.md), fixed at
 # creation: the Features / Annotation / Model / Analysis tabs, the tools and
 # the view options follow it. Written on every task since v4.
@@ -84,6 +87,11 @@ def _as_int(value: Any, default: Any) -> Any:
 def _note(notes: Optional[List[str]], msg: str) -> None:
     if notes is not None:
         notes.append(msg)
+
+
+def _json_copy(value: Any) -> Any:
+    """A structural copy of JSON-safe data: two tasks never share a dict."""
+    return json.loads(json.dumps(value))
 
 
 def _passthrough_profile(doc: Any, notes: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -216,10 +224,11 @@ def build_session_doc(*, app: str,
                       tasks: Optional[Sequence[Dict[str, Any]]] = None,
                       active_task: Optional[str] = None) -> Dict[str, Any]:
     """The session document. With ``tasks`` (each a ``Task.to_doc()`` dict:
-    uid / name / workflow / annotations / models / view) the document is v3
-    and the per-task ``annotations`` / ``models`` live ONLY under their task
-    -- one source of truth, so the top-level keys are not written even when
-    passed. Without tasks it is the v2 document it always was, byte for
+    uid / name / workflow / annotations / models / view) the document is v5:
+    the per-task ``annotations`` / ``models`` / ``workflow`` live ONLY under
+    their task -- one source of truth, so neither the top-level
+    ``annotations`` / ``models`` nor the ``profiles`` pool is written even
+    when passed. Without tasks it is the v2 document it always was, byte for
     byte: the viewers, which have no tasks, keep writing exactly that."""
     doc: Dict[str, Any] = {
         "app": str(app),
@@ -236,6 +245,7 @@ def build_session_doc(*, app: str,
         "view": dict(view),
     }
     if tasks is not None:
+        del doc["profiles"], doc["active_profile"]
         doc["tasks"] = [dict(t) for t in tasks]
         uids = [str(t.get("uid") or "") for t in tasks]
         doc["active_task"] = (str(active_task) if active_task is not None and str(active_task) in uids
@@ -318,17 +328,22 @@ def session_doc_from_json(doc: Any, notes: Optional[List[str]] = None, *,
     # A copy: the tasks-less path below moves the Model-tab keys out of it.
     view = dict(_as_dict(root.get("view")))
 
-    # Tasks. A v3 document lists them; anything older IS one task -- the
+    by_name = {p["name"]: p for p in profiles}
+
+    # Tasks. A v3+ document lists them; anything older IS one task -- the
     # session's single annotations block, model registry and Model-tab
     # settings, named after the active profile -- so a reader never has to
     # know which it was given. Either way the result is a list of normalized
-    # task entries and the uid of the active one.
+    # task entries and the uid of the active one, and every task carries its
+    # OWN workflow (a profile dict named after the task): v5 writes it
+    # inline, an older document named a pool profile, which is copied.
     raw_tasks = [t for t in _as_list(root.get("tasks")) if isinstance(t, dict)]
     had_tasks = bool(raw_tasks)
     tasks: List[Dict[str, Any]] = []
     if had_tasks:
         uids: List[str] = []
         tnames: List[str] = []
+        copied = 0
         for td in raw_tasks:
             uid = str(td.get("uid") or "")
             if not uid or uid in uids:
@@ -337,12 +352,20 @@ def session_doc_from_json(doc: Any, notes: Optional[List[str]] = None, *,
                              f"{'duplicate' if uid else 'missing'} uid - assigned {fresh}")
                 uid = fresh
             name = dedupe_profile_name(str(td.get("name") or "task"), tnames)
-            workflow = td.get("workflow")
-            workflow = str(workflow) if workflow is not None else None
-            if workflow is not None and workflow not in names:
-                _note(notes, f"task {name!r}: workflow {workflow!r} is not in the "
-                             f"session - using {active!r}")
-                workflow = active
+            raw_wf = td.get("workflow")
+            if isinstance(raw_wf, dict):
+                # (A copy: an app's reader may normalise in place, and the
+                # document is the caller's.)
+                workflow = reader(_json_copy(raw_wf), notes)
+            else:
+                src = str(raw_wf) if raw_wf is not None else active
+                if src not in by_name:
+                    _note(notes, f"task {name!r}: workflow {src!r} is not in the "
+                                 f"session - using {active!r}")
+                    src = active
+                workflow = _json_copy(by_name[src])
+                copied += 1
+            workflow["name"] = name
             tview = _as_dict(td.get("view"))
             kind = normalise_kind(td.get("kind"), notes, f"task {name!r}")
             # Enrolment only when written: absent means "every place".
@@ -359,11 +382,15 @@ def session_doc_from_json(doc: Any, notes: Optional[List[str]] = None, *,
                           **({"inputs": inputs} if inputs else {})})
             uids.append(uid)
             tnames.append(name)
+        if copied:
+            _note(notes, f"workflows copied into {copied} task(s): every task now "
+                         "owns its workflow")
         active_task = str(root.get("active_task") or "")
         if active_task not in uids:
             active_task = uids[0]
     else:
-        tasks.append({"uid": new_task_uid(), "name": active, "workflow": active,
+        tasks.append({"uid": new_task_uid(), "name": active,
+                      "workflow": _json_copy(by_name[active]),
                       "kind": DEFAULT_TASK_KIND,
                       # "labels" is what sessions written before the rename
                       # call this, and it is the ONLY thing that key ever
@@ -374,6 +401,13 @@ def session_doc_from_json(doc: Any, notes: Optional[List[str]] = None, *,
                       "view": {k: view.pop(k) for k in TASK_VIEW_KEYS if k in view}})
         active_task = tasks[0]["uid"]
     current = next(t for t in tasks if t["uid"] == active_task)
+    if had_tasks:
+        # The pool a labeler holds IS its tasks' workflows, in task order
+        # (AnnotationShell keeps profiles[i] the same dict as tasks[i]'s);
+        # what a v4 pool held beyond them was only ever reachable through a
+        # task, so nothing is lost.
+        profiles = [t["workflow"] for t in tasks]
+        active = current["workflow"]["name"]
 
     return {
         "app": str(root.get("app") or ""),

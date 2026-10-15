@@ -182,7 +182,8 @@ class ModelPanelMixin:
                                    foundation=self._foundation_spec_from_ui())
 
     def _apply_context_spec(self, spec):
-        """Push a ContextSpec onto the Model tab controls."""
+        """Push a ContextSpec onto its controls: the Features tab's Context
+        group (columns, labels) and the Model tab's latent ring head."""
         for k, var in self.context_kind_vars.items():
             var.set(k in spec.kinds)
         for w, var in self.context_weight_vars.items():
@@ -210,12 +211,23 @@ class ModelPanelMixin:
         self._refresh_model_readout()
         self._refresh_model_strip()
 
-    def _build_context_panel(self, parent):
-        """The neighbourhood context columns (context.py): which reductions
+    CONTEXT_GROUP_TITLE = "9. Context"
+
+    def _build_context_features_group(self):
+        """The neighbourhood context columns (context.py) -- which reductions
         over a region's arc neighbours join its feature row, under which
-        weighting, over which source columns."""
-        box = ttk.LabelFrame(parent, text="Context: neighbourhood columns added to every region's row")
-        box.pack(side="top", fill="x", padx=6, pady=4)
+        weighting, over which source columns, and the ring's annotations --
+        as the LAST group of the Features tab: they are columns of the row,
+        like everything above them, built from the columns above them. A
+        region task's (the group hides for a polyline task). The latent ring
+        head, which needs a trained net, stays on the Model tab."""
+        box = self._group(self.feat_col, self.CONTEXT_GROUP_TITLE, key="context")
+        self._context_group = self._proc_groups["context"]
+        self.context_frame = box
+        ttk.Label(box, foreground="#666", wraplength=380, justify="left",
+                  text="Columns built from each region's neighbours. Like the rest "
+                       "of this tab they describe the task's NEXT model: they apply "
+                       "at Train (R).").pack(anchor="w", padx=4, pady=(2, 0))
         row = ttk.Frame(box); row.pack(fill="x", padx=4, pady=(4, 2))
         lbl = ttk.Label(row, text="ring:")
         lbl.pack(side="left")
@@ -268,8 +280,34 @@ class ModelPanelMixin:
                               "non-positional column, only the ext_* columns (the seeding "
                               "extremum: what the region looks like away from its boundary), "
                               "or only the mean_* columns.")
-        # The latent ring: a second head on the base net's embedding of the ring.
+        # Labels as context: the ring's annotations as columns.
         row = ttk.Frame(box); row.pack(fill="x", padx=4, pady=(0, 4))
+        chk = ttk.Checkbutton(row, text="labels as context", variable=self.context_labels_var,
+                              command=self._on_context_settings_change)
+        chk.pack(side="left")
+        attach_tooltip(chk, "One column per class: the fraction of the ring annotated with "
+                            "it (plus the fraction annotated at all). A region's own label "
+                            "never enters. Predictions then depend on the annotations, so "
+                            "they clear whenever the store changes -- Classify (C) refreshes "
+                            "them with everything drawn so far.")
+        ttk.Label(row, text=" dropout:").pack(side="left")
+        en = ttk.Entry(row, textvariable=self.context_label_dropout_var, width=5)
+        en.pack(side="left", padx=2)
+        en.bind("<Return>", lambda e: (self._unfocus_entries(), self._on_context_settings_change()))
+        en.bind("<FocusOut>", lambda e: self._on_context_settings_change())
+        attach_tooltip(en, "At training, each labeled neighbour is hidden with this "
+                           "probability (0..0.95), so the net learns to work with a partly "
+                           "labeled ring -- what it meets on a fresh slice.")
+
+    def _build_context_panel(self, parent):
+        """The Model tab's half of the context: the latent ring head, a second
+        net on the trained base net's embedding of the ring. (The context
+        COLUMNS are on the Features tab: _build_context_features_group.)"""
+        box = ttk.LabelFrame(parent, text="Latent ring head (on the trained net)")
+        box.pack(side="top", fill="x", padx=6, pady=4)
+        self.latent_frame = box
+        # The latent ring: a second head on the base net's embedding of the ring.
+        row = ttk.Frame(box); row.pack(fill="x", padx=4, pady=(4, 4))
         chk = ttk.Checkbutton(row, text="latent ring head", variable=self.context_latent_var,
                               command=self._on_context_settings_change)
         chk.pack(side="left")
@@ -304,24 +342,6 @@ class ModelPanelMixin:
                             "against its ring reads high) and the component count at "
                             "mean + std of the slice's arc distances (a ring with two kinds "
                             "of neighbour reads 2).")
-        # Labels as context: the ring's annotations as columns.
-        row = ttk.Frame(box); row.pack(fill="x", padx=4, pady=(0, 4))
-        chk = ttk.Checkbutton(row, text="labels as context", variable=self.context_labels_var,
-                              command=self._on_context_settings_change)
-        chk.pack(side="left")
-        attach_tooltip(chk, "One column per class: the fraction of the ring annotated with "
-                            "it (plus the fraction annotated at all). A region's own label "
-                            "never enters. Predictions then depend on the annotations, so "
-                            "they clear whenever the store changes -- Classify (C) refreshes "
-                            "them with everything drawn so far.")
-        ttk.Label(row, text=" dropout:").pack(side="left")
-        en = ttk.Entry(row, textvariable=self.context_label_dropout_var, width=5)
-        en.pack(side="left", padx=2)
-        en.bind("<Return>", lambda e: (self._unfocus_entries(), self._on_context_settings_change()))
-        en.bind("<FocusOut>", lambda e: self._on_context_settings_change())
-        attach_tooltip(en, "At training, each labeled neighbour is hidden with this "
-                           "probability (0..0.95), so the net learns to work with a partly "
-                           "labeled ring -- what it meets on a fresh slice.")
 
     def _custom_hidden(self):
         """The custom base's hidden sizes from the Model tab entry (first rung

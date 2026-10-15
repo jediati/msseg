@@ -94,9 +94,11 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
     APP_TITLE = "labeler"
     WINDOW_TITLE = "labeler"
     MODEL_APP_TAG = model_bundle.DEFAULT_APP_TAG     # the classifier pickle "app" tag
-    # The left column's profile section: in a labeler a profile is the active
-    # task's WORKFLOW (the Combobox shows and rebinds it), so say so.
-    PROFILE_SECTION_TITLE = "0. Workflow"
+    # A labeler has no profile picker: every task OWNS its workflow (stage 6
+    # of docs/design_multi_model_tasks.md), and the shell's profile pool is
+    # kept as a mirror of the tasks -- profiles[i] is tasks[i].workflow, the
+    # same dict -- so the shell's snapshot / switch / keep-the-primes logic
+    # runs unchanged underneath a task switch.
 
     # -- the active task's state (see the factories above) ------------------ #
     store = _task_attr("store", "The active task's LabelStore (gestures, seams, vocabulary).")
@@ -290,9 +292,8 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         self.features_hint_var = tk.StringVar(master=root, value="")
         self._hint_after = None
         super().__init__(root, initial=initial, autosave=autosave)
-        # The profiles exist now: the first task's workflow is the active one.
-        if self._task.workflow is None and 0 <= self.active_profile_idx < len(self.profiles):
-            self._task.workflow = self.profiles[self.active_profile_idx]["name"]
+        # The profiles exist now: the first task owns the one on the widgets.
+        self._bind_first_workflow()
         self._update_task_rows()
         root.title(self.WINDOW_TITLE)
         self._build_label_panel()
@@ -300,6 +301,7 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         self._build_seam_features_group()
         self._build_seam_inputs_group()
         self._build_foundation_group()
+        self._build_context_features_group()      # last: built from the columns above
         if self.viewer is not None:
             self.viewer.tool = DrawController(self)
             # Zoom/pan invalidates screen-space annotation geometry.
@@ -374,10 +376,11 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         self.proc_col = self.proc_scroll.inner
         self._proc_groups = {}               # key -> Collapsible
         ttk.Label(self.features_tab, foreground="#666", wraplength=400, justify="left",
-                  text="What each region is measured by: the base channel the "
-                       "statistics are read from, and the statistics. An edit "
-                       "re-measures the item on screen -- the regions stay, only "
-                       "their statistics are rebuilt; no Run needed.").pack(side="top", anchor="w",
+                  text="The row this task's model reads: the base channel the "
+                       "statistics are read from, the statistics, and the columns "
+                       "built on them (inputs, foundation features, context). A "
+                       "statistics edit re-measures the item on screen -- the "
+                       "regions stay; no Run needed.").pack(side="top", anchor="w",
                                                         padx=6, pady=(4, 0))
         self.feat_scroll = ScrollFrame(self.features_tab, width=420, canvas_width=400)
         self.feat_scroll.pack(side="top", fill="both", expand=True)
@@ -1188,6 +1191,13 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
                 group.pack_forget()
                 if poly:
                     group.pack(fill="x", padx=4, pady=(0, 2))
+        # The context columns are a region row's (a polyline task's seam row
+        # has its own descriptor); packed last, as they were built.
+        group = getattr(self, "_context_group", None)
+        if group is not None:
+            group.pack_forget()
+            if not poly:
+                group.pack(fill="x", padx=4, pady=(0, 2))
         if poly:
             self._refresh_inputs_panel()
         self._coerce_tool()
@@ -1464,7 +1474,12 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
 
     # -- new session ---------------------------------------------------- #
     def _new_session_options(self):
-        return super()._new_session_options() + [(
+        base = [(key, label, tip) if key != "profiles" else (
+                    key, "Keep the tasks' workflows (filter chains, MSC, persistence, statistics)",
+                    "Every task keeps its workflow; only folders, sequences and computed "
+                    "results are dropped. Off: every task starts from the default workflow.")
+                for key, label, tip in super()._new_session_options()]
+        return base + [(
             "model",
             "Keep model selection & settings (kind, loaded model, edge and search settings)",
             "The picked kind, the model in memory and its saved-model records, the "
@@ -1480,12 +1495,15 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         (class count, colours, names) and, with the model option, their
         saved-model records and Model-tab views -- with every store emptied.
         The old session was auto-saved first, so nothing is lost."""
-        doc = super()._new_session_doc(keep)
+        doc = super()._new_session_doc(keep)     # (snapshots the workflow)
         keep_model = keep.get("model", True)
+        keep_wf = keep.get("profiles", True)
         self._stash_task_view(self._task)
         tasks = []
         for t in self.tasks:
             td = t.to_doc()
+            if not keep_wf:
+                td["workflow"] = self._default_profile(t.name)
             empty = td["annotations"]
             empty["interactions"] = []        # classes + colours + names, no gestures
             empty.pop("seams", None)          # ...and no seam gestures: a v2 doc
@@ -1496,8 +1514,8 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
             if self.ENROLMENT:
                 td["enrolled"] = {}           # no slides left to work
             tasks.append(td)
-        doc.pop("annotations", None)
-        doc.pop("models", None)
+        for key in ("annotations", "models", "profiles", "active_profile"):
+            doc.pop(key, None)
         doc["tasks"] = tasks
         doc["active_task"] = self._task.uid
         doc["session_version"] = session_doc.SESSION_DOC_VERSION_TASKS
@@ -1589,6 +1607,19 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         # The tasks install AFTER sequences exist, so rebind sees them (and
         # migrates legacy bare-basename keys against the qualified identity).
         self.tasks = [Task.from_doc(td, notes) for td in sdoc["tasks"]]
+        # The base put the active task's workflow on the widgets (the reader
+        # lists the tasks' workflows as the pool); the pool now IS theirs.
+        # A tasks-less document (a viewer's) had a pool of templates beyond
+        # the active one, which no task owns.
+        had_tasks = sdoc["session_version"] == session_doc.SESSION_DOC_VERSION_TASKS
+        dropped = [] if had_tasks else [p["name"] for p in self.profiles
+                                        if p["name"] != sdoc["active_profile"]]
+        if dropped:
+            notes.append(f"profile(s) {', '.join(map(repr, dropped))} not carried over: "
+                         "a task owns ONE workflow (save a profile as a workflow file "
+                         "in the viewer to keep it)")
+        active = next((t for t in self.tasks if t.uid == sdoc["active_task"]), self.tasks[0])
+        self._link_pool(active)
         for t in self.tasks:
             self._normalize_enrolment(t, notes)
         for t in self.tasks:
@@ -1596,7 +1627,6 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
             if unbound:
                 notes.append(f"task {t.name!r}: {unbound} annotation(s) reference "
                              f"{self.ITEM_NOUN}s not in the session (kept, greyed)")
-        active = next((t for t in self.tasks if t.uid == sdoc["active_task"]), self.tasks[0])
         # Activation switches to the task's workflow, reloads its newest saved
         # pickle (a failure -- moved file, incompatible profile -- is a note,
         # never fatal) and pushes its Model-tab view, which wins over the
@@ -1628,51 +1658,199 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
     # ------------------------------------------------------------------ #
     # Tasks: several named detectors, one active
     # ------------------------------------------------------------------ #
-    def _profile_index(self, name):
-        for i, p in enumerate(self.profiles):
-            if p["name"] == name:
-                return i
-        return None
+    # -- every task owns its workflow; the profile pool mirrors them ------- #
+    # The shell edits "the active profile", profiles[active_profile_idx]:
+    # it snapshots the widgets into it, switches between entries (keeping
+    # the primes when the field agrees) and builds the params from it. A
+    # labeler keeps that machinery and makes the pool its tasks' workflows,
+    # in task order -- profiles[i] IS tasks[i].workflow -- so the entry on
+    # the widgets is the active task's own. The snapshot REPLACES the entry,
+    # so it is copied back onto the task (_pool_to_tasks); a change to the
+    # task list re-derives the pool (_link_pool).
+    def _bind_first_workflow(self):
+        """At construction: the first task owns the profile on the widgets."""
+        if self._task.workflow is None and 0 <= self.active_profile_idx < len(self.profiles):
+            self._task.workflow = self.profiles[self.active_profile_idx]
+            self._task.workflow["name"] = self._task.name
+        self._link_pool()
 
-    def _bind_workflow(self, name):
-        """Make the profile called `name` the active task's workflow (and
-        the active profile). The bindings' `_profile_from_model` hooks use
-        this after appending a profile, instead of poking the index."""
-        idx = self._profile_index(name)
-        if idx is not None:
-            self._switch_profile(idx)
+    def _link_pool(self, shown=None):
+        """profiles := the tasks' workflows; active_profile_idx := the row of
+        `shown`, the task whose workflow is on the widgets (default the
+        active one). A task without a workflow gets the app's default."""
+        for t in self.tasks:
+            if not isinstance(t.workflow, dict):
+                t.workflow = self._default_profile(t.name)
+            t.workflow["name"] = t.name
+        self.profiles = [t.workflow for t in self.tasks]
+        shown = shown if shown is not None else self._task
+        self.active_profile_idx = (self.tasks.index(shown) if shown in self.tasks else 0)
+
+    def _pool_to_tasks(self):
+        if len(self.profiles) == len(self.tasks):
+            for t, p in zip(self.tasks, self.profiles):
+                t.workflow = p
+
+    def _snapshot_active_profile(self):
+        super()._snapshot_active_profile()
+        self._pool_to_tasks()
 
     def _switch_profile(self, idx):
-        """The active profile IS the active task's workflow: whichever way it
-        changes -- the Combobox, New / Duplicate / Load / Delete profile, a
-        profile built from a model -- the task follows."""
+        """Only ever reached through a task switch or a workflow replacement
+        (there is no profile picker): the pool entry at `idx` is a task's.
+        Two tasks whose workflows are EQUAL (a copy never edited) switch with
+        nothing to redo: the widgets already show it, the primes and records
+        are already its."""
+        cur = self.active_profile_idx
+        if 0 <= idx < len(self.profiles) and idx != cur and 0 <= cur < len(self.profiles):
+            self._snapshot_active_profile()
+            if (dict(self.profiles[idx], name=None)
+                    == dict(self.profiles[cur], name=None)):
+                self.active_profile_idx = idx
+                self._pool_to_tasks()
+                self._update_task_rows()
+                return
         super()._switch_profile(idx)
-        if 0 <= self.active_profile_idx < len(self.profiles):
-            self._task.workflow = self.profiles[self.active_profile_idx]["name"]
+        self._pool_to_tasks()
         self._update_task_rows()
 
-    def _profile_rename(self):
-        old = self.profiles[self.active_profile_idx]["name"]
-        super()._profile_rename()
-        new = self.profiles[self.active_profile_idx]["name"]
-        if new != old:
-            for t in self.tasks:
-                if t.workflow == old:
-                    t.workflow = new
-            self._update_task_rows()
+    def _build_profile_section(self):
+        """No picker: the workflow is the active task's. Its management --
+        copy another task's, load a template file, save it as one -- sits on
+        top of the Processing tab, where the workflow is edited."""
+        row = ttk.Frame(self._profile_tools_parent(None))
+        row.pack(fill="x", padx=4, pady=2)
+        self.workflow_tools = row
+        b = ttk.Button(row, text="Copy from task…", command=self._workflow_copy_dialog)
+        b.pack(side="left", padx=(0, 2))
+        attach_tooltip(b, "Replace this task's workflow with a copy of another task's")
+        self.workflow_copy_btn = b
+        self.profile_load_btn = ttk.Button(row, text="Load workflow…",
+                                           command=self._workflow_load)
+        self.profile_load_btn.pack(side="left", padx=2)
+        attach_tooltip(self.profile_load_btn,
+                       "Replace this task's workflow with a template file (*.profile.json)")
+        b = ttk.Button(row, text="Save workflow…", command=self._save_profile)
+        b.pack(side="left", padx=2)
+        attach_tooltip(b, "Write this task's workflow as a template file")
 
-    def _profile_delete(self):
-        old = self.profiles[self.active_profile_idx]["name"]
-        super()._profile_delete()
-        names = [p["name"] for p in self.profiles]
-        if old not in names:
-            # The active task was re-stamped by the switch inside; every
-            # other task on the deleted workflow moves to the survivor too.
-            survivor = names[self.active_profile_idx]
-            for t in self.tasks:
-                if t.workflow == old:
-                    t.workflow = survivor
-            self._update_task_rows()
+    def _set_load_enabled(self, enabled):
+        super()._set_load_enabled(enabled)
+        btn = getattr(self, "workflow_copy_btn", None)
+        if btn is not None:
+            try:
+                btn.config(state="normal" if enabled else "disabled")
+            except tk.TclError:
+                pass
+
+    def _replace_workflow(self, profile, source=""):
+        """The active task's workflow becomes a copy of `profile` (named after
+        the task), applied as a profile switch is: the primes stay when the
+        field agrees, the statistics re-measure as needed."""
+        if self._run_active:
+            self.status_var.set("Busy priming — wait for the run to finish.")
+            return False
+        idx = self.tasks.index(self._task)
+        doc = json.loads(json.dumps(profile))
+        doc["name"] = self._task.name
+        self._link_pool()
+        self.profiles[idx] = doc
+        self._task.workflow = doc
+        self.active_profile_idx = -1            # nothing to snapshot: replaced
+        self._switch_profile(idx)
+        if source:
+            self.status_var.set(f"Task '{self._task.name}' workflow from {source}.")
+        return True
+
+    def _workflow_copy_from(self, task):
+        """Headless: the active task takes a copy of `task`'s workflow."""
+        if task is self._task or task not in self.tasks:
+            return False
+        self._snapshot_active_profile()
+        return self._replace_workflow(task.workflow, f"task '{task.name}'")
+
+    def _workflow_load_file(self, path):
+        """Headless: the active task's workflow from a template file."""
+        doc = self.SESSION_IO.read_json_file(path)
+        if doc is None:
+            self.status_var.set(f"Could not read {path}")
+            return False
+        notes = []
+        profile = self._profile_from_file_doc(doc, notes)
+        for msg in notes:
+            self._log(msg)
+        return self._replace_workflow(profile, os.path.basename(path))
+
+    def _workflow_load(self):
+        path = filedialog.askopenfilename(title="Load workflow",
+                                          filetypes=[("Workflow", "*.json")])
+        if path:
+            self._workflow_load_file(path)
+
+    def _workflow_copy_dialog(self):
+        others = [t for t in self.tasks if t is not self._task]
+        if not others:
+            self.status_var.set("No other task to copy a workflow from.")
+            return
+        choice = self._pick_workflow_source(
+            "Copy workflow", f"Replace the workflow of '{self._task.name}' with:",
+            [(f"task '{t.name}'", t) for t in others])
+        if choice is not None:
+            self._workflow_copy_from(choice)
+
+    def _pick_workflow_source(self, title, prompt, choices):
+        """A modal list of (label, value); returns the value or None."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.transient(self.root)
+        ttk.Label(dlg, text=prompt).pack(anchor="w", padx=10, pady=(10, 4))
+        var = tk.IntVar(master=dlg, value=0)
+        for i, (label, _v) in enumerate(choices):
+            ttk.Radiobutton(dlg, text=label, variable=var, value=i).pack(anchor="w", padx=16)
+        result = {}
+
+        def ok():
+            result["v"] = choices[var.get()][1]
+            dlg.destroy()
+        row = ttk.Frame(dlg)
+        row.pack(fill="x", padx=10, pady=10)
+        ttk.Button(row, text="Cancel", command=dlg.destroy).pack(side="right")
+        ttk.Button(row, text="OK", command=ok).pack(side="right", padx=(0, 6))
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.bind("<Return>", lambda e: ok())
+        try:
+            dlg.grab_set()
+            dlg.focus_set()
+            self.root.wait_window(dlg)
+        except tk.TclError:
+            return None
+        return result.get("v")
+
+    def _new_task_workflow(self):
+        """Ask where a new task's workflow comes from: a copy of a task's
+        (the active one first), a template file, or the defaults. A dict, or
+        None when cancelled."""
+        self._snapshot_active_profile()
+        order = [self._task] + [t for t in self.tasks if t is not self._task]
+        choices = [(f"Copy from task '{t.name}'", t) for t in order]
+        choices += [("From template file…", "file"), ("New workflow (defaults)", "new")]
+        pick = self._pick_workflow_source("New task", "Workflow of the new task:", choices)
+        if pick is None:
+            return None
+        if pick == "new":
+            return self._default_profile()
+        if pick == "file":
+            path = filedialog.askopenfilename(title="Workflow template",
+                                              filetypes=[("Workflow", "*.json")])
+            doc = self.SESSION_IO.read_json_file(path) if path else None
+            if doc is None:
+                return None
+            notes = []
+            prof = self._profile_from_file_doc(doc, notes)
+            for msg in notes:
+                self._log(msg)
+            return prof
+        return pick.workflow
 
     def _activate_task(self, task, initial=False):
         """Make `task` the active one: its workflow becomes the active
@@ -1703,17 +1881,11 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         self._hover_key = None
         self._hover_uid = None
         self._task = task
-        idx = self._profile_index(task.workflow)
-        if idx is None:
-            if task.workflow is not None:
-                self._log(f"task {task.name!r}: workflow {task.workflow!r} is not in "
-                          f"the session - using the active profile")
-            idx = max(0, self.active_profile_idx)
-        # A no-op (primes kept) when it is already the active profile; a
-        # different workflow drops them, as a profile switch always has.
-        self._switch_profile(idx)
-        if 0 <= self.active_profile_idx < len(self.profiles):
-            task.workflow = self.profiles[self.active_profile_idx]["name"]
+        # The task's own workflow goes on the widgets (the outgoing one is
+        # snapshotted into ITS task first). The primes stay when the two
+        # fields agree -- the engines key them by content -- and a different
+        # field drops them (mspath keeps a slot per field).
+        self._switch_profile(self.tasks.index(task))
         # The saved pickle loads on activation, not at session restore: the
         # load runs the compatibility gate against the ACTIVE workflow.
         if task.model_pending and task.model.empty:
@@ -1853,9 +2025,11 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         tree.bind("<<TreeviewSelect>>", self._on_task_select)
         tree.bind("<Double-1>", lambda _e: self._task_rename())
         attach_tooltip(tree, "The detectors this session trains, each with its own "
-                             "classes, annotations, workflow and model.\n"
-                             "Click: switch (a different workflow drops the primed "
-                             "data, as a profile switch does). Double-click: rename.")
+                             "classes, annotations, workflow and model. The workflow "
+                             "column shows what builds its regions.\n"
+                             "Click: switch (tasks whose workflows build the same "
+                             "field share the primed data; a different field needs "
+                             "a Run). Double-click: rename.")
         self.task_tree = tree
         row = ttk.Frame(c)
         row.pack(fill="x", padx=4, pady=(0, 4))
@@ -1877,8 +2051,7 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
                           "workflow and Model-tab settings -- no gestures, no model")
         ttk.Button(row, text="Rename…", command=self._task_rename).pack(side="left", padx=2)
         ttk.Button(row, text="Delete", command=self._task_delete).pack(side="left", padx=2)
-        if self._task.workflow is None and 0 <= self.active_profile_idx < len(self.profiles):
-            self._task.workflow = self.profiles[self.active_profile_idx]["name"]
+        self._bind_first_workflow()
         self._paint_task_rows(tree)
 
     def _task_row_values(self, task):
@@ -1891,8 +2064,22 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
             model = f"{task.models[-1].get('kind', '?')} (saved)"
         else:
             model = ""
-        return (self._KIND_GLYPH.get(task.kind, "?"), task.workflow or "-",
+        return (self._KIND_GLYPH.get(task.kind, "?"), self._workflow_brief(task.workflow),
                 str(n) if n else "", model)
+
+    def _workflow_brief(self, workflow):
+        """The Tasks list's workflow cell: the field line of the summary
+        (what decides the regions), without its label."""
+        if not isinstance(workflow, dict):
+            return "-"
+        try:
+            line = str(self._workflow_summary(workflow)).splitlines()[0]
+        except Exception:
+            return "?"
+        for prefix in ("topo field: ", "field: "):
+            if line.startswith(prefix):
+                return line[len(prefix):]
+        return line
 
     def _paint_task_rows(self, tree):
         """Repaint in place (the sequence tree's pattern): rows are keyed by
@@ -1941,24 +2128,39 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
     def _task_by_name(self, name):
         return next((t for t in self.tasks if t.name == name), None)
 
-    def _task_new(self, name=None, kind="region"):
-        """A task of `kind` ("region" | "polyline", fixed from here on) on
-        the active workflow with the current class count and default
-        colours, activated. `name` given -> no dialog (headless)."""
+    def _task_new(self, name=None, kind="region", workflow=None):
+        """A task of `kind` ("region" | "polyline", fixed from here on) with
+        the current class count and default colours, activated. Its workflow
+        is a COPY of `workflow` (a profile dict); without one, an
+        interactive call (no `name`) asks -- a task's, a template file's or
+        the defaults -- and a headless one copies the active task's."""
+        if workflow is None:
+            if name is None:
+                workflow = self._new_task_workflow()
+                if workflow is None:
+                    return None
+            else:
+                self._snapshot_active_profile()
+                workflow = self._task.workflow
         taken = [t.name for t in self.tasks]
         name = dedupe_task_name(str(name or ("walls" if kind == "polyline" else "task")), taken)
-        workflow = None
-        if 0 <= self.active_profile_idx < len(self.profiles):
-            workflow = self.profiles[self.active_profile_idx]["name"]
         task = Task.new(name, workflow=workflow, n_classes=self.store.n_classes,
                         taken=[t.uid for t in self.tasks], kind=kind)
         if self.ENROLMENT:
             task.enrolled = {}             # a new task works nothing yet
+        return self._add_task(task, f"Task '{task.name}' created.")
+
+    def _add_task(self, task, status):
+        """Append `task` (its workflow joins the pool) and activate it;
+        rolled back when the activation is refused."""
         self.tasks.append(task)
+        self._link_pool(self._task)
         if not self._activate_task(task):
             self.tasks.remove(task)
+            self._link_pool(self._task)
+            self._update_task_rows()
             return None
-        self.status_var.set(f"Task '{task.name}' created on workflow '{task.workflow}'.")
+        self.status_var.set(status)
         return task
 
     def _task_duplicate(self, name=None):
@@ -1966,14 +2168,10 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         taken = [t.name for t in self.tasks]
         name = dedupe_task_name(str(name or src.name), taken)
         self._stash_task_view(src)
+        self._snapshot_active_profile()       # the copy takes the workflow on screen
         task = src.duplicate(name, taken=[t.uid for t in self.tasks])
-        self.tasks.append(task)
-        if not self._activate_task(task):
-            self.tasks.remove(task)
-            return None
-        self.status_var.set(f"Task '{task.name}' duplicated from '{src.name}' "
-                            "(classes and settings; no gestures, no model).")
-        return task
+        return self._add_task(task, f"Task '{task.name}' duplicated from '{src.name}' "
+                                    "(classes, workflow and settings; no gestures, no model).")
 
     def _task_rename(self, name=None):
         current = self._task.name
@@ -1986,6 +2184,8 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
             return False
         name = dedupe_task_name(name, [t.name for t in self.tasks if t is not self._task])
         self._task.name = name
+        if isinstance(self._task.workflow, dict):
+            self._task.workflow["name"] = name    # the same dict as the pool entry
         self._update_task_rows()
         return True
 
@@ -2011,6 +2211,7 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         if not self._activate_task(neighbour):
             return False
         self.tasks.remove(task)
+        self._link_pool()
         self._update_task_rows()
         self.status_var.set(f"Task '{task.name}' deleted.")
         return True
@@ -2026,6 +2227,22 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
 
     def _workflow_hint_tooltip(self):
         return "The active profile. Click to open the Processing tab."
+
+    def _workflow_field_key(self, workflow):
+        """What decides a workflow's regions, comparable across tasks (the
+        app's field fingerprint), or None when the app cannot say."""
+        return None
+
+    def _field_differs_from(self, task):
+        """True when `task`'s workflow builds a different field than the one
+        on the widgets (the active task's, unsaved edits included); False
+        when they agree or the app cannot tell."""
+        try:
+            mine = self._workflow_field_key(self._profile_from_ui())
+            theirs = self._workflow_field_key(task.workflow)
+        except Exception:
+            return False
+        return mine is not None and theirs is not None and mine != theirs
 
     def _set_region_layer_visible(self, on):
         """Show or hide the region layer under the class layer (the app's)."""

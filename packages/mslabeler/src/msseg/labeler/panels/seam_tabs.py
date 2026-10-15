@@ -163,8 +163,14 @@ class SeamTabsMixin:
                 continue
             self.input_vars[slot].set(prov.name if isinstance(prov, artifacts.TaskProvider)
                                       else f"({why})")
-            self.input_status[slot].set(f"cannot use: {why}" if why
-                                        else self._input_status_text(slot, prov))
+            text = f"cannot use: {why}" if why else self._input_status_text(slot, prov)
+            if (not why and isinstance(prov, artifacts.TaskProvider)
+                    and self._field_differs_from(prov.task)):
+                # Not a refusal: the provider's net reads THIS task's rows,
+                # so ids line up -- but they are other regions than it saw.
+                text += (f" -- note: task '{prov.name}' builds different regions "
+                         "(its workflow's field differs)")
+            self.input_status[slot].set(text)
         entry = self._input_entry("labels")
         if entry is not None:
             self.input_boundary_var.set(str(self._input_boundary_class()))

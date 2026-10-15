@@ -1733,8 +1733,8 @@ class ClassifierMixin:
         if msg and interactive and doc.statistics:
             if not messagebox.askyesno(
                     self.APP_TITLE,
-                    msg + "\n\nCreate a profile from the model's own statistics "
-                          "and switch to it?"):
+                    msg + "\n\nSet this task's workflow to measure the model's own "
+                          "statistics?"):
                 raise ValueError(msg)
             self._profile_from_model(path, doc.statistics)
             # The new profile can still miss: feature_fields may resolve

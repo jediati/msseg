@@ -21,7 +21,7 @@ pytest packages/mslabeler/tests packages/mscoupon/tests      # conftest.py puts 
 ## Layout
 
 Three panes. The **left** pane is data navigation and processing *selection*:
-the compute-profile dropdown, the session (folders, files, the sequence tree,
+the Tasks list, the session (folders, files, the sequence tree,
 which divide the height through draggable sashes) and Run, pinned to the
 bottom so it is always visible. Clicking a TIFF in the file list or an
 unprimed row of a sequence previews it; the Image dropdown then computes the
@@ -35,12 +35,12 @@ things you edit.
 
 | column / tab | holds |
 |---|---|
-| **left** | the workflow (compute-profile) picker, the **Tasks** list, the session browser (folders, files, sequences) and Run |
-| **middle** | the slice canvas, hover readout, slice navigation, image/overlay/alpha controls and the persistence entry |
-| **Processing** (default tab) | the profile tools (New/Dup/Rename/Delete, Save/Load profile) and the profile being edited, as one column of collapsible groups: colour input, filter chain, base channel, MSC parameters |
-| **Features** | what every region is measured by: the base channel (the base chain, e.g. a normalize) and the statistics -- channels, reductions, seeding extremum and its sample radius, histograms -- i.e. the classifier's input columns (see "Features: an edit re-measures" below) |
+| **left** | the **Tasks** list, the session browser (folders, files, sequences) and Run |
+| **middle** | the slice canvas, hover readout, slice navigation, image/overlay/alpha controls |
+| **Processing** (default tab) | the workflow tools (**Copy from task…**, **Load workflow…**, **Save workflow…**) and the ACTIVE task's workflow, as one column of collapsible groups: colour input, filter chain, MSC parameters and, last, **4b. Persistence** (the live persistence and "update region simplification") |
+| **Features** | the row the task's model reads: the base channel (the base chain, e.g. a normalize), the statistics -- channels, reductions, seeding extremum and its sample radius, histograms -- then the columns built on them: a polyline task's seam descriptor and inputs, foundation features and, last, **9. Context** (a region task's neighbourhood columns) (see "Features: an edit re-measures" below) |
 | **Annotation** | classes, tools, the Magic rows, the per-class interaction lists, Save/Load annotations, and the classifier (Train/Classify, the model strip, the confusion matrix, exports, Save/Load classifier) |
-| **Model** | the classifier kind, a read-only description of its architecture, the **Edge model** panel (the `-> edges` kinds) and the **Optimize network** search (trials, time limit, seed, feature-subset toggle, progress line) |
+| **Model** | the classifier kind, a read-only description of its architecture, the **Latent ring head**, the **Edge model** panel (the `-> edges` kinds) and the **Optimize network** search (trials, time limit, seed, feature-subset toggle, progress line) |
 | **Analysis** | **Predictions vs annotations** (the regions behind a confusion cell; double-click a row to go there) and the **Size sweep** report; a home for plots later |
 
 The three columns start at about **1:3:2**, and **only the middle one grows**:
@@ -63,8 +63,9 @@ screen reflected the edit. So the picture is never the thing that is hidden.
 
 A session holds several **tasks** -- named detectors such as *gland detector*
 or *bubble & background* -- over the same folders and sequences, and exactly
-one is active. A task owns what a detector is made of: its **workflow** (a
-compute profile, referenced by name from the session's shared pool), its
+one is active. A task owns what a detector is made of: its **workflow** (the
+whole compute profile -- chains, MSC, persistence, base chain, statistics --
+its own copy, never a link), its
 **class vocabulary** (count, colours and names -- double-click a class title
 to name it *gland* / *not gland*), its **annotations** with their undo
 history, its **model stack** (the region classifier, the edge model, the
@@ -87,27 +88,39 @@ edge model through **input slots** on its Features tab. All of it:
 [seam_labeling.md](seam_labeling.md).
 
 The **Tasks** list sits above the session lists in the left column: name,
-kind (▦ region / ⌇ polyline), workflow, gesture count, model. Click a row to switch -- the workflow box
-follows (it shows and rebinds the ACTIVE task's workflow; two tasks on one
-workflow share its primed data, a different workflow drops it, as a profile
-switch always has) and the class stack, the Model tab and the predictions are
-the task's. **New** (*Region task* / *Polyline task*) starts an empty task
-of that kind on the active workflow; **Dup** copies the kind, vocabulary,
-workflow, Model-tab settings and inputs and nothing else; **Rename…** and **Delete** (refused for the last
+kind (▦ region / ⌇ polyline), workflow (its field: what builds the regions),
+gesture count, model. Click a row to switch -- the Processing and Features
+tabs show that task's workflow (the outgoing one's edits are kept in its
+task), and the class stack, the Model tab and the predictions are the
+task's. Sharing is by **content**, not by name: two tasks whose workflows
+build the same field share the primed data (a statistics-only difference
+re-measures), and a task on a different field needs a Run; two equal
+workflows switch with nothing to redo. **New** (*Region task* / *Polyline
+task*) asks where the new task's workflow comes from -- a copy of any task's
+(the active one first), a template file, or the defaults -- and starts an
+empty task of that kind; **Dup** copies the kind, vocabulary, workflow,
+Model-tab settings and inputs and nothing else. **Copy from task…** /
+**Load workflow…** on the Processing tab replace the active task's workflow
+with a copy, **Save workflow…** writes it as a template file
+(`<name>.profile.json`, the viewer's profile file). **Rename…** and **Delete** (refused for the last
 task; asks when the task has gestures or a model) do what they say. A switch
 is refused while an Optimize / sweep / evaluate search runs, because its
 result installs into the active task. A task's saved pickle loads when the
 task is first activated, and its Optimize autosaves go to
 `models/<task uid>/`.
 
-The session document is **v4**: `tasks[]` + `active_task`, each task with its
-`kind`, `annotations`, `models` and `view` (and `inputs`, `enrolled` when
-set). A labeler session written before task kinds **does not load** ("written
-by an older labeler -- start a new session"); a viewer's session (no tasks)
-restores as one region task named after its active profile;
-**New session…** keeps the tasks and empties their stores (their models too,
-when the model option is kept). Renaming or deleting a profile follows
-through to the tasks that point at it. Design and the stages that follow
+The session document is **v5**: `tasks[]` + `active_task`, each task with its
+`kind`, `workflow` (the profile document inline), `annotations`, `models` and
+`view` (and `inputs`, `enrolled` when set), and no session-level `profiles`.
+A **v4** session (tasks naming profiles in a shared pool) loads with each
+task given its own copy of the profile it named, and a note saying so. A
+labeler session written before task kinds **does not load** ("written by an
+older labeler -- start a new session"); a viewer's session (no tasks)
+restores as one region task whose workflow is a copy of its active profile
+(the other profiles are noted, not carried over: save them as workflow files
+in the viewer first). **New session…** keeps the tasks and empties their
+stores (their workflows and models too, when those options are kept).
+Design and the stages that follow
 (shared places, slide-bound gestures, cross-task masks and borrowed gestures):
 [design_multi_model_tasks.md](design_multi_model_tasks.md).
 
@@ -141,10 +154,11 @@ are keyed and cached apart. Editing anything on the Features tab settles for a
 quarter second and then re-measures the slice on screen -- the canvas says
 `Measuring` -- keeping its MSC, its regions and its arcs, and rebuilding only
 the rows; other slices re-measure when something reads them (a Rerun, a Train,
-navigating there). No Run. The same holds for a profile or task switch whose
-profile differs only in its statistics (or selection): the primed stack is
-kept and re-measured, where a different field still drops it, and for
-**Create a profile from the model's statistics** after loading a classifier.
+navigating there). No Run. The same holds for a task switch whose workflow
+differs only in its statistics (or selection): the primed stack is kept and
+re-measured, where a different field still drops it, and for **Set this
+task's workflow to measure the model's own statistics** after loading a
+classifier.
 A Run reuses every sequence primed under the same field, re-measuring the ones
 whose statistics moved. What a re-measure costs is a prime minus its MSC: on a
 2048² item, 0.2 s for base-only and 0.9 s for twelve derived channels (the
@@ -519,7 +533,8 @@ bin must mean the same thing the model learned it as.
 
 The row describes a region's own pixels, and sometimes they do not say
 enough: a shallow dip inside metal and a real void can share a `mean_base`.
-The **Context** panel on the Model tab appends columns computed from the
+The **9. Context** group -- the last one on the Features tab, because its
+columns are built from the ones above it -- appends columns computed from the
 living-region graph (`msseg.labeler.context`), so the net sees the
 neighbourhood *before* it decides -- unlike the edge model, which can only
 reshuffle probabilities afterwards. Each checked **ring** kind adds one
@@ -560,7 +575,8 @@ byte-identical to before: same fingerprint, same pickle document.
 **Latent ring head.** The raw rungs aggregate pixel statistics; the
 feature-row -> 16 -> 8 net distils *what kind of material* a region is, and
 that is the thing worth averaging over a ring. With **latent ring head**
-on, Train fits the base net as usual, embeds every region with its hidden
+on (its own panel on the Model tab: it needs a trained net, so it is not a
+Features column), Train fits the base net as usual, embeds every region with its hidden
 layer (`layer`: last = the narrow one), averages the ring's embeddings
 (`weight`: uniform / area / contact, or `latent` = a softmax over the
 latent distance scaled by the slice's median arc distance, so neighbours

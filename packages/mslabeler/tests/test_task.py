@@ -44,8 +44,11 @@ def test_caches_clear():
 
 
 def test_new_task_and_doc_round_trip():
-    t = Task.new("gland detector", workflow="H&E L0", n_classes=4)
-    assert t.workflow == "H&E L0" and t.store.n_classes == 4 and t.gesture_count == 0
+    wf = {"name": "H&E L0", "msc": {"persistence_percent": 5}}
+    t = Task.new("gland detector", workflow=wf, n_classes=4)
+    assert t.workflow == {"name": "gland detector", "msc": {"persistence_percent": 5}},         "a private copy named after the task"
+    assert t.workflow is not wf and wf["name"] == "H&E L0"
+    assert t.store.n_classes == 4 and t.gesture_count == 0
     t.store.set_name(1, "gland")
     t.store.add("squiggle", [(1, 1), (2, 2)], 1, "f/a.tif", 0, 0)
     t.models.append({"path": "/nowhere/m.pkl", "kind": "dense FC", "fingerprint": ["a"]})
@@ -61,6 +64,7 @@ def test_new_task_and_doc_round_trip():
     assert doc["annotations"]["classes"][0] == {"id": 1, "color": t.store.color(1), "name": "gland"}
     back = Task.from_doc(doc)
     assert back.uid == t.uid and back.name == t.name and back.workflow == t.workflow
+    assert doc["workflow"] is not t.workflow, "the document holds a copy"
     assert back.store.to_json() == t.store.to_json()
     assert back.models == t.models and back.view == doc["view"]
     assert back.model_pending is False          # the recorded pickle does not exist
@@ -74,14 +78,17 @@ def test_unbound_workflow_is_omitted_from_the_doc():
 
 
 def test_duplicate_copies_vocabulary_not_gestures():
-    t = Task.new("stroma", workflow="w", n_classes=3)
+    t = Task.new("stroma", workflow={"name": "w", "statistics": {"channels": ["base"]}}, n_classes=3)
     t.store.set_color(1, "#123456")
     t.store.set_name(2, "not stroma")
     t.store.add("box", [(0, 0), (3, 3)], 1, "f/a.tif", 0, 0)
     t.view = {"model_kind": "dense (tuned)", "neighbours": {"custom_hidden": "8"}}
     t.model.clf = object()
     d = t.duplicate("stroma (2)")
-    assert d.uid != t.uid and d.name == "stroma (2)" and d.workflow == "w"
+    assert d.uid != t.uid and d.name == "stroma (2)"
+    assert d.workflow == {"name": "stroma (2)", "statistics": {"channels": ["base"]}}
+    d.workflow["statistics"]["channels"].append("filtered")
+    assert t.workflow["statistics"]["channels"] == ["base"], "the workflow is copied, not shared"
     assert d.store.n_classes == 3 and d.store.color(1) == "#123456" and d.store.name(2) == "not stroma"
     assert d.gesture_count == 0 and d.model.empty and d.models == []
     assert d.view == t.view and d.view is not t.view

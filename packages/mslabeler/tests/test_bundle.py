@@ -64,8 +64,9 @@ def test_record_entry(tmp_path):
 def test_compat_message_is_a_set_comparison():
     assert compat_message(["a", "b"], ["b", "a"], "p", "load") is None
     msg = compat_message(["a", "mean_blur_s1.5"], ["a", "bbox_h", "bbox_w"], "default", "load")
-    assert msg == ("Model does not match profile 'default' statistics (load) - "
-                   "model needs: mean_blur_s1.5; profile adds: bbox_h, bbox_w. "
-                   "Switch profiles or retrain.")
+    assert msg == ("Model does not match workflow 'default' statistics (load) - "
+                   "model needs: mean_blur_s1.5; workflow adds: bbox_h, bbox_w. "
+                   "Change the workflow's Features or retrain.")
     many = compat_message([], [f"f{i}" for i in range(9)], "p", "train")
-    assert many.endswith("profile adds: f0, f1, f2, f3, f4, f5…. Switch profiles or retrain.")
+    assert many.endswith("workflow adds: f0, f1, f2, f3, f4, f5…. "
+                         "Change the workflow's Features or retrain.")

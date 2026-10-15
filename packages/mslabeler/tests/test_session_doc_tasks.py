@@ -1,5 +1,7 @@
-"""The session document with tasks (v3), and how a v2 document reads as one
-task. Pure; the framework's default (pass-through) profile reader."""
+"""The session document with tasks (v5: every task owns its workflow), how a
+v4 document's shared profile pool is copied into its tasks, and how a v2
+document reads as one task. Pure; the framework's default (pass-through)
+profile reader."""
 import json
 import re
 
@@ -45,7 +47,7 @@ def test_v2_document_reads_as_one_task_with_the_view_keys_split_out():
     assert len(back["tasks"]) == 1
     t = back["tasks"][0]
     assert UID.fullmatch(t["uid"]) and back["active_task"] == t["uid"]
-    assert t["name"] == "p2" and t["workflow"] == "p2", "named after the active profile"
+    assert t["name"] == "p2" and t["workflow"] == {"name": "p2"}, "named after the active profile"
     assert t["annotations"] == ann
     assert t["models"][0]["context"] == {"kinds": ["ring_mean"]}, "the record's context survives"
     assert t["view"] == {"model_kind": "random forest", "model_search": {"trials": 4}}
@@ -62,30 +64,38 @@ def test_pre_rename_labels_key_reads_into_the_task():
     assert back["annotations"]["n_classes"] == 2
 
 
-def test_v3_round_trip_two_tasks():
-    a = Task.new("gland", workflow="p1", n_classes=3)
+def test_v5_round_trip_two_tasks():
+    a = Task.new("gland", workflow={"name": "p1", "msc": {"persistence_percent": 5}}, n_classes=3)
     a.store.set_name(1, "gland")
     a.store.add("squiggle", [(0, 0), (1, 1)], 1, "d/a.tif", 0, 0)
     a.models.append({"path": "ga.pkl", "kind": "dense (tuned)", "fingerprint": ["x"],
                      "scope": "L0", "context": {"kinds": ["ring_mean"]}})
     a.view = {"model_kind": "dense (tuned)", "context": {"kinds": ["ring_mean"]}}
-    b = Task.new("stroma", workflow="p2", n_classes=3, kind="polyline")
+    b = Task.new("stroma", workflow={"name": "p2", "statistics": {"channels": ["base"]}},
+                 n_classes=3, kind="polyline")
     b.store.add_seam("scope", [(0, 0), (5, 5)], 1, "d/a.tif", 0, 0)
     b.models.append({"path": "sb.pkl", "kind": "seam logistic", "fingerprint": ["y"],
                      "task_kind": "polyline", "seam": True})
     doc = build_session_doc(**_base(), tasks=[a.to_doc(), b.to_doc()], active_task=b.uid,
                             annotations={"should": "not appear"}, models=[{"path": "no"}])
-    assert doc["session_version"] == SESSION_DOC_VERSION_TASKS == 4
+    assert doc["session_version"] == SESSION_DOC_VERSION_TASKS == 5
     assert is_session_doc(doc)
     assert "annotations" not in doc and "models" not in doc, "one source of truth"
+    assert "profiles" not in doc and "active_profile" not in doc, "no shared pool"
     assert doc["active_task"] == b.uid
     notes = []
     back = session_doc_from_json(json.loads(json.dumps(doc)), notes)
     assert notes == []
-    assert back["session_version"] == 4 and back["active_task"] == b.uid
+    assert back["session_version"] == 5 and back["active_task"] == b.uid
     ta, tb = back["tasks"]
-    assert (ta["uid"], ta["name"], ta["workflow"]) == (a.uid, "gland", "p1")
-    assert (tb["uid"], tb["name"], tb["workflow"]) == (b.uid, "stroma", "p2")
+    # Each task's own workflow, named after the task.
+    assert (ta["uid"], ta["name"]) == (a.uid, "gland")
+    assert ta["workflow"] == {"name": "gland", "msc": {"persistence_percent": 5}}
+    assert (tb["uid"], tb["name"]) == (b.uid, "stroma")
+    assert tb["workflow"] == {"name": "stroma", "statistics": {"channels": ["base"]}}
+    # The pool a shell reads IS the tasks' workflows, the active one named.
+    assert back["profiles"] == [ta["workflow"], tb["workflow"]]
+    assert back["active_profile"] == "stroma"
     assert ta["annotations"] == a.store.to_json()
     assert ta["models"] == [{"path": "ga.pkl", "fingerprint": ["x"], "kind": "dense (tuned)",
                              "statistics": {}, "spec": None, "edge": False, "scope": "L0",
@@ -119,9 +129,10 @@ def test_missing_workflow_is_repointed_and_dupes_are_fixed():
     notes = []
     back = session_doc_from_json(json.loads(json.dumps(doc)), notes)
     t0, t1, t2 = back["tasks"]
-    assert t0["workflow"] == "p2" and any("workflow 'gone'" in n for n in notes)
+    assert t0["workflow"] == {"name": "x"} and any("workflow 'gone'" in n for n in notes)
     assert t0["uid"] == "t_aaaaaa" and t1["uid"] != "t_aaaaaa" and UID.fullmatch(t1["uid"])
-    assert t1["workflow"] is None, "an unbound task stays unbound"
+    assert t1["workflow"] == {"name": "x (2)"}, "an unbound task gets the active profile's copy"
+    assert t2["workflow"] == {"name": "y"}
     assert (t0["name"], t1["name"]) == ("x", "x (2)")
     assert UID.fullmatch(t2["uid"]) and t2["models"] == [] and t2["view"] == {"model_kind": "k"}
     assert back["active_task"] == "t_aaaaaa", "an unknown active task falls back to the first"
@@ -131,7 +142,41 @@ def test_reader_is_total_and_always_has_a_task():
     back = session_doc_from_json(None)
     assert back["session_version"] == 2
     assert len(back["tasks"]) == 1 and back["tasks"][0]["name"] == "default"
-    assert back["tasks"][0]["workflow"] == "default" and back["annotations"] is None
+    assert back["tasks"][0]["workflow"] == {"name": "default"} and back["annotations"] is None
     junk = session_doc_from_json({"tasks": "nope", "view": "x", "active_task": 3})
     assert len(junk["tasks"]) == 1 and junk["view"] == {}
     assert session_doc.new_task_uid(["t_000000"]) != "t_000000"
+
+
+def test_v4_pool_is_copied_into_every_task_that_named_it():
+    """A v4 document named profiles in a session pool; reading it gives each
+    task an equal but INDEPENDENT copy, named after the task."""
+    shared = {"name": "H&E", "msc": {"persistence_percent": 7}}
+    doc = {"session_version": 4, "profiles": [shared, {"name": "other"}],
+           "active_profile": "other", "active_task": "t_000002",
+           "tasks": [{"uid": "t_000001", "name": "gland", "kind": "region", "workflow": "H&E"},
+                     {"uid": "t_000002", "name": "walls", "kind": "polyline", "workflow": "H&E"},
+                     {"uid": "t_000003", "name": "odd", "kind": "region", "workflow": "gone"}]}
+    notes = []
+    back = session_doc_from_json(json.loads(json.dumps(doc)), notes)
+    g, w, o = back["tasks"]
+    assert g["workflow"] == {"name": "gland", "msc": {"persistence_percent": 7}}
+    assert w["workflow"] == {"name": "walls", "msc": {"persistence_percent": 7}}
+    assert g["workflow"] is not w["workflow"] and g["workflow"]["msc"] is not w["workflow"]["msc"]
+    assert o["workflow"] == {"name": "odd"}, "an unknown name copies the active profile"
+    assert any("workflow 'gone'" in n for n in notes)
+    assert any("copied into 3 task(s)" in n for n in notes)
+    assert back["session_version"] == SESSION_DOC_VERSION_TASKS
+    assert [p["name"] for p in back["profiles"]] == ["gland", "walls", "odd"]
+    assert back["active_profile"] == "walls"
+    # And it writes back as v5 with the copies inline.
+    tasks = [Task.from_doc(t) for t in back["tasks"]]
+    tasks[0].workflow["msc"]["persistence_percent"] = 3
+    assert tasks[1].workflow["msc"]["persistence_percent"] == 7, "independent copies"
+    out = build_session_doc(**_base(), tasks=[t.to_doc() for t in tasks], active_task="t_000002")
+    assert out["tasks"][0]["workflow"]["msc"] == {"persistence_percent": 3}
+
+
+def test_pre_kind_documents_are_still_refused():
+    doc = {"session_version": 3, "tasks": [{"uid": "t_000001", "name": "a", "workflow": "p"}]}
+    assert session_doc.labeler_refusal(doc) is not None

@@ -194,7 +194,7 @@ def compat_message(names: Sequence[str], expected: Sequence[str], profile_name: 
     case, so listing them would say nothing about what is wrong.
     """
     if (scope or None) != (expected_scope or None):
-        return (f"Model was trained at {scope or 'no scope'}, but profile "
+        return (f"Model was trained at {scope or 'no scope'}, but workflow "
                 f"{profile_name!r} is at {expected_scope or 'no scope'} "
                 f"({context}) - the feature names match but the measurements "
                 f"are not comparable. Switch back, or retrain here.")
@@ -208,8 +208,8 @@ def compat_message(names: Sequence[str], expected: Sequence[str], profile_name: 
         parts.append("model needs: " + ", ".join(missing[:6])
                      + ("…" if len(missing) > 6 else ""))
     if extra:
-        parts.append("profile adds: " + ", ".join(extra[:6])
+        parts.append("workflow adds: " + ", ".join(extra[:6])
                      + ("…" if len(extra) > 6 else ""))
-    return (f"Model does not match profile '{profile_name}' statistics "
+    return (f"Model does not match workflow '{profile_name}' statistics "
             f"({context}) - " + "; ".join(parts)
-            + ". Switch profiles or retrain.")
+            + ". Change the workflow's Features or retrain.")

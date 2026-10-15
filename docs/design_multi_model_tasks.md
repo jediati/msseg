@@ -563,6 +563,8 @@ Stages:
 3. **Derivation module** (§7.2) and the closed-trace-plus-tap tool.
 4. **Places and enrolment** (§5).
 5. **Layered cache keys** (§6); the re-measure question answered here.
+5b. **Task-owned workflows**: every task owns its workflow; sharing is by
+   content (below).
 6. **Level sweep** (§8.4) -- cheap once 2 and 5 exist.
 7. **Layers and subscriptions** (§9): masks and gestures first, then context,
    then embeddings.
@@ -729,6 +731,48 @@ test; the mspath labeler selftest switches task A -> B -> A and finds A's
 record and prediction with no re-measure, and runs Run all tasks over a
 third field; the coupon labeler selftest checks that a profile round trip
 returns its commit.
+
+**What exists (stage 5b, task-owned workflows, 2026-10-15).** Stage 1 kept
+profiles session-level so that two tasks on one workflow would share its
+primes. Stage 5 made that sharing a property of CONTENT -- primes are kept
+by the field fingerprint, records interned by `(..., measurement,
+persistence)` -- and in practice a session is "every kind of task I want on
+this set of slides", where one shared pool is the wrong granularity: the
+statistics, base chain and persistence that make a task's row were shared,
+by name, with every task that happened to name the same profile. So every
+task now OWNS its workflow, the whole profile document, and a new one is a
+COPY (another task's, a template file, the defaults), never a link.
+
+* **Mechanism.** `Task.workflow` is the profile dict, named after the task.
+  The shell's profile machinery is untouched: `AnnotationShell` keeps the
+  pool as a mirror, `profiles[i] IS tasks[i].workflow` (`_link_pool` after a
+  task-list change, `_pool_to_tasks` after the shell's snapshot replaces an
+  entry), so a task switch is `_switch_profile(tasks.index(task))` with the
+  usual snapshot, keep-the-primes test and re-apply. Two EQUAL workflows
+  switch with nothing to redo. `_replace_workflow` is Copy from task /
+  Load workflow / a model's statistics.
+* **UI.** No picker; Copy from task… / Load workflow… / Save workflow… head
+  the Processing tab; New task asks for the source; the Tasks list's
+  workflow column is the field line of the summary. The live persistence is
+  the workflow's LAST Processing stage (4b, both labelers), not a view
+  control -- it decides which regions exist. The context columns moved to
+  the Features tab (9. Context, the last group: they are built from the
+  columns above them); the latent ring head, which needs a trained net,
+  stays on Model. The Features tab is now "the row this task's model reads".
+* **Document v5.** `tasks[].workflow` inline, no `profiles`. A v4 document
+  migrates rather than being refused (each task gets a copy of the profile
+  it named; lossless), a viewer's tasks-less document is one task with a
+  copy of its active profile (the spare profiles are noted).
+* **Run all tasks** (mspath) groups by field fingerprint; **input slots**
+  keep their semantics (the provider's net reads the consumer's rows) and
+  note a provider on another field ("builds different regions").
+* **Accepted.** The coupon keeps one field live, so switching between
+  tasks on different fields re-primes (mspath has a slot per field). The
+  CLI export (dormant) takes the live persistence.
+* **Future.** A field REFERENCE (`{"source": "task", "uid"}`, the input
+  slots' shape) for "this task's regions are that task's": a guarantee kept
+  across edits, where content equality today is only a coincidence the
+  caches exploit.
 
 Stage 1 touched `session_doc.py`, the new `msseg/labeler/task.py`,
 `labeling.py`, `annotate.py`, `shell.py`, `panels/classpanel.py`,

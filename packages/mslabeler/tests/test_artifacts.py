@@ -50,8 +50,8 @@ def test_normalise_inputs_is_total():
 
 
 def test_task_writes_inputs_only_when_set_and_round_trips():
-    region = Task.new("glands", workflow="p1")
-    walls = Task.new("walls", workflow="p1", kind="polyline")
+    region = Task.new("glands", workflow={"name": "p1"})
+    walls = Task.new("walls", workflow={"name": "p1"}, kind="polyline")
     assert "inputs" not in walls.to_doc()
     walls.inputs = {"labels": {"source": "task", "uid": region.uid, "boundary_class": 2}}
     doc = walls.to_doc()
@@ -73,9 +73,9 @@ def test_task_writes_inputs_only_when_set_and_round_trips():
 
 
 def test_resolve_and_capabilities_without_a_model():
-    region = Task.new("glands", workflow="p1")
-    walls = Task.new("walls", workflow="p1", kind="polyline")
-    other = Task.new("more walls", workflow="p1", kind="polyline")
+    region = Task.new("glands", workflow={"name": "p1"})
+    walls = Task.new("walls", workflow={"name": "p1"}, kind="polyline")
+    other = Task.new("more walls", workflow={"name": "p1"}, kind="polyline")
     tasks = [region, walls, other]
     assert af.resolve(None, tasks) is None
     p = af.resolve(af.ProviderRef.task(region.uid), tasks, consumer=walls.uid)
@@ -145,10 +145,10 @@ def test_model_read_without_activation_and_pdiff(tmp_path):
     path = str(tmp_path / "glands.pkl")
     b = bundle.ModelBundle(model=est, names=NAMES, kind="dense FC", edge=edge.to_dict())
     b.save(path)
-    region = Task.new("glands", workflow="p1")
+    region = Task.new("glands", workflow={"name": "p1"})
     region.models.append(b.record_entry(path))
     region.model_pending = True
-    walls = Task.new("walls", workflow="p1", kind="polyline")
+    walls = Task.new("walls", workflow={"name": "p1"}, kind="polyline")
     af.clear_stack_cache()
     p = af.resolve(af.ProviderRef.task(region.uid), [region, walls], consumer=walls.uid)
     assert p.capabilities() == {"labels", "embedding", "pdiff"}
@@ -218,10 +218,10 @@ def test_a_net_over_context_columns_is_an_input(tmp_path):
                                                            max_iter=300), names), Xa, c)
     edge = em.fit_edge_model(est, Xa, c, em.gather_edges([(fids, arcs, c, 0)]), None,
                              em.EdgeSpec(), names)
-    region = Task.new("glands", workflow="p1")
+    region = Task.new("glands", workflow={"name": "p1"})
     region.model.clf, region.model.names = est, names
     region.model.context, region.model.edge = spec, edge
-    walls = Task.new("walls", workflow="p1", kind="polyline")
+    walls = Task.new("walls", workflow={"name": "p1"}, kind="polyline")
     p = af.resolve(af.ProviderRef.task(region.uid), [region, walls], consumer=walls.uid)
     assert p.capabilities() == {"labels", "embedding", "pdiff"}
     assert p.context_spec() == spec and p.base() == (est, names)
@@ -255,9 +255,9 @@ def test_the_embedding_layer_is_picked_on_the_slot():
     fids, X, c, arcs = _lattice()
     est = ms.fit_estimator(ms.build_estimator(ms.ModelSpec(hidden=(16, 8, 4), backend="sklearn",
                                                            max_iter=200), NAMES), X, c)
-    region = Task.new("glands", workflow="p1")
+    region = Task.new("glands", workflow={"name": "p1"})
     region.model.clf, region.model.names, region.model.kind = est, NAMES, "custom FC"
-    walls = Task.new("walls", workflow="p1", kind="polyline")
+    walls = Task.new("walls", workflow={"name": "p1"}, kind="polyline")
     ref = af.ProviderRef.task(region.uid)
 
     def prov(layer=None):

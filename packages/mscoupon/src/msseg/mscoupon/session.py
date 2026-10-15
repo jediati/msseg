@@ -151,6 +151,12 @@ def profile_from_json(doc: Any, notes: Optional[List[str]] = None) -> Dict[str, 
         "max_region_area": max_region_area(msc),
         "max_region_parallel": msc.get("max_region_parallel") is not False,
     }
+    # A labeler workflow's live persistence (the regions are read at it; the
+    # percentage above is the prime's cap). Only when present, so a viewer
+    # profile reads back exactly as before.
+    live = _opt_float(msc.get("persistence_live"))
+    if live is not None:
+        out["msc"]["persistence_live"] = float(live)
 
     stats = config_io.statistics_from_json(root.get("statistics"), notes)
     # `sources` rides through: a profile that declares one and loses it on load

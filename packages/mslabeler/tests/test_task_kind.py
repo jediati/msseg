@@ -16,7 +16,7 @@ def test_kinds_and_the_default():
 
 
 def test_the_kind_round_trips_and_survives_duplicate():
-    t = Task.new("walls", workflow="p", kind="polyline")
+    t = Task.new("walls", workflow={"name": "p"}, kind="polyline")
     doc = t.to_doc()
     assert doc["kind"] == "polyline"
     back = Task.from_doc(doc)
@@ -32,11 +32,11 @@ def test_normalise_kind_notes_junk():
 
 
 def test_the_reader_passes_the_kind_and_a_tasks_less_document_is_one_region_task():
-    t = Task.new("walls", workflow="p", kind="polyline")
+    t = Task.new("walls", workflow={"name": "p"}, kind="polyline")
     doc = build_session_doc(app="labeler", folders=[], sequences=[],
                             profiles=[{"name": "p"}], active_profile="p",
                             run={}, view={}, tasks=[t.to_doc()], active_task=t.uid)
-    assert doc["session_version"] == 4
+    assert doc["session_version"] == 5
     back = session_doc_from_json(doc)
     assert back["tasks"][0]["kind"] == "polyline"
     assert labeler_refusal(doc) is None

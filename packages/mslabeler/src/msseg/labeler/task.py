@@ -10,9 +10,13 @@ stage 1 of §12).
 
 What a task owns:
 
-* ``workflow`` -- the NAME of a compute profile in the session's shared pool.
-  Profiles stay session-level (two tasks that share one share its primes for
-  free, later); the task only points at one.
+* ``workflow`` -- its compute profile, the whole document (topology chain,
+  MSC, persistence, base chain, statistics): every task owns one (stage 6 of
+  docs/design_multi_model_tasks.md). Two tasks whose workflows agree still
+  share primes and records -- the caches key on content (the field and
+  measurement fingerprints), not on which task asked -- so owning costs
+  nothing when the settings match. A new task's workflow is a COPY (of a
+  template file or of another task), never a live link.
 * ``store`` -- its ``LabelStore``: region gestures, seam gestures, the class
   count, colours and names. Gestures are geometry, so a store never depends
   on the workflow it was drawn under.
@@ -131,7 +135,9 @@ class TaskCaches:
 class Task:
     uid: str
     name: str
-    workflow: Optional[str] = None        # a profile name; None until bound
+    # The task's own profile document (the app's ``_profile_from_ui`` shape,
+    # its "name" kept equal to the task's); None until the shell binds one.
+    workflow: Optional[Dict[str, Any]] = None
     # "region" | "polyline": what the task labels, fixed at creation.
     kind: str = DEFAULT_TASK_KIND
     store: LabelStore = field(default_factory=LabelStore)
@@ -158,7 +164,7 @@ class Task:
 
     # -- construction ------------------------------------------------------ #
     @classmethod
-    def new(cls, name: str, workflow: Optional[str] = None, n_classes: int = 3,
+    def new(cls, name: str, workflow: Optional[Dict[str, Any]] = None, n_classes: int = 3,
             uid: Optional[str] = None, taken: Sequence[str] = (),
             kind: str = DEFAULT_TASK_KIND) -> "Task":
         if kind not in TASK_KINDS:
@@ -171,18 +177,19 @@ class Task:
                 if k < store.n_classes:
                     store.names[k] = label
                     store.colors[k] = colour
-        return cls(uid=uid or new_uid(taken), name=str(name), workflow=workflow,
-                   kind=kind, store=store)
+        return cls(uid=uid or new_uid(taken), name=str(name),
+                   workflow=_named_workflow(workflow, name), kind=kind, store=store)
 
     def duplicate(self, name: str, uid: Optional[str] = None,
                   taken: Sequence[str] = ()) -> "Task":
         """A new task with this one's vocabulary (count, colours, names),
-        workflow, Model-tab settings and enrolment (it works the same
-        places) -- and no gestures, no model, no history."""
+        a copy of its workflow, its Model-tab settings and enrolment (it
+        works the same places) -- and no gestures, no model, no history."""
         store = LabelStore(n_classes=self.store.n_classes)
         store.colors = dict(self.store.colors)
         store.names = dict(self.store.names)
-        return Task(uid=uid or new_uid(taken), name=str(name), workflow=self.workflow,
+        return Task(uid=uid or new_uid(taken), name=str(name),
+                    workflow=_named_workflow(self.workflow, name),
                     kind=self.kind, store=store, view=_deep_copy_json(self.view),
                     enrolled=_deep_copy_json(self.enrolled),
                     inputs=_deep_copy_json(self.inputs))
@@ -196,7 +203,7 @@ class Task:
     def to_doc(self) -> Dict[str, Any]:
         doc: Dict[str, Any] = {"uid": self.uid, "name": self.name, "kind": self.kind}
         if self.workflow is not None:
-            doc["workflow"] = str(self.workflow)
+            doc["workflow"] = _deep_copy_json(self.workflow)
         doc["annotations"] = self.store.to_json()
         doc["models"] = [dict(m) for m in self.models]
         doc["view"] = {k: self.view[k] for k in TASK_VIEW_KEYS if k in self.view}
@@ -217,8 +224,7 @@ class Task:
         d = d if isinstance(d, dict) else {}
         name = str(d.get("name") or DEFAULT_TASK_NAME)
         uid = str(d.get("uid") or new_uid())
-        workflow = d.get("workflow")
-        workflow = str(workflow) if workflow is not None else None
+        workflow = _named_workflow(d.get("workflow"), name)
         kind = d.get("kind") if d.get("kind") in TASK_KINDS else DEFAULT_TASK_KIND
         store = LabelStore()
         ann = d.get("annotations")
@@ -245,6 +251,18 @@ class Task:
 # derived interiors fill), 2 = a boundary; renameable and recolourable, and
 # more boundary kinds are one Classes click away.
 POLYLINE_DEFAULT_CLASSES = {1: ("not a boundary", "#46beff"), 2: ("boundary", "#ff3cc8")}
+
+
+def _named_workflow(workflow: Any, name: str) -> Any:
+    """A private copy of `workflow` named after its task (a profile's
+    name is how the shell's messages refer to it). Anything that is not a
+    profile dict -- None, or the bare name a hand-built test task carries --
+    passes through."""
+    if not isinstance(workflow, dict):
+        return workflow
+    out = _deep_copy_json(workflow)
+    out["name"] = str(name)
+    return out
 
 
 def _deep_copy_json(value: Any) -> Any:

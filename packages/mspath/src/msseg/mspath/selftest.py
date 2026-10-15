@@ -1251,31 +1251,47 @@ def run_labeler_selftest():
     app._undo()
     assert len(app.store.interactions) == 3 and not any(it.bound for it in app.store.interactions)
 
-    # Tasks: a second detector over the same slides has its own store and
-    # model; a profile built from a model binds to the active task; both
-    # tasks ride the session document into a fresh window.
+    # Tasks: a second detector over the same slides has its own store, model
+    # and workflow (a copy); a workflow built from a model replaces the
+    # active task's only; both tasks ride the session document into a fresh
+    # window.
+    import json as _json0
     t1 = app._task
     clf1 = app._clf
     assert clf1 is not None
     t2 = app._task_new("stroma")
     assert app._task is t2 and app._clf is None and app.store.interactions == []
-    assert app._pred == {} and t2.workflow == t1.workflow
+    assert app._pred == {} and t2.workflow == dict(t1.workflow, name="stroma")
+    assert t2.workflow is not t1.workflow
     assert str(app.classify_btn.cget("state")) == "disabled"
     assert app._activate_task(t1) and app._clf is clf1 and len(app.store.interactions) == 3
     assert str(app.classify_btn.cget("state")) == "normal"
     n_prof = len(app.profiles)
+    wf2 = _json0.loads(_json0.dumps(t2.workflow))
     prof = app._profile_from_model(os.path.join("C:", "x", "gland_model.pkl"), {"channels": ["base"]})
-    assert len(app.profiles) == n_prof + 1 and app.active_profile_idx == n_prof
-    assert t1.workflow == prof["name"] and t2.workflow != prof["name"], \
-        "a profile from a model becomes the active task's workflow only"
+    assert len(app.profiles) == n_prof and prof is t1.workflow
+    assert prof["statistics"] == {"channels": ["base"]} and prof["name"] == t1.name
+    assert t2.workflow == wf2, "a workflow from a model replaces the active task's only"
     doc_t = app._session_doc()
-    assert doc_t["session_version"] == 4 and len(doc_t["tasks"]) == 2
-    assert doc_t["active_task"] == t1.uid and doc_t["tasks"][0]["workflow"] == prof["name"]
+    assert doc_t["session_version"] == 5 and len(doc_t["tasks"]) == 2
+    assert doc_t["active_task"] == t1.uid and doc_t["tasks"][0]["workflow"] == t1.workflow
     app2 = LabelerApp(tk.Toplevel(root), autosave=False)
     app2._apply_session_doc(doc_t, "tasks")
+    assert doc_t["tasks"][0]["workflow"] == t1.workflow, "the reader leaves the document alone"
     assert [t.name for t in app2.tasks] == [t1.name, "stroma"] and app2._task.uid == t1.uid
     assert len(app2.store.interactions) == 3 and app2.tasks[1].gesture_count == 0
-    assert app2.profiles[app2.active_profile_idx]["name"] == prof["name"]
+    assert app2.profiles[app2.active_profile_idx] is app2._task.workflow
+    # (Compared as what they compute, each through the profile reader: the
+    # reader fills in defaults a workflow written by the widgets leaves out.)
+    from msseg.mscoupon import session as _cs
+    from msseg.mscoupon.fingerprints import field_fingerprint_of as _f0, measure_fingerprint_of as _m0
+
+    def _prints(wf):
+        wf = app2._profile_from_file_doc(_json0.loads(_json0.dumps(wf)), [])
+        doc = _json0.loads(_cs.profile_params_json(wf, 1, 3))
+        return _f0(doc), _m0(doc)
+    assert _prints(app2._task.workflow) == _prints(t1.workflow)
+    assert _prints(app2.tasks[1].workflow) == _prints(t2.workflow)
     assert app2._feature_scope() == app._feature_scope()
 
     # -- Places and enrolment (design note §5): a place is the slide's, the
@@ -1469,28 +1485,27 @@ def run_labeler_selftest():
         assert app.engine.primed[kk] is live0 and live0.live
         app._refresh_stages()
         assert app.viewer.stages["stats"] == "ok", "re-measured: the stats box is green"
-        # A profile that differs only in its statistics: kept, re-measured.
+        # A workflow that differs only in its statistics: kept, re-measured.
         app._snapshot_active_profile()
-        other = _json.loads(_json.dumps(app.profiles[app.active_profile_idx]))
-        other["name"] = "stats only"
+        blur_wf = _json.loads(_json.dumps(app._task.workflow))
+        other = _json.loads(_json.dumps(blur_wf))
         other["statistics"]["channels"] = ["base"]
-        app.profiles.append(other)
-        app._switch_profile(len(app.profiles) - 1)
+        assert app._replace_workflow(other)
         _settle(app)
         assert app.engine.primed.get(kk) is live0 and live0.live, "the switch kept the pipe"
         rec2 = app.engine.record(kk) or app.engine.ensure_record(kk, app._profile_for_compute())
         assert "mean_blur_s2" not in rec2["stats"].names
         assert np.array_equal(rec2["labels"], labels0) and primes == []
-        # Task switches keep what a task computed. A (this task, on "stats
-        # only") holds a prediction on rec2; B, a copy of A, works the same
-        # items on the blur workflow. Back in A the record is A's again --
+        # Task switches keep what a task computed. A (this task, base-only
+        # statistics) holds a prediction on rec2; B, a copy of A, works the
+        # same items with the blur statistics. Back in A the record is A's again --
         # the same id, so A's prediction is valid -- with no re-measure.
         tA = app._task
         fake_final = np.ones(int(rec2["n_ids"]), np.int64)            # every region: class 1
         app._pred[kk] = (rec2["commit"], fake_final, None)
         tB = app._task_duplicate("B")
         assert tB is not None and app._task is tB
-        app._switch_profile(len(app.profiles) - 2)             # B on the blur workflow
+        assert app._replace_workflow(blur_wf)                  # B measures the blur
         _settle(app)
         recB = app.engine.record(kk) or app.engine.ensure_record(kk, app._profile_for_compute())
         assert "mean_blur_s2" in recB["stats"].names and recB["commit"] == rec1["commit"], \
@@ -1509,13 +1524,11 @@ def run_labeler_selftest():
         # into its own slot; switching to it then needs no prime, and A's pipe
         # is still there when A comes back.
         from msseg.mscoupon.fingerprints import field_fingerprint_of as _ffp
-        coarse = _json.loads(_json.dumps(app.profiles[app._profile_index(tA.workflow)]))
-        coarse["name"] = "coarse"
+        coarse = _json.loads(_json.dumps(tA.workflow))
         coarse["filters"] = list(coarse.get("filters") or []) + [
             {"operation": "blur", "params": {"sigma": 3.0}}]
-        app.profiles.append(coarse)
         tC = app._task_duplicate("C")
-        app._switch_profile(len(app.profiles) - 1)           # C on "coarse": no prime
+        assert app._replace_workflow(coarse)                 # C on a coarser field: no prime
         _settle(app)
         assert app.engine.primed.get(kk) is None, "a new field starts empty -- and unprimed"
         assert app._activate_task(tA)
@@ -1557,7 +1570,7 @@ def run_labeler_selftest():
           "the slide's key + scale of intent + rect query + item-key rebase + "
           "an ROI's removal keeps them + the coarse mark, "
           "seam tools in slide coordinates, tasks: own store + model, "
-          "profile-from-model binds the active task, two tasks into a fresh window, "
+          "workflow-from-model replaces the active task's, two tasks into a fresh window, "
           f"{strip_checked}, {remeasured}, "
           "places + enrolment: nothing worked until enrolled, browse, outlines, "
           "one place at two levels, Run task / all, round trip + legacy, removal")

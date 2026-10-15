@@ -102,24 +102,64 @@ class LabelerApp(AnnotationShell, MscouponApp):
         self._refresh_confusion()
 
     def _build_live_panel(self, parent):
-        # persistence: region identity depends on it, so it stays adjustable;
-        # commit is the Rerun button exactly as in the viewer. These controls
-        # live directly under the image controls rather than in a subpanel.
-        row = ttk.Frame(parent); row.pack(fill="x", padx=4, pady=2)
+        """Nothing under the picture: the persistence is the LAST stage of the
+        workflow (it decides which regions exist), so it is a Processing
+        group (_build_persistence_group), not a view control. No per-slice
+        selection / pixel trim / connectivity either: the labeler works on
+        the full pre-filter MSC labeling (the guarded _rebuild_*_cards no-op
+        without their frames)."""
+
+    def _build_processing_sections(self):
+        super()._build_processing_sections()
+        self._build_persistence_group()
+
+    def _build_persistence_group(self):
+        # Region identity depends on it, so it stays adjustable; the commit is
+        # the button, exactly as the viewer's Rerun.
+        c = self._group(self._processing_parent("persistence"), "4b. Persistence",
+                        key="persistence")
+        self.persist_frame = c
+        row = ttk.Frame(c); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="Persistence %:").pack(side="left")
         self.persist_entry = ttk.Entry(row, textvariable=self.persist_live_var, width=8)
         self.persist_entry.pack(side="left", padx=4)
         self.persist_entry.bind("<Return>", self._on_persistence_change)
         self.persist_entry.bind("<FocusOut>", self._on_persistence_change)
+        attach_tooltip(self.persist_entry,
+                       "The simplification the regions are read at, up to the MSC's "
+                       "Max persistence % (above it, raise that and Run). Part of "
+                       "the task's workflow: a task switch brings its own back.")
         self.persist_value_label = ttk.Label(row, text="")
         self.persist_value_label.pack(side="left", padx=4)
-
-        # No per-slice selection / pixel trim / connectivity: the labeler works
-        # on the full pre-filter MSC labeling (the guarded _rebuild_*_cards
-        # no-op without their frames).
-        self.rerun_btn = ttk.Button(row, text="update region simplification", state="disabled",
+        self.rerun_btn = ttk.Button(c, text="update region simplification", state="disabled",
                                     command=self._rerun_selection)
-        self.rerun_btn.pack(side="left", padx=4)
+        self.rerun_btn.pack(anchor="w", padx=4, pady=(0, 4))
+
+    # The live persistence rides the task's WORKFLOW (msc.persistence_live),
+    # not the window's view: it decides which regions a task's gestures and
+    # predictions are about. (The viewer keeps it in its view.)
+    def _profile_from_ui(self):
+        prof = super()._profile_from_ui()
+        try:
+            prof["msc"]["persistence_live"] = float(self.persist_live_var.get())
+        except (ValueError, tk.TclError):
+            pass
+        return prof
+
+    def _apply_profile_to_ui(self, profile, setvar, notes):
+        super()._apply_profile_to_ui(profile, setvar, notes)
+        live = (profile.get("msc") or {}).get("persistence_live")
+        if live is not None:
+            setvar(self.persist_live_var, f"{float(live):g}")
+
+    def _view_state(self):
+        view = super()._view_state()
+        view.pop("persist_live", None)
+        return view
+
+    def _apply_view_state(self, view, setvar, notes):
+        super()._apply_view_state({k: v for k, v in view.items() if k != "persist_live"},
+                                  setvar, notes)
 
     def _feature_schema_now(self):
         try:
@@ -196,33 +236,33 @@ class LabelerApp(AnnotationShell, MscouponApp):
             return ("none", "Not computed at these parameters yet.")
         return ("ok", "Regions and statistics current for this workflow's Features.")
 
-    def _profile_from_model(self, path, statistics):
-        """Append a profile that keeps the active one's filters/MSC/selection
-        but MEASURES what the model was trained on, and activate it.
+    def _workflow_field_key(self, workflow):
+        from . import fingerprints
+        return fingerprints.field_fingerprint_of(session.profile_params_json(workflow))
 
-        A new profile rather than an edit of the active one: profiles have no
-        undo stack. The new profile shares the active one's FIELD, so the
-        switch keeps the primed stack and the slices re-measure under the
-        model's statistics as they are read -- no Run."""
+    def _profile_from_model(self, path, statistics):
+        """Make the active task's workflow MEASURE what the model was trained
+        on, keeping its filters / MSC / selection.
+
+        The workflow keeps its FIELD, so the replacement keeps the primed
+        stack and the slices re-measure under the model's statistics as they
+        are read -- no Run. (Save workflow… first to keep the old statistics
+        as a template: a workflow has no undo stack.)"""
         self._snapshot_active_profile()
-        base = {}
-        if 0 <= self.active_profile_idx < len(self.profiles):
-            base = json.loads(json.dumps(self.profiles[self.active_profile_idx]))
+        base = json.loads(json.dumps(self._task.workflow or {}))
         stats = json.loads(json.dumps(statistics))
         base["statistics"] = stats
         # profile_from_json takes the radius from msc, not from the statistics
         # block, so carry the model's across or the round-trip would reset it.
         base.setdefault("msc", {})["extremum_sample_radius"] = max(
             0, int(stats.get("extremum_sample_radius") or 0))
-        base["name"] = session.dedupe_profile_name(
-            f"from {os.path.basename(path)}", [p["name"] for p in self.profiles])
         notes = []
         # The round-trip re-validates feature_filters against the field
         # universe the NEW statistics produce, dropping the stale ones.
-        self.profiles.append(session.profile_from_json(base, notes))
+        prof = session.profile_from_json(base, notes)
         for msg in notes:
             log(msg)
-        self._switch_profile(len(self.profiles) - 1)
+        self._replace_workflow(prof, f"model {os.path.basename(path)}")
 
     def _make_training_set(self):
         """Pick a folder; write `train/` (the raw input TIFFs) and `labels/`
@@ -513,7 +553,12 @@ def _selftest():
                       if isinstance(w, ttk.Entry)
                       and str(w.cget("textvariable")) == str(app.ext_radius_var)]
     assert len(radius_entries) == 1, "the ext sample radius is a statistics field"
-    assert set(app._proc_groups) >= {"filters", "base", "msc", "stats"}
+    assert set(app._proc_groups) >= {"filters", "base", "msc", "stats", "persistence", "context"}
+    # The context columns are the row's last group on Features; the latent
+    # ring head (it needs a trained net) stays on Model.
+    assert _under(app.context_frame, app.features_tab) and not _under(app.context_frame, app.model_tab)
+    assert app.feat_col.pack_slaves()[-1] is app._context_group, "context is the last group"
+    assert _under(app.latent_frame, app.model_tab)
     app._refresh_hints()
     assert app.features_hint_var.get() == "stats: base→1ch×4", app.features_hint_var.get()
     app._show_center_tab("Features")
@@ -526,8 +571,11 @@ def _selftest():
     assert app._proc_groups["msc"].body.winfo_manager() == "", "the body is folded"
     app._apply_proc_open({"msc": True})
     assert app._proc_groups["msc"].is_open() and app._proc_open_state() == {}
-    assert _under(app.profile_combo, app.left) and _under(app.run_btn, app.left_pane)
-    assert not _under(app.profile_load_btn, app.left), "profile tools moved"
+    # No profile picker: the workflow is the active task's; its tools (copy
+    # from a task, load / save a template) head the Processing tab.
+    assert getattr(app, "profile_combo", None) is None and _under(app.run_btn, app.left_pane)
+    assert not _under(app.profile_load_btn, app.left), "workflow tools on Processing"
+    assert _under(app.workflow_copy_btn, app.processing_tab)
     # Left pane: Run pinned at the bottom (packed first, side=bottom), the
     # session's three lists as the panes of a vertical paned window.
     assert _under(app.run_frame, app.left_bottom) and not _under(app.run_btn, app.left)
@@ -829,9 +877,9 @@ def _selftest():
     sdoc = app._session_doc()
     assert sdoc["view"]["center_tab"] == "Model"
     assert sdoc["view"]["panes"] == [0.2, 0.5], sdoc["view"]["panes"]
-    # The Model-tab settings and the gestures are the TASK's (session v3):
-    # one task here, and nothing duplicated at the top level.
-    assert sdoc["session_version"] == 4 and len(sdoc["tasks"]) == 1
+    # The Model-tab settings, the gestures and the workflow are the TASK's
+    # (session v5): one task here, and nothing duplicated at the top level.
+    assert sdoc["session_version"] == 5 and len(sdoc["tasks"]) == 1
     assert sdoc["active_task"] == sdoc["tasks"][0]["uid"] == app._task.uid
     assert "model_kind" not in sdoc["view"], "the picked kind is the task's, not the window's"
     assert sdoc["tasks"][0]["view"]["model_kind"] == _CUSTOM_EDGE_KIND, \
@@ -842,7 +890,9 @@ def _selftest():
         "the gesture geometry is the task's 'annotations' now"
     assert sdoc["tasks"][0]["annotations"]["n_classes"] == 2
     assert len(sdoc["tasks"][0]["annotations"]["interactions"]) == 2
-    assert sdoc["tasks"][0]["workflow"] == app.profiles[app.active_profile_idx]["name"]
+    assert sdoc["tasks"][0]["workflow"] == app._task.workflow
+    assert app.profiles == [app._task.workflow] and app.profiles[0] is app._task.workflow
+    assert "profiles" not in sdoc and "active_profile" not in sdoc, "no shared pool"
     assert sdoc["sequences"][0]["folder"] == "data"
     # A labeler document whose tasks do not say their kind is refused whole.
     old = json.loads(json.dumps(sdoc))
@@ -875,11 +925,16 @@ def _selftest():
     # Model-tab keys in the window view.)
     legacy = {k: v for k, v in sdoc.items() if k not in ("tasks", "active_task")}
     legacy["session_version"] = 2
+    legacy["profiles"] = [sdoc["tasks"][0]["workflow"], dict(sdoc["tasks"][0]["workflow"],
+                                                             name="spare")]
+    legacy["active_profile"] = sdoc["tasks"][0]["workflow"]["name"]
     legacy["labels"] = sdoc["tasks"][0]["annotations"]
     legacy["view"] = dict(sdoc["view"], center_tab="bogus",      # unknown -> untouched
                           **sdoc["tasks"][0]["view"])
     app.store = LabelStore()
-    app._apply_session_doc(legacy, "legacy key")
+    legacy_notes = app._apply_session_doc(legacy, "legacy key")
+    assert any("'spare'" in n and "not carried over" in n for n in legacy_notes), legacy_notes
+    assert len(app.profiles) == 1, "a task owns ONE workflow; the viewer's spare is noted"
     assert app._center_tab_name() == "Processing", "an unknown tab name is ignored"
     assert len(app.store.interactions) == 2, \
         "a pre-rename session's 'labels' key still loads"
@@ -895,13 +950,12 @@ def _selftest():
 
     # Tasks: several detectors over the same data, one active. Gestures, undo
     # history, class vocabulary and Model-tab settings are per task; the
-    # session document carries every task; a task points at a profile by
-    # name and follows it through renames and deletions.
+    # session document carries every task; every task OWNS its workflow.
     from unittest import mock as _mock
     t1 = app._task
     n1 = len(app.store.interactions)
     assert app.tasks == [t1] and tuple(app.task_tree.selection()) == (t1.uid,)
-    assert t1.workflow == app.profiles[app.active_profile_idx]["name"]
+    assert t1.workflow is app.profiles[app.active_profile_idx]
     assert app._rename_class(1, "gland") and app.store.name(1) == "gland"
     assert app._class_title_labels[1].cget("text").startswith("1 gland ·")
     assert not app._rename_class(1, "gland"), "an unchanged name is a no-op"
@@ -910,6 +964,10 @@ def _selftest():
     assert t2 is app._task and app.tasks == [t1, t2] and t2.name == "stroma"
     assert app.store is t2.store and app.store.interactions == [], "a new task starts empty"
     assert app.store.n_classes == t1.store.n_classes and not app.store.has_name(1)
+    assert t2.workflow is not t1.workflow and t2.workflow["name"] == "stroma"
+    assert dict(t2.workflow, name=t1.name) == t1.workflow, \
+        "a headless new task copies the active task's workflow"
+    assert app.profiles == [t1.workflow, t2.workflow] and app.active_profile_idx == 1
     assert app._undo_stack == [] and app._pred == {}
     assert tuple(app.task_tree.selection()) == (t2.uid,)
     assert t1.view["model_kind"] == _CUSTOM_EDGE_KIND, "the outgoing task's Model tab was stashed"
@@ -936,7 +994,7 @@ def _selftest():
     assert app._task_rename("stroma detector")
     # The session document: both tasks, the active one marked, both restored.
     sdoc_t = app._session_doc()
-    assert sdoc_t["session_version"] == 4 and sdoc_t["active_task"] == t2.uid
+    assert sdoc_t["session_version"] == 5 and sdoc_t["active_task"] == t2.uid
     assert [t["name"] for t in sdoc_t["tasks"]] == [t1.name, "stroma detector"]
     assert sdoc_t["tasks"][0]["annotations"]["classes"][0]["name"] == "gland"
     assert sdoc_t["tasks"][0]["view"]["model_kind"] == _CUSTOM_EDGE_KIND
@@ -953,21 +1011,66 @@ def _selftest():
     assert not app._activate_task(t1) and app._task is t2
     assert tuple(app.task_tree.selection()) == (t2.uid,)
     app._search = None
-    # Profiles are the session's pool; a task points at one by name.
-    app._profile_new()
-    new_prof = app.profiles[app.active_profile_idx]["name"]
-    assert t2.workflow == new_prof and t1.workflow != new_prof
-    assert app.task_tree.set(t2.uid, "workflow") == new_prof
-    with _mock.patch("tkinter.simpledialog.askstring", return_value="renamed wf"):
-        app._profile_rename()
-    assert t2.workflow == "renamed wf" and app.task_tree.set(t2.uid, "workflow") == "renamed wf"
-    with _mock.patch.object(messagebox, "askyesno", return_value=True):
-        app._profile_delete()
-    assert "renamed wf" not in [p["name"] for p in app.profiles]
-    assert t2.workflow == app.profiles[app.active_profile_idx]["name"], \
-        "a task on a deleted profile moves to the survivor"
-    assert app._activate_task(t1) and app.profiles[app.active_profile_idx]["name"] == t1.workflow, \
-        "activating a task activates its workflow"
+    # Every task owns its workflow. The pool mirrors the tasks (the same
+    # dicts, task order); a switch snapshots the widgets into the OUTGOING
+    # task's and puts the incoming one's on screen.
+    assert app.profiles == [t1.workflow, t2.workflow]
+    assert app.profiles[app.active_profile_idx] is t2.workflow
+    assert t2.workflow["name"] == "stroma detector", "a task rename names its workflow"
+    assert app.task_tree.set(t2.uid, "workflow") == app._workflow_brief(t2.workflow)
+    pct1 = float(t1.workflow["msc"]["persistence_percent"])
+    app.persist_pct_var.set("17")
+    assert app._activate_task(t1)
+    assert t2.workflow["msc"]["persistence_percent"] == 17.0, "snapshotted into its own task"
+    assert float(app.persist_pct_var.get()) == pct1, "t1's workflow on the widgets"
+    assert app._activate_task(t2) and float(app.persist_pct_var.get()) == 17.0
+    # The live persistence is the workflow's last Processing stage, so it is
+    # per task too -- and no longer part of the window's view.
+    assert _under(app.persist_entry, app.processing_tab)
+    assert app.proc_col.pack_slaves()[-1] is app._proc_groups["persistence"], "the last group"
+    assert _under(app.rerun_btn, app._proc_groups["persistence"])
+    app.persist_live_var.set("4")
+    assert app._activate_task(t1)
+    assert t2.workflow["msc"]["persistence_live"] == 4.0
+    assert float(app.persist_live_var.get()) == t1.workflow["msc"]["persistence_live"] != 4.0
+    assert app._activate_task(t2) and float(app.persist_live_var.get()) == 4.0
+    assert "persist_live" not in app._view_state()
+    assert session.profile_from_json(t2.workflow)["msc"]["persistence_live"] == 4.0, \
+        "the reader keeps it"
+    assert "persistence_live" not in session.profile_from_json({"name": "v"})["msc"], \
+        "a viewer profile reads back as before"
+    # Copy from task: a copy, named after the task that takes it.
+    assert app._workflow_copy_from(t1)
+    assert t2.workflow == dict(t1.workflow, name=t2.name) and t2.workflow is not t1.workflow
+    assert float(app.persist_pct_var.get()) == pct1
+    assert app.profiles[app.active_profile_idx] is t2.workflow
+    assert not app._workflow_copy_from(t2), "not from itself"
+    # Save a template; load it back over an edit.
+    with tempfile.TemporaryDirectory() as _wd:
+        _wp = os.path.join(_wd, "x.profile.json")
+        app.persist_pct_var.set("23")
+        with _mock.patch.object(filedialog, "asksaveasfilename", return_value=_wp):
+            app._save_profile()
+        assert os.path.isfile(_wp)
+        app.persist_pct_var.set("31")
+        assert app._workflow_load_file(_wp)
+        assert float(app.persist_pct_var.get()) == 23.0
+        assert t2.workflow["msc"]["persistence_percent"] == 23.0
+        assert t2.workflow["name"] == t2.name, "a loaded template takes the task's name"
+        assert not app._workflow_load_file(os.path.join(_wd, "missing.json"))
+    # A new task from an explicit template; a refused activation rolls back.
+    t3 = app._task_new("bubbles", workflow=app._default_profile("anything"))
+    assert t3 is app._task and t3.workflow["name"] == "bubbles"
+    assert app.profiles == [t1.workflow, t2.workflow, t3.workflow]
+    assert app._task_delete(confirm=True) and app.tasks == [t1, t2]
+    assert app.profiles == [t1.workflow, t2.workflow]
+    assert app.profiles[app.active_profile_idx] is app._task.workflow
+    app._search = object()
+    assert app._task_new("refused") is None and app.tasks == [t1, t2]
+    assert len(app.profiles) == 2
+    app._search = None
+    assert app._activate_task(t1) and app.profiles[app.active_profile_idx] is t1.workflow, \
+        "activating a task puts its workflow on the widgets"
     # Delete: the neighbour takes over; the last task stays.
     assert app._activate_task(t2) and app._task_delete(confirm=True)
     assert app.tasks == [t1] and app._task is t1 and len(app.store.interactions) == n1
@@ -1866,7 +1969,7 @@ def _selftest():
             assert app._clf is None, "nothing installed on refusal"
 
             # Track A: interactively, a v2 pickle's OWN statistics can be
-            # applied as a new profile instead of that flat refusal.
+            # applied to the task's workflow instead of that flat refusal.
             def _expected_from_profile():
                 """Stand-in for the real schema call (which needs the compiled
                 extension): derive the field set from the ACTIVE profile's
@@ -1904,30 +2007,43 @@ def _selftest():
                     raise AssertionError("declining the offer must still refuse")
                 except ValueError:
                     pass
-            assert len(app.profiles) == n_prof, "declining creates no profile"
+            assert len(app.profiles) == n_prof, "declining changes nothing"
+            assert app.stat_kind_vars["blur"][0].get(), "...not even the statistics"
             assert app._clf is None, "nothing installed when the offer is declined"
-            # The primed stack's field is the new profile's (only the
-            # statistics differ), so the switch keeps it and re-assembles --
-            # re-measures -- the slice on screen instead of dropping it.
+            # The primed stack's field is the replaced workflow's (only the
+            # statistics differ), so the replacement keeps it and re-assembles
+            # -- re-measures -- the slice on screen instead of dropping it.
             from . import fingerprints as _fp
             app._primed_fingerprint = _fp.field_fingerprint_of(app._params_json(cores=1))
             primed_before = app.primed
-            prev_idx = app.active_profile_idx
             with _mock.patch.object(messagebox, "askyesno", return_value=True), \
                     _mock.patch.object(app, "_request_assembly") as _req:
                 app._load_classifier_from(clf_path, interactive=True)
             assert app.primed is primed_before, "a statistics-only switch keeps the primes"
             assert _req.called, "the slice on screen is re-assembled under the new statistics"
             # The commit is the identity of the parameters: back and forth
-            # between the two profiles (what a task switch does) returns each
-            # one's commit, so their records and predictions are found again.
+            # between two tasks whose workflows differ only in statistics
+            # returns each one's commit, so their records and predictions are
+            # found again -- and the primes are shared, the field being one.
             c_model = app._commit_id
+            orig = app._task
             with _mock.patch.object(app, "_request_assembly"):
-                app._switch_profile(prev_idx)
-                c_prev = app._commit_id
-                app._switch_profile(n_prof)
-            assert c_prev != c_model and app._commit_id == c_model, \
-                "returning to a profile returns its commit"
+                other = app._task_duplicate("blurred")
+                assert other is app._task and app.primed is primed_before
+                app.stat_kind_vars["blur"][0].set(True)
+                app.stat_kind_vars["blur"][1].set("1.5")
+                app._snapshot_active_profile()
+                c_other = app._commit_id
+                assert app._activate_task(orig)
+                c_back = app._commit_id
+                assert app._activate_task(other)
+                c_other2 = app._commit_id
+                assert app.primed is primed_before, "one field, one prime"
+                assert app._task_delete(confirm=True) and app._task is orig
+            # (The edit itself only settles into a re-measure later; the
+            # switch is what re-reads the workflow.)
+            assert c_other2 != c_model and c_back == c_model, \
+                "returning to a task returns its commit"
             # The stage strip: four boxes; a loaded model makes no claim about
             # what it was trained on; a stamp that moved turns it stale; a box
             # opens its tab.
@@ -1945,9 +2061,9 @@ def _selftest():
             app._on_stage_click("stats")
             assert app._center_tab_name() == "Features"
             app._show_center_tab("Processing")
-            assert len(app.profiles) == n_prof + 1, "accepting adds a profile"
-            assert app.active_profile_idx == n_prof, "and switches to it"
-            assert app.profiles[-1]["name"] == "from classifier.pkl"
+            assert len(app.profiles) == n_prof, "accepting replaces the task's workflow"
+            assert app.profiles[app.active_profile_idx] is app._task.workflow
+            assert app._task.workflow["name"] == app._task.name
             assert not app.stat_kind_vars["blur"][0].get(), \
                 "the model's statistics reached the stats panel"
             assert app._clf is not None and not app._pred, \
@@ -2590,6 +2706,7 @@ def _selftest():
     assert app.seam_frame.winfo_manager() == "pack" and app.annot_frame.winfo_manager() == "pack"
     assert not app.region_ml_frame.winfo_manager()
     assert app._model_polyline.winfo_manager() and not app._model_region.winfo_manager()
+    assert not app._context_group.winfo_manager(), "region context columns hide for a polyline task"
     app.tool_var.set("magic")
     assert app.tool_var.get() == "trace", "a region tool is refused in a polyline task"
     assert app._for_kind("region")(lambda e: "ran")() is None
@@ -2810,6 +2927,17 @@ def _selftest():
     assert t_walls.inputs == {"labels": {"source": "task", "uid": t_region.uid}}
     assert app.input_vars["labels"].get() == t_region.name
     assert f"{len(t_region.store.interactions)} region gestures" in app.input_status["labels"].get()
+    # Every task owns its workflow: a provider on ANOTHER field still fills
+    # the slot (its net reads this task's rows), with a note.
+    assert "different regions" not in app.input_status["labels"].get(), "same field: no note"
+    _keep_wf = t_region.workflow
+    t_region.workflow = dict(_keep_wf, msc=dict(_keep_wf["msc"], manifold="descending"))
+    app._refresh_inputs_panel()
+    assert "builds different regions" in app.input_status["labels"].get()
+    assert not app.input_status["labels"].get().startswith("cannot use"), "a note, not a refusal"
+    t_region.workflow = _keep_wf
+    app._link_pool()
+    app._refresh_inputs_panel()
     rc_in, ext_in = app._input_region_labels(0, 0, key_s, rec_s, np)
     assert rc_in[0] == 1 and rc_in[2] == 2 and ext_in == []
     g_in = app.regions.seams(key_s, np)
@@ -2984,11 +3112,10 @@ def _selftest():
     app._rebuild_class_panels()
 
     # New session: data, sequences, primed stacks and annotations go; the
-    # profiles and the model selection stay when asked to, and the model in
-    # memory survives the apply (it is not in the document).
+    # tasks' workflows and the model selection stay when asked to, and the
+    # model in memory survives the apply (it is not in the document).
     app.model_kind_var.set(_CUSTOM_EDGE_KIND)
     app.custom_hidden_var.set("4")
-    prof_names = [p["name"] for p in app.profiles]
     n_cls = app.store.n_classes
     app.store.add("squiggle", [(3.0, 3.0)], 1, "data/s0.tiff")
     assert app.store.interactions
@@ -3001,6 +3128,8 @@ def _selftest():
     app._push_history()
     app.store.add("box", [(1.0, 1.0), (5.0, 5.0)], 1, "data/s0.tiff")
     assert app._activate_task(app.tasks[0]) and app._clf is clf_keep
+    tb.workflow["msc"]["persistence_percent"] = 29.0      # bubbles' own workflow
+    wf_kept = [json.loads(json.dumps(t.workflow)) for t in app.tasks]
     assert [o[0] for o in app._new_session_options()] == ["profiles", "model"]
     assert app._new_session(keep={"profiles": True, "model": True})
     assert app.folders == [] and app.subsequences == [] and not app.primed
@@ -3010,15 +3139,18 @@ def _selftest():
     assert [t.name for t in app.tasks] == task_names and app._task is app.tasks[0]
     assert all(t.gesture_count == 0 and t.undo == [] for t in app.tasks), "every store emptied"
     assert app.tasks[-1].store.name(1) == "bubble", "vocabularies stay"
-    assert [p["name"] for p in app.profiles] == prof_names
+    assert [t.workflow for t in app.tasks] == wf_kept, "every task keeps its own workflow"
+    assert app.profiles == [t.workflow for t in app.tasks]
     assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND
     assert app.custom_hidden_var.get() == "4"
     assert app._clf is clf_keep, "the in-memory model survives"
     assert app._session_owned and "kept" in app.status_var.get()
     assert app._new_session(keep={"profiles": False, "model": False})
-    assert len(app.profiles) == 1 and app.profiles[0]["name"] == "default"
     assert [t.name for t in app.tasks] == task_names, "tasks survive; their models do not"
-    assert all(t.model.empty and t.models == [] and t.workflow == "default" for t in app.tasks)
+    assert all(t.model.empty and t.models == [] for t in app.tasks)
+    assert all(t.workflow == app._default_profile(t.name) for t in app.tasks), \
+        "every task starts from the default workflow"
+    assert app.profiles == [t.workflow for t in app.tasks]
     assert app._clf is None and app._edge_model is None and app.models == []
     assert app.model_kind_var.get() == "dense FC"
     assert app.custom_hidden_var.get() == _DEFAULT_CUSTOM_HIDDEN
@@ -3043,8 +3175,8 @@ def _selftest():
           "row / per class, context columns + their pickle/gate/session ride, "
           "saddle-free contact edges, latent ring head, labels as context, "
           "seam tools: scope + livewire trace + resolution + overlay + seam model + export, "
-          "tasks: per-task stores / vocabularies / Model tabs, session v3 + v2-as-one-task, "
-          "workflow binding through profile rename / delete, New session keeps tasks, "
+          "tasks: per-task stores / vocabularies / Model tabs, session v5 + v2-as-one-task, "
+          "task-owned workflows (copy / load / save, persistence + context groups), New session keeps tasks, "
           "extents: fill / blob core / lasso (Ctrl = sample) + the checkbox in the view, "
           "derived seam labels with no seam gesture, the outline -> enclosure in one step, "
           "region / polyline task kinds (tabs, tools, keys; older documents refused), "

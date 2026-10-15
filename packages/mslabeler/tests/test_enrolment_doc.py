@@ -25,7 +25,7 @@ def test_normalise_enrolled_forms_and_junk():
 
 
 def test_task_doc_writes_enrolment_only_when_set():
-    t = Task.new("gland", workflow="w")
+    t = Task.new("gland", workflow={"name": "w"})
     assert t.enrolled is None
     doc = t.to_doc()
     assert "enrolled" not in doc, "a task without enrolment writes the document it always has"
@@ -43,7 +43,7 @@ def test_task_doc_writes_enrolment_only_when_set():
 
 
 def test_duplicate_copies_enrolment():
-    t = Task.new("gland", workflow="w")
+    t = Task.new("gland", workflow={"name": "w"})
     t.enrolled = {"wsi/a.svs": {"p_aaaaaa": 0}}
     d = t.duplicate("gland (2)")
     assert d.enrolled == t.enrolled and d.enrolled is not t.enrolled
@@ -53,10 +53,10 @@ def test_duplicate_copies_enrolment():
 
 
 def test_session_round_trip_keeps_enrolment():
-    a = Task.new("gland", workflow="p")
+    a = Task.new("gland", workflow={"name": "p"})
     a.enrolled = {"wsi/a.svs": {"overview": None, "p_aaaaaa": 0}}
-    b = Task.new("stroma", workflow="p")                 # None: every place
-    c = Task.new("empty", workflow="p")
+    b = Task.new("stroma", workflow={"name": "p"})                 # None: every place
+    c = Task.new("empty", workflow={"name": "p"})
     c.enrolled = {}
     doc = build_session_doc(app="labeler", folders=[], sequences=[], profiles=[{"name": "p"}],
                             active_profile="p", run={}, view={},
