@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from . import edge_model, seam_path
+from . import edge_model, represent, seam_path
 from .fields import DEFAULT
 from .foundation import spec as fm_spec
 from .seams import SEAM_BOUNDARY, SEAM_INTERIOR
@@ -158,9 +158,11 @@ def seam_features(graph, table, names, np_, conv=DEFAULT, base_pipeline=None, ar
         if how == "net":
             X = _design(table, names, np_)
             layers = edge_model.embed(base_pipeline, X)
-            Z = layers[spec.layer]
+            # A layer the net does not have is refused, never substituted.
+            lk = represent.resolve_layer(represent.legacy_layer(spec.layer, len(layers)),
+                                         len(layers))
+            Z = layers[lk - 1]
             # Named by layer, so a model fitted on h2 is refused on h1.
-            lk = spec.layer % len(layers) + 1
             prefix = [f"h{lk}_{k}" for k in range(Z.shape[1])]
         else:
             Z = zscore_rows(table, names, np_)
@@ -169,8 +171,9 @@ def seam_features(graph, table, names, np_, conv=DEFAULT, base_pipeline=None, ar
         absd = np_.zeros((S, d), np_.float32)
         prod = np_.zeros((S, d), np_.float32)
         if keep.any():
-            absd[keep] = np_.abs(Z[ia] - Z[ib])
-            prod[keep] = Z[ia] * Z[ib]
+            pb = represent.pair_block(Z, ia, ib, np_)
+            absd[keep] = pb[:, :d]
+            prod[keep] = pb[:, d:]
         blocks += [absd, prod]
         fnames += [f"absdiff_{n}" for n in prefix] + [f"prod_{n}" for n in prefix]
     if "barrier" in spec.features:

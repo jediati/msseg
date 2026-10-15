@@ -15,7 +15,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from . import edge_model, magic_fill, model_search, fields
+from . import edge_model, magic_fill, model_search, fields, represent
 from . import bundle as model_bundle
 from .labeling import (LabelStore, MAX_CLASSES, TOOLS, resolve_slice, resolve_sets,
                           touched_sets, class_lut, scalar_lut, line_pixels, polygon_mask,
@@ -78,6 +78,11 @@ class DrawController:
         # focused (the Magic row, say) every hotkey -- Ctrl-Z above all --
         # would be swallowed as "typing" after the gesture.
         self.app._unfocus_entries()
+        # While the Inspect tab is open a click pins the region under it
+        # (Shift adds) and draws nothing; off the regions it pans.
+        active = getattr(self.app, "_inspect_active", None)
+        if active is not None and active():
+            return self.app._inspect_press(e, add=bool(e.state & self._SHIFT))
         # SHIFT = the accept tool: a box, regardless of the selected tool or
         # armed class, that turns the predictions under it into real labels.
         self._accept = bool(e.state & self._SHIFT)
@@ -380,6 +385,13 @@ class MagicFillController:
             mode = "anchor"
         return metric, mode, chans or ["base"]
 
+    def embedding(self):
+        """``(EmbeddingRef, distance)`` when the Magic row names an embedding
+        (a net layer, a column family -- ``represent``) rather than one of
+        the named metrics; None for a metric."""
+        get = getattr(self.app, "_magic_embedding", None)
+        return None if get is None else get()
+
     def hop_gain(self):
         return _bounded_float(self.app.magic_gain_var.get(), _DEFAULT_HOP_GAIN,
                               *_HOP_GAIN_RANGE)
@@ -423,6 +435,24 @@ class MagicFillController:
         arcs = app.regions.arcs(app.catalogue.key_of(*cur), np)
         metric, mode, want = self.options()
         table = rec["stats"]
+        picked = self.embedding()
+        vectors = None
+        if picked is not None:
+            # An embedding: the vectors come from the shared resolver (the
+            # same rows the edge model and Inspect read), compared by the
+            # picked distance; no metric-specific checks apply.
+            eref, dist = picked
+            try:
+                emb = app._embedding(app.catalogue.key_of(*cur), rec, eref, np)
+            except Exception as exc:          # noqa: BLE001 -- a refusal, pending grids
+                app._notify(f"magic fill: {represent.short_label(eref)}: {exc}")
+                return False
+            fid = table.column(app.FIELDS.id_field)
+            if fid is None or not np.array_equal(np.asarray(fid, np.intp), emb.ids):
+                app._notify("magic fill: the embedding's rows do not match the table")
+                return False
+            vectors = (emb.Z, dist)
+            metric = "embedding"
         avail = magic_fill.channel_names(table, app.FIELDS)
         chans = [c for c in want if c in avail]
         if not chans:
@@ -457,11 +487,11 @@ class MagicFillController:
         try:
             ladder = magic_fill.build_ladder(table, arcs, seed, metric, mode,
                                              chans, np, hop_gain=gain, extra=extra,
-                                             conv=app.FIELDS)
+                                             conv=app.FIELDS, vectors=vectors)
         except ValueError as exc:
             app.status_var.set(f"magic fill: {exc}")
             return False
-        key = (metric, mode,
+        key = ((metric, picked[0].key(), picked[1]) if picked is not None else metric, mode,
                tuple(chans) if metric in magic_fill.CHANNEL_METRICS else (),
                round(gain, 6))
         last_t = self._last.get(key)
@@ -479,6 +509,7 @@ class MagicFillController:
                    "ring_cls": ring_cls,
                    "ring_rgba": app.store.rgba(ring_cls) if ring_cls else None,
                    "ring": None,
+                   "emb": picked,
                    "hud": v.hud}
         app._begin_preview()
         self._preview(k0)
@@ -547,6 +578,11 @@ class MagicFillController:
                 "metric": ladder.metric, "mode": ladder.mode,
                 "channels": list(ladder.channels), "arcs": s["source"],
                 "hop_gain": float(ladder.hop_gain)}
+        if s.get("emb") is not None:
+            # Only an embedding fill carries these, so a metric fill's meta
+            # (and every older document) is unchanged.
+            meta["embedding"] = s["emb"][0].to_dict()
+            meta["distance"] = s["emb"][1]
         parts = []
         ring = s.get("ring")
         if s["ring_cls"] is not None and ring is not None and len(ring):

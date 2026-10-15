@@ -975,6 +975,16 @@ def run_labeler_selftest():
     px, py = float(ex[0]), float(ey[0])
     assert layer.id_at(int(px), int(py)) == target, "the extremum is in slide coordinates"
 
+    # -- Inspect on a placed item: the region under a SLIDE point ---------- #
+    key_p = app.catalogue.key_of(0, 0)
+    assert app._region_at(px, py) == (key_p, target), "the lookup goes through the placement"
+    assert app._inspect_pin(key_p, target)
+    app.region_mode_var.set("similarity")
+    vals_p, mask_p = app._inspect_scalar(0, 0, rec, np)
+    assert abs(float(vals_p[target]) - 1.0) < 1e-5 and mask_p[target]
+    assert app._inspect_clear()
+    app.region_mode_var.set("label id")
+
     app.active_class_var.set(1)
     app._commit_interaction("taps", [(px, py)])
     assert len(app.store.interactions) == 1

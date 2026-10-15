@@ -12,7 +12,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from .. import edge_model, magic_fill, model_search, fields
+from .. import edge_model, magic_fill, model_search, fields, represent
 from .. import bundle as model_bundle
 from ..labeling import (LabelStore, MAX_CLASSES, TOOLS, resolve_slice, resolve_sets,
                           touched_sets, class_lut, scalar_lut, line_pixels, polygon_mask,
@@ -88,9 +88,10 @@ class ClassPanelMixin:
         ttk.Label(row, text="Magic:").pack(side="left")
         cb = ttk.Combobox(row, textvariable=self.magic_metric_var,
                           values=list(magic_fill.METRICS), state="readonly",
-                          width=13)
+                          width=13, postcommand=self._refresh_magic_metrics)
+        self.magic_metric_combo = cb
         cb.pack(side="left", padx=2)
-        cb.bind("<<ComboboxSelected>>", self._unfocus_entries)
+        cb.bind("<<ComboboxSelected>>", self._on_magic_metric)
         attach_tooltip(cb, "mean: |mean difference| over the channels (z-scored)\n"
                            "bhattacharyya: Gaussian overlap from mean and std\n"
                            "cosine: 1 - cosine over EVERY statistic column "
@@ -99,7 +100,17 @@ class ClassPanelMixin:
                            "probabilities (Classify first; ignores 'on')\n"
                            "barrier: saddle height above the seed (MSC arcs only)\n"
                            "learned: the edge model's p(different) per arc "
-                           "(a '-> edges' kind, trained and classified)")
+                           "(a '-> edges' kind, trained and classified)\n"
+                           "below the line: any embedding on offer -- the region "
+                           "net's input or a hidden layer, another task's net, a "
+                           "foundation / encoder / context column family -- "
+                           "compared by the distance to the right")
+        cb = ttk.Combobox(row, textvariable=self.magic_distance_var,
+                          values=list(represent.FLOOD_DISTANCES), state="readonly", width=8)
+        cb.pack(side="left", padx=2)
+        cb.bind("<<ComboboxSelected>>", self._unfocus_entries)
+        attach_tooltip(cb, "Distance between embeddings (an embedding row only): "
+                           "cosine, euclidean, or euclidean between unit-length vectors")
         cb = ttk.Combobox(row, textvariable=self.magic_mode_var,
                           values=list(magic_fill.MODES), state="readonly",
                           width=7)
@@ -237,6 +248,52 @@ class ClassPanelMixin:
         self._rebuild_class_panels()
         self._refresh_model_strip()
 
+
+    # -- the Magic row's embedding choices (represent) ------------------- #
+    _MAGIC_SEPARATOR = "─" * 12
+
+    def _refresh_magic_metrics(self):
+        """Fill the metric combo: the named metrics, a separator, then every
+        usable embedding of the item on screen (``represent.options``)."""
+        try:
+            opts = [o for o in self._embedding_options() if o.usable]
+        except Exception as exc:                 # noqa: BLE001 -- never break the combo
+            self._log(f"magic: embedding options unavailable: {exc}")
+            opts = []
+        self._magic_emb_labels = {o.label: o.ref for o in opts}
+        values = list(magic_fill.METRICS)
+        if opts:
+            values += [self._MAGIC_SEPARATOR] + [o.label for o in opts]
+        combo = getattr(self, "magic_metric_combo", None)
+        if combo is not None:
+            combo.config(values=values)
+        return values
+
+    def _on_magic_metric(self, _e=None):
+        """A pick in the metric combo: a named metric clears the embedding, an
+        embedding label sets it (the separator restores the previous pick)."""
+        got = self.magic_metric_var.get()
+        if got in magic_fill.METRICS:
+            self.magic_emb_ref = None
+        elif got in self._magic_emb_labels:
+            self.magic_emb_ref = self._magic_emb_labels[got]
+        else:
+            ref = self.magic_emb_ref
+            self.magic_metric_var.set(represent.short_label(ref) if ref is not None else "mean")
+        self._unfocus_entries()
+
+    def _set_magic_embedding(self, ref, distance=None):
+        """Headless: flood over `ref` (a ``represent.EmbeddingRef``) by
+        `distance`; None goes back to the ``mean`` metric."""
+        if ref is None:
+            self.magic_emb_ref = None
+            self.magic_metric_var.set("mean")
+            return
+        self.magic_emb_ref = ref
+        label = next((k for k, r in self._magic_emb_labels.items() if r == ref), None)
+        self.magic_metric_var.set(label or represent.short_label(ref))
+        if distance in represent.FLOOD_DISTANCES:
+            self.magic_distance_var.set(distance)
     def _on_n_classes_change(self):
         try:
             n = int(self.n_classes_var.get())
@@ -1003,6 +1060,8 @@ class ClassPanelMixin:
         if tc is not None and tc.active:
             tc.on_hover(ix, iy)
             return
+        # The Inspect colouring's live anchor (panels/inspect.py).
+        self._inspect_on_hover(ix, iy)
         cur = self._current()
         region = None
         rec = None
@@ -1010,10 +1069,12 @@ class ClassPanelMixin:
             rec = self.regions.record(self.catalogue.key_of(*cur))
             if rec is not None and rec.get("labels") is not None:
                 labels = rec["labels"]
+                # The region through the provider's LabelLayer, so an item
+                # placed off the image origin (an mspath ROI) is hit right.
+                hit = self._region_at(ix, iy)
+                if hit is not None:
+                    region = hit[1]
                 if 0 <= iy < labels.shape[0] and 0 <= ix < labels.shape[1]:
-                    r = int(labels[iy, ix])
-                    if r >= 0:
-                        region = r
                     ctx = self._hover_ctx
                     if ctx is not None:
                         base = ctx["base"]

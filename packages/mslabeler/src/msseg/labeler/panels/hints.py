@@ -142,7 +142,11 @@ class HintsMixin:
     def _on_center_tab_changed(self, _e=None):
         """The canvas is above the notebook now, so a tab change is no longer
         a reveal and needs no repaint. All that is left is finishing a fit
-        deferred while the window itself was still unmapped."""
+        deferred while the window itself was still unmapped -- and the
+        Inspect tab, which is the pin tool while it shows."""
+        changed = getattr(self, "_inspect_tab_changed", None)
+        if changed is not None:
+            changed()
         if self.viewer is None:
             return
         try:

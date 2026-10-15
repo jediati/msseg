@@ -507,16 +507,35 @@ class Ladder:
         self.channels = tuple(channels)
 
 
+def _vector_rows(vectors, n_rows, np):
+    """``(X, kind)`` of precomputed row vectors (``represent``), checked
+    against the table and with ``l2n`` folded into euclidean on unit rows."""
+    X, kind = vectors
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim != 2 or len(X) != n_rows:
+        raise ValueError("the embedding has a row count other than the table's")
+    if kind == "l2n":
+        nx = np.sqrt((X * X).sum(axis=1, keepdims=True))
+        X = X / np.where(nx > 1e-12, nx, 1.0)
+        kind = "euclidean"
+    return X, kind
+
+
 def build_ladder(table, arcs, seed_id, metric, mode, channels, np,
-                 hop_gain=1.0, extra=None, conv=DEFAULT):
+                 hop_gain=1.0, extra=None, conv=DEFAULT, vectors=None):
     """Join ladder for `seed_id` (a label id present in `table`). `extra`
     carries what the table does not (``{"proba": (K, C)}`` for the proba
-    metric); `hop_gain` is the flood's per-hop multiplier (>= 1)."""
-    if metric not in METRICS:
+    metric); `hop_gain` is the flood's per-hop multiplier (>= 1).
+
+    `vectors` = ``(X, kind)`` floods over precomputed per-row vectors (a
+    ``represent`` embedding: a net layer, a column family...) compared by
+    distance `kind` instead of a named metric; `metric` is then only the
+    ladder's label (``"embedding"``)."""
+    if vectors is None and metric not in METRICS:
         raise ValueError(f"unknown metric {metric!r}")
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}")
-    need = EXTRA_METRICS.get(metric)
+    need = None if vectors is not None else EXTRA_METRICS.get(metric)
     if need is not None and (extra is None or extra.get(need) is None):
         raise ValueError(f"{metric!r} needs {need} (extra[{need!r}]) - Classify first")
     fid = table.column(conv.id_field)
@@ -534,6 +553,16 @@ def build_ladder(table, arcs, seed_id, metric, mode, channels, np,
     if saddle is not None:
         saddle = np.asarray(saddle, dtype=np.float64)[keep]
     pdiff = None
+    if vectors is not None:
+        X, kind = _vector_rows(vectors, len(ids), np)
+        if mode == "anchor":
+            node_key = pairwise(X, seed_row, np.arange(len(X)), kind, np)
+            w = np.maximum(node_key[ia], node_key[ib])
+        else:
+            node_key = None
+            w = pairwise(X, ia, ib, kind, np)
+        return _ladder_from(table, ids, ia, ib, w, seed_id, seed_row, node_key, metric,
+                            mode, channels, hop_gain, conv, np)
     if metric == "learned":
         # One P(different) per arc of `arcs`, in its order (the labeler
         # computes it against the record's own arcs at Classify time).
@@ -561,6 +590,12 @@ def build_ladder(table, arcs, seed_id, metric, mode, channels, np,
         w = edge_weights(table, ia, ib, seed_row, metric, mode, channels, np,
                          saddle=saddle, seed_ext_value=seed_ext, extra=extra,
                          pdiff=pdiff, conv=conv)
+    return _ladder_from(table, ids, ia, ib, w, seed_id, seed_row, node_key, metric, mode,
+                        channels, hop_gain, conv, np)
+
+
+def _ladder_from(table, ids, ia, ib, w, seed_id, seed_row, node_key, metric, mode, channels,
+                 hop_gain, conv, np):
     order, join = growth_order(len(ids), ia, ib, w, seed_row, np,
                                node_key=node_key, hop_gain=hop_gain)
     sorted_join = join[order]

@@ -38,6 +38,11 @@ _MODE_UNCERTAINTY = "uncertainty"
 # how boundary-like each region is (its max p(diff) over its arcs).
 _MODE_FLIPPED = "flipped by neighbours"
 _MODE_PDIFF = "boundary p(diff)"
+# The Inspect colourings (panels/inspect.py): similarity to the anchors in
+# the inspected embedding, and one embedding column.
+_MODE_SIMILARITY = "similarity"
+_MODE_UNIT = "embedding unit"
+_INSPECT_MODES = (_MODE_SIMILARITY, _MODE_UNIT)
 
 # Classifier kinds are shared by the dropdown, factory, and pickle loader so
 # adding one cannot leave a trained model that the UI does not recognize.
@@ -149,7 +154,7 @@ def _model_description(kind, spec=None, n_features=None):
 # Features holds the statistics -- what a region is MEASURED by -- apart from
 # Processing, which builds the field it is found in: a statistics edit
 # re-measures the item on screen, a Processing edit needs a Run.
-_CENTER_TABS = ("Processing", "Features", "Annotation", "Model", "Analysis")
+_CENTER_TABS = ("Processing", "Features", "Annotation", "Model", "Analysis", "Inspect")
 # The labeler's three columns -- data navigation, the viewer, the tabs -- as
 # the fractions of the width its two sashes sit at: roughly 1:3:2. Only the
 # viewer pane carries a weight, so window growth goes to the picture and the
@@ -234,4 +239,4 @@ _SEAM_MODES = (_SEAM_MODE_CLASS, _SEAM_MODE_BOUNDARYNESS)
 from .widgets import TYPING_CLASSES as _TYPING_CLASSES  # noqa: E402
 
 
-__all__ = ['_REGION_ALPHA', '_PRED_ALPHA', '_SCALAR_ALPHA', '_MODE_ID', '_MODE_UNCERTAINTY', '_MODE_FLIPPED', '_MODE_PDIFF', '_TUNED_KIND', '_CUSTOM_KIND', '_TUNED_EDGE_KIND', '_CUSTOM_EDGE_KIND', '_EDGE_KINDS', '_MODEL_KINDS', '_DEFAULT_CUSTOM_HIDDEN', '_EDGE_LAM_RANGE', '_EDGE_ROUNDS_RANGE', '_EDGE_C_RANGE', '_is_edge_kind', '_base_kind', '_edge_kind_of', '_DENSE_TOP_N', '_FOREST_TREES', '_OOB_MIN_SAMPLES', '_MLP_HIDDEN', '_MLP_MAX_ITER', '_SEARCH_TRIALS', '_SEARCH_TIMEOUT_MIN', '_SEARCH_TIMEOUT_S', '_SEARCH_TRIALS_RANGE', '_SEARCH_TIMEOUT_RANGE', '_SEARCH_PUMP_MS', '_SWEEP_TRIALS', '_SWEEP_TRIALS_RANGE', '_hms', '_model_description', '_PREVIEW_SETTLE_MS', '_PREVIEW_POLL_MS', '_PREVIEW_PUMP_MS', '_CENTER_TABS', '_LABELER_PANES', '_PANE_MIN_PX', '_PANE_SASH_TRIES', '_HINT_COLOR', '_HINT_POLL_MS', '_NON_FEATURE_FIELDS', '_TOOL_LABELS', '_RING_CHOICES', '_DEFAULT_HOP_GAIN', '_HOP_GAIN_RANGE', '_DEFAULT_DRAG_PX', '_DRAG_PX_RANGE', '_DEFAULT_MAGIC_EXTENT', '_bounded_float', '_UI_TOOLS', '_REGION_TOOLS', '_POLYLINE_TOOLS', '_TYPING_CLASSES', '_SEAM_TOOL_LABELS', '_SEAM_MODE_CLASS', '_SEAM_MODE_BOUNDARYNESS', '_SEAM_MODES']
+__all__ = ['_REGION_ALPHA', '_PRED_ALPHA', '_SCALAR_ALPHA', '_MODE_ID', '_MODE_UNCERTAINTY', '_MODE_FLIPPED', '_MODE_PDIFF', '_MODE_SIMILARITY', '_MODE_UNIT', '_INSPECT_MODES', '_TUNED_KIND', '_CUSTOM_KIND', '_TUNED_EDGE_KIND', '_CUSTOM_EDGE_KIND', '_EDGE_KINDS', '_MODEL_KINDS', '_DEFAULT_CUSTOM_HIDDEN', '_EDGE_LAM_RANGE', '_EDGE_ROUNDS_RANGE', '_EDGE_C_RANGE', '_is_edge_kind', '_base_kind', '_edge_kind_of', '_DENSE_TOP_N', '_FOREST_TREES', '_OOB_MIN_SAMPLES', '_MLP_HIDDEN', '_MLP_MAX_ITER', '_SEARCH_TRIALS', '_SEARCH_TIMEOUT_MIN', '_SEARCH_TIMEOUT_S', '_SEARCH_TRIALS_RANGE', '_SEARCH_TIMEOUT_RANGE', '_SEARCH_PUMP_MS', '_SWEEP_TRIALS', '_SWEEP_TRIALS_RANGE', '_hms', '_model_description', '_PREVIEW_SETTLE_MS', '_PREVIEW_POLL_MS', '_PREVIEW_PUMP_MS', '_CENTER_TABS', '_LABELER_PANES', '_PANE_MIN_PX', '_PANE_SASH_TRIES', '_HINT_COLOR', '_HINT_POLL_MS', '_NON_FEATURE_FIELDS', '_TOOL_LABELS', '_RING_CHOICES', '_DEFAULT_HOP_GAIN', '_HOP_GAIN_RANGE', '_DEFAULT_DRAG_PX', '_DRAG_PX_RANGE', '_DEFAULT_MAGIC_EXTENT', '_bounded_float', '_UI_TOOLS', '_REGION_TOOLS', '_POLYLINE_TOOLS', '_TYPING_CLASSES', '_SEAM_TOOL_LABELS', '_SEAM_MODE_CLASS', '_SEAM_MODE_BOUNDARYNESS', '_SEAM_MODES']

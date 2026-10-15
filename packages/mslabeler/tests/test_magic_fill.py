@@ -595,3 +595,25 @@ def test_learned_metric_orders_by_per_arc_pdiff():
                                 extra={"pdiff": pd[:-1]})
     assert "learned" in mf.METRICS and "learned" in mf.ARC_METRICS
     assert mf.EXTRA_METRICS["learned"] == "pdiff"
+
+
+# --------------------------------------------------------------------------- #
+# precomputed vectors (represent): a flood over any embedding
+# --------------------------------------------------------------------------- #
+def test_ladder_over_precomputed_vectors_matches_the_metric():
+    t = _chain_table([0.0, 1.0, 5.0, 5.2, 9.0])
+    arcs = {"a": np.array([0, 1, 2, 3], np.int32), "b": np.array([1, 2, 3, 4], np.int32),
+            "saddle": None}
+    X, kind = mf.row_vectors(t, "mean", ["base"], np)
+    for mode in mf.MODES:
+        ref = mf.build_ladder(t, arcs, 0, "mean", mode, ["base"], np)
+        got = mf.build_ladder(t, arcs, 0, "embedding", mode, [], np, vectors=(X, kind))
+        assert got.metric == "embedding"
+        assert np.array_equal(got.order, ref.order) and np.allclose(got.join, ref.join)
+    # l2n: euclidean between unit rows -- scale-free per row.
+    Z = np.c_[np.arange(5.0) + 1, np.ones(5)]
+    a = mf.build_ladder(t, arcs, 0, "embedding", "anchor", [], np, vectors=(Z, "l2n"))
+    b = mf.build_ladder(t, arcs, 0, "embedding", "anchor", [], np, vectors=(Z * 3.0, "l2n"))
+    assert np.allclose(a.join, b.join)
+    with pytest.raises(ValueError, match="row count"):
+        mf.build_ladder(t, arcs, 0, "embedding", "anchor", [], np, vectors=(Z[:3], "cosine"))

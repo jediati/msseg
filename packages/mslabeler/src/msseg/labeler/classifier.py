@@ -15,7 +15,7 @@ from tkinter import ttk, filedialog, messagebox
 
 from . import seam_model
 from .foundation.worker import fm_deferred
-from . import context, edge_model, magic_fill, model_search, fields
+from . import artifacts, context, edge_model, magic_fill, model_search, fields, represent
 from . import bundle as model_bundle
 from .labeling import (LabelStore, MAX_CLASSES, TOOLS, resolve_slice, resolve_sets,
                           touched_sets, class_lut, scalar_lut, line_pixels, polygon_mask,
@@ -158,6 +158,104 @@ class ClassifierMixin:
     def _foundation_table(self, key, rec, table, fs, np):
         """Headless: no pixels, so no foundation columns (FoundationMixin)."""
         raise ValueError("foundation features are not available here")
+
+    # ------------------------------------------------------------------ #
+    # Region embeddings (represent): one resolver, one cache, every consumer
+    # ------------------------------------------------------------------ #
+    @property
+    def _emb_cache(self):
+        cache = self.__dict__.get("_emb_cache_obj")
+        if cache is None:
+            cache = self.__dict__["_emb_cache_obj"] = represent.EmbeddingCache()
+        return cache
+
+    def _embedding_stack(self, ref):
+        """The model `ref` reads: the active task's stack, or -- with a
+        provider -- that task's (read without activating it). ValueError
+        with the reason when it has none to embed with."""
+        if ref.provider is None:
+            return self._task.model
+        prov = artifacts.resolve(artifacts.ProviderRef.task(ref.provider), self.tasks,
+                                 app_tag=self.MODEL_APP_TAG, consumer=self._task.uid)
+        why = "that task was deleted" if prov is None else prov.unavailable("embedding")
+        if why:
+            raise ValueError(why)
+        return prov.stack()
+
+    def _embedding_providers(self):
+        """``(uid, name, stack, why_not)`` for every OTHER region task with a
+        model, for ``represent.options``."""
+        out = []
+        for t in self.tasks:
+            if t is self._task or t.kind != "region":
+                continue
+            prov = artifacts.TaskProvider(t, self.MODEL_APP_TAG)
+            stack = prov.stack()
+            if stack is None or stack.clf is None:
+                continue
+            ctx = getattr(stack, "context", None)
+            why = None
+            if ctx is not None and not ctx.empty() and (ctx.labels is not None
+                                                         or ctx.foundation is not None):
+                why = f"{t.name}'s net reads neighbour labels or foundation columns"
+            out.append((t.uid, t.name, stack, why))
+        return out
+
+    def _embedding_options(self, key=None, rec=None):
+        """``represent.options`` for the item on screen (or `key`/`rec`)."""
+        import numpy as np
+        if rec is None:
+            cur = self._current()
+            if cur is None:
+                return []
+            key = self.catalogue.key_of(*cur)
+            rec = self.regions.record(key)
+        if rec is None or rec.get("stats") is None:
+            return []
+        try:
+            table = self._context_table(key, rec, getattr(self, "_clf_context", None), np)
+        except Exception:                    # noqa: BLE001 -- pending grids, a bad spec
+            table = rec["stats"]
+        pr = self._pred.get(key)
+        return represent.options(list(table.names), stack=self._task.model,
+                                 pred_ok=pr is not None and pr[0] == rec.get("commit"),
+                                 providers=self._embedding_providers(), conv=self.FIELDS)
+
+    def _embedding(self, key, rec, ref, np):
+        """`ref`'s vectors on item `key` (``represent.Embedding``), through
+        the shared cache: a net's input is the item's context table, as
+        ``_predict_slice`` builds it, so the edge model, the magic fill and
+        the Inspect panel read the same rows. ValueError with the reason."""
+        stack = None
+        table = rec.get("stats")
+        kw = {}
+        if ref.source in ("net", "head"):
+            stack = self._embedding_stack(ref)
+            ctx = getattr(stack, "context", None)
+            if ref.provider is None:
+                table = self._context_table(key, rec, ctx, np)
+            elif ctx is not None and not ctx.empty():
+                if ctx.labels is not None or ctx.foundation is not None:
+                    raise ValueError("that net reads neighbour labels or foundation columns")
+                table = artifacts.input_table(stack, table, self.regions.arcs(key, np),
+                                              rec.get("labels"), np, conv=self.FIELDS)
+            latent = getattr(stack, "latent", None)
+            if ref.source == "head" and latent is not None and stack.clf is not None:
+                tbl = table
+
+                def head_input(mat):
+                    g, area = self._latent_graph(key, tbl, rec["labels"], latent.spec, np)
+                    return context.design_with_latent(stack.clf, mat, g, latent.spec, np,
+                                                      area=area)[0]
+                kw["head_input"] = head_input
+        elif ref.source == "columns" and ref.block in ("family", "names"):
+            table = self._context_table(key, rec, getattr(self, "_clf_context", None), np)
+        elif ref.source == "proba":
+            pr = self._pred.get(key)
+            kw["pred_entry"] = pr if pr is not None and pr[0] == rec.get("commit") else None
+        return self._emb_cache.resolve(key, ref, commit=rec.get("commit"), table=table, np=np,
+                                       stack=stack, store_rev=self.store.rev, conv=self.FIELDS,
+                                       **kw)
 
     def _fm_resolved(self, fs):
         return fs
@@ -1495,8 +1593,14 @@ class ClassifierMixin:
                     contact = None
                     if "contact" in edge.spec.features:
                         contact = context.ensure_contact(arcs, labels, np)[keep_e]
+                    # The edge model's layer of the base net, through the
+                    # shared cache (the magic fill and Inspect read it too).
+                    eref = represent.EmbeddingRef(
+                        source="net",
+                        layer=edge_model.spec_layer(edge.spec, represent.depth_of(self._clf)))
+                    emb = self._embedding(self.catalogue.key_of(si, li), rec, eref, np).Z
                     pd_rows = edge_model.predict_pdiff(edge, self._clf, mat, ia, ib, sad, ext,
-                                                       contact=contact)
+                                                       emb=emb, contact=contact)
                     pdiff = np.full(len(arcs["a"]), np.nan, np.float32)
                     pdiff[keep_e] = pd_rows
                     spec = self._edge_spec_from_ui()

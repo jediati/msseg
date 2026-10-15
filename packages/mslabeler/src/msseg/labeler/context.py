@@ -869,13 +869,13 @@ class LatentContextModel:
 
 def embedding_of(base_pipeline, X, spec: LatentSpec, np):
     """The hidden layer `spec.layer` of the base net for rows `X`
-    (``edge_model.embed``); TypeError when the base has no embedding."""
-    from . import edge_model
+    (``edge_model.embed``); TypeError when the base has no embedding,
+    ValueError when it has no such layer (a retrain made it shallower) --
+    never another layer (``represent``)."""
+    from . import edge_model, represent
     layers = edge_model.embed(base_pipeline, X)
-    try:
-        return np.asarray(layers[spec.layer], np.float64)
-    except IndexError:
-        return np.asarray(layers[-1], np.float64)
+    k = represent.resolve_layer(represent.legacy_layer(spec.layer, len(layers)), len(layers))
+    return np.asarray(layers[k - 1], np.float64)
 
 
 def design_with_latent(base_pipeline, X, g: Graph, spec: LatentSpec, np, area=None,

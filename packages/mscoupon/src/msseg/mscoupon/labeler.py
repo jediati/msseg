@@ -74,6 +74,7 @@ from msseg.labeler.labeling import (LabelStore, MAX_CLASSES, TOOLS,
 from msseg.labeler import magic_fill
 from msseg.labeler import model_search
 from msseg.labeler import edge_model
+from msseg.labeler import represent
 from msseg.labeler import bundle as model_bundle
 from msseg.labeler import fields
 from msseg.labeler.training import TrainingSetBuilder, TrainingProblem
@@ -471,7 +472,7 @@ def _selftest():
 
     tabs = [str(app.center.tab(t, "text")) for t in app.center.tabs()]
     assert tabs == list(_CENTER_TABS) == ["Processing", "Features", "Annotation",
-                                          "Model", "Analysis"], tabs
+                                          "Model", "Analysis", "Inspect"], tabs
     assert [str(p) for p in app.paned.panes()] \
         == [str(app.left_pane), str(app.right), str(app.center)], "data | view | tabs"
     assert _under(app.viewer.canvas, app.right), "the canvas is the middle column"
@@ -1209,8 +1210,9 @@ def _selftest():
         app.region_mode_var.set("label id")
         app._pred.clear()
         app._refresh_region_modes()
-        assert list(app.region_mode_combo.cget("values")) == ("label id",) or \
-            list(app.region_mode_combo.cget("values")) == ["label id"], \
+        # The prediction modes collapse when the cache is dropped; the Inspect
+        # modes need no prediction and stay.
+        assert list(app.region_mode_combo.cget("values")) == ["label id"] + list(_INSPECT_MODES), \
             "modes collapse when the cache is dropped"
         app._classify()
         pr = app._pred.get(app.catalogue.key_of(0, 0))
@@ -1319,6 +1321,129 @@ def _selftest():
             assert "Classify" in app.status_var.get(), app.status_var.get()
             app._pred = saved_pred
             app.magic_metric_var.set("mean")
+            # An embedding fill (represent): the base net's last hidden layer
+            # by cosine, picked from the combo's listing; the vectors come
+            # through the shared cache the edge model filled at Classify.
+            opts = app._embedding_options()
+            nets = [o for o in opts if o.ref.source == "net" and o.ref.provider is None]
+            assert nets and all(o.usable for o in nets), [(o.label, o.why_not) for o in opts]
+            assert nets[-1].label in app._refresh_magic_metrics()
+            app.magic_metric_var.set(nets[-1].label)
+            app._on_magic_metric()
+            assert app.magic_emb_ref == nets[-1].ref and app._magic_embedding()[1] == "cosine"
+            hits = app._emb_cache.hits
+            assert tool.on_press(_FakeEvent(5, 5)), app.status_var.get()
+            assert tool.magic._s["ladder"].metric == "embedding"
+            assert app._emb_cache.hits > hits, "Classify cached the edge model's layer"
+            assert tool.on_move(_FakeEvent(5, 5 - 400)) and tool.on_release(_FakeEvent(5, 5 - 400))
+            meta = app.store.interactions[-1].meta
+            assert meta["metric"] == "embedding" and meta["embedding"] == nets[-1].ref.to_dict()
+            assert meta["distance"] == "cosine"
+            app._undo()
+            vm = app._view_state()["magic"]
+            assert vm["metric"] == "embedding" and vm["embedding"] == nets[-1].ref.to_dict()
+            app._set_magic_embedding(None)
+            assert app._view_state()["magic"]["metric"] == "mean" and "embedding" not in app._view_state()["magic"]
+            app._apply_magic_view(vm)                        # a restored view, no listing needed
+            assert app.magic_emb_ref == nets[-1].ref and app.magic_metric_var.get() == "net last"
+            # The separator restores the previous pick; a layer the net lacks is refused.
+            app.magic_metric_var.set(app._MAGIC_SEPARATOR)
+            app._on_magic_metric()
+            assert app.magic_metric_var.get() == "net last"
+            app._set_magic_embedding(represent.EmbeddingRef(source="net", layer=9))
+            assert not tool.on_press(_FakeEvent(5, 5)) and "h9" in app.status_var.get()
+            app._set_magic_embedding(None)
+
+            # -- Inspect (panels/inspect.py): pins, similarity colouring, the tab
+            key00 = app.catalogue.key_of(0, 0)
+            rec00 = app.regions.record(key00)
+            assert app._inspect_ref_now() == represent.EmbeddingRef(source="net"), "default: the net"
+            assert "inspect" not in _UI_TOOLS, "the tab is the tool, not a tool button"
+            # Opening the tab IS picking the pin tool: the colouring switches to
+            # similarity and a click pins instead of drawing (the drawing tool,
+            # magic here, is left as it was).
+            mode_before, tool_was = app.region_mode_var.get(), app.tool_var.get()
+            app._on_inspect_key()
+            assert app._inspect_active() and app.region_mode_var.get() == _MODE_SIMILARITY
+            assert app.tool_var.get() == tool_was == "magic"
+            app.inspect_live_var.set(False)
+            assert app._inspect_scalar(0, 0, rec00, np) is None, "no anchor, no colouring"
+            n_draw = len(app.store.interactions)
+            assert tool.on_press(_FakeEvent(5, 5)) and len(app._inspect_pins) == 1
+            assert not tool.magic.active and len(app.store.interactions) == n_draw, "pinned, not drawn"
+            pin_r = app._inspect_pins[0]["region"]
+            vals_i, mask_i = app._inspect_scalar(0, 0, rec00, np)
+            assert abs(float(vals_i[pin_r]) - 1.0) < 1e-5 and mask_i[pin_r] and mask_i.sum() == 4
+            ovs_i = app._seg_overlays(0, 0, rec00, None, np, _mc)
+            assert app._inspect_live_lut is not None and any(o.get("lut") is app._inspect_live_lut
+                                                              for o in ovs_i)
+            other = next(h for h in (app._region_at(x, y) for x, y in
+                                     ((15, 15), (15, 5), (5, 15), (12, 12)))
+                         if h is not None and h[1] != pin_r)
+            assert app._inspect_pin(other[0], other[1], add=True) and len(app._inspect_pins) == 2
+            app._on_escape()
+            assert app._inspect_pins == [], "Escape clears the pins first"
+            # Live hover: the region under the pointer is the anchor.
+            app.inspect_live_var.set(True)
+            app._inspect_on_hover(5, 5)
+            assert app._inspect_hover == (key00, pin_r)
+            assert app._inspect_scalar(0, 0, rec00, np) is not None
+            # The net layer means the same on every item: a pin on (0, 0)
+            # colours (0, 1), and the neighbours walk both items.
+            assert app._inspect_pin(key00, pin_r)
+            rec01 = app.regions.record(app.catalogue.key_of(0, 1))
+            if rec01 is not None:
+                assert app._inspect_scalar(0, 1, rec01, np) is not None, "a cross-item pin"
+            near = app._inspect_neighbours(k=5, scope="this item")
+            assert near and all(r["region"] != pin_r for r in near)
+            assert near[0]["sim"] >= near[-1]["sim"]
+            app._fill_inspect_neighbours()
+            app.inspect_tree.selection_set("0")
+            app._on_inspect_row_open()
+            # A class centroid pin, and one embedding unit as a colouring.
+            assert app._inspect_pin_class(1) and "centroid" in app._inspect_pins[-1]["what"]
+            app.region_mode_var.set(_MODE_UNIT)
+            app.inspect_unit_var.set("1")
+            vu, mu = app._inspect_scalar(0, 0, rec00, np)
+            assert mu.sum() == 4 and 0.0 <= float(vu.min()) and float(vu.max()) <= 1.0
+            # A per-item embedding: the statistics row.
+            app._set_inspect_embedding(represent.EmbeddingRef())
+            assert not app._inspect_ref_now().cross_item
+            assert app._inspect_pins_for(key00, app._inspect_embedding(key00, rec00, np)) == [], \
+                "pins of another embedding do not count"
+            app._set_inspect_embedding(None)
+            # The scatter: project, select a box, label the selection.
+            sc_i = app._draw_inspect_scatter()
+            assert sc_i is not None and sc_i["xy"].shape == (4, 2)
+            sel_i = app._scatter_select_box(0, 0, 1000, 1000)
+            assert sorted(sel_i) == [0, 2, 5, 9], sel_i
+            n_int = len(app.store.interactions)
+            app.inspect_label_cls_var.set("2")
+            app._on_inspect_label_selection()
+            assert len(app.store.interactions) == n_int + 1
+            it_i = app.store.interactions[-1]
+            assert it_i.class_id == 2 and it_i.meta["tool"] == "inspect" and not it_i.meta["extent"]
+            app._undo()
+            # Which embedding separates the classes (sync: no worker thread).
+            assert app._evaluate_embeddings(sync=True), app.inspect_eval_var.get()
+            assert app._inspect_eval_rows and app._inspect_eval is None
+            knn = [r[1]["knn"] for r in app._inspect_eval_rows]
+            assert knn == sorted(knn, reverse=True)
+            app.inspect_eval_tree.selection_set("0")
+            app._on_inspect_eval_open()
+            assert app.inspect_ref == app._inspect_eval_rows[0][0].ref
+            vi = app._view_state()["inspect"]
+            app._apply_inspect_view({"similarity": "dot"})
+            assert app.inspect_ref is None and app.inspect_sim_var.get() == "dot"
+            app._apply_inspect_view(vi)
+            assert app.inspect_ref == app._inspect_eval_rows[0][0].ref
+            app._set_inspect_embedding(None, similarity="cosine")
+            app._inspect_clear()
+            # Leaving the tab gives the drawing tool and the colouring back.
+            app._on_inspect_key()
+            assert not app._inspect_active() and app.region_mode_var.get() == mode_before
+            assert tool.on_press(_FakeEvent(5, 5)) and tool.magic.active, "clicks draw again"
+            assert tool.magic.cancel() and app._inspect_pins == []
             app.tool_var.set(tool_before)
             app.active_class_var.set(cls_before)
         # Freeze base: Train keeps the base net and refits only the edges.
@@ -2902,7 +3027,7 @@ def _selftest():
           "persistent outlines + canvas right-click, gesture previews, "
           "magic fill, blobber, hop gain + drag + cosine/proba metrics, "
           "center notebook + model tab, toolbar hints, optimize network, size sweep, "
-          "edge kinds, analysis tab + region list, panel diffing (no rebuild "
+          "edge kinds + embedding magic fill + Inspect (pins, similarity, neighbours, scatter, evaluate), analysis tab + region list, panel diffing (no rebuild "
           "on a commit), tree context menu + guarded row removal + clear per "
           "row / per class, context columns + their pickle/gate/session ride, "
           "saddle-free contact edges, latent ring head, labels as context, "

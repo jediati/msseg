@@ -21,7 +21,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from . import context, edge_model, magic_fill, model_search, fields
+from . import context, edge_model, magic_fill, model_search, fields, represent
 from . import bundle as model_bundle
 from . import session_doc
 from .labeling import (LabelStore, MAX_CLASSES, TOOLS, resolve_slice, resolve_sets,
@@ -38,6 +38,7 @@ from .panels.seam_tabs import SeamTabsMixin
 from .panels.foundation import FoundationMixin
 from .panels.model import ModelPanelMixin
 from .panels.analysis import AnalysisPanelMixin
+from .panels.inspect import InspectMixin
 from .panels.view import ViewControlsMixin
 from .panels.classpanel import ClassPanelMixin
 from .panels.seams import SeamPanelMixin
@@ -87,7 +88,7 @@ def _cache_attr(field, doc):
 
 
 class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, ModelPanelMixin,
-                      AnalysisPanelMixin, ViewControlsMixin, ClassPanelMixin, SeamPanelMixin,
+                      AnalysisPanelMixin, InspectMixin, ViewControlsMixin, ClassPanelMixin, SeamPanelMixin,
                       SeamModelMixin, ClassifierMixin):
     SESSION_APP = "labeler"
     APP_TITLE = "labeler"
@@ -231,6 +232,11 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         # Magic-fill options (metric / compare mode / measurement channels);
         # part of the session's view state.
         self.magic_metric_var = tk.StringVar(master=root, value="mean")
+        # An embedding the fill floods over instead of a named metric (the
+        # combo then shows its label; represent.EmbeddingRef) and its distance.
+        self.magic_emb_ref = None
+        self.magic_distance_var = tk.StringVar(master=root, value="cosine")
+        self._magic_emb_labels = {}      # combo label -> EmbeddingRef (last listing)
         self.magic_mode_var = tk.StringVar(master=root, value="anchor")
         self.magic_channels_var = tk.StringVar(master=root, value="base")
         self.blob_ring_var = tk.StringVar(master=root, value="next")
@@ -238,6 +244,8 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         self.magic_drag_var = tk.StringVar(master=root, value=f"{_DEFAULT_DRAG_PX:g}")
         # A released fill is an extent (derive.py) unless this is off.
         self.magic_extent_var = tk.BooleanVar(master=root, value=_DEFAULT_MAGIC_EXTENT)
+        # Inspect: the embedding looked at, its anchors and the tab's settings.
+        self._init_inspect_state(root)
         # Seam tools (docs/seam_labeling.md): the class a trace / scope
         # paints, the trace's toll and channels, the overlay and its colouring,
         # and the per-item caches the overlay and the tools share.
@@ -341,11 +349,15 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         # Analysis: what the models DO with the annotations -- the region
         # list behind a confusion cell, the size sweep -- and, later, plots.
         self.analysis_tab = ttk.Frame(self.center)
+        # Inspect: the regions' embeddings -- similarity colouring, nearest
+        # regions, the embedding space, which embedding separates the classes.
+        self.inspect_tab = ttk.Frame(self.center)
         self._center_tabs = {"Processing": self.processing_tab,
                              "Features": self.features_tab,
                              "Annotation": self.annot_tab,
                              "Model": self.model_tab,
-                             "Analysis": self.analysis_tab}
+                             "Analysis": self.analysis_tab,
+                             "Inspect": self.inspect_tab}
         for name in _CENTER_TABS:
             self.center.add(self._center_tabs[name], text=name)
 
@@ -383,6 +395,8 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         self._build_analysis_tab(self._analysis_region)
         self._analysis_polyline = ttk.Frame(self.analysis_tab)
         self._build_seam_analysis_body(self._analysis_polyline)
+        self._inspect_region = self._tab_scroll(self.inspect_tab)
+        self._build_inspect_tab(self._inspect_region)
         self.center.select(self.processing_tab)
         # Bound AFTER the initial select: <<NotebookTabChanged>> fires
         # synchronously on select(), and the viewer does not exist yet.
@@ -1070,6 +1084,9 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         self.root.bind("M", region(self._on_magic_key))
         self.root.bind("b", region(self._on_blob_key))
         self.root.bind("B", region(self._on_blob_key))
+        # I: the Inspect tab on / off (while open, a click pins a region).
+        self.root.bind("i", self._on_inspect_key)
+        self.root.bind("I", self._on_inspect_key)
         self.root.bind("<Control-z>", self._on_undo_key)
         self.root.bind("<Control-y>", self._on_undo_key)
         self.root.bind("<Tab>", self._on_tab_toggle)
@@ -1214,6 +1231,8 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         tool = self.viewer.tool if self.viewer is not None else None
         if tool is not None and hasattr(tool, "cancel") and tool.cancel():
             return
+        if self._inspect_active() and self._inspect_clear():
+            return
         self.active_class_var.set(0)
 
     # _unfocus_entries and _typing live on ViewerShell (the viewer's own
@@ -1298,6 +1317,7 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         d = super()._view_state()
         d["tool"] = self.tool_var.get()
         d["seams"] = self._seams_view_state()
+        d["inspect"] = self._inspect_view_state()
         d["magic"] = {"metric": self.magic_metric_var.get(),
                       "mode": self.magic_mode_var.get(),
                       "channels": self.magic_channels_var.get(),
@@ -1309,6 +1329,11 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
                       "drag_px": _bounded_float(self.magic_drag_var.get(),
                                                 _DEFAULT_DRAG_PX, *_DRAG_PX_RANGE),
                       "extent": bool(self.magic_extent_var.get())}
+        picked = self._magic_embedding()
+        if picked is not None:
+            # An embedding fill: written only then, so a metric's view is as before.
+            d["magic"].update(metric="embedding", embedding=picked[0].to_dict(),
+                              distance=picked[1])
         d["center_tab"] = self._center_tab_name()
         # The sashes as FRACTIONS, not pixels: a session restored into a
         # differently sized window should divide it the same way. The folded
@@ -1387,6 +1412,15 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         if isinstance(d.get("edge_spec"), dict):
             self._apply_edge_spec(edge_model.EdgeSpec.from_dict(d["edge_spec"]))
 
+    def _magic_embedding(self):
+        """``(EmbeddingRef, distance)`` when the Magic row names an embedding
+        rather than one of the named metrics, else None."""
+        ref = self.magic_emb_ref
+        if ref is None or self.magic_metric_var.get() in magic_fill.METRICS:
+            return None
+        dist = self.magic_distance_var.get()
+        return ref, (dist if dist in represent.FLOOD_DISTANCES else "cosine")
+
     def _apply_magic_view(self, magic):
         """Restore the Magic rows from a session view dict, field by field --
         an unknown or malformed value leaves that setting as it is."""
@@ -1394,6 +1428,17 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
             return
         if magic.get("metric") in magic_fill.METRICS:
             self.magic_metric_var.set(magic["metric"])
+            self.magic_emb_ref = None
+        elif magic.get("metric") == "embedding" and isinstance(magic.get("embedding"), dict):
+            try:
+                ref = represent.EmbeddingRef.from_dict(magic["embedding"])
+            except (TypeError, ValueError):
+                ref = None
+            if ref is not None:
+                self.magic_emb_ref = ref
+                self.magic_metric_var.set(represent.short_label(ref))
+                if magic.get("distance") in represent.FLOOD_DISTANCES:
+                    self.magic_distance_var.set(magic["distance"])
         if magic.get("mode") in magic_fill.MODES:
             self.magic_mode_var.set(magic["mode"])
         if isinstance(magic.get("channels"), str) and magic["channels"].strip():
@@ -1564,6 +1609,7 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
             self.tool_var.set(view["tool"])
         self._apply_magic_view(view.get("magic"))
         self._apply_seams_view(view.get("seams"))
+        self._apply_inspect_view(view.get("inspect"))
         # Keep the regions toggle in sync with whatever seg_source restored to.
         self.show_regions_var.set(self._region_layer_visible())
         # The center tab, by name; an unknown or missing value leaves it alone

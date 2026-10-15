@@ -957,3 +957,47 @@ penalty, with schema-group dropout and marginal corruption as augmentation;
 EncoderBundle`) applies with numpy alone and exposes the latent as
 `emb<hash8>__z..` columns so the name-set compat gate needs no new logic.
 NOT yet wired into the labeler, and the transfer probe is unbuilt.
+
+**Region embeddings and Inspect** (2026-10-15, `msseg.labeler.represent`,
+`panels/inspect.py`, [docs/design_region_embeddings.md](docs/design_region_embeddings.md)):
+"a vector per region" is chosen, resolved, cached and compared in ONE place.
+An `EmbeddingRef` names the source -- `columns` (`row` = every column but
+positions and histogram bins, z-scored per item; `channels` / `gauss` /
+`histogram`; a column `family`: `fm<hash>`, `emb<hash>`, a context kind,
+`hist`), `net` (the active task's region net, or another task's by
+`provider` uid), `head` (the latent head's net) or `proba`. **One layer
+convention**: 0 = the net's scaled input (FeatureSubset + scaler applied), k
+= `h<k>`, None = last; a layer the net lacks is REFUSED with the reason --
+`edge_model._layer`, `context.embedding_of` and the seam model's `net` pair
+block used to fall back silently (`legacy_layer` maps their old `-1` / `-2`
+/ 0-based spellings). `options()` lists what the table and the model offer
+right now (the last hidden layer as `layer None`, so a pick survives a
+retrain); `ClassifierMixin._embedding(key, rec, ref, np)` resolves through
+the app's `EmbeddingCache` (signature = commit + ref + the net's `net_hash`,
+input names, context spec, store rev for labels-as-context), and
+`_predict_slice` fills it with the edge model's layer, so the magic fill and
+Inspect reuse that forward pass. `edge_model.embed_layers` is the one
+forward pass; `represent.pair_block` builds the edge and seam pair terms.
+The **magic fill** combo lists the metrics, a separator, then every usable
+embedding (flooded by `cosine` / `euclidean` / `l2n`; `build_ladder(...,
+vectors=)`); `view.magic` and the gesture meta gain `embedding` /
+`distance` only for such a fill. **Inspect** (sixth tab; **the tab is the
+pin tool** -- while it shows, a canvas click pins instead of drawing and the
+colouring switches to `similarity`, leaving restores both; key I toggles the
+tab, `_inspect_tab_changed` from `_on_center_tab_changed`): region
+modes `similarity` and `embedding unit` (no prediction needed); pins (click,
+Shift adds, Escape clears; a pin keeps its vector plus task and net
+signature, so it recolours other items under a cross-item embedding and
+retires on a retrain) or live hover (the LUT is swapped in place on the
+canvas's overlay list); class-centroid pins; nearest regions (this item /
+all computed items, double-click goes there, Label commits taps gestures);
+a PCA scatter (PIL raster; colour by annotation / prediction / similarity;
+linked hover; box-select + Label); and "Evaluate embeddings" (leave-items-out
+kNN / nearest-centroid / silhouette for every option, worker-scored).
+`_region_at` is the placement-correct region lookup (`LabelLayer.id_at`);
+the class panel's hover now uses it (it indexed the raster with image
+coordinates, wrong on a placed mspath item). Not rerouted: the livewire's
+table tolls, the context `source`, `artifacts.layer_of`. Tests:
+`test_represent.py`, `test_magic_fill.py` (vectors path), the coupon labeler
+selftest's embedding-fill + Inspect blocks, the mspath labeler selftest's
+placed-item block.

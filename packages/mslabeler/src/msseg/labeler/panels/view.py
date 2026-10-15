@@ -149,6 +149,8 @@ class ViewControlsMixin:
             modes.append(_MODE_UNCERTAINTY)
         if any((self._pred_aux(v) or {}).get("pdiff") is not None for v in self._pred.values()):
             modes += [_MODE_FLIPPED, _MODE_PDIFF]
+        # Inspect (panels/inspect.py): need no prediction, only an embedding.
+        modes += list(_INSPECT_MODES)
         return modes
 
     @staticmethod
@@ -224,18 +226,25 @@ class ViewControlsMixin:
                     o["lut"][:, 3] = np.minimum(o["lut"][:, 3], _REGION_ALPHA)
             return overlays + self._seam_layers(si, li, rec, np)
         scalar = None
+        inspecting = self.region_mode_var.get() in _INSPECT_MODES
+        self._inspect_live_lut = None
         if rec is not None and self.show_regions_var.get():
-            entry = self._pred.get(self.catalogue.key_of(si, li))
-            if entry is not None and entry[0] == rec.get("commit"):
-                scalar = self._region_scalar(entry, np)
+            if inspecting:
+                scalar = self._inspect_scalar(si, li, rec, np)
+            else:
+                entry = self._pred.get(self.catalogue.key_of(si, li))
+                if entry is not None and entry[0] == rec.get("commit"):
+                    scalar = self._region_scalar(entry, np)
         if scalar is not None:
             # A coloring mode REPLACES the id LUT rather than tinting it: the
             # ids and the scalar are two readings of the same regions, and
             # stacking them would just muddy both.
             values, mask = scalar
             overlays = [o for o in overlays if "lut" not in o]
-            overlays.append(self._region_overlay(
-                rec["labels"], scalar_lut(values, np, _SCALAR_ALPHA, mask), np))
+            lut = scalar_lut(values, np, _SCALAR_ALPHA, mask)
+            if inspecting:
+                self._inspect_live_lut = lut      # a hover swaps it in place
+            overlays.append(self._region_overlay(rec["labels"], lut, np))
         else:
             # The inherited region overlay is orientation, not the point: fade
             # it under the class layer (copy first -- _id_lut results may be

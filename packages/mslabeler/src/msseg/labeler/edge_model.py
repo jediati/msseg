@@ -137,13 +137,26 @@ def embed(pipeline, X) -> List[np.ndarray]:
     each ``float32[n, width]``, for rows ``X`` in the pipeline's input space
     (every step but the last is applied first, so FeatureSubset / scaler
     pipelines and the top-N ones all work)."""
-    _net, hidden, _out = _hidden_layers(pipeline)
+    return embed_layers(pipeline, X)[1:]
+
+
+def embed_layers(pipeline, X, upto: Optional[int] = None) -> List[np.ndarray]:
+    """``[h0, h1, ...]``: ``h0`` is what the last step sees (every earlier
+    step applied -- FeatureSubset, scaler), then each hidden ReLU layer, all
+    ``float32[n, width]``; `upto` stops after layer ``h<upto>``. ``upto=0``
+    needs no hidden layer (a forest behind a scaler has an ``h0``)."""
+    steps = getattr(pipeline, "steps", None)
+    if not steps:
+        raise TypeError("region model is not a pipeline")
     Z = np.asarray(X, np.float64)
-    for _name, step in pipeline.steps[:-1]:
+    for _name, step in steps[:-1]:
         Z = step.transform(Z)
     h = np.asarray(Z, np.float32)
-    out = []
-    for W, b in hidden:
+    out = [h]
+    if upto == 0:
+        return out
+    _net, hidden, _out = _hidden_layers(pipeline)
+    for W, b in hidden[:upto]:
         h = np.maximum(h @ W + b, 0.0).astype(np.float32)
         out.append(h)
     return out
@@ -211,15 +224,11 @@ def pair_features(emb: np.ndarray, a, b, bar=None,
                   features: Sequence[str] = DEFAULT_FEATURES, contact=None) -> np.ndarray:
     """``float32[n, d]`` symmetric in (a, b): ``|e_a - e_b|``, ``e_a * e_b``,
     the barrier columns and the contact column, as `features` selects."""
+    from . import represent
     a = np.asarray(a, np.intp)
     b = np.asarray(b, np.intp)
-    ea = np.asarray(emb, np.float32)[a]
-    eb = np.asarray(emb, np.float32)[b]
-    parts = []
-    if "absdiff" in features:
-        parts.append(np.abs(ea - eb))
-    if "prod" in features:
-        parts.append(ea * eb)
+    ops = [op for op in ("absdiff", "prod") if op in features]
+    parts = [represent.pair_block(emb, a, b, np, ops)] if ops else []
     if "barrier" in features:
         if bar is None or len(np.asarray(bar)) != len(a):
             bar = np.zeros((len(a), 2), np.float32)
@@ -227,7 +236,7 @@ def pair_features(emb: np.ndarray, a, b, bar=None,
     if "contact" in features:
         parts.append(contact_column(contact, len(a)))
     if not parts:
-        parts.append(np.abs(ea - eb))
+        parts.append(represent.pair_block(emb, a, b, np, ("absdiff",)))
     return np.concatenate(parts, axis=1).astype(np.float32)
 
 
@@ -400,10 +409,18 @@ def _fit_pair(est, F, y, spec: EdgeSpec):
 
 
 def _layer(emb: List[np.ndarray], layer: int) -> np.ndarray:
-    try:
-        return emb[layer]
-    except IndexError:
-        return emb[-1]
+    """The hidden layer an ``EdgeSpec.layer`` names (a Python index into the
+    hidden layers, ``-1`` = last) from ``embed``'s output; ValueError when the
+    net has no such layer -- never another layer (``represent``)."""
+    from . import represent
+    k = represent.resolve_layer(represent.legacy_layer(layer, len(emb)), len(emb))
+    return emb[k - 1]
+
+
+def spec_layer(spec: "EdgeSpec", depth: int) -> Optional[int]:
+    """The spec's layer in ``represent``'s convention (None = last)."""
+    from . import represent
+    return represent.legacy_layer(spec.layer, depth)
 
 
 def fit_edge_model(base_pipeline, X, cls, edges: Dict[str, np.ndarray], ext=None,
