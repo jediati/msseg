@@ -253,17 +253,22 @@ class ClassPanelMixin:
     _MAGIC_SEPARATOR = "─" * 12
 
     def _refresh_magic_metrics(self):
-        """Fill the metric combo: the named metrics, a separator, then every
-        usable embedding of the item on screen (``represent.options``)."""
+        """Fill the metric combo: the named metrics, a separator, then the
+        embeddings of the item on screen in sections, each entry indented
+        under what it is computed from (``represent.menu_rows``)."""
         try:
-            opts = [o for o in self._embedding_options() if o.usable]
+            opts = self._embedding_options()
         except Exception as exc:                 # noqa: BLE001 -- never break the combo
             self._log(f"magic: embedding options unavailable: {exc}")
             opts = []
-        self._magic_emb_labels = {o.label: o.ref for o in opts}
+        rows = represent.menu_rows(opts)
+        # display line -> option (headers and greyed lines are not picks);
+        # the picked one then shows by its whole label.
+        self._magic_emb_labels = {t: o for t, o in rows if o is not None and o.usable}
+        self._magic_emb_clean = {o.ref.key(): o.label for o in opts}
         values = list(magic_fill.METRICS)
-        if opts:
-            values += [self._MAGIC_SEPARATOR] + [o.label for o in opts]
+        if rows:
+            values += [self._MAGIC_SEPARATOR] + [t for t, _o in rows]
         combo = getattr(self, "magic_metric_combo", None)
         if combo is not None:
             combo.config(values=values)
@@ -276,7 +281,9 @@ class ClassPanelMixin:
         if got in magic_fill.METRICS:
             self.magic_emb_ref = None
         elif got in self._magic_emb_labels:
-            self.magic_emb_ref = self._magic_emb_labels[got]
+            o = self._magic_emb_labels[got]
+            self.magic_emb_ref = o.ref
+            self.magic_metric_var.set(o.label)
         else:
             ref = self.magic_emb_ref
             self.magic_metric_var.set(represent.short_label(ref) if ref is not None else "mean")
@@ -290,7 +297,7 @@ class ClassPanelMixin:
             self.magic_metric_var.set("mean")
             return
         self.magic_emb_ref = ref
-        label = next((k for k, r in self._magic_emb_labels.items() if r == ref), None)
+        label = getattr(self, "_magic_emb_clean", {}).get(ref.key())
         self.magic_metric_var.set(label or represent.short_label(ref))
         if distance in represent.FLOOD_DISTANCES:
             self.magic_distance_var.set(distance)

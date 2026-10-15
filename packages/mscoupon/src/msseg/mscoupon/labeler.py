@@ -1327,9 +1327,20 @@ def _selftest():
             opts = app._embedding_options()
             nets = [o for o in opts if o.ref.source == "net" and o.ref.provider is None]
             assert nets and all(o.usable for o in nets), [(o.label, o.why_not) for o in opts]
-            assert nets[-1].label in app._refresh_magic_metrics()
-            app.magic_metric_var.set(nets[-1].label)
+            values = app._refresh_magic_metrics()
+            # Sections: the net's header names its shape, and each layer is
+            # listed under the one it is computed from.
+            header = next(v for v in values if v.startswith("\u2500\u2500 region net: "))
+            assert "classes" in header and "\u2192" in header, header
+            line = next(t for t, o in app._magic_emb_labels.items() if o.ref == nets[-1].ref)
+            assert line in values and "\u2514 h" in line, line
+            assert values.index(header) < values.index(line)
+            app.magic_metric_var.set(header)                 # a header is not a pick
             app._on_magic_metric()
+            assert app.magic_emb_ref is None and app.magic_metric_var.get() == "mean"
+            app.magic_metric_var.set(line)
+            app._on_magic_metric()
+            assert app.magic_metric_var.get() == nets[-1].label, "the pick shows its whole label"
             assert app.magic_emb_ref == nets[-1].ref and app._magic_embedding()[1] == "cosine"
             hits = app._emb_cache.hits
             assert tool.on_press(_FakeEvent(5, 5)), app.status_var.get()

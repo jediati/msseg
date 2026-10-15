@@ -85,10 +85,7 @@ class InspectMixin:
         return represent.EmbeddingRef()
 
     def _inspect_label_of(self, ref):
-        for label, r in self._inspect_labels.items():
-            if r == ref:
-                return label
-        return represent.short_label(ref)
+        return getattr(self, "_inspect_clean", {}).get(ref.key()) or represent.short_label(ref)
 
     def _refresh_inspect_options(self):
         """Repopulate the picker from ``represent.options`` for the item on
@@ -98,9 +95,12 @@ class InspectMixin:
         except Exception as exc:                 # noqa: BLE001 -- never break the picker
             self._log(f"inspect: embedding options unavailable: {exc}")
             opts = []
-        self._inspect_labels = {o.label: o.ref for o in opts if o.usable}
-        values = [o.label for o in opts if o.usable]
-        values += [f"({o.label}: {o.why_not})" for o in opts if not o.usable]
+        # Sections with each entry under what it is computed from; headers
+        # and greyed lines are not picks.
+        rows = represent.menu_rows(opts)
+        self._inspect_labels = {t: o.ref for t, o in rows if o is not None and o.usable}
+        self._inspect_clean = {o.ref.key(): o.label for o in opts}
+        values = [t for t, _o in rows]
         combo = getattr(self, "inspect_combo", None)
         if combo is not None:
             try:

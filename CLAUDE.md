@@ -972,7 +972,11 @@ convention**: 0 = the net's scaled input (FeatureSubset + scaler applied), k
 block used to fall back silently (`legacy_layer` maps their old `-1` / `-2`
 / 0-based spellings). `options()` lists what the table and the model offer
 right now (the last hidden layer as `layer None`, so a pick survives a
-retrain); `ClassifierMixin._embedding(key, rec, ref, np)` resolves through
+retrain), in sections that `menu_rows` draws for both pickers: a header per
+source naming the net's shape (`region net: 40 → 64 → 32 → 3 classes`, the
+latent head, `task '<name>' region net`) and each entry indented under what
+it is computed from (row ⊃ channel means / families; input → h1 → h2 →
+class probabilities); `ClassifierMixin._embedding(key, rec, ref, np)` resolves through
 the app's `EmbeddingCache` (signature = commit + ref + the net's `net_hash`,
 input names, context spec, store rev for labels-as-context), and
 `_predict_slice` fills it with the edge model's layer, so the magic fill and

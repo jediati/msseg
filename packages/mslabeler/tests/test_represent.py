@@ -221,7 +221,8 @@ def test_options_populate_from_table_and_model():
     assert all(o.usable for o in net)
     assert any(o.ref.source == "proba" for o in opts)
     other = [o for o in opts if o.ref.provider == "t_000001"]
-    assert other and all(o.usable and o.group == "other tasks" for o in other)
+    assert other and all(o.usable and o.group.startswith("task 'glands' region net: ")
+                         for o in other)
     assert all(not o.usable for o in opts if o.ref.provider == "t_000002")
     assert all(o.why_not == "measured at L4" for o in opts if o.ref.provider == "t_000003")
     # Every usable statistics/model option resolves.
@@ -336,3 +337,38 @@ def test_by_id_scatters_rows_onto_region_ids():
     assert vals.shape == (12,) and list(np.flatnonzero(mask)) == [0, 2, 4, 6, 8]
     assert vals[8] == 4.0 and vals[1] == 0.0
     assert e.row_of(6) == 3 and e.row_of(7) is None
+
+
+def test_menu_rows_show_what_each_entry_is_derived_from():
+    t = stats_table()
+    est, _X = region_net()
+
+    class Latent:
+        head = est
+    opts = rp.options(t.names, stack=Stack(est, NAMES, latent=Latent()), pred_ok=True,
+                      providers=[("t_000001", "glands", Stack(est, NAMES), None)])
+    rows = rp.menu_rows(opts)
+    heads = [text for text, o in rows if o is None]
+    assert heads[0] == "\u2500\u2500 " + rp.STATS_GROUP + " \u2500\u2500"
+    assert heads[1] == "\u2500\u2500 region net: 6 \u2192 16 \u2192 8 \u2192 2 classes \u2500\u2500"
+    assert heads[2].startswith("\u2500\u2500 latent head") and heads[3].startswith("\u2500\u2500 task 'glands'")
+    text = {o.ref.key() + (o.group,): t for t, o in rows if o is not None}
+    by = lambda ref, g: text[ref.key() + (g,)]           # noqa: E731
+    net_g = "region net: 6 \u2192 16 \u2192 8 \u2192 2 classes"
+    # The row, then the subsets it contains one level in; histograms beside it.
+    assert by(rp.EmbeddingRef(), rp.STATS_GROUP).startswith("    row")
+    assert by(rp.EmbeddingRef(block="family", family="fm0123abcd", norm="none"),
+              rp.STATS_GROUP).startswith("    \u2514 foundation")
+    assert by(rp.EmbeddingRef(block="histogram"), rp.STATS_GROUP).startswith("    histograms")
+    # input -> h1 -> h2 -> probabilities, each one step deeper.
+    chain = [by(rp.EmbeddingRef(source="net", layer=0), net_g),
+             by(rp.EmbeddingRef(source="net", layer=1), net_g),
+             by(rp.EmbeddingRef(source="net"), net_g),
+             by(rp.EmbeddingRef(source="proba"), net_g)]
+    leads = [len(c) - len(c.lstrip(" \u2514")) for c in chain]
+    assert leads == sorted(leads) and len(set(leads)) == 4, chain
+    assert "scaled as at training" in chain[0] and "(the output)" in chain[3]
+    # greyed entries say why
+    grey = rp.menu_rows([rp.EmbeddingOption(rp.EmbeddingRef(), "row", 3, "g", "because")])
+    assert grey[1][0].endswith("(row: because)")
+    assert rp.arch_text(est) == "6 \u2192 16 \u2192 8 \u2192 2 classes"

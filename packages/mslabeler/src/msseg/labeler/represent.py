@@ -259,10 +259,12 @@ def family_label(fam: str) -> str:
 @dataclass(frozen=True)
 class EmbeddingOption:
     ref: EmbeddingRef
-    label: str
+    label: str                      # whole, for a picker's selected text
     dim: Optional[int]
-    group: str                      # statistics | learned columns | model | other tasks
+    group: str                      # the section it is listed under (its header)
     why_not: Optional[str] = None
+    short: str = ""                 # the entry under its section header
+    indent: int = 0                 # depth under the section: what it is derived from
 
     @property
     def usable(self) -> bool:
@@ -280,84 +282,140 @@ def _missing(want: Sequence[str], have: Sequence[str]) -> Optional[str]:
     return f"needs {', '.join(miss[:3])}{more}, which this table lacks"
 
 
+def arch_text(pipeline) -> str:
+    """``"40 \u2192 64 \u2192 32 \u2192 3 classes"``: the net's shape from its
+    input (after FeatureSubset) to its outputs."""
+    layers = layers_of(pipeline)
+    parts = [str(w) if w is not None else "?" for _k, w, _n in layers]
+    classes = getattr(pipeline, "classes_", None)
+    if classes is not None:
+        parts.append(f"{len(classes)} classes")
+    return " \u2192 ".join(parts)
+
+
 def net_options(pipeline, *, source="net", provider=None, owner="region net",
                 input_names: Optional[Sequence[str]] = None,
                 have: Optional[Sequence[str]] = None,
-                why_not: Optional[str] = None) -> List[EmbeddingOption]:
+                why_not: Optional[str] = None, group: Optional[str] = None,
+                proba: bool = False) -> List[EmbeddingOption]:
     """One option per layer of `pipeline` (``layers_of``), labelled
-    ``"h2 · 16-d (region net)"``; `why_not` greys them all (a provider's
-    gate), else missing input columns do."""
+    ``"h2 · 16-d (region net)"`` and listed as a chain under ONE section
+    (`group`, default ``"<owner>: <arch>"``): the input, then each hidden
+    layer one step deeper than the one it is computed from, then -- with
+    `proba` -- the class probabilities the last layer produces. `why_not`
+    greys them all (a provider's gate), else missing input columns do."""
     layers = layers_of(pipeline)
     if not layers:
         return []
     why = why_not or (None if input_names is None else _missing(input_names, have))
+    group = group or f"{owner}: {arch_text(pipeline)}"
     last = max(k for k, _w, _n in layers)
     out = []
-    for k, w, name in layers:
-        dim = f" · {w}-d" if w is not None else ""
+    for i, (k, w, name) in enumerate(layers):
+        dim = f" \u00b7 {w}-d" if w is not None else ""
         is_last = k == last and k >= 1
         tail = ", last" if is_last else (", scaled input" if k == 0 else "")
+        note = (" (the net's columns, scaled as at training)" if k == 0
+                else (" (last)" if is_last else ""))
         # The last hidden layer is offered as "last" (layer None): what the
         # edge model reads by default, and still the last after a retrain
         # changes the depth.
         out.append(EmbeddingOption(
             EmbeddingRef(source=source, layer=None if is_last else k, provider=provider),
-            f"{name}{dim} ({owner}{tail})", w,
-            "model" if provider is None else "other tasks", why))
+            f"{name}{dim} ({owner}{tail})", w, group, why,
+            short=f"{name}{dim}{note}", indent=i))
+    if proba:
+        classes = getattr(pipeline, "classes_", None)
+        n = "" if classes is None else f" \u00b7 {len(classes)}"
+        out.append(EmbeddingOption(EmbeddingRef(source="proba"), "class probabilities",
+                                   None if classes is None else len(classes), group, why,
+                                   short=f"class probabilities{n} (the output)",
+                                   indent=len(layers)))
     return out
+
+
+STATS_GROUP = "statistics of the item on screen"
 
 
 def options(table_names: Sequence[str], *, stack=None, pred_ok: bool = False,
             providers: Sequence[Tuple[str, str, Any, Optional[str]]] = (),
             conv: FieldConventions = DEFAULT) -> List[EmbeddingOption]:
-    """Every embedding on offer for a table with columns `table_names`:
+    """Every embedding on offer for a table with columns `table_names`, in
+    sections (``group``), each entry indented under what it is a part of or
+    computed from (``indent``; ``menu_rows`` draws it):
 
-    * statistics -- ``row``, the channel means, histograms, and a block per
-      column family that is not plain statistics (foundation, encoder,
-      context kinds);
+    * statistics -- ``row`` (z-scored per item) and, under it, the subsets
+      it contains (channel means, each column family: foundation, encoder,
+      context kinds); histograms beside it (``row`` leaves the bins out);
     * the active model (`stack`: ``.clf``, ``.names``, ``.latent``) -- its
-      input and every hidden layer, and the latent head's layers;
-    * ``proba`` when `pred_ok` (a prediction is current for the item);
-    * other tasks -- `providers` as ``(uid, name, stack, why_not)``.
+      input, each hidden layer and, when `pred_ok` (a prediction is current
+      for the item), the class probabilities; the latent head's net in a
+      section of its own;
+    * other tasks -- `providers` as ``(uid, name, stack, why_not)``, one
+      section per task.
 
     An option that cannot be resolved here carries ``why_not``."""
     names = list(table_names)
     out: List[EmbeddingOption] = []
     rows = row_names(names, conv)
     if rows:
-        out.append(EmbeddingOption(EmbeddingRef(), f"row · {len(rows)}-d (statistics, per item)",
-                                   len(rows), "statistics"))
+        out.append(EmbeddingOption(EmbeddingRef(), f"row \u00b7 {len(rows)}-d (statistics, per item)",
+                                   len(rows), STATS_GROUP,
+                                   short=f"row \u00b7 {len(rows)}-d (every column but positions "
+                                         f"and histograms, z-scored per item)"))
     chans = [n[len(conv.mean_prefix):] for n in names if n.startswith(conv.mean_prefix)]
     if chans:
         out.append(EmbeddingOption(EmbeddingRef(block="channels", channels=tuple(chans)),
-                                   f"channel means · {len(chans)}-d (per item)", len(chans),
-                                   "statistics"))
+                                   f"channel means \u00b7 {len(chans)}-d (per item)", len(chans),
+                                   STATS_GROUP, short=f"channel means \u00b7 {len(chans)}-d",
+                                   indent=1))
     fams = families(names, conv)
-    if HIST_FAMILY in fams:
-        out.append(EmbeddingOption(EmbeddingRef(block="histogram"),
-                                   f"histograms · {len(fams[HIST_FAMILY])}-d", len(fams[HIST_FAMILY]),
-                                   "statistics"))
     for fam, cols in fams.items():
         if fam in (STATS_FAMILY, HIST_FAMILY):
             continue
         norm = "none" if fam.startswith(("fm", "emb")) else "slice"
+        how = "raw" if norm == "none" else "per item"
         out.append(EmbeddingOption(EmbeddingRef(block="family", family=fam, norm=norm),
-                                   f"{family_label(fam)} · {len(cols)}-d", len(cols),
-                                   "learned columns"))
+                                   f"{family_label(fam)} \u00b7 {len(cols)}-d", len(cols),
+                                   STATS_GROUP,
+                                   short=f"{family_label(fam)} \u00b7 {len(cols)}-d ({how})",
+                                   indent=1))
+    if HIST_FAMILY in fams:
+        n = len(fams[HIST_FAMILY])
+        out.append(EmbeddingOption(EmbeddingRef(block="histogram"), f"histograms \u00b7 {n}-d", n,
+                                   STATS_GROUP, short=f"histograms \u00b7 {n}-d (bin fractions)"))
     if stack is not None and getattr(stack, "clf", None) is not None:
-        out += net_options(stack.clf, input_names=list(stack.names or ()), have=names)
+        out += net_options(stack.clf, input_names=list(stack.names or ()), have=names,
+                           owner="region net", proba=pred_ok)
         latent = getattr(stack, "latent", None)
         if latent is not None:
-            out += net_options(latent.head, source="head", owner="latent head")
-    if pred_ok:
-        out.append(EmbeddingOption(EmbeddingRef(source="proba"), "class probabilities",
-                                   None, "model"))
+            out += net_options(latent.head, source="head", owner="latent head",
+                               group=f"latent head (input = the region net's input + "
+                                     f"ring columns): {arch_text(latent.head)}")
     for uid, pname, pstack, why in providers:
         clf = getattr(pstack, "clf", None)
         if clf is None:
             continue
         out += net_options(clf, provider=uid, owner=pname, why_not=why,
+                           group=f"task '{pname}' region net: {arch_text(clf)}",
                            input_names=list(getattr(pstack, "names", None) or ()), have=names)
+    return out
+
+
+def menu_rows(opts: Sequence[EmbeddingOption]) -> List[Tuple[str, Optional[EmbeddingOption]]]:
+    """The picker's lines: a ``"\u2500\u2500 section \u2500\u2500"`` header
+    (option None) before each section, then its entries indented by depth --
+    a layer under the one it is computed from, a subset under the row it is
+    part of. Greyed entries say why, in brackets."""
+    out: List[Tuple[str, Optional[EmbeddingOption]]] = []
+    group = None
+    for o in opts:
+        if o.group != group:
+            group = o.group
+            out.append((f"\u2500\u2500 {group} \u2500\u2500", None))
+        lead = "    " + ("   " * (o.indent - 1) + "\u2514 " if o.indent > 0 else "")
+        body = o.short or o.label
+        out.append((f"{lead}{body}" if o.usable else f"{lead}({body}: {o.why_not})", o))
     return out
 
 
@@ -792,6 +850,7 @@ __all__ = ["SOURCES", "BLOCKS", "NORMS", "DISTANCES", "SIMILARITIES", "REDUCES",
            "EmbeddingRef", "EmbeddingOption", "Embedding", "EmbeddingCache",
            "legacy_layer", "to_legacy_layer", "resolve_layer", "layer_name", "layers_of",
            "depth_of", "family_of", "families", "row_names", "family_label", "short_label",
+           "arch_text", "menu_rows", "STATS_GROUP",
            "net_options",
            "options", "option_for", "resolve", "signature_of", "distance", "similarity",
            "to_unit", "pair_block", "top_k", "project_2d", "separability"]
