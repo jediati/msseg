@@ -894,11 +894,52 @@ need no new keys; views keep `hash8`, never the basis) and a polyline
 task's `SeamSpec.foundation` (`_seam_items` appends flank pools + the
 crossing block). The basis is fitted at Train, kept by the model, restored on
 load; context kinds never reduce over fm columns. Pixels via the OPTIONAL
-provider pair `item_pixels` / `pixels_halo` (mspath only so far); extraction
-runs on the Tk thread (no worker, no `fm` stage box yet). Also fixed: region
+provider pair `item_pixels` / `pixels_halo` (mspath only so far). Extraction
+and the PCA fit run on `foundation.worker.GridWorker`: entry points carry
+`@fm_deferred` (scope `all` | `one`), a miss raises `GridsPending` (NOT a
+ValueError), the call returns and re-runs itself when its grids land
+(`_fm_defer`); `_fm_sync` = inline for the selftests; no `fm` stage box yet. Also fixed: region
 pickles never wrote their scope, so a reloaded mspath model was refused.
 Tests: `test_foundation_pool.py`, `test_foundation_extract.py`,
-`test_foundation_spec.py`, the mspath labeler selftest's foundation block.
+`test_foundation_spec.py`, `test_foundation_worker.py`, the mspath labeler
+selftest's foundation block.
+
+**Places by drag + crops for GIMP** (2026-10-13, mspath viewer and labeler):
+the ROI section's **Draw rect** button arms a one-shot drag on the canvas
+(`rect_tool.RectPlaceTool`: stands in for `viewer.tool`, falls through to it
+for unknown attributes, Esc / a second click cancels) that cuts a place at the
+ROI level through the same `_add_roi_from_slide_rect` tail as Add from view.
+The slide tree's menu offers **Export for labeling…** (a place row) / **Export
+N place(s) for labeling…** (a slide row): `label_export.export_place` writes
+`<stem>.png` (8-bit, windowed per channel), `<stem>_mask.png` (an empty
+transparent RGBA layer to drag onto it in GIMP -- never overwritten once it
+exists), `<stem>_raw.tif` (own dtype, every channel) and a `<stem>.json`
+sidecar (slide, level, rect in slide + level px, mask convention red = edge,
+blue = ignore, the crop a complete box). No import yet. Tests:
+`test_label_export.py`, viewer selftest ROI block.
+
+**Learned filters: the `unet` chain stage** (2026-10-14,
+`msseg.mscoupon.learned_filters`): a pre-trained net as a filter card,
+`{"operation": "unet", "params": {model, output: probability|logit, device:
+auto|cuda|cpu}}`. A **package-only** operation (`PACKAGE_ONLY_OPERATIONS`,
+beside `normalize`): core never sees it -- `ComputeEngine._apply_tail` runs
+the scalar remainder of a topology chain as core batches with the package
+stages applied between them (one call, as before, when there are none), used
+by the coupon run + preview and mspath prime / re-measure; `_apply_base_chain`
+applies it too; the per-stage preview runs the prefix through the same split.
+The C++ prime ignores the entry in its params; the CLI cannot run it. The
+`model` row is a choice filled per card build from the bundles in
+`models_dir()` -- the card's **Folder…** pick (`set_models_dir`, kept as
+`view.filter_models_dir` only when set; **Default** clears it), else
+`$MSSEG_FILTER_MODELS`, else `<app data>/filters` -- keeping a missing name;
+an unset model applies the first bundle (the card's default). The card shows
+where the list came from and logs it (`[unet] ...`, `models_report`). A bundle is one `.pt` (arch + widths + percentile input norm +
+trained level + `state_dict`); inference is tiled (2048 + 64 margin; GroupNorm
+makes a tile's output depend on its content, hence big tiles). Trainer:
+`packages/mspath/experiments/train_edge_filter.py CROPS --name N` over the
+GIMP-exported crops (alpha > 0.5 = edge, blue = ignore, 3 px stroke flanks
+ignored), heavy GPU augmentation. Torch is needed only to apply one. Tests:
+`test_learned_filters.py`, the mspath viewer selftest's unet block.
 
 **Region encoder, offline** (2026-09-15, [docs/design_region_autoencoder.md](docs/design_region_autoencoder.md)):
 a task-free latent of the statistics ROW, so the labeler's head is not the

@@ -13,6 +13,7 @@ import time
 from tkinter import filedialog
 
 from . import artifacts
+from .foundation.worker import fm_deferred
 from . import bundle as model_bundle
 from . import edge_model, model_search, seam_export, seam_model
 from .training import TrainingProblem
@@ -329,6 +330,7 @@ class SeamModelMixin:
     # ------------------------------------------------------------------ #
     # Train / score
     # ------------------------------------------------------------------ #
+    @fm_deferred
     def _train_seam_model(self):
         try:
             import sklearn  # noqa: F401
@@ -371,6 +373,7 @@ class SeamModelMixin:
                             f"({model.n_boundary} boundary) in "
                             f"{1e3 * (time.perf_counter() - t0):.0f} ms - {model.brief()}")
 
+    @fm_deferred
     def _classify_seams(self, items=None):
         """Score every seam of every item with the seam model (boundaryness,
         cached per commit)."""
@@ -400,6 +403,7 @@ class SeamModelMixin:
     # ------------------------------------------------------------------ #
     # Evaluate (worker + the Optimize pump)
     # ------------------------------------------------------------------ #
+    @fm_deferred
     def _evaluate_seams(self, sync=False):
         if self._search is not None:
             self.status_var.set("A search is already running - Cancel it first.")
@@ -502,13 +506,17 @@ class SeamModelMixin:
         if not folder:
             return
         try:
-            n_items, n_seams = self._export_seams_to(folder)
+            got = self._export_seams_to(folder)
         except Exception as exc:
             self.status_var.set(f"Seam export failed: {exc}")
             return
+        if got is None:           # waiting on foundation tokens; it re-runs itself
+            return
+        n_items, n_seams = got
         if n_items:
             self.status_var.set(f"Exported {n_seams} seams of {n_items} item(s) to {folder}")
 
+    @fm_deferred
     def _export_seams_to(self, folder):
         """Write ``seams_<item>.json`` per primed item and ``seams_summary.csv``;
         returns ``(n_items, n_seams)``."""

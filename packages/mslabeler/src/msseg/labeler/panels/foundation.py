@@ -17,9 +17,13 @@ here, because they need pixels:
 * a region row gains the spec's pools (``_foundation_table``), a seam the
   crossing block (``_foundation_seam_block``).
 
-Everything runs on the Tk thread with the compute badge, like streaming the
-records does; the first extraction loads the backbone (seconds), later ones
-are a GPU pass per uncached item.
+Extraction (and the projection fit) runs OFF the Tk thread (``foundation.worker.GridWorker``): a
+model operation that meets an uncached grid enqueues what it needs -- every
+ready item for Train / Classify all / Evaluate, the item on screen for
+classify-current -- returns at once with a status line, and re-runs itself
+when those grids have landed (``fm_deferred`` on its entry point,
+``_fm_defer`` here). Outside such an operation a miss enqueues the item and
+reads as "not available yet". ``_fm_sync`` (the selftests) computes inline.
 """
 from __future__ import annotations
 
@@ -33,6 +37,7 @@ from ..foundation import pool as fp
 from ..foundation.cache import TokenCache, cache_key
 from ..foundation.project import fit_basis, project
 from ..foundation.spec import MODELS, POOLS, FoundationSpec
+from ..foundation.worker import GridWorker, GridsPending
 from ..widgets import attach_tooltip
 
 FM_GROUP_TITLE = "8. Foundation features"
@@ -63,6 +68,10 @@ class FoundationMixin:
         self._fm_projected = {}         # (key, halo, hash8) -> (z, stride, offset)
         # Builds the backbone for a spec (tests inject a fake one).
         self._fm_backbone_for = fx.load_backbone
+        self._fm_worker = None          # GridWorker, created on first use
+        self._fm_retries = {}           # operation name -> (retry, cache keys waited on)
+        self._fm_sync = False           # True: extract inline (the selftests)
+        self._fm_fit_jobs = {}          # worker key of a basis fit -> (spec, n items)
 
     def _foundation_spec_from_ui(self):
         """The group's FoundationSpec (None when off), carrying the fitted
@@ -125,6 +134,9 @@ class FoundationMixin:
         cache = self._fm_cache
         if cache is not None:
             text += f"  (grids: {cache.misses} computed, {cache.hits + cache.disk_hits} reused)"
+        w = self._fm_worker
+        if w is not None and w.pending():
+            text += f"  - extracting {w.pending()} item(s)"
         try:
             self.fm_status_var.set(text)
         except tk.TclError:
@@ -180,6 +192,10 @@ class FoundationMixin:
         row = ttk.Frame(body); row.pack(fill="x", padx=4, pady=(0, 4))
         btn = ttk.Button(row, text="Refit projection", command=self._refit_foundation)
         btn.pack(side="left")
+        cbtn = ttk.Button(row, text="Cancel extraction", command=self._cancel_foundation)
+        cbtn.pack(side="left", padx=(6, 0))
+        attach_tooltip(cbtn, "Drop the token grids still queued (the one being computed "
+                             "finishes); the operation waiting on them does not run.")
         attach_tooltip(btn, "Forget the fitted PCA basis; the next Train fits a new one. "
                             "The basis is part of the column names, so this is a new "
                             "feature set.")
@@ -205,30 +221,129 @@ class FoundationMixin:
         probe = getattr(self.regions, "pixels_halo", None)
         return int(probe(key, rec)) if probe is not None else 0
 
-    def _fm_grid(self, key, rec, fs, np):
-        """``(grid, stride, halo)``: the item's raw token grid, from the cache
-        or computed now (ValueError when this app cannot supply pixels or the
-        model cannot be loaded)."""
-        read = getattr(self.regions, "item_pixels", None)
-        if read is None:
-            raise ValueError("foundation features need the item's pixels, and this "
-                             "app's region provider does not hand them out")
-        halo = self._fm_halo(key, rec)
-        ck = cache_key(key, rec.get("level"), halo, fs.extract_key())
+    def _fm_key(self, key, rec, fs):
+        level = rec.get("level") if rec is not None else None
+        return cache_key(key, level, self._fm_halo(key, rec), fs.extract_key())
 
-        def compute():
+    def _fm_job(self, key, rec, fs):
+        """The extraction of one item's grid, as a closure the worker runs:
+        nothing in it touches Tk or the cache."""
+        import numpy as np
+        read = self.regions.item_pixels
+        factory = self._fm_backbone_for
+        log = self._log
+
+        def job():
             try:
-                backbone = self._fm_backbone_for(fs)
+                backbone = factory(fs)
             except ImportError as exc:
                 raise ValueError(str(exc))
             arr, _h = read(key, rec, np)
             t0 = time.perf_counter()
             out = fx.extract_grid(backbone, arr, fs)
-            self._log(f"foundation grid {key}: {out[0].shape} in "
-                      f"{time.perf_counter() - t0:.2f} s")
+            log(f"foundation grid {key}: {out[0].shape} in {time.perf_counter() - t0:.2f} s")
             return out
-        grid, stride = self._fm_token_cache().get_or_compute(ck, compute)
-        return grid, stride, halo
+        return job
+
+    def _fm_grid(self, key, rec, fs, np):
+        """``(grid, stride, halo)``: the item's raw token grid from the cache.
+        On a miss the extraction is queued on the worker and this raises
+        ``GridsPending`` inside a deferred operation (ValueError outside one);
+        ValueError too when this app cannot supply pixels."""
+        if getattr(self.regions, "item_pixels", None) is None:
+            raise ValueError("foundation features need the item's pixels, and this "
+                             "app's region provider does not hand them out")
+        halo = self._fm_halo(key, rec)
+        ck = self._fm_key(key, rec, fs)
+        cache = self._fm_token_cache()
+        hit = cache.get(ck)
+        if hit is None and self._fm_sync:
+            hit = cache.put(ck, *self._fm_job(key, rec, fs)())
+        if hit is not None:
+            return hit[0], hit[1], halo
+        scopes = self.__dict__.get("_fm_scopes") or []
+        wanted = self._fm_request(fs, key, rec, everything=bool(scopes) and scopes[-1] == "all")
+        if scopes:
+            raise GridsPending(wanted)
+        raise ValueError("its foundation tokens are being extracted - try again in a moment")
+
+    def _fm_worker_get(self):
+        if self._fm_worker is None:
+            self._fm_worker = GridWorker(self.root, self._fm_job_done, self._fm_job_error,
+                                         log=self._log)
+        return self._fm_worker
+
+    def _fm_request(self, fs, key, rec, everything=False):
+        """Queue `key`'s grid (and, with `everything`, every other ready
+        item's that is not cached): the set of cache keys to wait for."""
+        worker = self._fm_worker_get()
+        cache = self._fm_token_cache()
+        wanted = set()
+        jobs = [(key, rec)]
+        if everything:
+            jobs += [(k, self.regions.record(k)) for k in self.regions.keys()
+                     if k != key and self._stream_ready(k)]
+        for k, r in jobs:
+            ck = self._fm_key(k, r, fs)
+            if ck in cache and not worker.is_pending(ck):
+                continue
+            worker.submit(ck, self._fm_job(k, r, fs), label=str(k))
+            wanted.add(ck)
+        self._refresh_foundation_status()
+        return wanted
+
+    def _fm_defer(self, name, retry, keys):
+        """Run `retry` once every grid in `keys` is cached (the same
+        operation asked twice keeps only its latest call)."""
+        worker = self._fm_worker_get()
+        keys = {k for k in keys if worker.is_pending(k)}
+        if not keys:
+            self.root.after(0, retry)
+            return
+        self._fm_retries[name] = (retry, keys)
+        n = worker.pending()
+        self.status_var.set(f"Extracting foundation tokens for {n} item(s) on the GPU - "
+                            f"{name.strip('_').replace('_', ' ')} continues when they are ready.")
+        self._refresh_foundation_status()
+
+    def _fm_job_done(self, ck, out):
+        fit = self._fm_fit_jobs.pop(ck, None)
+        if fit is not None:
+            self._fm_install_basis(fit[0], out, fit[1])
+        else:
+            grid, stride = out
+            self._fm_token_cache().put(ck, grid, stride)
+        ready = []
+        for name, (retry, keys) in list(self._fm_retries.items()):
+            keys.discard(ck)
+            if not keys:
+                ready.append(retry)
+                del self._fm_retries[name]
+        w = self._fm_worker
+        if w is not None and w.pending() and self._fm_retries:
+            self.status_var.set(f"Extracting foundation tokens: {w.pending()} item(s) to go.")
+        self._refresh_foundation_status()
+        for retry in ready:
+            self.root.after(0, retry)
+
+    def _fm_job_error(self, ck, msg):
+        dropped = [name for name, (_r, keys) in self._fm_retries.items() if ck in keys]
+        for name in dropped:
+            del self._fm_retries[name]
+        self._log(f"foundation extraction failed ({ck}): {msg}")
+        self.status_var.set(f"Foundation extraction failed: {msg}"
+                            + (f" - {', '.join(n.strip('_') for n in dropped)} did not run"
+                               if dropped else ""))
+        self._refresh_foundation_status()
+
+    def _cancel_foundation(self):
+        n = self._fm_worker.cancel() if self._fm_worker is not None else 0
+        waiting = len(self._fm_retries)
+        self._fm_retries.clear()
+        self._fm_fit_jobs.clear()
+        self.status_var.set(f"Foundation extraction cancelled ({n} item(s) dropped"
+                            + (f", {waiting} operation(s) will not run)." if waiting else ")."))
+        self._refresh_foundation_status()
 
     def _fm_proj(self, key, rec, fs, np):
         """``(z, stride, offset)`` -- the projected grid, memoised per item."""
@@ -265,10 +380,22 @@ class FoundationMixin:
             self._clear_compute_badge()
         if not grids:
             raise ValueError("no item could be read for the foundation projection")
-        fitted = fs.with_basis(fit_basis(grids, fs.dims))
+        if self._fm_sync or not self.__dict__.get("_fm_scopes"):
+            return self._fm_install_basis(fs, fit_basis(grids, fs.dims), len(grids))
+        # The PCA is seconds over a large sample: the worker fits it too, and
+        # the operation re-runs with the basis in place.
+        ck = f"fit|{fs.extract_key()}|{fs.dims}|{len(grids)}"
+        worker = self._fm_worker_get()
+        if not worker.is_pending(ck):
+            self._fm_fit_jobs[ck] = (fs, len(grids))
+            worker.submit(ck, lambda g=grids, d=fs.dims: fit_basis(g, d), label="projection")
+        raise GridsPending({ck})
+
+    def _fm_install_basis(self, fs, basis, n_items):
+        fitted = fs.with_basis(basis)
         self._fm_fitted = fitted
         self._fm_projected.clear()
-        self._log(f"foundation projection fitted over {len(grids)} item(s): "
+        self._log(f"foundation projection fitted over {n_items} item(s): "
                   f"{fitted.brief()} -> fm{fitted.hash8}")
         self._refresh_foundation_status()
         return fitted

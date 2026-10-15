@@ -203,7 +203,7 @@ def preview_raster(engine, arr, job, log=lambda _m: None, should_stop=None):
             if rest:
                 if stop():
                     return None
-                cur = engine.filter_chain(cur, json.dumps({"filters": rest}), default_method)
+                cur = ComputeEngine._apply_tail(cur, rest, engine, log, default_method)
             log(f"preview filter chain{on}: {1e3 * (time.perf_counter() - t0):.0f}ms")
             out["filtered"] = np.ascontiguousarray(cur, dtype=np.float32)
         return out["filtered"]
@@ -215,6 +215,19 @@ def preview_raster(engine, arr, job, log=lambda _m: None, should_stop=None):
         result may be a stack, which is the point -- an RGB intermediate."""
         if stop():
             return None
+        from . import config_io
+        chain = list(job["filters"] or [])
+        if any(str((c or {}).get("operation") or "") in config_io.PACKAGE_ONLY_OPERATIONS
+               for c in chain):
+            # Core cannot plan a stage it does not implement: run the prefix
+            # through the same split a run makes. The intermediate is then
+            # the scalar the run sees, never a stack.
+            head = chain[:int(job["upto"]) + 1]
+            cur, rest = ComputeEngine._leading_color(arr, head, engine, log,
+                                                     job["default_method"])
+            return np.ascontiguousarray(
+                ComputeEngine._apply_tail(cur, rest, engine, log, job["default_method"]),
+                dtype=np.float32)
         plan = engine.chain_plan(json.dumps(job["filters"]),
                                  arr.shape[0] if getattr(arr, "ndim", 2) == 3 else 1,
                                  job["default_method"], job["reduce_at"])
@@ -532,10 +545,59 @@ class ComputeEngine:
                 log(f"  base[{i}] normalize({params.get('method', 'gmm')}) "
                     f"-> low={tp.low:.6g} high={tp.high:.6g} "
                     f"[{cur.min():.4g}, {cur.max():.4g}]")
+            elif f.get("operation") == "unet":
+                flush()
+                cur = ComputeEngine._apply_unet(cur, f.get("params") or {}, log, f"base[{i}]")
             else:
                 pending.append(f)
         flush()
         return np.ascontiguousarray(cur, dtype=np.float32), measured
+
+    @staticmethod
+    def _apply_unet(cur, params, log, where="filters"):
+        """One `unet` stage (learned_filters.py) on a scalar raster."""
+        import numpy as np
+        from . import learned_filters
+        t0 = time.perf_counter()
+        out = learned_filters.apply(cur, params, np, log)
+        log(f"  {where} unet({params.get('model', '')}, {params.get('output', 'probability')}) "
+            f"-> min={out.min():.4g} max={out.max():.4g} "
+            f"({1e3 * (time.perf_counter() - t0):.0f}ms)")
+        return out
+
+    @staticmethod
+    def _apply_tail(cur, rest, engine, log, default_color_method="luminance"):
+        """The scalar remainder of a TOPOLOGY chain (after `_leading_color`):
+        consecutive core stages in ONE `filter_chain` call each, the package's
+        own stages (`unet`, `normalize`) applied here between them. With no
+        package stage this is exactly the single call every caller made
+        before, so such chains plan as they always did."""
+        import numpy as np
+        from . import config_io
+        from .normalize import measure_two_point
+        pending = []
+
+        def flush(cur):
+            if pending:
+                cur = engine.filter_chain(np.ascontiguousarray(cur, dtype=np.float32),
+                                          json.dumps({"filters": list(pending)}),
+                                          default_color_method)
+                pending.clear()
+            return cur
+
+        for f in rest or []:
+            op = str((f or {}).get("operation") or "")
+            if op not in config_io.PACKAGE_ONLY_OPERATIONS:
+                pending.append(f)
+                continue
+            cur = flush(cur)
+            params = dict(f.get("params") or {})
+            if op == "unet":
+                cur = ComputeEngine._apply_unet(cur, params, log)
+            else:                                   # normalize
+                tp = measure_two_point(np.asarray(cur, dtype=np.float32), **params)
+                cur = tp.apply(cur, clamp=bool(params.get("clamp", False)))
+        return flush(cur)
 
     def _run_worker(self, subseqs, params, run_info):
         try:
@@ -632,8 +694,7 @@ class ComputeEngine:
                     cur, rest = self._leading_color(arr, filters, engine, log,
                                                     default_color_method)
                     if rest:
-                        cur = engine.filter_chain(cur, json.dumps({"filters": rest}),
-                                                  default_color_method)
+                        cur = self._apply_tail(cur, rest, engine, log, default_color_method)
                         names = " -> ".join(f"{f['operation']}({f.get('params', {})})" for f in rest)
                         log(f"  filters {names} -> min={cur.min():.4g} max={cur.max():.4g}")
                     filt = np.ascontiguousarray(cur, dtype=np.float32)

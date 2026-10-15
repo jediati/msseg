@@ -41,7 +41,8 @@ except Exception:                                   # headless import
 from msseg.labeler.shell import ViewerShell
 from msseg.mscoupon import session as coupon_session
 from msseg.mscoupon import config_io
-from msseg.mscoupon.app import (build_hist_row, build_max_area_row, format_hist_ranges,
+from msseg.mscoupon.app import (build_hist_row, build_max_area_row, build_unet_folder_row,
+                                format_hist_ranges,
                                 hist_channel_choices, max_area_from_var, parse_hist_ranges,
                                 sync_hist_channels)
 from msseg.mscoupon.common import _format_sigmas, _parse_sigmas
@@ -348,8 +349,13 @@ class MsPathApp(ViewerShell):
             for pname, kind, default in filter_param_schema("color", card["params"])[1:]:
                 self._build_param_row(frame, card["params"], pname, kind, default)
         else:
-            for pname, kind, default in FILTER_SCHEMA.get(card["operation"], []):
+            # `unet`'s model list is the models folder, read when the card is built
+            rows = (filter_param_schema("unet", card["params"]) if card["operation"] == "unet"
+                    else FILTER_SCHEMA.get(card["operation"], []))
+            for pname, kind, default in rows:
                 self._build_param_row(frame, card["params"], pname, kind, default)
+            if card["operation"] == "unet":
+                build_unet_folder_row(frame, lambda c=chain: self._on_unet_folder(c))
 
     def _build_color_method_row(self, frame, card, chain):
         """The `method` picker of a colour card. Switching it swaps the card's
@@ -392,8 +398,10 @@ class MsPathApp(ViewerShell):
             choices = kind.split(":", 1)[1].split(",")
             var = tk.StringVar(value=str(params[pname]))
             var.trace_add("write", lambda *_: _set(pname, var.get()))
+            # wide enough for a model name; the short choices keep 12
+            width = max(12, min(32, max((len(c) for c in choices), default=0) + 2))
             ttk.Combobox(row, textvariable=var, values=choices, state="readonly",
-                         width=12).pack(side="left")
+                         width=width).pack(side="left")
         elif kind in ("str", "floats", "numstr"):
             var = tk.StringVar(value=str(params[pname]))
             var.trace_add("write", lambda *_: _set(pname, var.get()))
@@ -1159,6 +1167,9 @@ class MsPathApp(ViewerShell):
                     textvariable=self.roi_level_var).pack(side="left", padx=4)
         ttk.Button(row, text="Add from view",
                    command=self._add_roi_from_view).pack(side="left", padx=4)
+        self.draw_rect_btn = ttk.Button(row, text="Draw rect",
+                                        command=self._toggle_rect_tool)
+        self.draw_rect_btn.pack(side="left", padx=(0, 4))
         ttk.Button(row, text="Remove", command=self._remove_roi).pack(side="left")
         self.roi_hint = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.roi_hint, foreground="#666").pack(
@@ -1175,30 +1186,149 @@ class MsPathApp(ViewerShell):
         to the slide and capped at MAX_ROI_PX -- a request for a quarter of a
         slide at level 0 is a request for half an hour of compute.
         """
+        v = self.viewer
+        if v is None:
+            return
+        cw = max(v.canvas.winfo_width(), 1)
+        ch = max(v.canvas.winfo_height(), 1)
+        self._add_roi_from_slide_rect(v.view_x, v.view_y,
+                                      v.view_x + cw * v.scale, v.view_y + ch * v.scale)
+
+    def _view_slide_index(self):
+        """The slide the canvas shows (the current item's, else the browsed
+        one, else the first), or None with the status set."""
         cur = self._current()
         si = (cur[0] if cur is not None else self._browsed_slide())
         if si is None:
             si = 0 if self.subsequences else None
         if si is None:
             self.status_var.set("Add a slide first.")
-            return
+        return si
+
+    def _add_roi_from_slide_rect(self, x0, y0, x1, y1):
+        """Cut an ROI at the ROI level from a rect in SLIDE pixels on the slide
+        on screen, clamped to the slide (the shared tail of Add from view and
+        Draw rect)."""
+        si = self._view_slide_index()
+        if si is None:
+            return None
         sid, _path = self._slide_of(si)
-        v = self.viewer
-        if v is None or sid is None:
-            return
+        if sid is None:
+            return None
         try:
             src = self.engine.source(sid)
         except Exception as exc:
             self.status_var.set(f"{type(exc).__name__}: {exc}")
-            return
+            return None
         sh, sw = src.level_shape(0)
-        cw = max(v.canvas.winfo_width(), 1)
-        ch = max(v.canvas.winfo_height(), 1)
-        x0 = max(0, int(v.view_x)); y0 = max(0, int(v.view_y))
-        x1 = min(sw, int(v.view_x + cw * v.scale))
-        y1 = min(sh, int(v.view_y + ch * v.scale))
-        self._add_roi(si, max(0, int(self.roi_level_var.get())),
-                      x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+        x0 = max(0, int(x0)); y0 = max(0, int(y0))
+        x1 = min(sw, int(x1)); y1 = min(sh, int(y1))
+        return self._add_roi(si, max(0, int(self.roi_level_var.get())),
+                             x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+
+    # -- Draw rect: a one-shot drag on the canvas cuts a place ------------- #
+    def _toggle_rect_tool(self):
+        """Arm the rect tool (or, armed, cancel it). The drag is in the
+        canvas's slide coordinates, so it works on the overview and inside
+        a place alike; the ROI level spinbox picks the place's level."""
+        v = self.viewer
+        if v is None:
+            return None
+        tool = getattr(self, "_rect_tool", None)
+        if tool is not None and tool.armed:
+            tool.cancel()
+            return None
+        from .rect_tool import RectPlaceTool
+        self._rect_tool = RectPlaceTool(v, self._on_rect_drawn,
+                                        on_cancel=self._on_rect_tool_off)
+        self.draw_rect_btn.configure(text="Cancel rect")
+        if not getattr(self, "_rect_escape_bound", False):
+            # The labeler's Escape already cancels whatever `viewer.tool` is;
+            # the viewer has no such binding, so it gets this one.
+            if not hasattr(self, "_on_escape"):
+                self.root.bind("<Escape>", lambda _e: self._cancel_rect_tool(), add="+")
+            self._rect_escape_bound = True
+        self.status_var.set(
+            f"Drag a rectangle on the slide: a place at L{int(self.roi_level_var.get())} "
+            "(Esc cancels).")
+        return self._rect_tool
+
+    def _cancel_rect_tool(self):
+        tool = getattr(self, "_rect_tool", None)
+        return bool(tool is not None and tool.cancel())
+
+    def _on_rect_tool_off(self):
+        self.draw_rect_btn.configure(text="Draw rect")
+        self.status_var.set("Draw rect cancelled.")
+
+    def _on_rect_drawn(self, x0, y0, x1, y1):
+        self.draw_rect_btn.configure(text="Draw rect")
+        return self._add_roi_from_slide_rect(x0, y0, x1, y1)
+
+    # -- export places for labeling in GIMP --------------------------------- #
+    def _export_rows_for_labeling(self, rows, out_dir=None):
+        """Export the places at tree rows ``[(si, li)]`` (a slide row,
+        ``li`` None, means every place on it) at the level each is worked
+        at, through `label_export.export_place`. `out_dir` None -> ask.
+        Returns the sidecar dicts written."""
+        import numpy as np
+        from . import label_export
+        items = []
+        for si, li in rows:
+            lis = (range(1, len(self._rois_of(si)) + 1) if li is None else [li])
+            for k in lis:
+                if k <= 0:
+                    continue
+                item = self._item_at(si, k)
+                if item is not None and item.rect is not None:
+                    uid = (self._rois_of(si)[k - 1] or {}).get("uid")
+                    items.append((si, item, uid))
+        if not items:
+            self.status_var.set("No place to export (the overview is not one).")
+            return []
+        if out_dir is None:
+            from tkinter import filedialog
+            out_dir = filedialog.askdirectory(
+                title="Choose a folder for the labeling crops",
+                initialdir=getattr(self, "_label_export_dir", None) or None)
+            if not out_dir:
+                return []
+        self._label_export_dir = out_dir
+        docs, kept = [], 0
+        for si, item, uid in items:
+            sid, path = self._slide_of(si)
+            try:
+                doc = label_export.export_place(
+                    self.engine.source(sid), slide_id=sid, level=item.level,
+                    rect=item.rect, out_dir=out_dir, np=np, slide_path=path,
+                    place_uid=uid)
+            except Exception as exc:
+                self.status_var.set(f"Export failed on {item.label()}: "
+                                    f"{type(exc).__name__}: {exc}")
+                log(f"label export failed: {item.key}: {exc!r}")
+                return docs
+            kept += bool(doc.get("mask_kept"))
+            docs.append(doc)
+        note = f" ({kept} existing mask(s) kept)" if kept else ""
+        self.status_var.set(f"Exported {len(docs)} place(s) for labeling to {out_dir}{note}.")
+        log(f"label export: {len(docs)} place(s) -> {out_dir}{note}")
+        return docs
+
+    def _seq_tree_menu_entries(self, si, li):
+        """The shell's row menu plus Export for labeling, just before the
+        separator (the labeler splices its own after "Go to")."""
+        entries = super()._seq_tree_menu_entries(si, li)
+        if li is None:
+            n = len(self._rois_of(si))
+            entry = (f"Export {n} place(s) for labeling…",
+                     lambda: self._export_rows_for_labeling([(si, None)]), n > 0)
+        elif li > 0:
+            entry = ("Export for labeling…",
+                     lambda: self._export_rows_for_labeling([(si, li)]), True)
+        else:
+            return entries
+        cut = entries.index(None) if None in entries else len(entries)
+        return entries[:cut] + [entry] + entries[cut:]
 
     def _find_place(self, si, rect, level):
         """An existing place to reuse for a new ROI of this rect, as its index
@@ -1547,13 +1677,17 @@ class MsPathApp(ViewerShell):
         if want is None:
             return None
         key, (base_filters, filters, method) = want
-        shown = self._preview_shown
-        if shown is not None and shown[1] == channel and shown[2] == key:
-            return None                     # already on screen
-        item, arr, _geom = self._preview_item()
+        item, arr, geom = self._preview_item()
         if arr is None:
             return None
-        hit = self._preview_chan.get(key)
+        shown = self._preview_shown
+        if (shown is not None and shown[0] == item.key and shown[1] == channel
+                and shown[2] == key):
+            return None                     # already on screen
+        # Cached per ITEM as well as chain: a raster is placed where its own
+        # item sits, so another ROI's result under the same chain is a picture
+        # of somewhere else.
+        hit = self._preview_chan.get((item.key, key))
         if hit is not None:                 # retyping the old sigma: instant
             self._show_live(item.key, channel, key, hit[1])
             return None
@@ -1571,7 +1705,9 @@ class MsPathApp(ViewerShell):
                               planar=getattr(arr, "ndim", 2) == 3, label=item.key)
         self._preview_token += 1
         token = self._preview_token
-        self._preview_pending = (item, channel, key)
+        # The geometry rides with the job: a result landing after a
+        # navigation is placed where ITS item sits, not the new one.
+        self._preview_pending = (item, channel, key, geom)
         self.viewer.set_hud("busy", f"Previewing {channel}")
         self.status_var.set(f"preview: computing {channel} on {item.key}...")
         self._worker().submit(token,
@@ -1592,10 +1728,9 @@ class MsPathApp(ViewerShell):
         the source is cached with it -- a repaint must not rescan 16 Mpx."""
         if token != self._preview_token or self._preview_pending is None:
             return
-        item, channel, key = self._preview_pending
+        item, channel, key, geom = self._preview_pending
         self._preview_pending = None
         raster = (out or {}).get("base" if channel == "base" else "filtered")
-        geom = self._preview_arr[2] if self._preview_arr else None
         if raster is None or geom is None:      # stopped, or an empty chain
             self._update_busy()
             return
@@ -1603,7 +1738,7 @@ class MsPathApp(ViewerShell):
         if src is None:
             self._update_busy()
             return
-        self._preview_chan[key] = (raster, src)
+        self._preview_chan[(item.key, key)] = (raster, src)
         while len(self._preview_chan) > self._PREVIEW_CHAN_MAX:
             self._preview_chan.pop(next(iter(self._preview_chan)))
         self._show_live(item.key, channel, key, src)
@@ -1728,6 +1863,31 @@ class MsPathApp(ViewerShell):
 
     def _profile_to_file_doc(self, profile):
         return dict(profile)
+
+    def _on_unet_folder(self, chain):
+        """The models folder changed: rebuild the cards (the dropdown re-reads
+        it) and let the preview and the auto-save see the edit."""
+        self._rebuild_filter_cards(chain)
+        self._notify_profile_edit()
+
+    def _view_state(self):
+        view = super()._view_state()
+        from msseg.mscoupon.learned_filters import chosen_models_dir
+        if chosen_models_dir():                 # absent = default: older docs unchanged
+            view["filter_models_dir"] = chosen_models_dir()
+        return view
+
+    def _apply_view_state(self, view, setvar, notes):
+        super()._apply_view_state(view, setvar, notes)
+        from msseg.mscoupon.learned_filters import chosen_models_dir, set_models_dir
+        before = chosen_models_dir()
+        set_models_dir(view.get("filter_models_dir") or None)
+        if chosen_models_dir() != before:       # the cards were built against the old folder
+            for chain in ("topo", "base"):
+                try:
+                    self._rebuild_filter_cards(chain)
+                except Exception:               # mid-build: the panel is not up yet
+                    pass
 
     def _profile_from_file_doc(self, doc, notes):
         out = self._default_profile(str((doc or {}).get("name") or "default"))

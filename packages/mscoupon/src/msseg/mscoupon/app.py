@@ -148,6 +148,37 @@ def sync_hist_channels(var, combo, choices):
         var.set(", ".join(kept))
 
 
+def build_unet_folder_row(parent, on_change):
+    """The `unet` card's models-folder row: where the model list comes from
+    (folder, count, why that folder), "Folder..." to pick another and
+    "Default" to go back. `on_change()` runs after either -- the caller
+    rebuilds its cards, which re-reads the folder."""
+    from tkinter import filedialog
+    from .learned_filters import chosen_models_dir, models_dir, models_report, set_models_dir
+    report = models_report()
+    print("[unet] " + report, flush=True)
+    row = ttk.Frame(parent); row.pack(fill="x", padx=6, pady=(1, 2))
+
+    def pick():
+        folder = filedialog.askdirectory(title="Folder of unet models (.pt bundles)",
+                                         initialdir=models_dir() if os.path.isdir(models_dir())
+                                         else None)
+        if folder:
+            set_models_dir(folder)
+            on_change()
+
+    def default():
+        set_models_dir(None)
+        on_change()
+
+    ttk.Button(row, text="Folder…", command=pick).pack(side="left")
+    ttk.Button(row, text="Default", command=default,
+               state="normal" if chosen_models_dir() else "disabled").pack(side="left", padx=4)
+    ttk.Label(parent, text=report.split(" [")[0].replace("unet models: ", "models: "),
+              foreground="#777", wraplength=320, justify="left").pack(anchor="w", padx=6)
+    return row
+
+
 def build_hist_row(parent, on_var, bins_var, channels_var, on_change):
     """The histogram's first row (toggle, bins, channel dropdown), shared by
     the coupon and mspath statistics panels. Returns the channel combobox."""
@@ -946,8 +977,13 @@ class MscouponApp(ViewerShell):
             for pname, kind, default in filter_param_schema("color", card["params"])[1:]:
                 self._build_param_row(frame, card["params"], pname, kind, default)
         else:
-            for pname, kind, default in FILTER_SCHEMA.get(card["operation"], []):
+            # `unet`'s model list is the models folder, read when the card is built
+            rows = (filter_param_schema("unet", card["params"]) if card["operation"] == "unet"
+                    else FILTER_SCHEMA.get(card["operation"], []))
+            for pname, kind, default in rows:
                 self._build_param_row(frame, card["params"], pname, kind, default)
+            if card["operation"] == "unet":
+                build_unet_folder_row(frame, lambda c=chain: self._on_unet_folder(c))
         if card["operation"] == "normalize":
             self._build_normalize_readout(frame, card)
 
@@ -1023,8 +1059,10 @@ class MscouponApp(ViewerShell):
             choices = kind.split(":", 1)[1].split(",")
             var = tk.StringVar(value=str(params[pname]))
             var.trace_add("write", lambda *_: _set(pname, var.get()))
+            # wide enough for a model name; the short choices keep 12
+            width = max(12, min(32, max((len(c) for c in choices), default=0) + 2))
             ttk.Combobox(row, textvariable=var, values=choices, state="readonly",
-                         width=12).pack(side="left")
+                         width=width).pack(side="left")
         elif kind in ("str", "floats", "numstr"):
             var = tk.StringVar(value=str(params[pname]))
             var.trace_add("write", lambda *_: _set(pname, var.get()))
@@ -2557,8 +2595,17 @@ class MscouponApp(ViewerShell):
             paths.append(path)
         return paths
 
+    def _on_unet_folder(self, chain):
+        """The models folder changed: rebuild the cards (the dropdown re-reads
+        it) and let the preview and the auto-save see the edit."""
+        self._rebuild_filter_cards(chain)
+        self._notify_profile_edit()
+
     def _view_state(self):
         view = super()._view_state()
+        from .learned_filters import chosen_models_dir
+        if chosen_models_dir():                 # absent = default: older docs unchanged
+            view["filter_models_dir"] = chosen_models_dir()
         view.update({
             "persist_live": self.persist_live_var.get(),
             "seg_source": self.seg_source_var.get(),
@@ -2666,6 +2713,15 @@ class MscouponApp(ViewerShell):
             setvar(self.concurrent_slices_var, int(run["concurrent_slices"]))
 
     def _apply_view_state(self, view, setvar, notes):
+        from .learned_filters import chosen_models_dir, set_models_dir
+        before = chosen_models_dir()
+        set_models_dir(view.get("filter_models_dir") or None)
+        if chosen_models_dir() != before:       # the cards were built against the old folder
+            for chain in ("topo", "base"):
+                try:
+                    self._rebuild_filter_cards(chain)
+                except Exception:               # mid-build: the panel is not up yet
+                    pass
         if view.get("persist_live") is not None:
             setvar(self.persist_live_var, str(view["persist_live"]))
         # An older session's separate filtered pair becomes that channel's

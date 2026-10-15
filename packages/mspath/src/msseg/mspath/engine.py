@@ -348,7 +348,7 @@ class SlideEngine:
         # passed alone is a chain of one, which can plan differently from the
         # same stage inside its chain.
         if rest:
-            cur = ext.filter_chain(cur, json.dumps({"filters": rest}), method)
+            cur = ComputeEngine._apply_tail(cur, rest, ext, say, method)
         filtered = np.ascontiguousarray(cur, dtype=np.float32)
         base, _norms = ComputeEngine._apply_base_chain(
             arr, profile.get("base_filters") or [], ext, say, method)
@@ -432,7 +432,7 @@ class SlideEngine:
         cur, rest = ComputeEngine._leading_color(arr, chains.get("filters") or [], ext, say,
                                                  method)
         if rest:
-            cur = ext.filter_chain(cur, json.dumps({"filters": rest}), method)
+            cur = ComputeEngine._apply_tail(cur, rest, ext, say, method)
         filtered = np.ascontiguousarray(cur, dtype=np.float32)
         # The base chain is a measurement: the NEW profile's, not the prime's.
         base, _norms = ComputeEngine._apply_base_chain(

@@ -373,6 +373,54 @@ def run_selftest():
     app._preview_shown = ("x", "filtered", ("filtered", "{}"), primed_src)
     app._handle_compute_event(("primed",))
     assert app._preview_shown is None and app._primed_chain == app._chain_fingerprint()
+
+    # -- a learned filter: the unet card's model list is the models folder,
+    # and the live preview runs it (a package stage, applied between core
+    # batches -- core never sees it)
+    try:
+        import torch as _torch  # noqa: F401
+    except ImportError:
+        _torch = None
+    if _torch is not None:
+        from msseg.mscoupon import learned_filters as _lf
+        old_env = os.environ.get(_lf.ENV_DIR)
+        os.environ[_lf.ENV_DIR] = os.path.join(tmp, "filters")
+        try:
+            meta = {"arch": "unet", "widths": [4, 8, 8, 8], "groups": 4}
+            _lf.save_bundle(os.path.join(tmp, "filters", "tiny.pt"), _lf.build_net(meta), meta)
+            app._on_filter_op_change(0, "unet")
+            card = app.filter_cards[0]
+            assert card["operation"] == "unet" and card["params"].get("model") == "tiny", card
+            assert app._profile_for_compute()["filters"][0] == {
+                "operation": "unet",
+                "params": {"model": "tiny", "output": "probability", "device": "auto"}}
+            app.background_var.set("filtered")
+            assert app._launch_preview() is not None, "a unet card recomputes the preview"
+            r = app._channel_source(item.key, "filtered", src)[0].raster
+            assert r.shape == primed_src.raster.shape and 0.0 <= r.min() and r.max() <= 1.0, \
+                (r.shape, r.min(), r.max())
+            # Folder...: a picked folder replaces the list and rides the view;
+            # Default goes back, and an unpicked view carries no key at all
+            picked = os.path.join(tmp, "picked_models")
+            _lf.save_bundle(os.path.join(picked, "other.pt"), _lf.build_net(meta), meta)
+            assert "filter_models_dir" not in app._view_state()
+            _lf.set_models_dir(picked); app._on_unet_folder("topo")
+            assert app._view_state()["filter_models_dir"] == picked
+            assert config_io.filter_param_schema("unet", {})[0][1] == "choice:other"
+            _lf.set_models_dir(None)
+            app._apply_view_state({"filter_models_dir": picked}, lambda var, v: var.set(v), [])
+            assert _lf.chosen_models_dir() == picked, "the session restores the pick"
+            app._apply_view_state({}, lambda var, v: var.set(v), [])
+            assert _lf.chosen_models_dir() is None and "filter_models_dir" not in app._view_state()
+        finally:
+            _lf.set_models_dir(None)
+            if old_env is None:
+                os.environ.pop(_lf.ENV_DIR, None)
+            else:
+                os.environ[_lf.ENV_DIR] = old_env
+            app.filter_cards[:] = json.loads(json.dumps(chain_before))
+            app._rebuild_filter_cards("topo")
+            app._handle_compute_event(("primed",))
     app._preview_sync = False
     app._primed_chain = None
     app.background_var.set("slide"); app._on_image_channel_change()
@@ -449,6 +497,77 @@ def run_selftest():
     assert app.catalogue.group_of(roi.key) == app.catalogue.group_of(item.key)
     rows = app._sequence_item_labels(0)
     assert len(rows) == 2 and rows[0].startswith("overview"), rows
+
+    # Draw rect: a one-shot drag on the canvas cuts a place at the ROI level,
+    # in the canvas's slide coordinates, and hands the drawing tool back
+    class _E:
+        def __init__(self, x, y):
+            self.x, self.y = x, y
+    v = app.viewer
+    prev_tool = v.tool
+    tool = app._toggle_rect_tool()
+    assert v.tool is tool and app.draw_rect_btn.cget("text") == "Cancel rect"
+    app._toggle_rect_tool()                       # a second click cancels
+    assert v.tool is prev_tool and app.draw_rect_btn.cget("text") == "Draw rect"
+    tool = app._toggle_rect_tool()
+    gx, gy = sw // 2, sh0 // 2
+    scr = lambda X, Y: _E((X - v.view_x) / v.scale, (Y - v.view_y) / v.scale)
+    tool.on_press(scr(gx, gy))
+    tool.on_move(scr(gx + side, gy + side))
+    tool.on_release(scr(gx + side, gy + side))
+    assert v.tool is prev_tool and app.draw_rect_btn.cget("text") == "Draw rect"
+    assert len(app._rois_of(0)) == 2, app._rois_of(0)
+    drawn = app._rois_of(0)[-1]
+    tol = 2 * v.scale + 1
+    assert drawn["level"] == roi_level and abs(drawn["x"] - gx) <= tol \
+        and abs(drawn["w"] - side) <= tol, (drawn, gx, side, v.scale)
+
+    # Export for labeling: the slide row exports every place, a place row one;
+    # each gets image + empty transparent mask layer + raw TIFF + sidecar
+    slide_menu = [e[0] for e in app._seq_tree_menu_entries(0, None) if e]
+    assert "Export 2 place(s) for labeling…" in slide_menu, slide_menu
+    assert "Export for labeling…" in [e[0] for e in app._seq_tree_menu_entries(0, 1) if e]
+    assert not any(e and e[0].startswith("Export") for e in app._seq_tree_menu_entries(0, 0))
+    out = os.path.join(tmp, "label_crops")
+    docs = app._export_rows_for_labeling([(0, None)], out_dir=out)
+    assert len(docs) == 2 and app._label_export_dir == out
+    from PIL import Image as _Image
+    for d in docs:
+        base = os.path.join(out, d["files"]["image"][:-4])
+        assert all(os.path.exists(base + s) for s in (".png", "_mask.png", ".json"))
+        m = _Image.open(base + "_mask.png")
+        assert m.mode == "RGBA" and m.size == (d["shape"][1], d["shape"][0])
+        assert d["level"] == roi_level and d["slide"] == item.slide
+    assert len(app._export_rows_for_labeling([(0, 1)], out_dir=out)) == 1
+    assert "1 existing mask(s) kept" in app.status_var.get(), app.status_var.get()
+    _settle(app)                                  # the drawn place started a prime
+    app._remove_roi_at(0, 2)                      # the rest counts one ROI
+    assert len(app._rois_of(0)) == 1
+
+    # The live preview is per ITEM: one chain previewed on the ROI and then
+    # on the overview computes twice, each raster placed where its own item
+    # sits. (Cached by chain alone, the second showed the ROI's picture at the
+    # ROI's place -- "the stage sits away from the image".)
+    app._preview_sync = True
+    saved_cards = json.loads(json.dumps(app.filter_cards))
+    app.filter_cards[:] = [{"operation": "blur", "params": {"sigma": 2.5}},
+                           {"operation": "none", "params": {}}]
+    app.background_var.set("filtered")
+    app._goto_slice(app.flat_slices.index((0, 1))); _settle(app)
+    assert app._launch_preview() is not None
+    roi_src = app._preview_shown[3]
+    app._goto_slice(app.flat_slices.index((0, 0))); _settle(app)
+    assert app._launch_preview() is not None, "another item computes its own"
+    ovw_src = app._preview_shown[3]
+    assert ovw_src is not roi_src and (ovw_src.ox, ovw_src.oy) != (roi_src.ox, roi_src.oy)
+    app._goto_slice(app.flat_slices.index((0, 1))); _settle(app)
+    assert app._launch_preview() is None and app._preview_shown[3] is roi_src, \
+        "back on the ROI, its own raster comes from the cache"
+    app.filter_cards[:] = saved_cards
+    app._rebuild_filter_cards("topo")
+    app._handle_compute_event(("primed",))
+    app._preview_sync = False
+    app.background_var.set("slide"); app._on_image_channel_change()
 
     # an ROI is capped rather than allowed to be a half-hour of compute
     app._add_roi(0, 0, 0, 0, sw, sh0)
@@ -582,6 +701,7 @@ def _foundation_block(app, item, rec, tmp, np):
     app._fm_backbone_for = lambda fs: (loads.append(fs.model), fake)[1]
     app._fm_cache = TokenCache(None)               # no disk writes from a selftest
     app._fm_fitted = None
+    app._fm_sync = True                            # inline first; the worker below
     assert app.regions.pixels_halo(item.key, rec) == app.engine.primed[item.key].halo
     arr, halo = app.regions.item_pixels(item.key, rec, np)
     assert arr.shape[-2:] == tuple(s + 2 * halo for s in rec["labels"].shape), (arr.shape, halo)
@@ -643,6 +763,61 @@ def _foundation_block(app, item, rec, tmp, np):
     if items[0][8] == "features":
         assert any(n.startswith("absdiff_fm") for n in fnames), "flank pools in the pair terms"
     assert app._task_delete(confirm=True) and app._task is t_region
+
+    # -- off the Tk thread: an operation that meets an uncached grid queues it,
+    # returns at once, and re-runs itself when the worker has delivered.
+    import time as _time
+
+    def drain(limit=60.0):
+        # Until quiet: a re-run can queue the next step (grids, then the
+        # projection fit), and each retry is scheduled with after(0).
+        end, quiet = _time.time() + limit, 0
+        while quiet < 10 and _time.time() < end:
+            app.root.update()
+            _time.sleep(0.01)          # a tight loop starves the worker of the GIL
+            busy = app._fm_worker.pending() or app._fm_retries
+            quiet = 0 if busy else quiet + 1
+        assert not app._fm_worker.pending() and not app._fm_retries, "the worker never drained"
+
+    app._fm_sync = False
+    app._fm_cache = TokenCache(None)
+    app._refit_foundation()
+    app.fm_enabled_var.set(True)
+    app._on_foundation_change()
+    before = id(app._clf)
+    app.model_kind_var.set("dense FC")
+    assert app._train_classifier() is None
+    assert app._fm_worker.pending() >= 1, "Train did not queue its grids"
+    assert "_train_classifier" in app._fm_retries, app._fm_retries
+    assert id(app._clf) == before, "Train must not run before its grids exist"
+    assert "Extracting foundation tokens" in app.status_var.get(), app.status_var.get()
+    drain()
+    assert id(app._clf) != before, f"Train did not re-run: {app.status_var.get()!r}"
+    assert app._clf_context.foundation is not None and app._clf_context.foundation.basis is not None
+    # classify-current waits for its own item only
+    app._fm_cache = TokenCache(None)
+    app._fm_projected.clear()          # the memos above the grid cache would answer
+    app._ctx_cache.clear()
+    app._pred.clear()
+    assert not app._classify_current()
+    assert app._fm_worker.pending() == 1 and "_classify_current" in app._fm_retries
+    drain()
+    pred = app._pred.get(item.key)
+    assert pred is not None and pred[0] == rec["commit"], "classify-current did not re-run"
+    # cancel drops the queue and the waiting operation
+    app._fm_cache = TokenCache(None)
+    app._fm_projected.clear()          # the memos above the grid cache would answer
+    app._ctx_cache.clear()
+    app._pred.clear()
+    assert not app._classify_current()
+    app._cancel_foundation()
+    assert not app._fm_worker.pending() and not app._fm_retries
+    assert "cancelled" in app.status_var.get()
+    for _ in range(20):                # let a job that was already running finish
+        app.root.update()
+        _time.sleep(0.02)
+    assert app._pred.get(item.key) is None, "a cancelled operation ran anyway"
+    app._fm_sync = True
 
     app.fm_enabled_var.set(False)
     app._on_foundation_change()
@@ -1022,7 +1197,9 @@ def run_labeler_selftest():
     assert app._row_owns_key(0, None, cut.key), "a slide row still owns item keys"
     assert len(app._row_interactions(0, None)) == 3 and len(app._row_interactions(0, li)) == n_roi
     labels = [e[0] if e else None for e in app._seq_tree_menu_entries(0, None)]
-    assert labels == ["Go to", "Enrol every place in 'task 1'", None,
+    n_places = len(app._rois_of(0))
+    assert labels == ["Go to", "Enrol every place in 'task 1'",
+                      f"Export {n_places} place(s) for labeling…", None,
                       "Clear annotations\u2026 (3)", "Remove slide\u2026"], labels
     # the ROI: removing it dooms nothing -- its gestures are the slide's and
     # stay, visible on the overview -- the engine forgets it and the view
@@ -1361,7 +1538,8 @@ def run_labeler_selftest():
 
     root.destroy()
     print("labeler selftest OK: placement, slide-coordinate gestures, class layer, "
-          "foundation columns (pixels + halo, fitted basis, gate, pickle, seams), "
+          "foundation columns (pixels + halo, fitted basis, gate, pickle, seams, "
+          "background extraction + deferred re-run + cancel), "
           "box over the item, training rows, level-scoped compat gate, "
           "classify + propose ROIs, refusal notice on the HUD, "
           "predictions survive an incremental prime, undo, tree rows: "

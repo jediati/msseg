@@ -41,3 +41,6 @@ coupon_viewer.html
 # --- Editor / OS ---------------------------------------------------------
 .DS_Store
 Thumbs.db
+
+# learned-filter bundles (the unet stage): local, large, not source
+filter_models/

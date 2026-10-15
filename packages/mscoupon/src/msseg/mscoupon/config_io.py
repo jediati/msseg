@@ -136,7 +136,14 @@ LIFTABLE_OPERATIONS = tuple(o for o in CORE_SCALAR_OPERATIONS if o != "label_com
 # batches. They are the ONLY legitimate reason to cut a chain in two: the
 # synthesis decision is a whole-chain property, so any other cut re-plans a
 # fragment and can insert a conversion the whole chain would not have.
-PACKAGE_ONLY_OPERATIONS = ("normalize",)
+PACKAGE_ONLY_OPERATIONS = ("normalize", "unet")
+
+# A pre-trained network as a filter (learned_filters.py). `model` is a choice
+# over the bundles in the models folder, filled in per call by
+# filter_param_schema -- the folder changes while the app runs.
+FILTER_SCHEMA["unet"] = [("model", "choice:", ""),
+                         ("output", "choice:probability,logit", "probability"),
+                         ("device", "choice:auto,cuda,cpu", "auto")]
 
 FILTER_SCHEMA["stain_deconvolution"] = [("preset", "choice:he,hdab,hed", "he"),
                                         ("i0", "numstr", "max"), ("eps", "float", 0.001)]
@@ -319,6 +326,9 @@ def chain_plan(chain: Sequence[Any], channels: int = 1,
             "error": error}
 
 
+_UNET_REPORT = None   # the last models-folder report printed (filter_param_schema)
+
+
 def filter_param_schema(operation: str, params: Any = None) -> List[tuple]:
     """The [(param, kind, default), ...] rows a card renders: the operation's
     schema, plus -- for `color` -- the rows of the method `params` names."""
@@ -329,6 +339,21 @@ def filter_param_schema(operation: str, params: Any = None) -> List[tuple]:
     elif operation == "adapt":
         mode = (params or {}).get("mode", "select") if isinstance(params, dict) else "select"
         rows += ADAPT_MODE_PARAMS.get(str(mode), [])
+    elif operation == "unet":
+        from .learned_filters import list_models, models_report
+        names = list_models()
+        global _UNET_REPORT
+        report = models_report()
+        if report != _UNET_REPORT:        # every profile poll lands here; say it once
+            _UNET_REPORT = report
+            print("[unet] " + report, flush=True)
+        # A profile naming a model that is not installed keeps the name: the
+        # card shows it, and applying it says where it was looked for.
+        cur = str((params or {}).get("model") or "") if isinstance(params, dict) else ""
+        if cur and cur not in names:
+            names = [cur] + names
+        default = names[0] if names else ""
+        rows[0] = ("model", "choice:" + ",".join(names), default)
     return rows
 
 

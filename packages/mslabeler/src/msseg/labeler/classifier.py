@@ -14,6 +14,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from . import seam_model
+from .foundation.worker import fm_deferred
 from . import context, edge_model, magic_fill, model_search, fields
 from . import bundle as model_bundle
 from .labeling import (LabelStore, MAX_CLASSES, TOOLS, resolve_slice, resolve_sets,
@@ -161,6 +162,10 @@ class ClassifierMixin:
     def _fm_resolved(self, fs):
         return fs
 
+    def _fm_defer(self, name, retry, keys):
+        """Headless: nothing is ever extracted in the background."""
+        self.root.after(0, retry)
+
     def _resolve_context_spec(self, spec):
         """`spec` ready to build rows: its foundation projection fitted now
         when it has none (ValueError when that cannot be done)."""
@@ -218,6 +223,7 @@ class ClassifierMixin:
 
     _feature_matrix = staticmethod(TrainingSetBuilder.feature_matrix)
 
+    @fm_deferred
     def _train_classifier(self, preserve_view=False):
         """Fit the selected model kind on the labeled regions' statistics rows.
 
@@ -732,6 +738,7 @@ class ClassifierMixin:
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             self.sweep_trials_var.set(str(int(v)))
 
+    @fm_deferred
     def _optimize_network(self, sync=False):
         """Search the dense FC space by leave-slices-out cross-validation and
         install the winner as the "dense (tuned)" model, then classify.
@@ -922,6 +929,7 @@ class ClassifierMixin:
         return path
 
     # -- Size sweep ------------------------------------------------------ #
+    @fm_deferred
     def _sweep_network(self, sync=False):
         """Score a ladder of architectures, each at its own best settings
         (one fixed-size search per rung), report them, install the best rung
@@ -1094,6 +1102,7 @@ class ClassifierMixin:
         return path
 
     # -- Evaluate edges -------------------------------------------------- #
+    @fm_deferred
     def _evaluate_edges(self, sync=False):
         """Leave-slices-out report for the edge model on top of the CURRENT
         base kind: per fold the base is refit on the training slices, the
@@ -1209,6 +1218,7 @@ class ClassifierMixin:
             return
         self._classify_current()
 
+    @fm_deferred(scope="one")
     def _classify_current(self, quiet=False):
         """Predict the item on screen only -- the one update the user is
         waiting for. Returns True when a prediction is in place. `quiet`
@@ -1355,6 +1365,7 @@ class ClassifierMixin:
         return model_bundle.compat_message(names, expected, prof, context,
                                            scope, self._feature_scope())
 
+    @fm_deferred
     def _classify(self):
         """Predict a class for EVERY region of every computed slice and show
         the result as a translucent layer under the drawn labels. BLOCKS with

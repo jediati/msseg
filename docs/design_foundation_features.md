@@ -230,16 +230,46 @@ Every mspath (level-scoped) region pickle came back "trained at no scope"
 and Classify refused it. It now passes `scope=_clf_scope` (scope-less
 pickles are unchanged).
 
+**Background extraction** (`foundation/worker.py`, added the same day):
+- `GridWorker` is one daemon thread over a FIFO of jobs. A job is an item's
+  grid (read the pixels, run the backbone, stitch) or the projection fit.
+  Results are drained on the Tk thread by a `root.after` pump.
+- `fm_deferred` decorates the model operations' entry points: Train,
+  Optimize, the size sweep, Evaluate edges, Classify all, classify-current,
+  and the seam model's train / classify / evaluate / export.
+- An operation that meets an uncached grid gets a `GridsPending` (not a
+  ValueError, so the "item cannot be computed" handlers let it pass). It
+  returns at once with a status line, and `_fm_defer` re-runs the same call
+  when everything it waited on has landed.
+- What a miss queues depends on the operation: every ready item (`scope
+  "all"`), or only the item on screen (`"one"`, classify-current and
+  classify-on-arrival).
+- Outside an operation a miss queues the item and reads as "not available
+  yet".
+- The projection fit is the second step: the re-run finds every grid cached,
+  queues the fit, and re-runs again once the basis is in place.
+  `fit_basis` is now an eigendecomposition of a chunked float64 covariance
+  instead of an SVD of the sample: 1.5 s instead of 7 s for 200k x 768.
+- *Cancel extraction* drops the queue and the operations waiting on it.
+- `_fm_sync` (the selftests) extracts inline.
+- Measured on the user's session (2 large items, DINOv2 ViT-B):
+  - Train returns in 0.26 s.
+  - Grids land at 6.4 s / 7.1 s, the first of them including the backbone
+    load, and the fit at 8.1 s.
+  - The only Tk stall left is the final Train pass itself (3 s: pooling about
+    1 s per large item, the fit, Classify), which was always on the Tk
+    thread.
+
 **Not built yet:**
-- A worker thread: extraction runs on the Tk thread under the compute badge,
-  like record streaming. The first Train loads the backbone (about 7 s),
-  then about 0.6 s per uncached 2048² item.
 - An `fm` stage-strip box.
+- Pooling on the worker: about 1 s per 17 Mpx item on the Tk thread.
 - The coupon's `item_pixels`.
 - The core / CLI / 3D matcher are not planned: a `ChannelStats` cell is a
   fixed 24 B for every slot, and the CLI cannot run torch.
 
-Tests: `test_foundation_spec.py` (spec plumbing) and the mspath labeler
-selftest's foundation block (fake backbone: pixels + halo, fitted basis,
-names, gate, classify, view, pickle round trip, cache reuse, polyline seam
-block).
+Tests: `test_foundation_spec.py` (spec plumbing),
+`test_foundation_worker.py` (worker + decorator) and the mspath labeler
+selftest's foundation block. It uses a fake backbone and covers pixels +
+halo, fitted basis, names, gate, classify, view, pickle round trip, cache
+reuse, the polyline seam block, and background Train / classify-current
+re-runs + cancel.
