@@ -352,9 +352,11 @@ class ClassifierMixin:
             spec = build_spec = model_search.ModelSpec(
                 hidden=tuple(self._custom_hidden()), max_iter=_MLP_MAX_ITER,
                 backend=self._search_settings()[4])
-        # A frozen base: an edge kind keeps the current base net (same
-        # features, has an embedding) and refits only the edges on top.
-        want_frozen = _is_edge_kind(kind) and bool(self.freeze_base_var.get())
+        # A frozen base: with an edge model ticked, Train keeps the current
+        # base net (same features, has an embedding) and refits only the
+        # edges on top.
+        want_edges = bool(self.edge_on_var.get()) and base not in _FLAT_KINDS
+        want_frozen = want_edges and bool(self.freeze_base_var.get())
         frozen = (want_frozen
                   and self._clf is not None and list(self._clf_names or []) == list(names)
                   and self._has_embedding(self._clf))
@@ -378,7 +380,7 @@ class ClassifierMixin:
                 self._clear_compute_badge()
         dt_ms = 1e3 * (time.perf_counter() - t0)
         edge, edge_note = (None, "")
-        if _is_edge_kind(kind):
+        if want_edges:
             edge, edge_note = self._fit_edge_model_now(clf, names, ctx)
         latent, latent_note = (None, "")
         if ctx.latent is not None:
@@ -585,8 +587,9 @@ class ClassifierMixin:
         ContextSpec `ctx` (whose `latent` block says how):
         (LatentContextModel | None, status note). The head is the base's own
         architecture (the tuned spec when there is one, its feature mask
-        widened by the latent columns) refit on the row plus the ring's
-        embedding columns, with balanced weights like the base."""
+        widened by the latent columns; `latent.hidden` overrides its sizes)
+        refit on the row plus the ring's embedding columns, with balanced
+        weights like the base."""
         import numpy as np
         if ctx is None or ctx.latent is None:
             return None, ""
@@ -615,6 +618,8 @@ class ClassifierMixin:
                 hs = dataclasses.replace(base_spec, features=feats, max_iter=_MLP_MAX_ITER)
             else:
                 hs = model_search.ModelSpec(max_iter=_MLP_MAX_ITER, backend=backend)
+            if lspec.hidden:            # the head's own sizes, else the base's
+                hs = dataclasses.replace(hs, hidden=tuple(lspec.hidden))
             return model_search.build_estimator(hs, all_names), model_search.fit_estimator
 
         self._compute_badge("Fitting latent head")
@@ -629,6 +634,22 @@ class ClassifierMixin:
         self._log(f"latent head: {model.describe()}")
         return model, (f" -> {lspec.brief()}: +{len(context.latent_names(lspec, model.width))} "
                        f"columns, {model.fit_s * 1e3:.0f} ms")
+
+    def _voting_on(self):
+        """Neighbour voting applies the edge model (the checkbox / N)."""
+        var = getattr(self, "voting_var", None)
+        return bool(var.get()) if var is not None else False
+
+    def _edge_for(self, clf, names, ctx):
+        """The edge model for an installed-elsewhere base (Optimize / sweep
+        winners) when '+ edge model' is ticked, else None -- the note goes
+        to the log."""
+        if not self.edge_on_var.get():
+            return None
+        model, note = self._fit_edge_model_now(clf, names, ctx)
+        if note:
+            self._log("edge model:" + note)
+        return model
 
     def _latent_for(self, clf, names, ctx, spec=None):
         """The latent head for an installed-elsewhere base (Optimize / sweep
@@ -676,7 +697,7 @@ class ClassifierMixin:
         milliseconds, no forward pass. Entries classified before the edge
         model existed have no aux and force a Classify."""
         import numpy as np
-        active = self._edge_model is not None and _is_edge_kind(self.model_kind_var.get())
+        active = self._edge_model is not None and self._voting_on()
         spec = self._edge_spec_from_ui()
         missing = False
         for key, entry in list(self._pred.items()):
@@ -983,8 +1004,9 @@ class ClassifierMixin:
         self._search_spec = spec
         ctx = st.get("context")
         latent = self._latent_for(res.estimator, names, ctx, spec)
+        edge = self._edge_for(res.estimator, names, ctx)
         self._install_model(res.estimator, names, _TUNED_KIND, spec, preserve_view=True,
-                            ctx=ctx, latent=latent)
+                            edge=edge, ctx=ctx, latent=latent)
         self._refresh_model_readout()
         gain = ""
         if spec.baseline_score is not None:
@@ -1154,8 +1176,9 @@ class ClassifierMixin:
                else getattr(self, "_sweep_context", None))
         self._search_spec = row.spec
         latent = self._latent_for(row.estimator, names, ctx, row.spec)
+        edge = self._edge_for(row.estimator, names, ctx)
         self._install_model(row.estimator, names, _TUNED_KIND, row.spec, preserve_view=True,
-                            ctx=ctx, latent=latent)
+                            edge=edge, ctx=ctx, latent=latent)
         self._refresh_model_readout()
         self._refresh_model_strip()
         if announce:
@@ -1211,7 +1234,7 @@ class ClassifierMixin:
             return
         if self._clf is None or not self._has_embedding(self._clf):
             self.status_var.set("Evaluate edges needs a trained dense base - Train a dense "
-                                "or '-> edges' kind first.")
+                                "kind first.")
             return
         names = list(self._clf_names)
         data = self._edge_training_data(names)
@@ -1608,7 +1631,7 @@ class ClassifierMixin:
                            "la": np.asarray(arcs["a"]), "lb": np.asarray(arcs["b"]),
                            "lam": spec.lam, "rounds": spec.rounds, "flips": 0,
                            "active": False, "source": arcs.get("source")}
-                    if _is_edge_kind(self.model_kind_var.get()):
+                    if self._voting_on():
                         final, flips = self._vote_entry(region_proba, aux, spec.lam,
                                                         spec.rounds, np)
                         aux["flips"], aux["active"] = flips, True
@@ -1664,8 +1687,8 @@ class ClassifierMixin:
         self._snapshot_active_profile()
         stats = dict(self.profiles[self.active_profile_idx].get("statistics") or {})
         spec = None if self._clf_spec is None else self._clf_spec.to_dict()
-        # v4: the edge model on top (None for plain kinds) and the stack's
-        # settings, so a loaded '-> edges' model can be retrained as is.
+        # v4: the edge model on top (None without one) and the stack's
+        # settings, so a loaded model with edges can be retrained as is.
         edge = None if self._edge_model is None else self._edge_model.to_dict()
         stack = {"custom_hidden": self.custom_hidden_var.get(),
                  "edge_spec": self._edge_spec_from_ui().to_dict()}
@@ -1751,7 +1774,9 @@ class ClassifierMixin:
         self._clf_scope = doc.scope
         self._clf_context = ctx
         self._apply_context_spec(ctx)
-        self._clf_kind = doc.kind
+        # An older pickle's "-> edges" kind is its base (the edge model, if
+        # it is restored below, says the rest).
+        self._clf_kind, legacy_edges = _split_kind(doc.kind)
         self._clf_spec = (model_search.ModelSpec.from_dict(doc.spec)
                           if doc.spec is not None else None)
         if self._clf_spec is not None and _base_kind(self._clf_kind) == _TUNED_KIND:
@@ -1791,6 +1816,11 @@ class ClassifierMixin:
             self._apply_edge_spec(edge_model.EdgeSpec.from_dict(stack["edge_spec"]))
         if self._clf_kind in _MODEL_KINDS:
             self.model_kind_var.set(self._clf_kind)
+        # The checkbox follows what was loaded: an edge model means Train
+        # would fit one again; an older edge kind also meant voting on.
+        self.edge_on_var.set(self._edge_model is not None)
+        if legacy_edges:
+            self.voting_var.set(True)
         self._refresh_model_readout()
         self.classify_btn.config(state="normal")
         self._record_model(path, doc.statistics)

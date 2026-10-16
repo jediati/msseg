@@ -1052,14 +1052,16 @@ def run_labeler_selftest():
     # -- foundation-model columns (panels/foundation.py), on a fake backbone - #
     _foundation_block(app, item, rec, tmp, np)
 
-    # An "-> edges" kind first: its pair model groups edges by the catalogue's
+    # An edge model first: its pair model groups edges by the catalogue's
     # group, which here is the slide NAME. int("WSI/a.tiff") took the first
     # real Train down.
-    app.model_kind_var.set("custom FC -> edges")
+    app.model_kind_var.set("custom FC")
+    app.edge_on_var.set(True)
     app._train_classifier()
-    assert app._clf is not None, f"edges kind failed to train: {app.status_var.get()!r}"
-    assert app._edge_model is not None, "no edge model came out of an -> edges kind"
+    assert app._clf is not None, f"edge model failed to train: {app.status_var.get()!r}"
+    assert app._edge_model is not None, "no edge model came out of '+ edge model'"
     app.model_kind_var.set("dense FC")
+    app.edge_on_var.set(False)
     app._train_classifier()          # returns None on success; the model is the result
     if app._clf is None:
         print(f"[mspath] (classifier unavailable: {app.status_var.get()!r} "

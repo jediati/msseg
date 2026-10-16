@@ -376,7 +376,7 @@ class TaskProvider(Provider):
             if why:
                 return f"{self.name}'s net: {why}"
         if slot == "pdiff" and stack.edge is None:
-            return f"{self.name} has no edge model (Model tab, an '-> edges' kind)"
+            return f"{self.name} has no edge model (Model tab, '+ edge model')"
         return None
 
     def requires(self, slot: str) -> Requirement:

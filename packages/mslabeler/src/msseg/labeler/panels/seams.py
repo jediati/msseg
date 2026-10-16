@@ -59,7 +59,7 @@ class SeamPanelMixin:
                            "geometric: length only. feature: z-scored mean dissimilarity "
                            "of the two flanks over the channels. bhattacharyya: their "
                            "Gaussian overlap. barrier: the arc's saddle depth (MSC arcs). "
-                           "edges: the '-> edges' model's p(diff). model: the trained "
+                           "edges: the region edge model's p(diff). model: the trained "
                            "seam model's boundaryness.")
         ttk.Label(row, text="on").pack(side="left", padx=(6, 2))
         ent = ttk.Entry(row, textvariable=self.seam_channels_var, width=10)

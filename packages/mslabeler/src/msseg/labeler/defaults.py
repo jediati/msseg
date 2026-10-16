@@ -48,37 +48,38 @@ _INSPECT_MODES = (_MODE_SIMILARITY, _MODE_UNIT)
 # adding one cannot leave a trained model that the UI does not recognize.
 _TUNED_KIND = "dense (tuned)"
 # "custom FC": a dense net whose hidden sizes are typed on the Model tab.
-# The "-> edges" kinds stack an edge model (edge_model.py: a pair classifier
-# on the base net's hidden layer over the living-region graph, plus
-# neighbour voting) on top of a base net; Train fits the base, then the
-# edges. `_clf` is always the BASE pipeline, `_edge_model` the top.
+# A kind names the BASE region classifier only. An edge model (edge_model.py:
+# a pair classifier on the base net's hidden layer over the living-region
+# graph) is a separate choice -- the "+ edge model" checkbox, any dense base
+# -- and neighbour voting with it another (the "voting" checkbox, key N).
+# `_clf` is always the BASE pipeline, `_edge_model` the top.
 _CUSTOM_KIND = "custom FC"
+_MODEL_KINDS = ("random forest", "dense FC", "dense-top-16", "dense-top-32", _TUNED_KIND,
+                _CUSTOM_KIND)
+# Kinds with no hidden layer: no embedding, so no edge model or latent head.
+_FLAT_KINDS = ("random forest",)
+# The kinds older sessions / pickles wrote for "base + edge model + voting":
+# read as their base with both checkboxes on (`_split_kind`), never written.
 _TUNED_EDGE_KIND = "dense (tuned) -> edges"
 _CUSTOM_EDGE_KIND = "custom FC -> edges"
-_EDGE_KINDS = (_TUNED_EDGE_KIND, _CUSTOM_EDGE_KIND)
-_MODEL_KINDS = ("random forest", "dense FC", "dense-top-16", "dense-top-32", _TUNED_KIND,
-                _CUSTOM_KIND) + _EDGE_KINDS
+_LEGACY_EDGE_KINDS = {_TUNED_EDGE_KIND: _TUNED_KIND, _CUSTOM_EDGE_KIND: _CUSTOM_KIND}
 _DEFAULT_CUSTOM_HIDDEN = "16-8"
 _EDGE_LAM_RANGE = (0.0, 5.0)
 _EDGE_ROUNDS_RANGE = (0, 10)
 _EDGE_C_RANGE = (1e-3, 1e3)
 
 
-def _is_edge_kind(kind):
-    return kind in _EDGE_KINDS
+def _split_kind(kind):
+    """``(base kind, edges)``: a legacy ``-> edges`` kind is its base with an
+    edge model and voting; anything else is itself, no edges implied."""
+    if kind in _LEGACY_EDGE_KINDS:
+        return _LEGACY_EDGE_KINDS[kind], True
+    return kind, False
 
 
 def _base_kind(kind):
-    """The base net a kind trains: the kind itself, or the one under `-> edges`."""
-    if kind == _TUNED_EDGE_KIND:
-        return _TUNED_KIND
-    if kind == _CUSTOM_EDGE_KIND:
-        return _CUSTOM_KIND
-    return kind
-
-
-def _edge_kind_of(base):
-    return _TUNED_EDGE_KIND if base == _TUNED_KIND else (_CUSTOM_EDGE_KIND if base == _CUSTOM_KIND else None)
+    """The base net a kind trains (a legacy ``-> edges`` kind's base)."""
+    return _split_kind(kind)[0]
 _DENSE_TOP_N = {"dense-top-16": 16, "dense-top-32": 32}
 # The architectures behind the kinds. Module constants rather than literals
 # inside _make_model so the Model tab's readout is formatted from the same
@@ -239,4 +240,4 @@ _SEAM_MODES = (_SEAM_MODE_CLASS, _SEAM_MODE_BOUNDARYNESS)
 from .widgets import TYPING_CLASSES as _TYPING_CLASSES  # noqa: E402
 
 
-__all__ = ['_REGION_ALPHA', '_PRED_ALPHA', '_SCALAR_ALPHA', '_MODE_ID', '_MODE_UNCERTAINTY', '_MODE_FLIPPED', '_MODE_PDIFF', '_MODE_SIMILARITY', '_MODE_UNIT', '_INSPECT_MODES', '_TUNED_KIND', '_CUSTOM_KIND', '_TUNED_EDGE_KIND', '_CUSTOM_EDGE_KIND', '_EDGE_KINDS', '_MODEL_KINDS', '_DEFAULT_CUSTOM_HIDDEN', '_EDGE_LAM_RANGE', '_EDGE_ROUNDS_RANGE', '_EDGE_C_RANGE', '_is_edge_kind', '_base_kind', '_edge_kind_of', '_DENSE_TOP_N', '_FOREST_TREES', '_OOB_MIN_SAMPLES', '_MLP_HIDDEN', '_MLP_MAX_ITER', '_SEARCH_TRIALS', '_SEARCH_TIMEOUT_MIN', '_SEARCH_TIMEOUT_S', '_SEARCH_TRIALS_RANGE', '_SEARCH_TIMEOUT_RANGE', '_SEARCH_PUMP_MS', '_SWEEP_TRIALS', '_SWEEP_TRIALS_RANGE', '_hms', '_model_description', '_PREVIEW_SETTLE_MS', '_PREVIEW_POLL_MS', '_PREVIEW_PUMP_MS', '_CENTER_TABS', '_LABELER_PANES', '_PANE_MIN_PX', '_PANE_SASH_TRIES', '_HINT_COLOR', '_HINT_POLL_MS', '_NON_FEATURE_FIELDS', '_TOOL_LABELS', '_RING_CHOICES', '_DEFAULT_HOP_GAIN', '_HOP_GAIN_RANGE', '_DEFAULT_DRAG_PX', '_DRAG_PX_RANGE', '_DEFAULT_MAGIC_EXTENT', '_bounded_float', '_UI_TOOLS', '_REGION_TOOLS', '_POLYLINE_TOOLS', '_TYPING_CLASSES', '_SEAM_TOOL_LABELS', '_SEAM_MODE_CLASS', '_SEAM_MODE_BOUNDARYNESS', '_SEAM_MODES']
+__all__ = ['_REGION_ALPHA', '_PRED_ALPHA', '_SCALAR_ALPHA', '_MODE_ID', '_MODE_UNCERTAINTY', '_MODE_FLIPPED', '_MODE_PDIFF', '_MODE_SIMILARITY', '_MODE_UNIT', '_INSPECT_MODES', '_TUNED_KIND', '_CUSTOM_KIND', '_TUNED_EDGE_KIND', '_CUSTOM_EDGE_KIND', '_LEGACY_EDGE_KINDS', '_MODEL_KINDS', '_FLAT_KINDS', '_DEFAULT_CUSTOM_HIDDEN', '_EDGE_LAM_RANGE', '_EDGE_ROUNDS_RANGE', '_EDGE_C_RANGE', '_split_kind', '_base_kind', '_DENSE_TOP_N', '_FOREST_TREES', '_OOB_MIN_SAMPLES', '_MLP_HIDDEN', '_MLP_MAX_ITER', '_SEARCH_TRIALS', '_SEARCH_TIMEOUT_MIN', '_SEARCH_TIMEOUT_S', '_SEARCH_TRIALS_RANGE', '_SEARCH_TIMEOUT_RANGE', '_SEARCH_PUMP_MS', '_SWEEP_TRIALS', '_SWEEP_TRIALS_RANGE', '_hms', '_model_description', '_PREVIEW_SETTLE_MS', '_PREVIEW_POLL_MS', '_PREVIEW_PUMP_MS', '_CENTER_TABS', '_LABELER_PANES', '_PANE_MIN_PX', '_PANE_SASH_TRIES', '_HINT_COLOR', '_HINT_POLL_MS', '_NON_FEATURE_FIELDS', '_TOOL_LABELS', '_RING_CHOICES', '_DEFAULT_HOP_GAIN', '_HOP_GAIN_RANGE', '_DEFAULT_DRAG_PX', '_DRAG_PX_RANGE', '_DEFAULT_MAGIC_EXTENT', '_bounded_float', '_UI_TOOLS', '_REGION_TOOLS', '_POLYLINE_TOOLS', '_TYPING_CLASSES', '_SEAM_TOOL_LABELS', '_SEAM_MODE_CLASS', '_SEAM_MODE_BOUNDARYNESS', '_SEAM_MODES']

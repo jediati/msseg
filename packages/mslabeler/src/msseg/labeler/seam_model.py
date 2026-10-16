@@ -9,7 +9,7 @@ A **seam descriptor** is the per-seam feature vector the model reads:
              available). Symmetric in the flanks, like the edge model.
   barrier    ``edge_model.barrier``: the arc's saddle depth and the flanks'
              extremum gap (two columns, zero without MSC saddles).
-  edges      the '-> edges' model's p(diff) for the pair, plus a present flag.
+  edges      the region edge model's p(diff) for the pair, plus a present flag.
   geometry   crack length, its log, the bbox aspect, the tortuosity
              (length / chord) and whether the seam is a loop.
   foundation (``SeamSpec.foundation``, optional) the mean foundation-model

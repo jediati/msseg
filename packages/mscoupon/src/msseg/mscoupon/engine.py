@@ -20,6 +20,14 @@ Threading model (unchanged from the original in-app implementation):
       ("primed",)                     priming finished; self.primed is set
       ("assembly_done", si, accepted) an assembly landed (accepted=False when a
                                       newer token superseded it)
+
+Field slots (like mspath's ``SlideEngine``): the primed stack, its records and
+assemblies, its stack generation and commit belong to ONE field (the field
+fingerprint, ``fingerprints.py``). ``use_field`` stashes the active field's
+state and restores another's, so labeler tasks whose workflows build different
+fields each keep their stack; at most ``coupon_fields()`` fields
+(``MSSEG_COUPON_FIELDS``, default 2) are kept, the least recently used evicted.
+A Run fills the ACTIVE slot (re-keyed to the run's field), as before.
 """
 from __future__ import annotations
 
@@ -37,6 +45,22 @@ from msseg.labeler.record_keys import Interner, records_per_item
 from .common import log, FeatureTable
 from .fingerprints import measure_fingerprint_of
 from .session import DEFAULT_SIMPLIFICATION
+
+DEFAULT_COUPON_FIELDS = 2
+
+
+def coupon_fields() -> int:
+    """How many primed fields the coupon engine keeps (``MSSEG_COUPON_FIELDS``).
+    A field is a whole primed stack -- every slice's rasters and pipe -- so
+    the bound is small."""
+    try:
+        return max(1, int(os.environ.get("MSSEG_COUPON_FIELDS", "")
+                          or DEFAULT_COUPON_FIELDS))
+    except ValueError:
+        return DEFAULT_COUPON_FIELDS
+
+# What one field slot holds: the engine attributes use_field swaps.
+_SLOT_ATTRS = ("primed", "_slices", "_assembly", "stack_gen", "commit_id", "_gpu_active")
 
 
 def color_planes(p, li, np):
@@ -401,8 +425,21 @@ class ComputeEngine:
         # A commit is the interned id of (stack generation, the parameter
         # snapshot a Rerun commits) -- see commit_selection.
         self._ids = Interner(start=1)
+        # Generations are numbered across every field slot, so two fields'
+        # (stack_gen, snapshot) commits can never intern to one id.
+        self._gen_seq = 0
         self.stack_gen = 0
         self.commit_id = 0                       # the current record identity
+        self._gpu_active = None
+        # Field slots: field fingerprint -> {attr: value} for the INACTIVE
+        # fields (_SLOT_ATTRS), oldest use first; the active field's state is
+        # the plain attributes, so every caller reads one field at a time.
+        self._slots = OrderedDict()
+        self._active = None
+        # The app's per-field bookkeeping (its fingerprints of the prime),
+        # stashed and handed back by use_field.
+        self._stash = {}
+        self.max_fields = coupon_fields()
         # subseq_idx -> 3D assembly result (cc/global label rasters + global table).
         # Only populated at the "global" level -- see the app's _needed_level().
         # Two commits per sequence (a whole stack of rasters each).
@@ -439,9 +476,166 @@ class ComputeEngine:
         self._assembly = _ByCommit.of(self, value, "_commit", cap=2)
 
     # ------------------------------------------------------------------ #
+    # Field slots
+    # ------------------------------------------------------------------ #
+    def _next_gen(self):
+        self._gen_seq = max(self._gen_seq, self.stack_gen) + 1
+        return self._gen_seq
+
+    @property
+    def active_field(self):
+        """The field fingerprint the active state belongs to (None before
+        any field is named)."""
+        return self._active
+
+    @property
+    def fields(self):
+        """Every field with a slot, oldest use first, the active one last."""
+        out = list(self._slots)
+        if self._active is not None:
+            out.append(self._active)
+        return out
+
+    def has_field(self, field):
+        """True when `field` has a primed stack (active or stashed)."""
+        if field is not None and field == self._active:
+            return bool(self.primed)
+        s = self._slots.get(field)
+        return bool(s and s["primed"])
+
+    def name_field(self, field):
+        """The active state belongs to `field` (a Run landed, or a caller
+        installed a stack by hand): re-key the active slot. A stashed slot of
+        the same field is replaced -- the active stack is the newer one."""
+        if field is None or field == self._active:
+            return
+        self._slots.pop(field, None)
+        self._stash.pop(field, None)
+        self._stash.pop(self._active, None)
+        self._active = field
+        self._evict()
+
+    def _capture(self):
+        return {a: getattr(self, a) for a in _SLOT_ATTRS}
+
+    def _restore(self, s):
+        for a in _SLOT_ATTRS:
+            setattr(self, a, s[a])
+
+    def _empty_state(self):
+        return {"primed": [], "_slices": _ByCommit(self, "commit"),
+                "_assembly": _ByCommit(self, "_commit", cap=2),
+                "stack_gen": self._next_gen(), "commit_id": self._ids.fresh(),
+                "_gpu_active": None}
+
+    def _release_gpu_of(self, primed, at):
+        if at is None:
+            return
+        try:
+            pipe = primed[at[0]]["pipes"][at[1]]
+        except (IndexError, KeyError, TypeError):
+            return
+        if pipe is not None and hasattr(pipe, "release_gpu"):
+            try:
+                pipe.release_gpu()
+            except Exception:
+                pass
+
+    def use_field(self, field, stash=None):
+        """Make `field` the active slot, keeping the outgoing field's stack,
+        records and assemblies (and the caller's `stash` for it) in its own
+        slot. Returns the incoming field's stash when it had a primed stack,
+        else None (the slot is empty: a Run primes it).
+
+        An assembly in flight keeps running on the stack it was launched on
+        (it binds the primed list at launch); its result lands as not
+        accepted. A Run must not be in flight: its stack would land in the
+        wrong slot."""
+        if self.run_active:
+            raise RuntimeError("cannot switch fields while a run is priming")
+        if field == self._active:
+            if stash is not None:
+                self._stash[field] = dict(stash)
+            return self._stash.get(field) if self.primed else None
+        # Out: only a slot with something in it is worth keeping.
+        if self.primed:
+            self._release_gpu_of(self.primed, self._gpu_active)
+            self._gpu_active = None
+            if self._active is not None or stash is not None:
+                key = self._active
+                self._slots[key] = self._capture()
+                self._slots.move_to_end(key)
+                if stash is not None:
+                    self._stash[key] = dict(stash)
+        else:
+            self._stash.pop(self._active, None)
+        # In.
+        s = self._slots.pop(field, None)
+        self._active = field
+        self._restore(s if s is not None else self._empty_state())
+        self.asm_token += 1                  # an in-flight assembly is the old field's
+        self.asm_pending = None
+        self._evict()
+        return self._stash.get(field) if (s is not None and self.primed) else None
+
+    def _evict(self):
+        """Keep at most max_fields primed fields, the active one included:
+        the least recently used stashed slot goes first."""
+        while self._slots and len(self._slots) + int(bool(self.primed)) > self.max_fields:
+            key, s = self._slots.popitem(last=False)
+            self._stash.pop(key, None)
+            log(f"field slots: evicted a primed stack ({len(s['primed'])} sequence(s); "
+                f"MSSEG_COUPON_FIELDS={self.max_fields})")
+
+    def drop_stashed(self, si, files, li=None):
+        """A sequence (or, with `li`, one of its slices) left the session:
+        drop it from every STASHED field the way drop_sequence / drop_slice
+        drop it from the active one. `files` is the sequence's file list
+        before the removal; a stashed stack whose entry `si` holds other
+        files is out of step with the sequences and is dropped whole (a
+        Run re-primes it). Not while a worker runs."""
+        files = list(files or [])
+        here = self._capture()
+        try:
+            for key in list(self._slots):
+                s = self._slots[key]
+                n = len(s["primed"])
+                if si >= n:
+                    continue                 # never primed there: nothing shifts
+                if list(s["primed"][si].get("files") or []) != files:
+                    del self._slots[key]
+                    self._stash.pop(key, None)
+                    continue
+                self._restore(s)
+                if li is None:
+                    self.drop_sequence(si)
+                else:
+                    self.drop_slice(si, li)
+                self._slots[key] = self._capture()
+        finally:
+            self._restore(here)
+
+    def check_stashed(self, sequences):
+        """Drop every stashed field whose stack is out of step with
+        `sequences` (the caller's {"files": [...]} list): an entry primed
+        for other files than the sequence at its index. Returns how many
+        were dropped."""
+        dropped = 0
+        for key in list(self._slots):
+            primed = self._slots[key]["primed"]
+            ok = len(primed) <= len(sequences) and all(
+                list(p.get("files") or []) == list(sequences[i].get("files") or [])
+                for i, p in enumerate(primed))
+            if not ok:
+                del self._slots[key]
+                self._stash.pop(key, None)
+                dropped += 1
+        return dropped
+
+    # ------------------------------------------------------------------ #
     # Priming
     # ------------------------------------------------------------------ #
-    def start_run(self, subseqs, params, run_info):
+    def start_run(self, subseqs, params, run_info, field=None):
         """Prime `subseqs` (list of {"name", "files"} dicts) with `params`
         (the params_json string). `run_info` carries the UI's concurrency
         numbers for the log line so the worker never reads Tk state.
@@ -449,8 +643,12 @@ class ComputeEngine:
         A subsequence carrying `"_reuse": <primed entry>` is NOT re-primed --
         the caller vouches that the entry was primed under identical
         parameters and files (incremental runs: adding a sequence must not
-        recompute the ones already primed)."""
+        recompute the ones already primed).
+
+        `field` (the run's field fingerprint) names the active slot when the
+        stack lands: a Run fills the ACTIVE slot, whatever field it held."""
         self.run_active = True
+        self._run_field = field
         t = threading.Thread(target=self._run_worker,
                              args=(subseqs, params, run_info), daemon=True)
         t.start()
@@ -795,8 +993,11 @@ class ComputeEngine:
             # caller-side cache keyed on the commit (the labeler's class LUTs
             # and predictions). A new stack generation, and a commit no key
             # maps to, invalidate them all; the app then commits its snapshot.
-            self.stack_gen += 1
+            self.stack_gen = self._next_gen()
             self.commit_id = self._ids.fresh()
+            self._gpu_active = None
+            self.name_field(getattr(self, "_run_field", None))
+            self._evict()                    # a stack now fills the active slot
             return ("primed",)
         if kind == "assembly":
             token, si, out = payload
@@ -924,19 +1125,28 @@ class ComputeEngine:
                 self._gpu_active = (si, ali - 1)
         return True
 
-    def reset(self):
+    def reset(self, all_fields=True):
         """Drop every primed stack, cached slice and assembly (a config load is
-        replacing the parameters that produced them).
+        replacing the parameters that produced them) -- in every field slot,
+        or with `all_fields=False` only the active one's.
 
         A running assembly worker is deliberately left running. Bumping the
-        token makes its result land as not-accepted, and the worker's own
-        except-clause posts back when it trips over the empty primed list.
+        token makes its result land as not-accepted, and the worker keeps the
+        primed list it was launched on, so it finishes on the old pipes.
         Clearing asm_running here would let a second worker start beside the
         first, and the pipes are not re-entrant."""
+        if all_fields:
+            self._slots.clear()
+            self._stash.clear()
+            self._active = None
+        else:
+            self._stash.pop(self._active, None)
         self.primed = []
-        self.assembly.clear()
-        self.slices.clear()
-        self.stack_gen += 1
+        self._gpu_active = None
+        # New objects, not clear(): a stashed slot never shares these.
+        self.assembly = {}
+        self.slices = {}
+        self.stack_gen = self._next_gen()
         self.commit_id = self._ids.fresh()   # stale slice records now fail slice_ready
         self.asm_token += 1
         self.asm_pending = None
@@ -975,14 +1185,18 @@ class ComputeEngine:
         params["commit"] = self.commit_id
         params["level"] = level
         params["li"] = li
-        threading.Thread(target=self._assemble_worker, args=(token, si, params),
+        # The worker binds the stack it was launched on: a field switch while
+        # it runs swaps self.primed, never the pipes under it.
+        threading.Thread(target=self._assemble_worker,
+                         args=(token, si, params, self.primed),
                          daemon=True).start()
         return (si, level, li)
 
-    def _slice_result(self, si, li, params, engine, np, tm):
+    def _slice_result(self, si, li, params, engine, np, tm, primed=None):
         """Per-slice work for one slice: re-threshold, labels, stats, selection.
-        Returns the record cached in self.slices."""
-        p = self.primed[si]
+        Returns the record cached in self.slices. `primed` is the stack to
+        read (the assembly worker's bound one), default the active stack."""
+        p = (self.primed if primed is None else primed)[si]
         pipe = p["pipes"][li]
         pct, queries, min_area = params["pct"], params["queries"], params["min_area"]
         qjson = json.dumps(queries)
@@ -1002,7 +1216,7 @@ class ComputeEngine:
 
         if params.get("json"):
             t = time.perf_counter()
-            if self._ensure_measured(si, li, params["json"], engine, np):
+            if self._ensure_measured(si, li, params["json"], engine, np, p=p):
                 tm["measure"] = tm.get("measure", 0.0) + (time.perf_counter() - t)
 
         t = time.perf_counter()
@@ -1071,14 +1285,14 @@ class ComputeEngine:
             return False
         return measured[li] != measure_fingerprint_of(params_json)
 
-    def _ensure_measured(self, si, li, params_json, engine, np):
+    def _ensure_measured(self, si, li, params_json, engine, np, p=None):
         """Re-measure slice `li` in place when its statistics are stale: the
         MSC, labels and arcs are kept and only the rows are rebuilt, from the
         base / filtered / colour rasters the slice was primed from. Returns
         True when it re-measured. A record without a stamp (an older priming,
         a test's fake) is taken as current; an extension without
         ``remeasure`` keeps the old rows, as before this existed."""
-        p = self.primed[si]
+        p = self.primed[si] if p is None else p
         fp = measure_fingerprint_of(params_json)
         measured = p.get("measured")
         if measured is None:
@@ -1126,13 +1340,17 @@ class ComputeEngine:
         stamps[li] = want
         return True
 
-    def _release_inactive_gpu(self, si, li):
+    def _release_inactive_gpu(self, si, li, primed=None):
         """Keep only the ACTIVE slice's GPU residue resident.
 
         Each primed pipe that painted on the GPU holds a device label context
         (~2-3 label images of VRAM); across a long sequence that exceeds the
         card. Releasing is cheap and lossless -- the pipe's next select lazily
-        re-uploads once. Only called from the single-flight assembly worker."""
+        re-uploads once. Only called from the single-flight assembly worker.
+        A worker whose stack is no longer the active one leaves the active
+        field's bookkeeping alone."""
+        if primed is not None and primed is not self.primed:
+            return
         prev = getattr(self, "_gpu_active", None)
         self._gpu_active = (si, li)
         if prev is None or prev == (si, li):
@@ -1145,7 +1363,7 @@ class ComputeEngine:
         if pipe is not None and hasattr(pipe, "release_gpu"):
             pipe.release_gpu()
 
-    def _assemble_worker(self, token, si, params):
+    def _assemble_worker(self, token, si, params, primed=None):
         """Worker, tiered by params["level"] -- see the app's _needed_level().
 
         "slice"/"cc" touch only the visible slice; "global" does every slice and
@@ -1154,7 +1372,8 @@ class ComputeEngine:
             import numpy as np
             from msseg import mscoupon as engine
             from . import assembly as asm_mod
-            p = self.primed[si]
+            primed = self.primed if primed is None else primed
+            p = primed[si]
             pct, queries = params["pct"], params["queries"]
             pixels, conn = params["pixels"], params["connectivity"]
             level, li0 = params["level"], params["li"]
@@ -1167,8 +1386,8 @@ class ComputeEngine:
 
             if level != "global":
                 # --- cheap tiers: the visible slice only --------------------- #
-                rec = self._slice_result(si, li0, params, engine, np, tm)
-                self._release_inactive_gpu(si, li0)
+                rec = self._slice_result(si, li0, params, engine, np, tm, primed)
+                self._release_inactive_gpu(si, li0, primed)
                 if level == "cc":
                     t = time.perf_counter()
                     base = np.asarray(p["base"][li0], dtype=np.float32)
@@ -1195,7 +1414,7 @@ class ComputeEngine:
             merged_labels, merged_stats, base_list, filt_list, kept_list = [], [], [], [], []
             recs, n_feat = [], 0
             for li in range(len(p["pipes"])):
-                rec = self._slice_result(si, li, params, engine, np, tm)
+                rec = self._slice_result(si, li, params, engine, np, tm, primed)
                 # A global pass re-selects every pipe; don't let each one leave
                 # a GPU label context behind (VRAM scales with slice count).
                 pipe_li = p["pipes"][li]

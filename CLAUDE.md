@@ -487,12 +487,14 @@ than the net's own argmax (97 % / 94 % boundary recall / precision vs 93 % / 88 
 and three rounds of neighbour voting cut held-out region errors 115 -> 66. Paths
 forward are listed in the doc (real MSC arcs + saddles, a `learned` magic-fill
 metric, a refine-with-neighbours action, joint training). **Landed** (2026-09-08)
-as `edge_model.py` + the `-> edges` model kinds: `_clf` stays the BASE
+as `edge_model.py` + the `-> edges` model kinds (since 2026-10-15 a
+`+ edge model` checkbox, `edge_on_var`, beside a base-only Kind, plus a
+`voting_var` checkbox; legacy kinds read through `_split_kind`): `_clf` stays the BASE
 pipeline, `_edge_model` (a balanced logistic on the base net's last hidden
 layer: `|d|`, product, saddle barrier) sits on top; Train fits base then edges
 (`freeze base` keeps the base); `_predict_slice` stores a 4-tuple `(commit,
 final, proba, aux)` with per-arc `pdiff` aligned to the RECORD's arcs and
-`raw`, voting runs in label space (`_vote_entry`), `N` flips kind <-> base
+`raw`, voting runs in label space (`_vote_entry`), `N` toggles voting
 and re-votes from the cache (`_revote_all`), pickle v4 carries `edge` +
 `stack`, the `learned` magic metric reads `aux["pdiff"]`, coloring modes
 `flipped by neighbours` / `boundary p(diff)`, and `Evaluate edges` reports
@@ -775,8 +777,8 @@ the current record and keep 2 assemblies). mspath pipes live per **field
 slot** (`SlideEngine.use_field`; `primed` / `level_range` /
 `persistence_abs` are properties over the active slot; one LRU across all;
 pins per field) and `start_run` takes `(item, profile)` jobs, so **Run all
-tasks** primes every task under its own workflow. The coupon keeps one field
-live. **The base chain is a measurement** (fingerprints, both re-measures --
+tasks** primes every task under its own workflow. The coupon keeps a few
+fields too (field slots, below). **The base chain is a measurement** (fingerprints, both re-measures --
 the coupon re-reads the slice file -- and the Features tab); a settled edit
 goes through `AnnotationShell._preview_edit_settled` -> the app's
 `_measurement_moved()` -> `_remeasure_current`, a field edit stays a preview.
@@ -812,9 +814,26 @@ copy of the profile it named, noted); the reader's `profiles` IS the tasks'
 workflows; a viewer doc's spare profiles are noted, not carried. mspath
 **Run all tasks** groups by field fingerprint (`_workflow_params(task)`).
 Input slots: messages name the task; a provider on another field fills the
-slot with a note (`_field_differs_from`, `_workflow_field_key`). Accepted:
-the coupon keeps one field live, so switching between tasks on different
-fields re-primes. Also: the reader copies a task's workflow before the app's
+slot with a note (`_field_differs_from`, `_workflow_field_key`). **Coupon
+field slots** (2026-10-15, parity with mspath): `ComputeEngine.use_field(fp,
+stash)` stashes the active field's state (`_SLOT_ATTRS`: primed stack,
+records, assemblies, stack generation, commit, GPU residue) with the app's
+bookkeeping (`_FIELD_STASH`: `_primed_fingerprint` / `_primed_chain` /
+`_measured_fp`) and restores another's, so a task switch A (field X) -> B
+(field Y, primed by its own Run) -> A finds A's stack, records and commit
+with no Run; at most `MSSEG_COUPON_FIELDS` (default 2) primed fields, the
+least recently used evicted. Generations are numbered across slots, so the
+interned commits of two fields never collide. `_keep_compute_for` enters the
+target field (True when it has a stack; with none, the `_reset_compute` that
+follows resets only that empty slot -- a session load still drops them all);
+a Run fills the ACTIVE slot, re-keyed to its field, except that
+`_park_field_for_run` first moves the active stack to its own slot when
+another profile (task) still builds it (Dup a task, edit its chain, Run).
+The assembly worker binds the stack it launched on; a switch bumps the token.
+Removed rows are dropped from stashed stacks too (`drop_stashed`; a stack
+out of step with the sequences is dropped whole, `check_stashed`). Tests:
+`test_engine_fields.py`, the coupon labeler selftest's two-field block.
+Also: the reader copies a task's workflow before the app's
 reader normalises it (the mspath reader worked in place). Future: a field
 reference (`{"source": "task", "uid"}`) to keep two tasks' fields in lock
 step. Tests: `test_session_doc_tasks.py` (v5 round trip, v4 migration),

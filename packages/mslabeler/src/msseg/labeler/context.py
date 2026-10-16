@@ -74,6 +74,13 @@ _KIND_PREFIXES = tuple(f"{k}{SEP}" for k in _ALL_KINDS) + tuple(f"{k}[" for k in
 # --------------------------------------------------------------------------- #
 LATENT_WEIGHTS = WEIGHTS + ("latent",)
 LATENT_LAYERS = {"last": -1, "previous": -2}
+# The latent geometry (H0 shape, the `latent` softmax weight and the
+# component threshold): `euclidean` on the raw activations, or between the
+# L2-normalised embeddings -- `l2n` (in [0, 2]) and `cosine` (1 - cos, in
+# [0, 2], = l2n^2 / 2) -- which compare direction, not magnitude. The same
+# names as represent.FLOOD_DISTANCES.
+LATENT_DISTANCES = ("euclidean", "cosine", "l2n")
+_LATENT_DISTANCE_TAG = {"cosine": "cos", "l2n": "l2n"}
 
 
 @dataclass
@@ -89,10 +96,19 @@ class LatentSpec:
     h0: bool = True                       # add the H0 shape columns
     z: float = 1.0                        # components: merges above mean + z * std
     max_degree: int = 24                  # ring cap for the batched Prim
+    distance: str = "euclidean"           # LATENT_DISTANCES
+    hidden: Optional[Tuple[int, ...]] = None   # the head's hidden sizes; None = the base's
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"layer": int(self.layer), "weight": str(self.weight), "h0": bool(self.h0),
-                "z": float(self.z), "max_degree": int(self.max_degree)}
+        # `distance` / `hidden` only when set, so an older spec's dict (view,
+        # pickle, model record) is unchanged.
+        d = {"layer": int(self.layer), "weight": str(self.weight), "h0": bool(self.h0),
+             "z": float(self.z), "max_degree": int(self.max_degree)}
+        if self.distance != "euclidean":
+            d["distance"] = str(self.distance)
+        if self.hidden:
+            d["hidden"] = [int(h) for h in self.hidden]
+        return d
 
     @classmethod
     def from_dict(cls, d: Any) -> "LatentSpec":
@@ -112,15 +128,32 @@ class LatentSpec:
             md = max(1, int(d.get("max_degree", 24)))
         except (TypeError, ValueError):
             md = 24
-        return cls(layer=layer, weight=weight, h0=bool(d.get("h0", True)), z=z, max_degree=md)
+        distance = str(d.get("distance") or "euclidean")
+        if distance not in LATENT_DISTANCES:
+            distance = "euclidean"
+        try:
+            hidden = tuple(int(h) for h in (d.get("hidden") or ()) if int(h) > 0) or None
+        except (TypeError, ValueError):
+            hidden = None
+        return cls(layer=layer, weight=weight, h0=bool(d.get("h0", True)), z=z, max_degree=md,
+                   distance=distance, hidden=hidden)
 
     def brief(self) -> str:
+        """`latent(mean[latent],h0/cos,z=0.5) head 16-8`; the defaults print
+        as before."""
         text = "latent(mean"
         if self.weight != "uniform":
             text += f"[{self.weight}]"
         if self.h0:
             text += ",h0"
-        return text + ")"
+        if self.distance != "euclidean":
+            text += "/" + _LATENT_DISTANCE_TAG.get(self.distance, self.distance)
+        if self.h0 and self.z != 1.0:
+            text += f",z={self.z:g}"
+        text += ")"
+        if self.hidden:
+            text += " head " + "-".join(str(h) for h in self.hidden)
+        return text
 
 
 @dataclass
@@ -717,12 +750,30 @@ def latent_names(spec: LatentSpec, width: int) -> List[str]:
     return out
 
 
-def _edge_distances(emb, g: Graph, np):
-    """Euclidean latent distance per directed edge."""
+def _latent_geometry(emb, distance: str, np):
+    """The points the latent distances are measured between: the embedding
+    itself (euclidean) or its L2-normalised rows (cosine / l2n; an all-zero
+    row -- a dead ReLU layer -- stays at the origin)."""
+    if distance == "euclidean":
+        return emb
+    norm = np.sqrt((emb * emb).sum(-1, keepdims=True))
+    return emb / np.where(norm > 1e-12, norm, 1.0)
+
+
+def _from_euclid(d, distance: str):
+    """A euclidean distance between `_latent_geometry` points -> `distance`
+    (cosine = 1 - cos = |u - v|^2 / 2 on unit rows; the order of every merge
+    is the same as l2n's, the values are not)."""
+    return 0.5 * d * d if distance == "cosine" else d
+
+
+def _edge_distances(emb, g: Graph, np, distance: str = "euclidean"):
+    """Latent distance per directed edge, in the spec's `distance`."""
     if g.n_edges == 0:
         return np.zeros(0)
-    d = emb[g.src] - emb[g.dst]
-    return np.sqrt((d * d).sum(1))
+    pts = _latent_geometry(emb, distance, np)
+    d = pts[g.src] - pts[g.dst]
+    return _from_euclid(np.sqrt((d * d).sum(1)), distance)
 
 
 def _per_slice(values, slice_of_edge, np, fn):
@@ -745,14 +796,15 @@ def latent_weights(spec: LatentSpec, emb, g: Graph, np, area=None, row_slice=Non
     of the edge's slice (a per-slice scale, so the softmax needs no units)."""
     if spec.weight != "latent":
         return neighbour_weights(spec.weight, g, np, area)
-    d = _edge_distances(emb, g, np)
+    d = _edge_distances(emb, g, np, spec.distance)
     sl = None if row_slice is None else np.asarray(row_slice)[g.src]
     tau = _per_slice(d, sl, np, np.median)
     tau = np.where(tau > 0, tau, 1.0)
     return np.exp(-d / tau)
 
 
-def ring_h0(emb, g: Graph, np, z: float = 1.0, max_degree: int = 24, row_slice=None):
+def ring_h0(emb, g: Graph, np, z: float = 1.0, max_degree: int = 24, row_slice=None,
+            distance: str = "euclidean"):
     """``(n, 4)``: the H0 (single-linkage) shape of each region's ring in latent
     space -- ``largest`` merge, ``ratio`` largest / second largest, ``attach``
     (the region's own death: its distance to its nearest neighbour) and
@@ -761,8 +813,9 @@ def ring_h0(emb, g: Graph, np, z: float = 1.0, max_degree: int = 24, row_slice=N
     vectorised Prim over its ``(m, d+1, d+1)`` distance matrices, so the cost
     is sum(m_d * d^2) rather than one Python call per region. A ring wider
     than `max_degree` keeps its nearest neighbours. A region without
-    neighbours reads zeros (components 1, ratio 1)."""
-    emb = np.asarray(emb, np.float64)
+    neighbours reads zeros (components 1, ratio 1). `distance` is one of
+    LATENT_DISTANCES."""
+    emb = _latent_geometry(np.asarray(emb, np.float64), distance, np)
     n = g.n
     out = np.zeros((n, 4))
     out[:, 1] = 1.0
@@ -770,7 +823,9 @@ def ring_h0(emb, g: Graph, np, z: float = 1.0, max_degree: int = 24, row_slice=N
     if g.n_edges == 0 or n == 0:
         return out
     deg = np.diff(g.indptr)
-    d_edge = _edge_distances(emb, g, np)
+    # `emb` is already the geometry's points: euclidean between them, then
+    # mapped to the distance (a no-op for euclidean / l2n).
+    d_edge = _from_euclid(_edge_distances(emb, g, np), distance)
     sl = None if row_slice is None else np.asarray(row_slice)[g.src]
     mu = _per_slice(d_edge, sl, np, np.mean)
     sd = _per_slice(d_edge, sl, np, np.std)
@@ -789,7 +844,7 @@ def ring_h0(emb, g: Graph, np, z: float = 1.0, max_degree: int = 24, row_slice=N
         pts = np.concatenate([emb[rows][:, None, :], emb[g.dst[idx]]], axis=1)  # (m, k, w)
         k = dd + 1
         diff = pts[:, :, None, :] - pts[:, None, :, :]
-        D = np.sqrt((diff * diff).sum(-1))                              # (m, k, k)
+        D = _from_euclid(np.sqrt((diff * diff).sum(-1)), distance)     # (m, k, k)
         ar = np.arange(m)
         in_tree = np.zeros((m, k), bool)
         in_tree[:, 0] = True
@@ -823,7 +878,7 @@ def latent_columns(emb, g: Graph, spec: LatentSpec, np, area=None, row_slice=Non
     blocks = [ring_reduce(emb, g, w, ("mean",), np)["mean"]]
     if spec.h0:
         blocks.append(ring_h0(emb, g, np, z=spec.z, max_degree=spec.max_degree,
-                              row_slice=row_slice))
+                              row_slice=row_slice, distance=spec.distance))
     return np.concatenate(blocks, axis=1)
 
 

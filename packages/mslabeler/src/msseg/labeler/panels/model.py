@@ -38,6 +38,27 @@ class ModelPanelMixin:
                                              width=22)
         self.model_kind_combo.pack(side="left", padx=4)
         self.model_kind_combo.bind("<<ComboboxSelected>>", self._unfocus_entries)
+        # The edge model is its own choice, beside the base it sits on.
+        self.edge_on_chk = ttk.Checkbutton(row, text="+ edge model", variable=self.edge_on_var)
+        self.edge_on_chk.pack(side="left", padx=(8, 0))
+        attach_tooltip(self.edge_on_chk,
+                       "Train (R) also fits an edge model on top of the base: a pair "
+                       "classifier over the region graph, on the base net's hidden-layer "
+                       "embedding, giving p(different class) per pair of touching regions "
+                       "(the 'learned' magic-fill metric, the boundary colourings, and "
+                       "neighbour voting when that is on). Any dense base; a forest has no "
+                       "hidden layer. Optimize / size-sweep winners get one too.")
+        self.edge_on_var.trace_add("write", lambda *_: self._on_edge_toggle())
+        self.voting_var.trace_add("write", lambda *_: self._on_voting_toggle())
+        # The custom FC's hidden sizes: shown only for the custom kinds
+        # (_sync_model_frames), with or without an edge model on top.
+        row = self.custom_hidden_row = ttk.Frame(box)
+        ttk.Label(row, text="hidden layers:").pack(side="left")
+        en = ttk.Entry(row, textvariable=self.custom_hidden_var, width=10)
+        en.pack(side="left", padx=4)
+        en.bind("<Return>", lambda e: (self._unfocus_entries(), self._on_edge_settings_change()))
+        en.bind("<FocusOut>", lambda e: self._on_edge_settings_change())
+        attach_tooltip(en, "Hidden layer sizes of the custom FC net (e.g. 16-8).")
         self.model_arch_var = tk.StringVar(master=self.root, value="")
         self.model_arch_label = ttk.Label(box, textvariable=self.model_arch_var,
                                           justify="left", wraplength=360,
@@ -51,7 +72,7 @@ class ModelPanelMixin:
         self._build_edge_panel(parent)
 
         # -- Optimize network: the search over the dense FC space ------------ #
-        srch = ttk.LabelFrame(parent, text="Optimize network (dense FC search)")
+        srch = self.optimize_frame = ttk.LabelFrame(parent, text="Optimize network (dense FC search)")
         srch.pack(side="top", fill="x", padx=6, pady=4)
         row = ttk.Frame(srch); row.pack(fill="x", padx=4, pady=(4, 2))
         for label, var, width, tip in (
@@ -108,6 +129,46 @@ class ModelPanelMixin:
         ttk.Label(srch, textvariable=self.search_progress_var, justify="left",
                   wraplength=700, foreground="#333").pack(anchor="w", padx=6,
                                                           pady=(0, 6))
+        self._sync_model_frames()
+
+    def _sync_model_frames(self):
+        """Show only the Model-tab frames that apply to the picked kind: the
+        custom sizes for a custom FC, the latent ring head for a dense base
+        (or while it is ticked, so it can be unticked), the edge frame while
+        '+ edge model' is ticked or an edge model exists (voting off keeps it,
+        and its lambda / rounds / Evaluate stay reachable). '+ edge model'
+        is disabled on a forest unless ticked."""
+        opt = getattr(self, "optimize_frame", None)
+        if opt is None:
+            return
+        base = _base_kind(self.model_kind_var.get())
+        flat = base in _FLAT_KINDS
+        self.edge_on_chk.state(["disabled"] if flat and not self.edge_on_var.get()
+                               else ["!disabled"])
+        if base == _CUSTOM_KIND:
+            if not self.custom_hidden_row.winfo_manager():
+                self.custom_hidden_row.pack(fill="x", padx=4, pady=(0, 2),
+                                            before=self.model_arch_label)
+        else:
+            self.custom_hidden_row.pack_forget()
+        edge = getattr(self, "_edge_model", None)
+        show = ((self.latent_frame, not flat or bool(self.context_latent_var.get())),
+                (self.edge_frame, bool(self.edge_on_var.get()) or edge is not None))
+        if edge is None:
+            title = ("Edge model: not trained yet - Train (R)" if not flat
+                     else "Edge model: a forest has no hidden layer - pick a dense kind")
+        elif self.edge_on_var.get():
+            title = "Edge model: trained on this base"
+        else:
+            title = "Edge model: trained, but '+ edge model' is off - Train (R) drops it"
+        self.edge_frame.configure(text=title)
+        # Re-pack in order, each before the Optimize frame, so the visible
+        # ones keep their relative order.
+        for frame, _on in show:
+            frame.pack_forget()
+        for frame, on in show:
+            if on:
+                frame.pack(side="top", fill="x", padx=6, pady=4, before=opt)
 
     def _refresh_model_readout(self):
         var = getattr(self, "model_arch_var", None)
@@ -117,7 +178,7 @@ class ModelPanelMixin:
     def _model_description_now(self, kind):
         """`_model_description` for the app's state: the tuned kind renders the
         last search's winner over the trained model's column count; the custom
-        kind its typed sizes; an edge kind adds the stacked pair model."""
+        kind its typed sizes; '+ edge model' adds the stacked pair model."""
         base = _base_kind(kind)
         n = len(self._clf_names) if self._clf_names else None
         if base == _TUNED_KIND:
@@ -129,7 +190,7 @@ class ModelPanelMixin:
                     f"sample weights; backend {model_search.backend_label(self._search_settings()[4])}.")
         else:
             text = _model_description(kind)
-        if _is_edge_kind(kind):
+        if self.edge_on_var.get() and base not in _FLAT_KINDS:
             widths = None
             try:
                 widths = edge_model.hidden_widths(self._clf) if self._clf is not None else None
@@ -168,10 +229,14 @@ class ModelPanelMixin:
         latent = None
         if self.context_latent_var.get():
             w = self.context_latent_weight_var.get()
+            dist = self.context_latent_distance_var.get()
             latent = context.LatentSpec(
                 layer=context.LATENT_LAYERS.get(self.context_latent_layer_var.get(), -1),
                 weight=w if w in context.LATENT_WEIGHTS else "uniform",
-                h0=bool(self.context_latent_h0_var.get()))
+                h0=bool(self.context_latent_h0_var.get()),
+                z=_bounded_float(self.context_latent_z_var.get(), 1.0, -3.0, 10.0),
+                distance=dist if dist in context.LATENT_DISTANCES else "euclidean",
+                hidden=self._latent_hidden())
         labels = None
         if self.context_labels_var.get():
             labels = context.LabelSpec(
@@ -196,6 +261,10 @@ class ModelPanelMixin:
                 if idx == spec.latent.layer:
                     self.context_latent_layer_var.set(name)
             self.context_latent_h0_var.set(bool(spec.latent.h0))
+            self.context_latent_distance_var.set(spec.latent.distance)
+            self.context_latent_z_var.set(f"{spec.latent.z:g}")
+            self.context_latent_hidden_var.set(
+                "-".join(str(h) for h in spec.latent.hidden) if spec.latent.hidden else "")
         self.context_labels_var.set(spec.labels is not None)
         if spec.labels is not None:
             self.context_label_dropout_var.set(f"{spec.labels.dropout:g}")
@@ -203,6 +272,7 @@ class ModelPanelMixin:
         # spec rides its context, a polyline task's its seam spec.
         if self._task_kind() != "polyline":
             self._apply_foundation_spec(spec.foundation)
+        self._sync_model_frames()
         self._refresh_model_readout()
 
     def _on_context_settings_change(self, *_a):
@@ -309,7 +379,8 @@ class ModelPanelMixin:
         # The latent ring: a second head on the base net's embedding of the ring.
         row = ttk.Frame(box); row.pack(fill="x", padx=4, pady=(4, 4))
         chk = ttk.Checkbutton(row, text="latent ring head", variable=self.context_latent_var,
-                              command=self._on_context_settings_change)
+                              command=lambda: (self._sync_model_frames(),
+                                               self._on_context_settings_change()))
         chk.pack(side="left")
         attach_tooltip(chk, "After the base net is fit, embed every region with its hidden "
                             "layer, average the ring's embeddings (what KIND of material "
@@ -342,6 +413,37 @@ class ModelPanelMixin:
                             "against its ring reads high) and the component count at "
                             "mean + std of the slice's arc distances (a ring with two kinds "
                             "of neighbour reads 2).")
+        row = ttk.Frame(box); row.pack(fill="x", padx=4, pady=(0, 4))
+        ttk.Label(row, text="distance:").pack(side="left")
+        combo = ttk.Combobox(row, textvariable=self.context_latent_distance_var, state="readonly",
+                             values=context.LATENT_DISTANCES, width=9)
+        combo.pack(side="left", padx=2)
+        combo.bind("<<ComboboxSelected>>",
+                   lambda e: (self._unfocus_entries(), self._on_context_settings_change()))
+        attach_tooltip(combo, "How far apart two regions sit in latent space -- for the H0 "
+                              "shape, the `latent` weighting and the component threshold. "
+                              "euclidean: on the raw activations, so a few large units "
+                              "dominate and a strongly-activated region is far from "
+                              "everything. cosine (1 - cos) / l2n (euclidean between "
+                              "length-1 vectors): direction only, 'what kind of thing', "
+                              "not how strongly. The ring MEAN is unaffected.")
+        ttk.Label(row, text=" z:").pack(side="left")
+        en = ttk.Entry(row, textvariable=self.context_latent_z_var, width=5)
+        en.pack(side="left", padx=2)
+        en.bind("<Return>", lambda e: (self._unfocus_entries(), self._on_context_settings_change()))
+        en.bind("<FocusOut>", lambda e: self._on_context_settings_change())
+        attach_tooltip(en, "H0 components: a merge counts as a separate component when it "
+                           "is longer than mean + z * std of the item's arc distances "
+                           "(-3..10; default 1). Lower = more components.")
+        ttk.Label(row, text=" head hidden:").pack(side="left")
+        en = ttk.Entry(row, textvariable=self.context_latent_hidden_var, width=8)
+        en.pack(side="left", padx=2)
+        en.bind("<Return>", lambda e: (self._unfocus_entries(), self._on_context_settings_change()))
+        en.bind("<FocusOut>", lambda e: self._on_context_settings_change())
+        attach_tooltip(en, "Hidden layer sizes of the head net (e.g. 32-16). Empty = the "
+                           "base net's own architecture. The head's input is wider than the "
+                           "base's (the row + the embedding width + 4 H0 columns), so it may "
+                           "want more room than a small base -- or less than a big tuned one.")
 
     def _custom_hidden(self):
         """The custom base's hidden sizes from the Model tab entry (first rung
@@ -350,6 +452,18 @@ class ModelPanelMixin:
             return model_search.parse_sizes(self.custom_hidden_var.get())[0]
         except (ValueError, IndexError):
             return tuple(model_search.parse_sizes(_DEFAULT_CUSTOM_HIDDEN)[0])
+
+    def _latent_hidden(self):
+        """The latent head's own hidden sizes from its entry, or None (empty
+        or unreadable) = the base's architecture."""
+        text = self.context_latent_hidden_var.get().strip()
+        if not text:
+            return None
+        try:
+            sizes = tuple(int(h) for h in model_search.parse_sizes(text)[0])
+        except (ValueError, IndexError, TypeError):
+            return None
+        return sizes if sizes and all(h > 0 for h in sizes) else None
 
     def _edge_spec_from_ui(self):
         layer = edge_model.LAYER_CHOICES.get(self.edge_layer_var.get(), -1)
@@ -377,31 +491,46 @@ class ModelPanelMixin:
         self.edge_rounds_var.set(str(int(spec.rounds)))
 
     def _on_kind_change(self):
-        """The kind combobox / N: the readout follows, and switching between an
-        edge kind and its base re-votes the cached predictions in place."""
+        """The kind combobox: the frames and the readout follow (voting is
+        its own checkbox, so nothing re-votes)."""
+        self._sync_model_frames()
         self._refresh_model_readout()
+        self._refresh_edge_readout()
+
+    def _on_edge_toggle(self):
+        """'+ edge model': applies at the next Train; the frame and the
+        readout follow at once."""
+        self._sync_model_frames()
+        self._refresh_model_readout()
+        self._refresh_edge_readout()
+
+    def _on_voting_toggle(self):
+        """The voting checkbox / N: the cached predictions re-vote in place."""
         if getattr(self, "_edge_model", None) is not None and getattr(self, "_pred", None):
             self._revote_all()
         self._refresh_edge_readout()
 
     def _build_edge_panel(self, parent):
-        """The edge model behind the `-> edges` kinds: the custom base, the pair
-        model's settings, the voting weight, an evaluation report."""
-        box = ttk.LabelFrame(parent, text="Edge model (-> edges kinds): a pair model over the region graph")
+        """The edge model ('+ edge model' beside the kind): voting, the pair
+        model's settings, an evaluation report. Its title says whether one is
+        trained (_sync_model_frames)."""
+        box = self.edge_frame = ttk.LabelFrame(parent, text="Edge model")
         box.pack(side="top", fill="x", padx=6, pady=4)
         row = ttk.Frame(box); row.pack(fill="x", padx=4, pady=(4, 2))
-        ttk.Label(row, text="base hidden:").pack(side="left")
-        en = ttk.Entry(row, textvariable=self.custom_hidden_var, width=8)
-        en.pack(side="left", padx=(2, 6))
-        en.bind("<Return>", lambda e: (self._unfocus_entries(), self._on_edge_settings_change()))
-        en.bind("<FocusOut>", lambda e: self._on_edge_settings_change())
-        attach_tooltip(en, "Hidden layer sizes of the custom FC base (e.g. 16-8), used by "
-                           "the custom FC / custom FC -> edges kinds.")
+        self.voting_chk = ttk.Checkbutton(row, text="neighbour voting (N)",
+                                          variable=self.voting_var)
+        self.voting_chk.pack(side="left", padx=(0, 10))
+        attach_tooltip(self.voting_chk,
+                       "Refine the predictions with the edge model: regions the pair "
+                       "model says are the same class pull each other's class "
+                       "probabilities together (lambda, rounds below). Off = the base "
+                       "net's own answers; p(diff) is still computed either way. Applies "
+                       "at once to cached predictions.")
         chk = ttk.Checkbutton(row, text="freeze base", variable=self.freeze_base_var,
                               command=self._on_edge_settings_change)
         chk.pack(side="left", padx=(0, 10))
-        attach_tooltip(chk, "Train (R) on a -> edges kind keeps the current base net and "
-                            "refits only the edge model: try edge variants on the same base.")
+        attach_tooltip(chk, "Train (R) keeps the current base net and refits only the edge "
+                            "model: try edge variants on the same base.")
         ttk.Label(row, text="layer:").pack(side="left")
         cb = ttk.Combobox(row, textvariable=self.edge_layer_var, state="readonly",
                           values=list(edge_model.LAYER_CHOICES), width=8)
@@ -510,17 +639,19 @@ class ModelPanelMixin:
                                                f"{r['errors']} held-out errors", ""))
 
     def _refresh_edge_readout(self):
+        # Every edge-model install / load / drop lands here: the edge frame's
+        # visibility follows it.
+        self._sync_model_frames()
         var = getattr(self, "edge_readout_var", None)
         if var is None:
             return
         edge = self._edge_model
-        kind = self.model_kind_var.get()
         if edge is None:
-            var.set("edges: not trained - Train (R) on this kind" if _is_edge_kind(kind)
-                    else "edges: none - pick a '-> edges' kind and Train (R)")
+            var.set("edges: not trained - Train (R)" if self.edge_on_var.get()
+                    else "edges: none - tick '+ edge model' (Model tab) and Train (R)")
             return
         text = edge.brief()
-        active = _is_edge_kind(kind)
+        active = self._voting_on()
         text += " · voting " + ("on" if active else "off") + " (N)"
         cur = self._current()
         entry = self._pred.get(self.catalogue.key_of(*cur)) if cur is not None else None
@@ -557,7 +688,7 @@ class ModelPanelMixin:
         expected = self._expected_names_for(None)
         if expected is not None and set(expected) != set(names):
             bits.append("⚠ profile mismatch")
-        if self._edge_model is not None and not _is_edge_kind(self._clf_kind):
+        if self._edge_model is not None:
             bits.insert(1, "-> edges")
         var.set(" · ".join(bits))
         self._refresh_hints()

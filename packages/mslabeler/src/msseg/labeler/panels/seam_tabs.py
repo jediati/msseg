@@ -32,7 +32,7 @@ _FEATURE_TIPS = {
     "pair": "|difference| and product of the two flank regions' rows (or of their "
             "embedding in the base net's hidden layer, see Model > embed)",
     "barrier": "the arc's saddle depth and the flanks' extremum gap (MSC arcs)",
-    "edges": "the '-> edges' model's p(different) for the pair -- needs a region "
+    "edges": "the region edge model's p(different) for the pair -- needs a region "
              "model with an edge head",
     "geometry": "crack length, its log, the bbox aspect, tortuosity, loop",
 }

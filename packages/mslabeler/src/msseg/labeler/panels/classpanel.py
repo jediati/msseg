@@ -100,7 +100,7 @@ class ClassPanelMixin:
                            "probabilities (Classify first; ignores 'on')\n"
                            "barrier: saddle height above the seed (MSC arcs only)\n"
                            "learned: the edge model's p(different) per arc "
-                           "(a '-> edges' kind, trained and classified)\n"
+                           "('+ edge model' on the Model tab, trained and classified)\n"
                            "below the line: any embedding on offer -- the region "
                            "net's input or a hidden layer, another task's net, a "
                            "foundation / encoder / context column family -- "
@@ -200,7 +200,7 @@ class ClassPanelMixin:
                        "Every computed item. The fast path is C (and R = train + C): "
                        "classify only the item on screen.")
 
-        # The edge model (the "-> edges" kinds): what it scored, whether
+        # The edge model ('+ edge model'): what it scored, whether
         # voting is on, how many regions it flipped on this slice.
         row = ttk.Frame(ml); row.pack(side="top", fill="x", padx=4)
         self.edge_readout = ttk.Label(row, textvariable=self.edge_readout_var,

@@ -475,8 +475,8 @@ class MagicFillController:
                 # record's arcs at Classify time.
                 aux = app._pred_aux(pr)
                 if aux is None or aux.get("pdiff") is None:
-                    app._notify("learned needs an edge model at this commit - pick "
-                                "a '-> edges' kind, Train (R), then Classify")
+                    app._notify("learned needs an edge model at this commit - tick "
+                                "'+ edge model', Train (R), then Classify")
                     return False
                 extra = {"pdiff": aux["pdiff"]}
             else:

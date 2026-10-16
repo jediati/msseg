@@ -40,7 +40,7 @@ things you edit.
 | **Processing** (default tab) | the workflow tools (**Copy from task…**, **Load workflow…**, **Save workflow…**) and the ACTIVE task's workflow, as one column of collapsible groups: colour input, filter chain, MSC parameters and, last, **4b. Persistence** (the live persistence and "update region simplification") |
 | **Features** | the row the task's model reads: the base channel (the base chain, e.g. a normalize), the statistics -- channels, reductions, seeding extremum and its sample radius, histograms -- then the columns built on them: a polyline task's seam descriptor and inputs, foundation features and, last, **9. Context** (a region task's neighbourhood columns) (see "Features: an edit re-measures" below) |
 | **Annotation** | classes, tools, the Magic rows, the per-class interaction lists, Save/Load annotations, and the classifier (Train/Classify, the model strip, the confusion matrix, exports, Save/Load classifier) |
-| **Model** | the classifier kind, a read-only description of its architecture, the **Latent ring head**, the **Edge model** panel (the `-> edges` kinds) and the **Optimize network** search (trials, time limit, seed, feature-subset toggle, progress line) |
+| **Model** | the classifier kind, a read-only description of its architecture, the **Latent ring head**, the **Edge model** panel (shown while `+ edge model` is ticked or one is trained) and the **Optimize network** search (trials, time limit, seed, feature-subset toggle, progress line) |
 | **Analysis** | **Predictions vs annotations** (the regions behind a confusion cell; double-click a row to go there) and the **Size sweep** report; a home for plots later |
 
 The three columns start at about **1:3:2**, and **only the middle one grows**:
@@ -424,23 +424,23 @@ interactions, `blobber ring (n)` first and `blobber core (n)` second, so on a
 re-decomposition that merges a ring point's region into a core point's the
 core wins; one undo step removes both.
 
-## Edge models (the `-> edges` kinds)
+## Edge models (`+ edge model`)
 
 The region net scores each living region from its statistics row alone.
 Regions tile the slice and touch through saddles, and the edge-pairs
 experiment ([mscoupon_edge_pairs.md](mscoupon_edge_pairs.md)) showed that a
 pair model on the net's own hidden layer tells same-class from
 different-class edges of the region graph better than the net's argmax, and
-that letting the graph vote fixes the isolated flips. Two model kinds stack
-that **edge model** on top of a dense base:
+that letting the graph vote fixes the isolated flips. The **Kind** dropdown
+names the base region classifier only; the **`+ edge model`** checkbox beside
+it stacks that **edge model** on top of any dense base (a random forest has no
+hidden layer, so the box is disabled there). Optimize and size-sweep winners
+get one too when it is ticked. (Until 2026-10-15 this was two kinds,
+`dense (tuned) -> edges` and `custom FC -> edges`; an older session or pickle
+naming one reads as its base with `+ edge model` and voting on.)
 
-| kind | base | on top |
-|---|---|---|
-| `dense (tuned) -> edges` | the last Optimize / size-sweep winner | the edge model |
-| `custom FC -> edges` | a dense net whose hidden sizes are typed on the Model tab (`base hidden`, default `16-8`) | the edge model |
-
-(`custom FC` on its own is also a kind.) **Train (R)** on an edge kind fits
-the base, then the pair model on every labeled edge -- the status line reports
+**Train (R)** with `+ edge model` fits the base, then the pair model on every
+labeled edge -- the status line reports
 both; with **freeze base** on, Train keeps the current base and refits only
 the edges, so edge variants can be tried on one base. **Classify (C)** runs
 the base, scores every arc of each slice's living-region graph with the pair
@@ -448,9 +448,13 @@ model (p(diff) = the probability the edge crosses classes), then runs
 `rounds` of neighbour voting -- `score_i(c) = log P_i(c) + lambda * sum_j
 [log(1 - p_ij) if class_j == c else log p_ij]` -- and the refined classes are
 *the* prediction: the overlay, the confusion matrix, SHIFT-accept, the CSV and
-the training set all see them. **N** flips between the edge kind and its base
-(the cached predictions re-vote in milliseconds, no forward pass), so raw vs
-refined is one keystroke and the confusion matrix is the before/after.
+the training set all see them. **Neighbour voting (N)** is its own checkbox
+at the top of the Edge model panel: off, the base net's answers are the
+prediction and p(diff) is still computed (the `learned` metric, the
+colourings); toggling re-votes the cached predictions in milliseconds, no
+forward pass, so raw vs refined is one keystroke and the confusion matrix is
+the before/after. Unticking `+ edge model` keeps a trained edge model until
+the next Train drops it; the panel's title says which state it is in.
 
 The **Edge model** panel on the Model tab holds the pair model's settings --
 `layer` (last = the narrow layer, best in the experiment; previous = the wider

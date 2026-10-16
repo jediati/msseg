@@ -2020,6 +2020,7 @@ class MscouponApp(ViewerShell):
         # moved is re-measured, lazily, the first time its record is built
         # (ComputeEngine._ensure_measured). A field change re-primes everything.
         fingerprint = fingerprints.field_fingerprint_of(self._params_json(cores=1))
+        self._park_field_for_run(fingerprint)
         reused = 0
         if fingerprint == getattr(self, "_primed_fingerprint", None) and self.primed:
             by_files = {tuple(p["files"]): p for p in self.primed}
@@ -2037,7 +2038,8 @@ class MscouponApp(ViewerShell):
         # never reads Tk state off the UI thread.
         self.engine.start_run(subseqs, params,
                               {"cores_per_slice": self._cores_per_slice(),
-                               "concurrent_slices": self._concurrent_slices()})
+                               "concurrent_slices": self._concurrent_slices()},
+                              field=fingerprint)
         self._ensure_pump()
 
     def _handle_compute_event(self, ev):
@@ -2620,8 +2622,12 @@ class MscouponApp(ViewerShell):
     # ------------------------------------------------------------------ #
     def _reset_compute(self):
         """Drop the primed data and everything derived from it (a profile
-        switch or a session load replaces the parameters that produced it)."""
-        self.engine.reset()
+        switch or a session load replaces the parameters that produced it).
+        Right after `_keep_compute_for` moved to a field with no stack, only
+        that (empty) slot is reset: the other fields keep theirs."""
+        switching = getattr(self, "_switching_field", False)
+        self._switching_field = False
+        self.engine.reset(all_fields=not switching)
         self._hover_ctx = None
         self._selection_dirty = False
         # Nothing is primed, so there is nothing for a preview to be stale
@@ -2631,14 +2637,79 @@ class MscouponApp(ViewerShell):
         self._preview_shown_key = None
         self._preview_chan_cache.budget = _PREVIEW_CHAN_BUDGET
 
+    # The app's bookkeeping of a prime, kept per field slot beside the stack.
+    _FIELD_STASH = ("_primed_fingerprint", "_primed_chain", "_measured_fp")
+
     def _keep_compute_for(self, profile):
-        """Keep the primed stack across a profile switch when the new
-        profile's FIELD is the one it was primed under: only its statistics
-        (or selection) differ, and those re-measure / re-select."""
-        if not self.primed or self.engine.run_active:
+        """A profile (a labeler task's workflow) is about to become active.
+        Its FIELD's slot becomes the engine's active one (``use_field``): the
+        outgoing field keeps its primed stack, records and assemblies, so
+        switching back needs no Run. True when the target field has a primed
+        stack -- the one primed now (only the statistics or selection differ,
+        and those re-measure / re-select) or a stashed one; False when it has
+        none (the switch then shows nothing primed until a Run), or while a
+        Run is priming (everything resets, as before)."""
+        if self.engine.run_active:
             return False
-        return (getattr(self, "_primed_fingerprint", None)
-                == fingerprints.field_fingerprint_of(session.profile_params_json(profile)))
+        target = fingerprints.field_fingerprint_of(session.profile_params_json(profile))
+        here = getattr(self, "_primed_fingerprint", None)
+        if self.primed and target == here:
+            return True
+        if self._enter_field(target) is None:
+            self._switching_field = True          # the reset that follows spares the others
+            return False
+        return True
+
+    def _enter_field(self, target):
+        """Make `target` the engine's active field slot, stashing the
+        outgoing stack with this app's bookkeeping of it. Returns the
+        target's stash when it has a primed stack (restored here), else None
+        (the active slot is empty)."""
+        here = getattr(self, "_primed_fingerprint", None)
+        if self.primed and here is not None and self.engine.active_field is None:
+            self.engine.name_field(here)          # a stack installed before any Run named it
+        self.engine.check_stashed(self.subsequences)
+        stash = self.engine.use_field(
+            target, {a: getattr(self, a, None) for a in self._FIELD_STASH})
+        # Caches keyed by (si, li) describe the outgoing stack's rasters.
+        self._chan_cache.clear()
+        self._hover_ctx = None
+        self._selection_dirty = False
+        if stash is None:
+            return None
+        for a in self._FIELD_STASH:
+            setattr(self, a, stash.get(a))
+        self._preview_override = None
+        self._preview_shown_key = None
+        self._preview_chan_cache.budget = _PREVIEW_CHAN_BUDGET_PRIMED
+        try:
+            self._refresh_subseq_list()           # the "msc" column follows the stack
+        except Exception:
+            pass
+        log(f"field slots: switched to a kept field ({len(self.primed)} sequence(s), "
+            f"{len(self.engine.fields)} field(s) kept)")
+        return stash
+
+    def _park_field_for_run(self, fingerprint):
+        """A Run fills the ACTIVE slot. When it primes another field than
+        the active stack's (the chain was edited) and some OTHER profile --
+        another task's workflow -- still builds the active stack's field,
+        that stack moves to its own slot first, so the other task finds it;
+        otherwise the Run replaces it, as before field slots. A slot the
+        Run's field already has becomes active, so its sequences are reused."""
+        active = self.engine.active_field or getattr(self, "_primed_fingerprint", None)
+        if not self.primed or active is None or active == fingerprint:
+            return
+        for i, p in enumerate(self.profiles):
+            if i == self.active_profile_idx:
+                continue
+            try:
+                fp = fingerprints.field_fingerprint_of(session.profile_params_json(p))
+            except Exception:
+                continue
+            if fp == active:
+                self._enter_field(fingerprint)
+                return
 
     def _measurement_moved(self):
         if not self.primed or self.engine.run_active:
@@ -2686,6 +2757,8 @@ class MscouponApp(ViewerShell):
     def _remove_item_at(self, si, li):
         if self._slice_msc_mark(si, li) == "Y":
             self.engine.drop_slice(si, li)
+        if si < len(self.subsequences):
+            self.engine.drop_stashed(si, self.subsequences[si]["files"], li)
         super()._remove_item_at(si, li)
         self._forget_derived()
 
@@ -2696,6 +2769,8 @@ class MscouponApp(ViewerShell):
             aligned = False
         if aligned:
             self.engine.drop_sequence(si)
+        if si < len(self.subsequences):
+            self.engine.drop_stashed(si, self.subsequences[si]["files"])
         super()._remove_sequence_at(si)
         self._forget_derived()
 

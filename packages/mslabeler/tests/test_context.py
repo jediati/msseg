@@ -394,6 +394,53 @@ def test_ring_h0_matches_a_reference_mst_and_caps_degree():
     assert hc[0, 0] == pytest.approx(ref3[0]) and hc[0, 2] == pytest.approx(D3[0, 1:].min())
 
 
+def test_ring_h0_distances_compare_direction():
+    # Scaling one region's embedding moves it far away in euclidean, nowhere
+    # in cosine / l2n (direction only).
+    rng = np.random.default_rng(5)
+    emb = np.abs(rng.standard_normal((9, 4))) + 0.1
+    g = star_graph(8)
+    scaled = emb.copy(); scaled[0] *= 50.0
+    for dist in ("cosine", "l2n"):
+        assert np.allclose(cx.ring_h0(emb, g, np, distance=dist),
+                           cx.ring_h0(scaled, g, np, distance=dist)), dist
+    assert not np.allclose(cx.ring_h0(emb, g, np), cx.ring_h0(scaled, g, np))
+    # The values against a reference MST in each geometry.
+    u = emb / np.linalg.norm(emb, axis=1, keepdims=True)
+    l2n = np.sqrt(((u[:, None] - u[None]) ** 2).sum(-1))
+    for dist, D in (("l2n", l2n), ("cosine", 1.0 - u @ u.T)):
+        h = cx.ring_h0(emb, g, np, distance=dist)
+        ref = _prim_reference(D)
+        assert h[0, 0] == pytest.approx(ref[0]) and h[0, 1] == pytest.approx(ref[0] / ref[1])
+        assert h[0, 2] == pytest.approx(D[0, 1:].min())
+    # A dead (all-zero) embedding row is not a NaN.
+    dead = emb.copy(); dead[3] = 0.0
+    assert np.isfinite(cx.ring_h0(dead, g, np, distance="cosine")).all()
+    # The `latent` weighting follows the distance too, the ring mean's VALUES
+    # stay the raw activations.
+    Lc = cx.latent_columns(scaled, g, cx.LatentSpec(weight="latent", h0=False,
+                                                     distance="cosine"), np)
+    Le = cx.latent_columns(scaled, g, cx.LatentSpec(weight="latent", h0=False), np)
+    assert Lc.shape == Le.shape and not np.allclose(Lc, Le)
+
+
+def test_latent_spec_distance_hidden_round_trip():
+    plain = cx.LatentSpec()
+    assert set(plain.to_dict()) == {"layer", "weight", "h0", "z", "max_degree"}, \
+        "an untouched spec writes what it always wrote"
+    spec = cx.LatentSpec(weight="latent", z=0.5, distance="cosine", hidden=(32, 16))
+    d = spec.to_dict()
+    assert d["distance"] == "cosine" and d["hidden"] == [32, 16]
+    assert cx.LatentSpec.from_dict(d) == spec
+    assert spec.brief() == "latent(mean[latent],h0/cos,z=0.5) head 32-16"
+    assert plain.brief() == "latent(mean,h0)"
+    tol = cx.LatentSpec.from_dict({"distance": "manhattan", "hidden": ["x"]})
+    assert tol.distance == "euclidean" and tol.hidden is None
+    ctx = cx.ContextSpec(latent=spec)
+    assert cx.ContextSpec.from_dict(ctx.to_dict()) == ctx
+    assert ctx != cx.ContextSpec(latent=cx.LatentSpec(weight="latent", z=0.5))
+
+
 def test_latent_columns_names_weights_and_slices():
     t, arcs = grid_table(3)
     g = graph_of(t, arcs)
@@ -427,7 +474,7 @@ def test_context_spec_carries_a_latent_block():
     assert not spec.empty() and spec.kinds == ()
     back = cx.ContextSpec.from_dict(spec.to_dict())
     assert back == spec and back.latent.weight == "latent" and back.latent.z == 0.5
-    assert spec.brief() == "ctx: +latent(mean[latent],h0)"
+    assert spec.brief() == "ctx: +latent(mean[latent],h0,z=0.5)"
     assert cx.ContextSpec(kinds=("ring_mean",), latent=cx.LatentSpec()).brief() == \
         "ctx: ring(mean) +latent(mean,h0)"
     assert cx.column_names(spec, ["area", "mean_base"]) == []      # not in the fingerprint

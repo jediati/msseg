@@ -181,10 +181,13 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         self.sweep_trials_var = tk.StringVar(master=root, value=str(_SWEEP_TRIALS))
         self.sweep_summary_var = tk.StringVar(master=root, value="")
         self._sweep = None                   # last model_search.SweepResult
-        # "-> edges" kinds: the pair model on top of the base net (rides the
-        # classifier pickle; on the task's stack), the custom base's hidden
-        # sizes, whether Train keeps the base (to try edge variants on top),
-        # and the edge spec.
+        # The edge model: whether Train fits one on top of a dense base
+        # (`edge_on_var`; the model rides the classifier pickle, on the task's
+        # stack), whether neighbour voting applies it (`voting_var`, key N),
+        # the custom base's hidden sizes, whether Train keeps the base (to try
+        # edge variants on top), and the edge spec.
+        self.edge_on_var = tk.BooleanVar(master=root, value=False)
+        self.voting_var = tk.BooleanVar(master=root, value=True)
         self.custom_hidden_var = tk.StringVar(master=root, value=_DEFAULT_CUSTOM_HIDDEN)
         self.freeze_base_var = tk.BooleanVar(master=root, value=False)
         self.edge_layer_var = tk.StringVar(master=root, value="last")
@@ -211,6 +214,9 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         self.context_latent_weight_var = tk.StringVar(master=root, value="uniform")
         self.context_latent_layer_var = tk.StringVar(master=root, value="last")
         self.context_latent_h0_var = tk.BooleanVar(master=root, value=True)
+        self.context_latent_distance_var = tk.StringVar(master=root, value="euclidean")
+        self.context_latent_z_var = tk.StringVar(master=root, value="1")
+        self.context_latent_hidden_var = tk.StringVar(master=root, value="")   # "" = the base's
         # Labels as context (context.LabelSpec): the ring's annotated classes
         # as columns, with a training-time dropout.
         self.context_labels_var = tk.BooleanVar(master=root, value=False)
@@ -1219,21 +1225,17 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         return self._on_classify_key(e)
 
     def _on_edge_key(self, _e=None):
-        """N: toggle neighbour voting by flipping between the current edge kind
-        and its base (the cached predictions re-vote in place)."""
+        """N: toggle neighbour voting (the cached predictions re-vote in
+        place; the edge model and its p(diff) stay either way)."""
         if self._typing():
             return
         if self._edge_model is None:
-            self.status_var.set("No edge model - pick a '-> edges' kind and Train (R)")
+            self.status_var.set("No edge model - tick '+ edge model' (Model tab) and Train (R)")
             return
-        kind = self.model_kind_var.get()
-        if _is_edge_kind(kind):
-            self.model_kind_var.set(_base_kind(kind))
-            self.status_var.set("Neighbour voting off - base net predictions (N to turn on)")
-        else:
-            target = _edge_kind_of(kind) or _edge_kind_of(_base_kind(self._clf_kind)) or _CUSTOM_EDGE_KIND
-            self.model_kind_var.set(target)
-            self.status_var.set("Neighbour voting on (N to turn off)")
+        on = not bool(self.voting_var.get())
+        self.voting_var.set(on)        # the trace re-votes
+        self.status_var.set("Neighbour voting on (N to turn off)" if on
+                            else "Neighbour voting off - base net predictions (N to turn on)")
 
     def _on_escape(self, _e=None):
         """Escape abandons a gesture in flight (any tool, preview and all);
@@ -1371,6 +1373,8 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
                                  "sweep_sizes": self.sweep_sizes_var.get(),
                                  "sweep_trials": self._sweep_settings_trials()},
                 "neighbours": {"custom_hidden": self.custom_hidden_var.get(),
+                               "edge_model": bool(self.edge_on_var.get()),
+                               "voting": bool(self.voting_var.get()),
                                "freeze_base": bool(self.freeze_base_var.get()),
                                "edge_spec": self._edge_spec_from_ui().to_dict()},
                 "context": self._context_spec_from_ui().to_dict(),
@@ -1392,8 +1396,12 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         self._apply_neighbours_view(view.get("neighbours"))
         self._apply_context_view(view.get("context"))
         self._apply_seam_spec(view.get("seam_spec"))
-        if view.get("model_kind") in _MODEL_KINDS:
-            self.model_kind_var.set(view["model_kind"])
+        base, edges = _split_kind(view.get("model_kind"))
+        if base in _MODEL_KINDS:
+            if edges:                   # an older view's "-> edges" kind
+                self.edge_on_var.set(True)
+                self.voting_var.set(True)
+            self.model_kind_var.set(base)
 
     def _apply_context_view(self, d):
         if isinstance(d, dict):
@@ -1419,6 +1427,9 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
                 pass
         if isinstance(d.get("freeze_base"), bool):
             self.freeze_base_var.set(d["freeze_base"])
+        for key, var in (("edge_model", self.edge_on_var), ("voting", self.voting_var)):
+            if isinstance(d.get(key), bool):
+                var.set(d[key])
         if isinstance(d.get("edge_spec"), dict):
             self._apply_edge_spec(edge_model.EdgeSpec.from_dict(d["edge_spec"]))
 
@@ -1574,6 +1585,8 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         self.models = []
         self.model_kind_var.set("dense FC")
         self.custom_hidden_var.set(_DEFAULT_CUSTOM_HIDDEN)
+        self.edge_on_var.set(False)
+        self.voting_var.set(True)
         self.freeze_base_var.set(False)
         self._apply_edge_spec(edge_model.EdgeSpec())
         self._apply_context_spec(context.ContextSpec())
@@ -1884,7 +1897,9 @@ class AnnotationShell(StagesMixin, SeamTabsMixin, FoundationMixin, HintsMixin, M
         # The task's own workflow goes on the widgets (the outgoing one is
         # snapshotted into ITS task first). The primes stay when the two
         # fields agree -- the engines key them by content -- and a different
-        # field drops them (mspath keeps a slot per field).
+        # field is a different slot: both engines keep a few fields primed
+        # (mspath a slot per field, the coupon MSSEG_COUPON_FIELDS), so
+        # switching back finds the stack without a Run.
         self._switch_profile(self.tasks.index(task))
         # The saved pickle loads on activation, not at session restore: the
         # load runs the compatibility gate against the ACTIVE workflow.

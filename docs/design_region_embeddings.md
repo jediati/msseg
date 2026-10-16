@@ -19,7 +19,7 @@ by similarity, look at the embedding space).
 | Magic fill, blobber (`mean`, `bhattacharyya`, `histogram`, `cosine`, `proba`) | table columns (by channel list), or the whole row minus positions and histogram bins, or `_pred` probabilities | z-scored **per slice** | euclidean / bhattacharyya / hellinger / cosine / tv | `magic_fill.row_vectors`, `pairwise` |
 | Magic fill `learned` | edge-model p(diff) per arc | -- | arc weight | `tools.py:443` |
 | Seam livewire tolls `feature`, `bhattacharyya` | `magic_fill.row_vectors` again | per slice | same | `seam_path.py:115` |
-| Edge model (`-> edges` kinds) | base net hidden layer `spec.layer` (default -1) | the pipeline's training-set scaler | `|d|`, product | `edge_model.embed`, `_layer`, `pair_features` |
+| Edge model (`+ edge model`) | base net hidden layer `spec.layer` (default -1) | the pipeline's training-set scaler | `|d|`, product | `edge_model.embed`, `_layer`, `pair_features` |
 | Seam model pair block | `features` = rows z-scored per slice, **histograms included**; `net` = `edge_model.embed(...)[spec.layer]` | per slice / scaler | `|d|`, product | `seam_model.zscore_rows`, `seam_features` |
 | Latent ring head | base net layer `LatentSpec.layer` | scaler | ring means, H0 in latent space | `context.embedding_of` |
 | Context columns `source` | `all` / `ext` / `mean` column families | raw | ring reductions | `context.py:62` |

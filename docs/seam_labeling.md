@@ -271,7 +271,7 @@ model goes stale when the region annotations change.
 Every slot shows its verdict under its picker: `3 region gestures; derived
 boundaries -> class 2 'gland wall'`, or `cannot use: needs mean_blur_s1.5,
 mean_blur_s3 (+2 more); workflow 'wide' does not measure it`, `glands has no
-edge model (Model tab, an '-> edges' kind)`, `glands's model has no hidden
+edge model (Model tab, '+ edge model')`, `glands's model has no hidden
 layer to embed with`. The stage strip grows an **inputs**
 box feeding the model -- green when every filled slot can be used, orange
 (with the reasons as its tip) when one cannot; a click opens Features. The

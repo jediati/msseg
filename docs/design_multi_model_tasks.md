@@ -766,8 +766,10 @@ COPY (another task's, a template file, the defaults), never a link.
 * **Run all tasks** (mspath) groups by field fingerprint; **input slots**
   keep their semantics (the provider's net reads the consumer's rows) and
   note a provider on another field ("builds different regions").
-* **Accepted.** The coupon keeps one field live, so switching between
-  tasks on different fields re-primes (mspath has a slot per field). The
+* **Accepted, then lifted.** The coupon kept one field live, so switching
+  between tasks on different fields re-primed (mspath has a slot per
+  field); since 2026-10-15 it keeps `MSSEG_COUPON_FIELDS` (default 2) field
+  slots too (`ComputeEngine.use_field`), least recently used evicted. The
   CLI export (dormant) takes the live persistence.
 * **Future.** A field REFERENCE (`{"source": "task", "uid"}`, the input
   slots' shape) for "this task's regions are that task's": a guarantee kept

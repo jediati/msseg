@@ -559,6 +559,27 @@ def _selftest():
     assert _under(app.context_frame, app.features_tab) and not _under(app.context_frame, app.model_tab)
     assert app.feat_col.pack_slaves()[-1] is app._context_group, "context is the last group"
     assert _under(app.latent_frame, app.model_tab)
+    # The Model tab shows only what the picked kind uses.
+    shown = lambda w: bool(w.winfo_manager())
+    kind0 = app.model_kind_var.get()
+    assert app._edge_model is None
+    assert "custom FC -> edges" not in _MODEL_KINDS, "a kind is a base net only"
+    for kind, on, edge, latent, hidden in (("dense FC", False, False, True, False),
+                                           ("random forest", False, False, False, False),
+                                           ("custom FC", False, False, True, True),
+                                           ("custom FC", True, True, True, True),
+                                           ("dense FC", True, True, True, False)):
+        app.model_kind_var.set(kind)
+        app.edge_on_var.set(on)
+        assert (shown(app.edge_frame), shown(app.latent_frame),
+                shown(app.custom_hidden_row)) == (edge, latent, hidden), (kind, on)
+        assert app.edge_on_chk.instate(["!disabled"]) == (kind != "random forest" or on)
+    assert "not trained yet" in str(app.edge_frame.cget("text"))
+    assert app.edge_frame.master.pack_slaves().index(app.latent_frame) \
+        < app.edge_frame.master.pack_slaves().index(app.edge_frame) \
+        < app.edge_frame.master.pack_slaves().index(app.optimize_frame)
+    app.edge_on_var.set(False)
+    app.model_kind_var.set(kind0)
     app._refresh_hints()
     assert app.features_hint_var.get() == "stats: base→1ch×4", app.features_hint_var.get()
     app._show_center_tab("Features")
@@ -873,7 +894,9 @@ def _selftest():
     # the selected center tab (by name).
     app.center.select(app.model_tab)
     kind_pick = app.model_kind_var.get()
-    app.model_kind_var.set(_CUSTOM_EDGE_KIND)
+    app.model_kind_var.set(_CUSTOM_KIND)
+    app.edge_on_var.set(True)
+    app.voting_var.set(False)
     sdoc = app._session_doc()
     assert sdoc["view"]["center_tab"] == "Model"
     assert sdoc["view"]["panes"] == [0.2, 0.5], sdoc["view"]["panes"]
@@ -882,9 +905,13 @@ def _selftest():
     assert sdoc["session_version"] == 5 and len(sdoc["tasks"]) == 1
     assert sdoc["active_task"] == sdoc["tasks"][0]["uid"] == app._task.uid
     assert "model_kind" not in sdoc["view"], "the picked kind is the task's, not the window's"
-    assert sdoc["tasks"][0]["view"]["model_kind"] == _CUSTOM_EDGE_KIND, \
+    assert sdoc["tasks"][0]["view"]["model_kind"] == _CUSTOM_KIND, \
         "the picked kind rides the task's view"
+    nb = sdoc["tasks"][0]["view"]["neighbours"]
+    assert nb["edge_model"] is True and nb["voting"] is False, nb
     app.model_kind_var.set("dense FC")
+    app.edge_on_var.set(False)
+    app.voting_var.set(True)
     app.center.select(app.processing_tab)
     assert "labels" not in sdoc and "annotations" not in sdoc and "models" not in sdoc, \
         "the gesture geometry is the task's 'annotations' now"
@@ -907,11 +934,25 @@ def _selftest():
     assert app._center_tab_name() == "Model", "the center tab restores by name"
     app.root.update_idletasks()
     assert app._pane_fractions() == [0.2, 0.5], "the sashes restore too"
-    assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND, "the picked kind restores"
+    assert app.model_kind_var.get() == _CUSTOM_KIND, "the picked kind restores"
+    assert app.edge_on_var.get() and not app.voting_var.get(), "and both edge checkboxes"
     bad = json.loads(json.dumps(sdoc))
     bad["tasks"][0]["view"]["model_kind"] = "no such kind"
     app._apply_session_doc(bad, "test")
-    assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND, "an unknown kind is ignored"
+    assert app.model_kind_var.get() == _CUSTOM_KIND, "an unknown kind is ignored"
+    # An older view's "-> edges" kind reads as its base with an edge model and voting.
+    old_kind = json.loads(json.dumps(sdoc))
+    old_kind["tasks"][0]["view"]["model_kind"] = _CUSTOM_EDGE_KIND
+    for k in ("edge_model", "voting"):
+        old_kind["tasks"][0]["view"]["neighbours"].pop(k)
+    app.edge_on_var.set(False)
+    app._apply_session_doc(old_kind, "older kind")
+    assert app.model_kind_var.get() == _CUSTOM_KIND
+    assert app.edge_on_var.get() and app.voting_var.get()
+    app.edge_on_var.set(False)
+    app.voting_var.set(True)
+    for k, v in (("edge_model", False), ("voting", True)):
+        sdoc["tasks"][0]["view"]["neighbours"][k] = v
     sdoc["tasks"][0]["view"]["model_kind"] = kind_pick   # later re-applies keep the default
     app.model_kind_var.set(kind_pick)
     app.center.select(app.processing_tab)
@@ -959,7 +1000,7 @@ def _selftest():
     assert app._rename_class(1, "gland") and app.store.name(1) == "gland"
     assert app._class_title_labels[1].cget("text").startswith("1 gland ·")
     assert not app._rename_class(1, "gland"), "an unchanged name is a no-op"
-    app.model_kind_var.set(_CUSTOM_EDGE_KIND)
+    app.model_kind_var.set(_CUSTOM_KIND)
     t2 = app._task_new("stroma")
     assert t2 is app._task and app.tasks == [t1, t2] and t2.name == "stroma"
     assert app.store is t2.store and app.store.interactions == [], "a new task starts empty"
@@ -970,8 +1011,8 @@ def _selftest():
     assert app.profiles == [t1.workflow, t2.workflow] and app.active_profile_idx == 1
     assert app._undo_stack == [] and app._pred == {}
     assert tuple(app.task_tree.selection()) == (t2.uid,)
-    assert t1.view["model_kind"] == _CUSTOM_EDGE_KIND, "the outgoing task's Model tab was stashed"
-    assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND, "a new task inherits what is on screen"
+    assert t1.view["model_kind"] == _CUSTOM_KIND, "the outgoing task's Model tab was stashed"
+    assert app.model_kind_var.get() == _CUSTOM_KIND, "a new task inherits what is on screen"
     app.model_kind_var.set("dense FC")
     app._push_history()
     app.store.add("squiggle", [(3.0, 3.0), (4.0, 4.0)], 1, "data/s0.tiff")
@@ -980,7 +1021,7 @@ def _selftest():
     assert app.task_tree.set(t2.uid, "annot") == "1" and app.task_tree.set(t1.uid, "annot") == str(n1)
     assert app._activate_task(t1) and app._task is t1
     assert len(app.store.interactions) == n1 and app.store.name(1) == "gland"
-    assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND, "each task's Model tab comes back"
+    assert app.model_kind_var.get() == _CUSTOM_KIND, "each task's Model tab comes back"
     assert t2.view["model_kind"] == "dense FC"
     assert len(app._undo_stack) == 1, "task 1's history: the class rename, and not task 2's gesture"
     assert tuple(app.task_tree.selection()) == (t1.uid,)
@@ -997,7 +1038,7 @@ def _selftest():
     assert sdoc_t["session_version"] == 5 and sdoc_t["active_task"] == t2.uid
     assert [t["name"] for t in sdoc_t["tasks"]] == [t1.name, "stroma detector"]
     assert sdoc_t["tasks"][0]["annotations"]["classes"][0]["name"] == "gland"
-    assert sdoc_t["tasks"][0]["view"]["model_kind"] == _CUSTOM_EDGE_KIND
+    assert sdoc_t["tasks"][0]["view"]["model_kind"] == _CUSTOM_KIND
     app._apply_session_doc(sdoc_t, "tasks")
     assert [t.name for t in app.tasks] == [t1.name, "stroma detector"]
     assert app._task.uid == t2.uid and len(app.store.interactions) == 1
@@ -1320,22 +1361,25 @@ def _selftest():
         app._classify()
         pr = app._pred.get(app.catalogue.key_of(0, 0))
 
-        # -- "-> edges" kinds: an edge model on top of a dense base --------- #
+        # -- '+ edge model': an edge model on top of a dense base ------------ #
         # The two fake slices carry the block raster (ids 0,2 -> class 2 and
         # 5,9 -> class 1), so pixel adjacency gives four arcs per slice: two
         # same-class, two crossing. Train fits the custom base, then the edges.
         kind_before = app.model_kind_var.get()
-        assert _CUSTOM_KIND in _MODEL_KINDS and _CUSTOM_EDGE_KIND in _MODEL_KINDS
-        assert _base_kind(_CUSTOM_EDGE_KIND) == _CUSTOM_KIND
-        assert _edge_kind_of(_TUNED_KIND) == _TUNED_EDGE_KIND and _edge_kind_of("dense FC") is None
+        assert _CUSTOM_KIND in _MODEL_KINDS and _CUSTOM_EDGE_KIND not in _MODEL_KINDS
+        assert _split_kind(_CUSTOM_EDGE_KIND) == (_CUSTOM_KIND, True)
+        assert _split_kind(_TUNED_EDGE_KIND) == (_TUNED_KIND, True)
+        assert _split_kind("dense FC") == ("dense FC", False)
         assert _under(app.edge_eval_btn, app.model_tab) and _under(app.edge_tree, app.model_tab)
         assert _under(app.edge_readout, app.confusion_holder.master)
         app.custom_hidden_var.set("4")
-        app.model_kind_var.set(_CUSTOM_EDGE_KIND)
+        app.model_kind_var.set(_CUSTOM_KIND)
+        app.edge_on_var.set(True)
         assert "not trained yet" in app.model_arch_var.get(), app.model_arch_var.get()
         assert "not trained" in app.edge_readout_var.get()
         app._train_classifier()
-        assert app._clf_kind == _CUSTOM_EDGE_KIND and app._clf_spec is not None
+        assert app._clf_kind == _CUSTOM_KIND and app._clf_spec is not None
+        assert str(app.edge_frame.cget("text")) == "Edge model: trained on this base"
         assert tuple(app._clf_spec.hidden) == (4,)
         edge = app._edge_model
         assert edge is not None, app.status_var.get()
@@ -1390,14 +1434,14 @@ def _selftest():
                      if 0 in (int(aux["la"][i]), int(aux["lb"][i]))]
         assert np.isclose(float(vals[0]), max(touching0))
         app.region_mode_var.set("label id")
-        # N flips to the base kind: raw predictions, voting off, no forward pass.
+        # N turns voting off: raw predictions, no forward pass, kind untouched.
         app._on_edge_key()
-        assert app.model_kind_var.get() == _CUSTOM_KIND
+        assert not app.voting_var.get() and app.model_kind_var.get() == _CUSTOM_KIND
         pr0 = app._pred.get(app.catalogue.key_of(0, 0))
         assert np.array_equal(pr0[1], app._pred_aux(pr0)["raw"]) and not app._pred_aux(pr0)["active"]
         assert "voting off" in app.edge_readout_var.get()
         app._on_edge_key()
-        assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND
+        assert app.voting_var.get() and app.model_kind_var.get() == _CUSTOM_KIND
         assert app._pred_aux(app._pred[app.catalogue.key_of(0, 0)])["active"]
         # lambda 0 is the base answer even with voting on; the entry re-votes in place.
         app.edge_lam_var.set("0")
@@ -1571,15 +1615,27 @@ def _selftest():
         with tempfile.TemporaryDirectory() as td:
             p4 = os.path.join(td, "edges.pkl")
             app._save_classifier_to(p4)
-            assert app.models[-1]["edge"] is True and app.models[-1]["kind"] == _CUSTOM_EDGE_KIND
+            assert app.models[-1]["edge"] is True and app.models[-1]["kind"] == _CUSTOM_KIND
             sdoc4 = session.session_doc_from_json(app._session_doc())
             assert sdoc4["models"][-1]["edge"] is True
             app._edge_model = None
             app.model_kind_var.set("dense FC")
+            app.edge_on_var.set(False)
             app._load_classifier_from(p4)
-            assert app._edge_model is not None and app._clf_kind == _CUSTOM_EDGE_KIND
-            assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND
+            assert app._edge_model is not None and app._clf_kind == _CUSTOM_KIND
+            assert app.model_kind_var.get() == _CUSTOM_KIND and app.edge_on_var.get()
             assert app.custom_hidden_var.get() == "4"
+            # An older pickle wrote the "-> edges" kind: it loads as its base
+            # with both checkboxes on.
+            old = model_bundle.ModelBundle.load(p4)
+            old.kind = _CUSTOM_EDGE_KIND
+            p_old = os.path.join(td, "old_edges.pkl")
+            old.save(p_old)
+            app.edge_on_var.set(False)
+            app.voting_var.set(False)
+            app._load_classifier_from(p_old)
+            assert app._clf_kind == _CUSTOM_KIND and app.model_kind_var.get() == _CUSTOM_KIND
+            assert app.edge_on_var.get() and app.voting_var.get() and app._edge_model is not None
         # Evaluate edges runs inline; with two slices every fold is stratified
         # inside them, so no fold has training edges and all are skipped -- the
         # report still lands and the buttons come back.
@@ -1622,9 +1678,12 @@ def _selftest():
         app._on_confusion_click(*cell)              # toggles the cell off
         assert app._cm_cell is None and not app.errors_tree.get_children()
         assert "No confusion cell" in app.errors_header_var.get()
-        # Back to the plain kind: the edge model goes with the base it sat on.
+        # Back to the plain kind without edges: Train drops the edge model.
         app.model_kind_var.set(kind_before)
+        app.edge_on_var.set(False)
+        assert "Train (R) drops it" in str(app.edge_frame.cget("text"))
         app._train_classifier()
+        assert not app.edge_frame.winfo_manager(), "no edge model, not ticked: no frame"
         app._classify()
         pr = app._pred.get(app.catalogue.key_of(0, 0))
         assert app._edge_model is None and len(pr) == 3
@@ -2044,6 +2103,53 @@ def _selftest():
             # switch is what re-reads the workflow.)
             assert c_other2 != c_model and c_back == c_model, \
                 "returning to a task returns its commit"
+            # Two FIELDS: a task whose workflow builds another topology field
+            # (here a higher persistence cap) is primed by its own Run into
+            # its own slot; switching back finds the first task's stack,
+            # records and commit with no Run, and forth finds the second's.
+            orig = app._task
+            fx = app._primed_fingerprint
+            rec_x = app._slices.get((0, 0))
+            assert rec_x is not None and app.engine.active_field in (None, fx)
+            assert primed_before[0]["files"] == app.subsequences[0]["files"]
+            stack_y = [{"files": primed_before[0]["files"], "base": [zeros],
+                        "filtered": [zeros], "pipes": [None], "normalizers": [[]]}]
+            runs = []
+
+            def _fake_start_run(subseqs, params, run_info, field=None):
+                runs.append(field)
+                app.engine.run_active = True
+                app.engine._run_field = field
+                app.engine.work_q.put(("done", stack_y))
+
+            def _pump():
+                for ev in app.engine.poll():
+                    app._handle_compute_event(ev)
+
+            with _mock.patch.object(app, "_request_assembly"), \
+                    _mock.patch.object(app, "_ensure_pump"), \
+                    _mock.patch.object(app.engine, "start_run", _fake_start_run):
+                other = app._task_duplicate("coarse")
+                assert app.primed is primed_before, "a duplicate shares the field"
+                app.persist_pct_var.set("37")      # the MSC cap: a field key
+                fy = _fp.field_fingerprint_of(app._params_json(cores=1))
+                assert fy != fx
+                app._run()
+                _pump()
+                assert runs == [fy] and app.primed is stack_y
+                assert app.engine.active_field == fy and app._primed_fingerprint == fy
+                assert app.engine.has_field(fx), "task A's stack moved to its own slot"
+                c_y = app._commit_id
+                assert app._activate_task(orig)
+                assert runs == [fy], "no prime on return"
+                assert app.primed is primed_before and app._primed_fingerprint == fx
+                assert app._commit_id == c_model and app._slices.get((0, 0)) is rec_x, \
+                    "task A's record and commit come back"
+                assert app._activate_task(other)
+                assert runs == [fy] and app.primed is stack_y and app._commit_id == c_y
+                assert sorted(app.engine.fields) == sorted([fx, fy])
+                assert app._task_delete(confirm=True) and app._task is orig
+                assert app.primed is primed_before and runs == [fy]
             # The stage strip: four boxes; a loaded model makes no claim about
             # what it was trained on; a stamp that moved turns it stale; a box
             # opens its tab.
@@ -2633,6 +2739,27 @@ def _selftest():
     app._classify()
     assert app._pred
     app.model_kind_var.set("dense FC")
+    # The head's own size and geometry: entries on the Model tab, carried by
+    # the spec, applied at Train.
+    app._apply_context_spec(_cx.ContextSpec(latent=_cx.LatentSpec(
+        weight="latent", distance="cosine", hidden=(6,), z=0.5)))
+    assert (app.context_latent_distance_var.get(), app.context_latent_hidden_var.get(),
+            app.context_latent_z_var.get()) == ("cosine", "6", "0.5")
+    app.context_latent_hidden_var.set("5-3")
+    got = app._context_spec_from_ui().latent
+    assert got.hidden == (5, 3) and got.distance == "cosine" and got.z == 0.5
+    app.context_latent_hidden_var.set("nonsense")
+    assert app._context_spec_from_ui().latent.hidden is None, "unreadable = the base's"
+    app.context_latent_hidden_var.set("5-3")
+    app._train_classifier()
+    head = app._context_model
+    assert head is not None and head.spec.hidden == (5, 3), app.status_var.get()
+    assert head.spec.distance == "cosine"
+    assert _MLP_HIDDEN != (5, 3) and "head 5-3" in app.status_var.get(), app.status_var.get()
+    from msseg.labeler import edge_model as _em
+    assert tuple(_em.hidden_widths(head.head)) == (5, 3), _em.hidden_widths(head.head)
+    app._classify()
+    assert app._pred
     app._apply_context_spec(_cx.ContextSpec())
     app._train_classifier()
     assert app._context_model is None and app._clf_context.empty()
@@ -3114,7 +3241,8 @@ def _selftest():
     # New session: data, sequences, primed stacks and annotations go; the
     # tasks' workflows and the model selection stay when asked to, and the
     # model in memory survives the apply (it is not in the document).
-    app.model_kind_var.set(_CUSTOM_EDGE_KIND)
+    app.model_kind_var.set(_CUSTOM_KIND)
+    app.edge_on_var.set(True)
     app.custom_hidden_var.set("4")
     n_cls = app.store.n_classes
     app.store.add("squiggle", [(3.0, 3.0)], 1, "data/s0.tiff")
@@ -3141,7 +3269,7 @@ def _selftest():
     assert app.tasks[-1].store.name(1) == "bubble", "vocabularies stay"
     assert [t.workflow for t in app.tasks] == wf_kept, "every task keeps its own workflow"
     assert app.profiles == [t.workflow for t in app.tasks]
-    assert app.model_kind_var.get() == _CUSTOM_EDGE_KIND
+    assert app.model_kind_var.get() == _CUSTOM_KIND and app.edge_on_var.get()
     assert app.custom_hidden_var.get() == "4"
     assert app._clf is clf_keep, "the in-memory model survives"
     assert app._session_owned and "kept" in app.status_var.get()

@@ -14,7 +14,7 @@ the affinity from one of:
   barrier        the arc's saddle depth |saddle - max(ext_a, ext_b)| (needs
                  MSC region arcs with saddles), likewise.
   edges          the edge model's p(diff) for the flank pair (needs a
-                 '-> edges' model classified at this commit).
+                 region edge model classified at this commit).
   model          the seam model's boundaryness (needs a trained seam model).
 
 The **livewire** anchors at any point on any seam (a virtual node joined to
@@ -135,7 +135,7 @@ def seam_affinity(graph, toll, np, table=None, arcs=None, channels=("base",),
     if toll == "edges":
         if pdiff is None or arcs is None:
             raise ValueError("edges needs an edge model's p(diff) at this commit - "
-                             "pick a '-> edges' kind, Train (R), then Classify")
+                             "tick '+ edge model', Train (R), then Classify")
         aff = arc_values(graph, arcs, pdiff, np)
         return np.clip(np.nan_to_num(aff, nan=0.0), 0.0, 1.0)
     if toll == "model":
